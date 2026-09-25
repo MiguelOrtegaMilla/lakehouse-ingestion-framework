@@ -1,175 +1,202 @@
 # Phase 0 — Architecture Discovery & Project Definition
 
-> Estado: **borrador para revisión** · Fecha: 2026-09-25
-> Alcance: análisis y decisiones previas al código. No contiene implementación.
+| | |
+|---|---|
+| **Status** | v2 — decisions D1–D6 applied · awaiting confirmation of the revised phase plan |
+| **Date** | 2026-09-25 |
+| **Scope** | Analysis and decisions prior to writing code. No implementation. |
+| **Decision records** | [`docs/adr/`](../adr/README.md) — this document summarises; the ADRs are authoritative |
+
+**Revision history**
+
+| Version | Change |
+|---|---|
+| v1 | Initial discovery (Spanish). Proposed a single writer per Delta table (AD-06). |
+| v2 | Decisions D1–D6 applied. **AD-06 removed**: multi-writer tables are in the MVP through a PostgreSQL-coordinated Delta LogStore (ADR-0004). Phase plan re-sequenced around the LogStore, which is now the highest-risk component. Translated to English (D6). |
 
 ---
 
-## 0. TL;DR (lo que cambia respecto al planteamiento inicial)
+## 0. Summary of decisions
 
-1. **El entorno actual no puede ejecutar el proyecto**: Windows 10 Home, 7.4 GB de RAM, sin Docker, sin WSL, sin Scala, sin sbt y sin `winutils`. Recomiendo **WSL2 + Docker Engine dentro de WSL** como entorno de desarrollo. Es un bloqueante de Phase 1.
-2. **Hallazgo crítico para la concurrencia multi-instancia.** Delta Lake sobre **sistema de ficheros local no garantiza exclusión mutua entre procesos distintos**. `HDFSLogStore` protege el commit con un lock *estático dentro de la JVM* (`LOCAL_FS_WRITE_LOCK`) porque `RawLocalFileSystem.rename` no falla si el destino existe. Dos `spark-submit` escribiendo la misma tabla Delta local pueden **sobrescribir el mismo commit** sin que el control optimista lo detecte. La sección 13 no puede apoyarse en el OCC de Delta entre procesos.
-3. Por (2), recomiendo que el **plano de control** (estado incremental, leases, auditoría) viva en **PostgreSQL**, que ya forma parte del stack, y que el **plano de datos** (Bronze, Silver, cuarentena) viva en Delta. Es el patrón de Airflow, Airbyte o Hive Metastore: metadatos transaccionales en un RDBMS y datos en el lake.
-4. La consistencia *datos ↔ watermark* se resuelve con un protocolo **plan → commit con write-ahead log**, el mismo modelo que los offset/commit logs de Spark Structured Streaming. Se apoya en las **escrituras idempotentes nativas de Delta** (`txnAppId` / `txnVersion`). No hace falta transacción distribuida.
-5. Reduzco las 19 fases a **12 fases MVP + extensiones**, con dos puntos de parada coherentes: el *mínimo demostrable* (fin de Phase 6) y el *MVP-para-CV* (fin de Phase 11).
-6. Stack verificado: **Java 17 · Scala 2.13 · Spark 4.1.3 · Delta 4.4.0 (`delta-spark_4.1_2.13`) · PostgreSQL 17 · sbt 1.x**.
-
----
-
-## 1. Análisis crítico del proyecto
-
-### Lo que está bien planteado
-
-- **El alcance llega hasta Silver, y es correcto.** Estoy de acuerdo en dejar Gold fuera. Gold es modelado dimensional o lógica de producto y pertenece a otro sistema, normalmente dbt o jobs de dominio. Un framework de ingesta que la incluye acaba siendo un "framework de todo".
-- **La concurrencia se diseña desde el inicio.** Retrofitearla es exactamente lo que rompe los frameworks internos.
-- **La prioridad de corrección sobre rendimiento**, y la optimización con medición antes/después.
-- **La preocupación por no terminar.** Es el riesgo número uno.
-
-### Lo que cuestiono
-
-| # | Punto | Problema | Propuesta |
+| # | Decision | Outcome | ADR |
 |---|---|---|---|
-| C1 | Entorno | Spark Standalone en Windows nativo es frágil: los scripts `start-*.sh` son bash y hace falta `winutils`/`hadoop.dll`. Docker Desktop en Windows Home exige WSL2 igualmente. Con 7.4 GB, Docker Desktop + Spark + IDE va muy justo. | WSL2 (Ubuntu) con Docker Engine nativo en WSL, sin Docker Desktop, y límite de memoria en `.wslconfig`. |
-| C2 | Delta como almacén de estado y auditoría compartidos | Con Delta en FS local, varios procesos escribiendo la misma tabla (auditoría, watermarks) **no es seguro**. En cloud se resuelve con un LogStore con coordinación externa, p. ej. S3 + DynamoDB. | Plano de control en PostgreSQL (§6.2). |
-| C3 | "Varias ingestas escribiendo en la misma tabla Delta" | Es un requisito legítimo, pero sobre FS local no se puede demostrar entre procesos con garantías reales. | MVP: **un escritor por tabla**, garantizado por lease y validado en la config. OCC real de Delta demostrado **dentro de una JVM** (runner paralelo). Multi-proceso sobre la misma tabla como extensión con MinIO + LogStore coordinado. **Lo decides tú** (D3). |
-| C4 | Phase 2 separada de "fuentes sintéticas" | Una fase de datos sin consumidor produce datos que luego no encajan con los tests reales. | Cada generador de datos nace en la fase del conector que lo usa. |
-| C5 | Lineage, observabilidad y auditoría como tres fases | Los tres salen del **mismo modelo de ejecución** (run, batch, versión Delta). Separarlos obliga a volver a tocar el núcleo. | Diseñarlos juntos en Phase 3 (modelo) y exponerlos en Phase 10 (vistas, logs, métricas). |
-| C6 | CI/CD como fase tardía (15) | Un CI al final no demuestra buenas prácticas, solo las declara. | CI mínimo en Phase 1, que crece en cada fase. La extensión solo añade extras (cobertura, releases). |
-| C7 | Testing avanzado como fase (14) | Los tests de fallo solo son creíbles si el código se diseñó con puntos de inyección. | La inyección de fallos entra en el diseño del motor (Phase 4) y los tests de recuperación en Phase 6. |
-| C8 | Parquet en el MVP | Aporta poco a la historia (no hay drift de texto ni registros corruptos), pero cuesta cero porque el conector de ficheros usa `DataFrameReader`. | Soportado "gratis" y documentado. Sin casos de test dedicados más allá de uno de humo. |
-| C9 | Streaming | Nada del diseño lo impide, siempre que el conector separe *planificar* de *leer* (§12). | Mantener el contrato `plan/read` replayable. |
+| D1 | Development environment | WSL2 (Ubuntu) + Docker Engine inside WSL + JDK 17/sbt in WSL + VS Code Remote-WSL with Metals. Code lives in the WSL filesystem. | [ADR-0001](../adr/0001-development-environment.md) |
+| D2 | Control plane | PostgreSQL holds state, leases (with epoch), the batch write-ahead log and the audit trail. This is a design decision that holds in the cloud too, not a workaround for the local filesystem. | [ADR-0003](../adr/0003-control-plane-in-postgresql.md) |
+| D3 | Multi-writer concurrency | Custom **PostgreSQL-coordinated Delta LogStore** (same pattern as `S3DynamoDBLogStore`). The MVP covers *Type 2* concurrency: several processes writing the **same** Delta table. Correct by design for multi-instance, multi-node and multi-cluster. Multi-instance is demonstrated in the MVP; multi-node and multi-cluster are extensions. | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md), [ADR-0010](../adr/0010-concurrent-write-conflict-handling.md), [ADR-0011](../adr/0011-storage-profiles.md) |
+| D4 | Versions | Spark 4.1.3 · Delta 4.4.0 (`delta-spark_4.1_2.13`) · Java 17 · Scala 2.13 | [ADR-0002](../adr/0002-technology-stack.md) |
+| D5 | Phase plan | Structure approved; re-sequenced for D3 (§17). **Pending your confirmation.** | — |
+| D6 | Repository identity | Code, comments, commits and docs in English. Organization placeholder defined in one place. Repository name pending (§21). | [ADR-0012](../adr/0012-module-structure.md) |
 
 ---
 
-## 2. Requisitos funcionales
+## 1. Critical analysis
 
-| ID | Requisito | MVP |
-|---|---|---|
-| RF-01 | Definir fuentes mediante ficheros de metadata versionados en git, sin código por fuente | ✅ |
-| RF-02 | Validar toda la configuración al arrancar, antes de tocar datos, acumulando todos los errores | ✅ |
-| RF-03 | Conector JDBC (PostgreSQL de referencia): full load e incremental por watermark | ✅ |
-| RF-04 | Conector de ficheros (CSV, JSON; Parquet sin coste extra): procesar solo ficheros nuevos | ✅ |
-| RF-05 | Escribir Bronze en append con metadatos de ingesta y fidelidad a la fuente | ✅ |
-| RF-06 | Silver: tipado, normalización de nombres, deduplicación por clave y upsert (`MERGE`) | ✅ |
-| RF-07 | Detección de borrados: implícita en full load y por reconciliación de claves en incremental | ✅ |
-| RF-08 | Estado incremental persistente y consistente con los datos escritos | ✅ |
-| RF-09 | Recuperación automática de una ejecución interrumpida | ✅ |
-| RF-10 | Reprocesamiento y backfill explícitos y auditados, sin romper el estado incremental | ✅ |
-| RF-11 | Reset controlado y auditado del estado de una fuente | ✅ |
-| RF-12 | Política de evolución de esquema configurable por fuente | ✅ (básica) |
-| RF-13 | Separación de registros corruptos a cuarentena con umbral de rechazo | ✅ |
-| RF-14 | Clasificación de errores (transitorio / permanente / datos) con reintentos acotados | ✅ |
-| RF-15 | Exclusión mutua por fuente entre instancias (lease con expiración) | ✅ |
-| RF-16 | Registro de auditoría por ejecución y por batch | ✅ |
-| RF-17 | Lineage a nivel tabla/batch: fuente → versión Delta Bronze → versión Delta Silver | ✅ |
-| RF-18 | Métricas reales por ejecución + frescura por fuente | ✅ |
-| RF-19 | Marcado de PII en metadata y masking/pseudonimización en Silver | ✅ |
-| RF-20 | CLI con modos `run`, `plan` (dry-run), `backfill`, `reprocess`, `reset-state`, `reconcile-deletes`, `maintain` | ✅ (progresivo) |
-| RF-21 | Ingesta en paralelo de N fuentes dentro de una aplicación Spark | ✅ |
-| RF-22 | Demo multi-proceso (N `spark-submit` concurrentes) con verificación | Extensión |
-| RF-23 | Conector REST | Extensión |
-| RF-24 | SCD tipo 2 en Silver | Extensión |
+### What is well framed
+- **Scope ends at Silver.** Gold is business modelling; an ingestion framework that owns it becomes a "framework for everything".
+- **Concurrency is designed in from the start.** Retrofitting it is what breaks in-house frameworks.
+- **Correctness before performance**, with before/after measurement for any optimisation.
+- **Finishing is the main risk.** The phase plan has two coherent stopping points (§17).
 
-## 3. Requisitos no funcionales
+### What was challenged, and how it was resolved
 
-| ID | Requisito | Cómo se verifica |
-|---|---|---|
-| RNF-01 | **Corrección bajo fallo**: matar la ejecución en cualquier punto no duplica ni pierde datos | Tests con inyección de fallos en cada punto del protocolo, más un test e2e con `kill -9` |
-| RNF-02 | **Idempotencia**: relanzar la misma ingesta produce el mismo estado final | Test: ejecutar 2 veces y comparar tablas y estado |
-| RNF-03 | **Seguridad bajo concurrencia**: N instancias sobre la misma fuente implican 1 ejecutor efectivo y N−1 `SKIPPED_LOCKED` auditados | Tests de concurrencia (hilos contra PostgreSQL real; procesos en extensión) |
-| RNF-04 | **Extensibilidad**: un tipo de fuente nuevo = una clase que implementa el contrato + registro | Un conector de test añadido sin tocar el módulo `engine` |
-| RNF-05 | **Auditabilidad**: toda ejecución, incluso fallida o bloqueada, deja registro | Tests sobre el registro de auditoría |
-| RNF-06 | **Testabilidad**: la lógica de dominio no depende de Spark ni de I/O | Módulo `core` sin dependencia de Spark (lo impone el compilador) |
-| RNF-07 | **Reproducibilidad**: datos de test deterministas (semilla) y entorno levantable con un comando | `docker compose up` + `sbt test` |
-| RNF-08 | **Observabilidad**: logs estructurados con `run_id` y `source_id` en cada línea | Inspección de logs y test del layout |
-| RNF-09 | **Seguridad**: ningún secreto en config, logs ni auditoría | Test que verifica la redacción de secretos |
-| RNF-10 | **Recursos**: todo el entorno cabe en ~5 GB de RAM | Límites en `.wslconfig` y en la configuración de Spark |
-| RNF-11 | **Portabilidad a streaming**: no cerrar la puerta (no se implementa) | Revisión del contrato de conector |
-
----
-
-## 4. Requisitos que faltan en el planteamiento
-
-Estos puntos no aparecen en el brief original, pero una ingesta real los necesita. Los clasifico por necesidad.
-
-| Requisito ausente | Por qué importa | Nivel |
-|---|---|---|
-| **Contrato con el orquestador**: CLI, **códigos de salida** (0 OK, 2 bloqueado, 3 fallo transitorio, 4 fallo permanente, 5 umbral de datos superado) | El framework no se autoplanifica (cron/Airflow/Control-M lo invocan). El orquestador necesita distinguir "reintenta" de "no reintentes". | Required |
-| **Ficheros a medio escribir** | Un fichero que el productor aún está copiando se ingeriría truncado. Se necesita edad mínima (`min_file_age`), patrón de exclusión de temporales o fichero marcador. | Required |
-| **Tamaño de batch acotado** (`max_files_per_batch`, rango máximo de watermark) | Sin límite, la primera carga de una fuente grande o un atasco de ficheros revienta la memoria o genera commits enormes. | Required |
-| **Zona horaria** | `timestamp without time zone` en PostgreSQL + zona de sesión de Spark distinta es un bug clásico de watermarks. Todo en UTC (`spark.sql.session.timeZone=UTC`). | Required |
-| **Fuente de reloj para leases y watermarks** | Los relojes de distintas instancias difieren. Los leases usan `now()` de PostgreSQL de control. El límite superior del watermark usa el reloj de la **fuente**. | Required |
-| **Primera ejecución de una fuente** (sin estado) | Hay que definirla: incremental sin watermark = carga completa acotada. | Required |
-| **Cambios de configuración "rompientes"** (cambiar la PK, la columna de watermark o el destino) | Invalidan el estado. Se detectan comparando con la última config usada (hash + snapshot) y exigen `reset-state` explícito. | Required |
-| **Dry-run / `plan`** | Muestra qué se leería sin escribir nada. Cuesta muy poco y aporta mucho a la demo y a la operación. | Recommended |
-| **Retención**: Bronze, cuarentena (contiene PII), histórico de auditoría, `VACUUM` | Sin retención no hay GDPR creíble ni control de coste. | Recommended |
-| **Propiedad del mantenimiento Delta** (`OPTIMIZE`/`VACUUM`) | Si corre en paralelo a una ingesta, entra en conflicto. Debe tomar el mismo lease que la fuente. | Recommended |
-| **Baja de una fuente** | Borrar el YAML deja estado huérfano. Basta con un estado `disabled` en la config. | Recommended |
-| **Encoding y dialecto CSV** (separador, comillas, cabecera, encoding) | Es la fuente real de la mayoría de los "registros corruptos". | Required (en config) |
-| **SLA de frescura por fuente** | Sin un objetivo declarado, la métrica `source_freshness` no tiene umbral contra el que alertar. | Recommended |
-| **Perfiles de entorno** (local / test / CI) | Rutas del lake y conexiones distintas sin tocar las definiciones de fuente. | Required |
-
----
-
-## 5. Riesgos y decisiones arquitectónicas clave
-
-### Riesgos
-
-| Riesgo | Prob. | Impacto | Mitigación |
+| # | Topic | Problem | Resolution |
 |---|---|---|---|
-| R1 — Entorno local insuficiente (RAM, Windows) | Alta | Alto | WSL2 con límites de memoria; `local[*]` para desarrollo y tests; Standalone solo para demos |
-| R2 — Scope creep / no terminar | Alta | Alto | Puntos de parada A y B; README útil desde Phase 1; extensiones separadas |
-| R3 — Garantías de Delta en FS local malinterpretadas | Media | Alto | Documentado aquí; un escritor por tabla + lease; test de "spike" en Phase 1 que lo evidencia |
-| R4 — Sobrediseño del plano de control | Media | Medio | Solo 7 tablas; cada columna justificada; nada de colas ni servicios adicionales |
-| R5 — Sutilezas de consistencia (zombies, leases expirados) | Media | Alto | Epoch como fencing token en el plano de control; limitación documentada honestamente en Delta (§14) |
-| R6 — Tests Spark lentos que desincentivan testear | Media | Medio | `core` sin Spark (tests en ms); una `SparkSession` compartida por suite; integración separada |
-| R7 — Ecosistema Spark 4 / Scala 2.13 | Baja | Medio | Pocas dependencias, maduras, verificadas en Phase 1 |
-| R8 — Windows ↔ WSL (rendimiento de FS, IDE) | Media | Medio | Código **dentro** del FS de WSL (`~/…`), no en `/mnt/c` |
-
-### Decisiones arquitectónicas (se detallan en §6–§15)
-
-| ID | Decisión | Recomendación |
-|---|---|---|
-| AD-01 | Formato de metadata | YAML (un fichero por fuente) + validación tipada al arrancar |
-| AD-02 | Dónde vive estado/lease/auditoría | PostgreSQL (plano de control) |
-| AD-03 | Consistencia datos ↔ estado | Protocolo *plan → write idempotente → commit* con WAL de batches |
-| AD-04 | Identidad de ejecución | `run_id` = UUIDv7 (intento) ≠ `batch_seq` (unidad lógica de datos) |
-| AD-05 | Coordinación entre instancias | Lease por fuente con expiración, heartbeat y epoch (fencing) |
-| AD-06 | Escritores por tabla Delta | Uno por tabla en el MVP (validado en config + lease) |
-| AD-07 | Bronze para ficheros de texto | Columnas como `string` + columna de rescate; tipado en Silver |
-| AD-08 | Escritura por capa | Bronze append · Silver `MERGE` |
-| AD-09 | Borrados | Full load → `WHEN NOT MATCHED BY SOURCE`; incremental → reconciliación de claves periódica; CDC como futuro |
-| AD-10 | Catálogo | Tablas Delta por ruta (sin metastore) |
-| AD-11 | Modularidad | sbt multi-módulo: `core` (sin Spark) / `engine` / `cli` / `integration-tests` |
+| C1 | Environment | Spark Standalone on native Windows is fragile (bash launch scripts, `winutils`). Docker Desktop on Windows Home needs WSL2 anyway. Memory is tight at 7.4 GB. | WSL2 with Docker Engine and memory caps (ADR-0001). |
+| C2 | Delta on the local filesystem with several writer processes | `HDFSLogStore` guards a commit with a **JVM-static** lock (`LOCAL_FS_WRITE_LOCK`), because `RawLocalFileSystem.rename` does not fail when the target exists. Two JVMs committing to the same table can overwrite each other's `N.json`, silently losing a commit. | Commit exclusivity is moved to PostgreSQL through a custom LogStore (ADR-0004). The loss is demonstrated before and after in the P1/P2 spike. |
+| C3 | Type 2 concurrency in the MVP | v1 proposed one writer per table. The owner requires Type 2 in the MVP (D3). | AD-06 removed. The LogStore makes multi-writer tables safe on `file://` and `s3a://`. |
+| C4 | Separate "synthetic data" phase | Data generators without a consumer drift from what the tests need. | Each generator is built in the phase of the connector that consumes it. |
+| C5 | Lineage, observability and audit as three phases | All three derive from one execution model (run, batch, Delta version). | Modelled once (P4), exposed in P11. |
+| C6 | CI/CD late (old phase 15) | CI added at the end only declares good practice. | Minimal CI in P1, growing every phase. |
+| C7 | Advanced testing as a late phase | Failure tests need injection points designed into the code. | Fault hooks are part of the engine and LogStore design. |
+| C8 | Parquet in the MVP | Adds little to the story, but costs nothing through `DataFrameReader`. | Supported; one smoke test. |
+| C9 | Streaming | Nothing blocks it as long as connectors split *plan* from *read*. | Contract keeps `plan`/`read` replayable (§12). |
+| C10 | *New in v2:* owning a correctness-critical LogStore | A bug here corrupts tables, which is worse than any bug in the engine. | Port a proven protocol (`BaseExternalLogStore`), justify every deviation, test with fault injection at each step plus a stress verifier. It is the first thing built after bootstrap (P2) and the top-ranked risk (R0). |
 
 ---
 
-## 6. Arquitectura general
+## 2. Functional requirements
 
-### 6.1 Vista de alto nivel
+| ID | Requirement | MVP |
+|---|---|---|
+| RF-01 | Define sources through versioned metadata files, with no per-source code | ✅ |
+| RF-02 | Validate the whole configuration at startup, before touching data, reporting all errors at once | ✅ |
+| RF-03 | JDBC connector (PostgreSQL as reference): full load and incremental by watermark | ✅ |
+| RF-04 | File connector (CSV, JSON; Parquet at no extra cost): process only new files | ✅ |
+| RF-05 | Bronze append with ingestion metadata and fidelity to the source | ✅ |
+| RF-06 | Silver: typing, name normalisation, deduplication by key, upsert (`MERGE`) | ✅ |
+| RF-07 | Delete detection: implicit on full loads, key reconciliation on incremental loads | ✅ |
+| RF-08 | Persistent incremental state, consistent with the data written | ✅ |
+| RF-09 | Automatic recovery of an interrupted run | ✅ |
+| RF-10 | Explicit, audited reprocessing and backfills that do not disturb incremental state | ✅ |
+| RF-11 | Controlled, audited reset of a source's state | ✅ |
+| RF-12 | Configurable per-source schema evolution policy, including schema changes made concurrently by another writer | ✅ (basic) |
+| RF-13 | Corrupt records routed to quarantine, with a rejection threshold | ✅ |
+| RF-14 | Error classification (transient / permanent / data / conflict) with bounded retries | ✅ |
+| RF-15 | Mutual exclusion per (source, layer) across instances: lease with expiry and epoch | ✅ |
+| RF-16 | Audit record per run and per batch | ✅ |
+| RF-17 | Table/batch lineage: source → Bronze Delta version → Silver Delta version | ✅ |
+| RF-18 | Real per-run metrics and per-source freshness | ✅ |
+| RF-19 | PII tagging in metadata; pseudonymisation in Silver | ✅ |
+| RF-20 | CLI modes `run`, `plan` (dry run), `backfill`, `reprocess`, `reset-state`, `reconcile-deletes`, `maintain`, `adopt-table` | ✅ (progressive) |
+| RF-21 | Parallel ingestion of N sources inside one Spark application | ✅ |
+| **RF-25** | **Coordinated commits: several processes can write the same Delta table safely (Type 2), on `file://` and `s3a://`** | ✅ |
+| **RF-26** | **Refuse to run if the LogStore is not configured for every lake scheme, and detect commits written without coordination** | ✅ |
+| RF-22 | Multi-instance demonstration: N processes on one machine writing shared tables, checked by a verifier | ✅ (was an extension in v1) |
+| RF-27 | Multi-node demonstration (Spark Standalone with several workers + MinIO) | Extension |
+| RF-28 | Multi-cluster demonstration (independent Spark applications/clusters sharing storage and coordination) | Extension |
+| RF-23 | REST connector | Extension |
+| RF-24 | SCD type 2 in Silver | Extension |
+
+## 3. Non-functional requirements
+
+| ID | Requirement | Verification |
+|---|---|---|
+| RNF-01 | **Correct under failure**: killing a run at any point neither duplicates nor loses data | Fault injection at every engine hook and every LogStore protocol step, plus an e2e `kill -9` test |
+| RNF-02 | **Idempotent**: re-running the same ingestion produces the same final state | Run twice, compare tables and state |
+| RNF-03 | **Concurrency-safe (same source)**: N instances on one source give one effective executor and N−1 audited `SKIPPED_LOCKED` | Lease tests with N threads against real PostgreSQL |
+| **RNF-12** | **Concurrency-safe (Type 2, same table)**: N writer processes produce contiguous versions with no lost commits, and every expected `txnVersion` is present exactly once | LogStore stress test with random `kill -9` and a final verifier (ADR-0004) |
+| **RNF-13** | **Fail closed**: if coordination (PostgreSQL) is unavailable, no commit is ever written without it | Fault tests with PostgreSQL stopped at each step |
+| **RNF-14** | **Deployment-level agnostic**: nothing in the design assumes one JVM, one machine or one cluster for correctness | Design review against ADR-0011; E1/E2 demonstrations |
+| RNF-04 | **Extensible**: a new source type is one class implementing the contract plus a registration | A test connector added without touching the `engine` module |
+| RNF-05 | **Auditable**: every run, including failed and skipped ones, leaves a record | Tests on audit records |
+| RNF-06 | **Testable**: domain logic does not depend on Spark or I/O | The `core` module has no Spark dependency (compiler-enforced) |
+| RNF-07 | **Reproducible**: deterministic seeded test data; environment up with one command | `docker compose up` + `sbt test` |
+| RNF-08 | **Observable**: structured logs with `run_id` and `source_id` on every line | Log layout test |
+| RNF-09 | **Secure**: no secret in configuration, logs or audit | Redaction test |
+| RNF-10 | **Resource bounded**: the MVP runs inside the WSL budget (§7.3) | `.wslconfig` limits and Spark memory settings |
+| RNF-11 | **Streaming-ready** (not implemented): no decision closes the door | Connector contract review |
+
+---
+
+## 4. Requirements missing from the original brief
+
+| Missing requirement | Why it matters | Level |
+|---|---|---|
+| **Orchestrator contract**: CLI and exit codes (0 OK, 2 skipped/locked, 3 transient failure, 4 permanent failure, 5 data threshold exceeded) | The framework does not schedule itself. The orchestrator must tell "retry" from "do not retry". | Required |
+| **Partially written files** | A file still being copied would be ingested truncated. Needs a minimum file age, temp-name exclusion, or a marker file. | Required |
+| **Bounded batch size** (`max_files_per_batch`, max watermark range) | An unbounded first load or a file backlog breaks memory and produces huge commits. | Required |
+| **Time zones** | `timestamp without time zone` combined with a different Spark session zone is a classic watermark bug. Everything is UTC. | Required |
+| **Clock source** | Instances' clocks differ. Leases and commit-entry timestamps use PostgreSQL `now()`; watermark upper bounds use the **source's** clock. | Required |
+| **First run of a source** | Incremental with no watermark means a bounded full load. | Required |
+| **Breaking configuration changes** (primary key, watermark column, target) | They invalidate state. Detected against the last used config snapshot; require an explicit `reset-state`. | Required |
+| **Canonical table identity** *(new)* | Two spellings of the same table path (symlink, `s3://` vs `s3a://`) would give two coordination keys, and therefore **no mutual exclusion**. | Required (ADR-0004, ADR-0011) |
+| **LogStore enforcement** *(new)* | One misconfigured writer without the LogStore voids every guarantee. | Required (ADR-0004) |
+| **Dry run / `plan`** | Show what would be read without writing. Cheap, and valuable for demos and operations. | Recommended |
+| **Retention**: Bronze, quarantine (holds PII), audit history, `VACUUM`, LogStore temp files | Without retention there is no credible GDPR story and no cost control. | Recommended |
+| **Ownership of Delta maintenance** (`OPTIMIZE`/`VACUUM`) | Concurrent maintenance is now *allowed* (Type 2); its conflicts must be classified (ADR-0010). | Recommended |
+| **Retiring a source** | Deleting the YAML orphans its state. A `disabled` flag is enough. | Recommended |
+| **CSV encoding and dialect** | The real source of most "corrupt records". | Required (in config) |
+| **Freshness SLA per source** | `source_freshness` needs a threshold to alert on. | Recommended |
+| **Environment profiles** (local / test / CI / multinode) | Different lake URIs and connections without touching source definitions. | Required |
+
+---
+
+## 5. Risks and decision index
+
+### Risks
+
+| Risk | Prob. | Impact | Mitigation |
+|---|---|---|---|
+| **R0 — PostgreSQL LogStore is incorrect** (lost or duplicated commit, partial `N.json` visible, deadlock, fail-open path). **Highest-risk component of the project.** | Medium | **Critical**: table corruption | Port Delta's proven prepare–commit–acknowledge protocol; every deviation justified (ADR-0004); fault injection at each step; stress test with `kill -9` and a verifier; built right after bootstrap (P2) so the rest of the project stands on verified ground; spike shows before/after. |
+| R1 — Local environment insufficient (RAM, Windows) | High | High | WSL2 with caps; `local[*]` day to day; stress and multi-node at small N locally, full size in CI (§7.3). |
+| R2 — Scope creep / not finishing | High | High | Checkpoints A and B; README kept useful from P1; extensions kept separate. |
+| R3 — Reliance on Delta internals (`Snapshot.transactions`, commit on the caller thread, which files go through `LogStore.write`) | Medium | Medium | Isolated behind small adapters; verification items listed in §20; pinned Delta version with an upgrade test. |
+| R4 — Over-designed control plane | Medium | Medium | Seven control tables plus two coordination tables; every column justified. |
+| R5 — Consistency subtleties (zombies, expired leases, non-monotonic commit order) | Medium | High | Epoch fencing in the control plane; `txnAppId`/`txnVersion` discard stale writes in Delta; Silver cursor is the Bronze Delta version (ADR-0010). |
+| R6 — Slow Spark tests discourage testing | Medium | Medium | `core` and LogStore unit tests have no Spark; one shared session per suite; integration module separate. |
+| R7 — Spark 4 / Scala 2.13 ecosystem | Low | Medium | Few, mature dependencies; verified in P1. |
+| R8 — Windows ↔ WSL friction (filesystem performance, IDE) | Medium | Medium | Code lives in the WSL filesystem, never under `/mnt/c`. |
+
+### Architectural decisions
+
+| ID | Decision | ADR |
+|---|---|---|
+| AD-01 | Metadata as YAML (one file per source), typed validation at startup | [0007](../adr/0007-metadata-format.md) |
+| AD-02 | State, leases, WAL and audit in PostgreSQL | [0003](../adr/0003-control-plane-in-postgresql.md) |
+| AD-03 | Data ↔ state consistency via *plan → idempotent write → commit* with a batch WAL | [0005](../adr/0005-batch-wal-and-idempotent-writes.md) |
+| AD-04 | `run_id` = UUIDv7 (attempt) ≠ `batch_seq` (logical unit of data) | [0005](../adr/0005-batch-wal-and-idempotent-writes.md) |
+| AD-05 | Per-(source, layer) lease with expiry, heartbeat and epoch fencing | [0006](../adr/0006-source-leases-with-epoch-fencing.md) |
+| ~~AD-06~~ | ~~One writer per Delta table~~ — **removed (D3)** | — |
+| **AD-13** | Multi-writer Delta tables through a PostgreSQL-coordinated LogStore | [0004](../adr/0004-postgresql-coordinated-delta-logstore.md) |
+| **AD-14** | Conflict classification (retry vs re-plan), Silver partitioning for concurrent `MERGE`, Silver cursor = Bronze Delta version | [0010](../adr/0010-concurrent-write-conflict-handling.md) |
+| **AD-15** | Lake storage profiles (`file://` single machine, `s3a://` multi-node/multi-cluster) and canonical table identity | [0011](../adr/0011-storage-profiles.md) |
+| AD-07 | Bronze keeps text formats as `string` + rescue column; typing happens in Silver | [0008](../adr/0008-layer-responsibilities.md) |
+| AD-08 | Bronze append · Silver `MERGE` | [0008](../adr/0008-layer-responsibilities.md) |
+| AD-09 | Deletes: `WHEN NOT MATCHED BY SOURCE` on full loads; periodic key reconciliation on incremental loads; CDC as a future option | [0009](../adr/0009-delete-detection.md) |
+| AD-10 | Tables addressed by path; no metastore (behind a `TableLocator` so a catalog can be added later) | [0011](../adr/0011-storage-profiles.md) |
+| AD-11 | sbt multi-module: `core` / `delta-pg-logstore` / `engine` / `cli` / `integration-tests` | [0012](../adr/0012-module-structure.md) |
+
+---
+
+## 6. Overall architecture
+
+### 6.1 High-level view
 
 ```mermaid
 flowchart LR
   subgraph Sources
-    PG[(PostgreSQL<br/>fuente)]
-    FS[/Directorio de llegada<br/>CSV · JSON · Parquet/]
+    PG[(PostgreSQL<br/>source DB)]
+    FS[/Landing directory<br/>CSV · JSON · Parquet/]
   end
 
   subgraph Config["Metadata (git)"]
-    Y[sources/*.yaml<br/>app.yaml]
+    Y[sources/*.yaml<br/>app profiles]
   end
 
-  subgraph App["Ingestion app (spark-submit)"]
-    CLI[CLI] --> ENG[Ingestion Engine]
+  subgraph App["Ingestion app — one or many processes"]
+    CLI[CLI] --> ENG[Ingestion engine]
     ENG --> CON[Connectors<br/>JDBC · Files]
     ENG --> WR[Writers<br/>Bronze append · Silver MERGE]
+    WR --> DL[Delta Lake<br/>OptimisticTransaction]
+    DL --> LS[PostgresLogStore]
   end
 
-  subgraph Control["Plano de control (PostgreSQL)"]
-    ST[(state · batches<br/>leases · runs<br/>files · config)]
+  subgraph Control["PostgreSQL — ingestion_control DB"]
+    CP[(schema control<br/>runs · batches · state<br/>leases · files · config)]
+    CO[(schema delta_coordination<br/>commit entries · table registry)]
   end
 
-  subgraph Lake["Plano de datos (Delta Lake, FS local)"]
+  subgraph Lake["Delta Lake storage — file:// or s3a://"]
     B[(Bronze)]
     S[(Silver)]
     Q[(Quarantine)]
@@ -178,296 +205,250 @@ flowchart LR
   Y --> CLI
   PG --> CON
   FS --> CON
-  WR --> B --> WR
-  WR --> S
-  WR --> Q
-  ENG <--> ST
+  ENG <--> CP
+  LS <-->|put-if-absent commit N| CO
+  LS -->|publish N.json| Lake
+  WR -->|data files<br/>executors| Lake
 ```
 
-### 6.2 Por qué dos planos (AD-02)
+**Two planes, three coordination mechanisms.** Each mechanism protects exactly one thing, and none of them depends on a single JVM, machine or cluster:
 
-| | |
-|---|---|
-| **Decision** | Estado incremental, leases, WAL de batches y auditoría en **PostgreSQL** (base `ingestion_control`). Datos, cuarentena y lineage de versiones en **Delta**. |
-| **Why** | (1) Los leases necesitan operaciones atómicas *compare-and-set* entre procesos. PostgreSQL las da (`UPDATE … WHERE … RETURNING`) y Delta en FS local no. (2) Avanzar el watermark, cerrar el batch y cerrar el run deben ser **una** transacción: en PostgreSQL es un `COMMIT`; en Delta serían tres commits en tres tablas. (3) La auditoría la escriben todas las instancias a la vez, y eso es multi-escritor sobre la misma tabla (C2). |
-| **Alternatives** | (a) Todo en tablas Delta. (b) Ficheros JSON de estado por fuente. (c) MinIO + Delta con LogStore coordinado (DynamoDB Local). (d) Zookeeper/etcd para locks. |
-| **Trade-offs** | (+) Correcto por construcción, fácil de consultar, reutiliza un componente ya presente. (−) Hay dos sistemas, así que no hay transacción única datos+estado. Se resuelve con el protocolo de §8 y es un trade-off que *quiero* que expliques en entrevista. (−) La auditoría no es "una tabla Delta más" consultable con Spark; se lee vía JDBC. |
-| **Industry practice** | Airflow (metadata DB), Airbyte (config/state DB en PostgreSQL), Hive Metastore, Dagster: plano de control en RDBMS. Delta/Iceberg con catálogo (Unity, Nessie, Polaris) desplazan justo la coordinación de commits a un servicio externo. |
-| **Why it fits** | Cero infraestructura nueva: se usa el mismo contenedor PostgreSQL con **otra base de datos**, separada de la fuente. En producción serían instancias distintas. |
-
-### 6.3 Responsabilidad por capa
-
-| Capa | Guarda | NO guarda / NO hace | Escritura | Errores |
-|---|---|---|---|---|
-| **Landing** (solo ficheros) | El directorio donde el productor deja ficheros. **El framework no copia ni mueve**: registra lo procesado en el plano de control. | Copias intermedias. Mover ficheros sería un efecto lateral no atómico con el commit Delta y rompería el replay. | La escribe el productor | Fichero ilegible → registro `FAILED` + política (`fail` o `skip`) |
-| **Bronze** | Fidelidad a la fuente. JDBC con tipos nativos. CSV/JSON como `string` + `_rescued_data`. Metadatos mínimos: `_run_id`, `_batch_seq`, `_ingested_at`, `_source_file` (solo ficheros). | Tipado de texto, deduplicación, renombrados, lógica de negocio | Append idempotente (`txnAppId`/`txnVersion`) | Registros estructuralmente corruptos → cuarentena Bronze. Umbral superado → el batch no se commitea. |
-| **Silver** | Estado actual por clave, tipado según el esquema declarado, nombres normalizados (`snake_case`), PII enmascarada, soft-delete (`_is_deleted`, `_deleted_at`) | Joins entre fuentes, agregados, reglas de negocio, métricas de negocio | `MERGE` por PK con guarda de orden (`updated_at`) | Fallos de cast → cuarentena Silver con el registro Bronze original |
-| **Gold** | Fuera de alcance | — | — | — |
-
-**¿Aporta valor una landing propia?** No como copia, pero sí como *contrato*: ruta por fuente (`landing/<source_id>/`), regla de fichero completo (edad mínima o marcador) y ficheros inmutables. Es exactamente lo que hace Auto Loader: no mueve ficheros y lleva la cuenta de los procesados en su checkpoint.
-
-**Por qué Bronze guarda texto como `string`:** si Bronze tipara, un `"12,5"` en una columna decimal sería un fallo *en Bronze*. Se perdería la fidelidad y el registro original. Con `string`, Bronze solo rechaza lo **estructuralmente** roto (JSON inválido, número de columnas incorrecto) y Silver es la frontera del tipado. Es el mismo comportamiento por defecto de Auto Loader (`inferColumnTypes=false`).
-
-### 6.4 Lineage (qué nivel es razonable)
-
-- **Required (MVP)**: nivel **tabla + batch**. Cada fila Bronze lleva `_run_id` y `_batch_seq`. Cada batch registra su input (rango de watermark o lista de ficheros) y su output (tabla y **versión Delta** resultante). Silver registra qué `batch_seq` de Bronze aplicó y en qué versión Silver quedó. Con eso se responde "¿de qué fichero viene esta fila Silver?" con dos joins.
-- **Técnica**: cada commit Delta lleva `userMetadata = {run_id, batch_seq, source_id}`. La versión se localiza en `DESCRIBE HISTORY` por `run_id`, no con "la última versión", que no es fiable si hubiera otro escritor.
-- **Future**: lineage a nivel columna y emisión de eventos OpenLineage. El modelo run/batch/input/output es 1:1 con `RunEvent` de OpenLineage, así que es un adaptador, no un rediseño.
-
----
-
-## 7. Stack concreto y compatibilidad
-
-Verificado el 2026-09-25 contra Maven Central y la documentación oficial.
-
-| Componente | Versión | Justificación / compatibilidad |
-|---|---|---|
-| Java | **17** (Temurin, dentro de WSL) | Spark 4.1 soporta Java 17 y 21. Ya usas 17 en Windows. 21 no aporta nada al proyecto. |
-| Scala | **2.13.x** (la misma minor que usa Spark 4.1.3) | Spark 4 solo se publica para 2.13. Scala 3 no es viable con encoders de Dataset (dependen de `TypeTag`). |
-| Apache Spark | **4.1.3** | Línea 4.1 madura (3 parches). Spark 4.2.0 salió en julio de 2026 y es una `.0`. Migrar después es cambiar dos coordenadas. |
-| Delta Lake | **4.4.0**, artefacto `io.delta:delta-spark_4.1_2.13` | Desde Delta 4.1 los artefactos llevan la versión de Spark. 4.4.0 soporta Spark 4.0/4.1/4.2. |
-| sbt | 1.x más reciente (se fija en Phase 1) | Estándar de Scala. `sbt-assembly` para el fat jar con Spark como `provided`. |
-| PostgreSQL | **17** (imagen oficial `postgres:17`) | Fuente y plano de control en el mismo contenedor, dos bases de datos |
-| Driver JDBC | `org.postgresql:postgresql` 42.7.x | Estándar |
-| Migraciones del plano de control | **Flyway** | Esquema versionado del plano de control. Es el estándar de la industria y evita SQL "a mano" al arrancar. |
-| Config | `circe` + `circe-yaml` | YAML → case classes con errores de decodificación precisos. `circe` ya trae `cats` (`Validated` para acumular errores). |
-| Tests | ScalaTest 3.2.x + Testcontainers (PostgreSQL) | Testcontainers requiere Docker, que estará disponible en WSL y en GitHub Actions |
-| Logging | log4j2 (el de Spark) con `JsonTemplateLayout` | Sin segundo framework de logging (evita conflictos de binding SLF4J con Spark) |
-| Calidad | scalafmt, `-Xlint` + `-Werror` selectivo, scoverage | Suficiente. scalafix queda opcional. |
-| CI | GitHub Actions (`ubuntu-latest` trae Docker) | Integración con Testcontainers sin configuración extra |
-| Contenedores | Docker Engine + Compose v2 **dentro de WSL2** | Sin Docker Desktop: menos RAM y sin licencia |
-
-**Incompatibilidades detectadas:**
-- El JDK 8 que tienes instalado no sirve para Spark 4 (solo afecta si queda primero en el `PATH`).
-- IntelliJ 2023.3 no tiene el plugin de Scala instalado, y es antiguo para Scala 2.13 reciente y sbt 1.10+. Si usas IntelliJ, conviene actualizarlo (ver D1).
-- Windows nativo exige `winutils.exe`/`hadoop.dll` para que Spark/Delta escriban en disco. WSL2 lo elimina.
-
-**Presupuesto de memoria (7.4 GB físicos):**
-
-| Proceso | RAM |
-|---|---|
-| WSL2 VM (tope en `.wslconfig`) | 5 GB |
-| ↳ PostgreSQL | ~0.3 GB |
-| ↳ Spark local (tests / dev): driver | 2 GB |
-| ↳ Spark Standalone (demo): master 0.5 + worker 2.5 (2 apps × 1 GB) | 3 GB (no simultáneo con los tests) |
-| Windows + IDE | ~2.4 GB |
-
-Funciona, pero sin margen para ejecutar tests y Standalone a la vez. Ese es otro motivo para usar `local[*]` en el día a día.
-
----
-
-## 8. Estado, idempotencia y recuperación (el núcleo)
-
-### 8.1 Run ≠ Batch (AD-04)
-
-- **Run** = un *intento* de ejecución. `run_id` es un **UUIDv7**: 48 bits de timestamp + 74 aleatorios. Se genera sin coordinación, no colisiona entre instancias y se ordena por tiempo. En Java 17 no viene de serie, pero se generan fácilmente (~15 líneas).
-- **Batch** = la *unidad lógica de datos* (rango de watermark o conjunto de ficheros). `batch_seq` es monotónico **por fuente y capa** y lo asigna el plano de control dentro del lease.
-- Un batch puede necesitar varios runs (crash + recuperación). La **idempotencia se ancla al batch, no al run**. Esta distinción es la que separa un diseño correcto de uno que "casi" funciona.
-
-### 8.2 Protocolo de ejecución
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant I as Instancia (run R)
-  participant C as Plano de control (PG)
-  participant S as Fuente
-  participant D as Delta (Bronze)
-
-  I->>C: registrar run R (STARTING)
-  I->>C: adquirir lease(source) → epoch E
-  alt lease ocupado
-    I->>C: run R = SKIPPED_LOCKED · exit 2
-  end
-  I->>C: ¿batch PLANNED pendiente?
-  alt hay batch pendiente N
-    I->>D: ¿txn(appId=source, version≥N) existe?
-    alt sí (datos escritos, estado no)
-      I->>C: roll-forward: commit estado del batch N
-    else no
-      I->>S: re-leer EXACTAMENTE el plan N (replay)
-    end
-  else no hay pendiente
-    I->>S: planificar (rango [wm, upper] / lista de ficheros)
-    I->>C: persistir batch N = PLANNED (WAL)
-  end
-  I->>S: leer según plan N
-  I->>D: escribir cuarentena (txn idempotente)
-  I->>D: append Bronze (txnAppId=source, txnVersion=N, userMetadata=R)
-  I->>C: TX{ watermark=upper · batch N=COMMITTED · run R=SUCCEEDED } WHERE epoch=E
-  I->>C: liberar lease
-```
-
-**Por qué es correcto sin transacción distribuida:**
-- **Delta es la fuente de verdad** de si los datos del batch N están escritos: `txnAppId`/`txnVersion` quedan en el log de Delta en el mismo commit atómico que los datos.
-- **El plan se persiste antes de leer** (write-ahead). Si se muere antes del commit Delta, se relee el *mismo* plan. Si se muere después, se detecta vía `txn` y se completa el estado (*roll-forward*). En ningún caso hay duplicados ni huecos.
-- Es el modelo de Spark Structured Streaming: offset log (plan) + commit log (estado), y `foreachBatch` idempotente con `txnAppId`/`txnVersion`. **Esto mantiene abierta la puerta al streaming** (§12).
-
-### 8.3 Ficheros
-
-- Registro `processed_file(source_id, path, size, mtime)`. El identificador es `path + size + mtime`: el mismo nombre con contenido distinto cuenta como fichero nuevo. El hash de contenido queda como opción futura por su coste en ficheros grandes.
-- El plan de un batch de ficheros **es la lista de ficheros**, persistida. Replay = leer esa lista.
-- Reprocesar un fichero exige `reprocess --files …`. Crea un **batch nuevo** (`run_kind=REPROCESS`), nunca reutiliza el anterior, y queda auditado.
-
-### 8.4 Incremental por watermark
-
-- `upper_bound` se fija **al planificar** con el reloj de la fuente: `now() − safety_margin`. Esto evita perder filas de transacciones largas que hacen commit con un `updated_at` anterior al leído.
-- `lookback` configurable: se lee `updated_at > wm − lookback AND updated_at <= upper_bound`. Las filas repetidas entran en Bronze con otro `batch_seq` (es historia de recepción) y Silver las deduplica con la guarda `source.updated_at >= target.updated_at`.
-- **Datos tardíos**: el `lookback` cubre el retraso típico y la guarda de orden en Silver impide que un dato viejo pise uno nuevo.
-- **Backfill**: `backfill --from --to` crea batches `run_kind=BACKFILL` que **no leen ni mueven** el watermark incremental. Silver los absorbe gracias a la guarda de orden.
-- **Reset**: `reset-state --source X --to <valor> --reason "..."` escribe en `state_change_log` (quién, cuándo, antes, después y motivo).
-
-### 8.5 Borrados en origen (AD-09)
-
-| Opción | Detecta | Coste | Recomendación |
+| Mechanism | Protects | Scope | ADR |
 |---|---|---|---|
-| Full load periódico | Todo | Alto (tabla completa) | Solo para tablas pequeñas: `load: full` |
-| Soft delete en la fuente (`deleted_at`) | Todo, si la fuente lo tiene | Nulo | Soportar si existe (`deleted_flag_column`) |
-| **Reconciliación de claves** (leer solo la PK y anti-join con Silver) | Borrados, con retraso de un ciclo | Bajo: solo una columna, indexada | **Recomendada** para incrementales, invocada por el orquestador con `reconcile-deletes` |
-| CDC real (Debezium / logical replication) | Todo, en orden y en tiempo casi real | Infraestructura (Kafka/Connect) | Evolución futura |
+| **Source lease** (row in `control.source_lease`, epoch fencing) | That only one run at a time advances the state (watermark, processed files) of a (source, layer) | Control plane | 0006 |
+| **Batch WAL + `txnAppId`/`txnVersion`** | That a logical batch is applied to a table exactly once, even across crashes and zombies | Control plane + Delta log | 0005 |
+| **PostgresLogStore** (put-if-absent on `(table, version)`) | That exactly one writer creates `N.json` for each version of a table (Delta's *mutual exclusion* requirement) | Delta log | 0004 |
+| **Delta optimistic concurrency** (built in) | That a commit is not logically invalidated by a concurrent one (e.g. two `MERGE`s touching the same files) | Delta log | 0010 |
 
-En Silver los borrados son **soft deletes** (`_is_deleted`, `_deleted_at`) para mantener la auditabilidad. El borrado físico se reserva para GDPR (§11).
+### 6.2 Concurrency taxonomy and deployment levels
 
----
-
-## 9. Concurrencia multi-instancia (sección 13 del brief)
-
-### 9.1 Qué se fija ya (va en el modelo de Phase 3, aunque la demo sea posterior)
-
-| # | Decisión | Diseño |
+| Concurrency type | Example | What makes it safe |
 |---|---|---|
-| 1 | `run_id` a prueba de colisión | UUIDv7 generado por la instancia. Sin coordinación ni infraestructura. |
-| 2 | Coordinación sobre una misma fuente | **Lease** en `source_lease`: `UPDATE … SET holder=?, epoch=epoch+1, expires_at=now()+ttl WHERE source_id=? AND (holder IS NULL OR expires_at < now()) RETURNING epoch`. Un hilo de heartbeat renueva el lease. Si la instancia muere, el lease expira sin dejar locks huérfanos. Tiempo del servidor PG, no de la instancia. Si está ocupado: `SKIPPED_LOCKED` (auditado) y exit 2, sin esperar. |
-| 3 | Estado incremental | Solo el titular del lease avanza el estado, y el commit de estado es condicional: `… WHERE epoch = :mi_epoch`. Un "zombi" con lease expirado **no puede** avanzar el watermark. El epoch es un *fencing token*. |
-| 4 | Conflictos de escritura Delta | Un escritor por tabla (AD-06). Las excepciones de OCC (`ConcurrentAppendException`, etc.) solo pueden venir del mantenimiento o del runner paralelo in-JVM. Se reintentan con backoff acotado **solo** porque las operaciones son idempotentes (append con `txn`, `MERGE` recomputable), y se cuentan en `write_conflicts`. |
-| 5 | Auditoría bajo concurrencia | Cada fila de auditoría lleva `run_id` + `instance_id` (host, pid, `spark.app.id`) + `lease_epoch`. Dos runs solapados son siempre distinguibles, y el que perdió el lease queda marcado. |
+| **Same source, same layer** | Two overlapping orchestrator triggers for `sales.orders` | Lease: the second run is `SKIPPED_LOCKED` (exit 2) |
+| **Type 1 — different sources, different tables** | 20 sources ingested in parallel | Nothing is shared except the control plane (row-level operations) |
+| **Type 2 — several processes, same Delta table** | Fan-in (several sources → one table), backfill running alongside the incremental run, `OPTIMIZE` alongside ingestion | LogStore (physical exclusivity per version) + Delta OCC (logical conflicts) + `txnAppId` (idempotence) |
 
-### 9.2 Por qué lease con epoch y no `pg_advisory_lock`
+| Deployment level | Definition | Requirement for correctness | Demonstrated in |
+|---|---|---|---|
+| **Multi-instance** | Several driver JVMs on one machine | Shared PostgreSQL; shared lake (`file://` is fine on one machine) | MVP (P2 stress test, P11 engine demo) |
+| **Multi-node** | One Spark cluster; executors on different machines write data files | Shared storage reachable by every executor (`s3a://` MinIO); `file://` is not valid | Extension E1 |
+| **Multi-cluster** | Independent Spark applications/clusters, each with its own driver | Same PostgreSQL and the same canonical lake URI for all writers | Extension E2 |
 
-`pg_advisory_lock` es más simple, pero está atado a la **conexión JDBC**. Si la conexión cae y el proceso sigue vivo, el lock desaparece en silencio: dos ejecutores a la vez sin que nadie lo sepa. Además no da fencing token ni deja rastro auditable. El lease cuesta una tabla y un hilo de heartbeat.
+Decisions that would have closed the door on multi-node or multi-cluster, and are therefore **forbidden** (ADR-0011):
+- JVM-local locks or in-memory state for correctness (only as an optimisation, as `PathLock` is in Delta's base class).
+- Client clocks for leases or commit timestamps.
+- Temporary files outside the table's `_delta_log/` (a recovering node must see them).
+- Mixing URI schemes or path spellings for the same table.
 
-### 9.3 Límite honesto (para la entrevista)
+### 6.3 Layer responsibilities
 
-El fencing protege el **plano de control**, pero Delta en FS local no puede rechazar la escritura de un zombi. Mitigaciones del MVP:
-1. TTL del lease ≫ duración máxima de un commit.
-2. Comprobación del lease justo antes del commit Delta.
-3. Idempotencia por `txnVersion`: si un zombi y el nuevo titular escriben el *mismo* batch, Delta descarta el segundo.
+(Full rationale in [ADR-0008](../adr/0008-layer-responsibilities.md).)
 
-La ventana residual se documenta. Cerrarla del todo requiere que el almacenamiento soporte commits condicionales (coordinated commits / catálogo), y eso es enterprise.
-
-### 9.4 Riesgo de sobrecomplicar el MVP y cómo acotarlo
-
-- **Dentro del MVP**: lease + epoch + WAL de batch + `run_id`/`instance_id`, tests de concurrencia de leases con N hilos contra PostgreSQL real (que es multi-proceso de verdad a nivel BD), y **runner paralelo in-JVM** (N fuentes, `FAIR` scheduler) donde el OCC de Delta sí es real y demostrable.
-- **Fuera del MVP**: N `spark-submit` simultáneos en Standalone con script de verificación (extensión E1), y multi-escritor sobre la **misma** tabla Delta entre procesos (extensión E5, requiere MinIO + LogStore coordinado).
-- **Gotcha que la demo debe mostrar**: en Standalone, cada app coge **todos los cores** si no se fija `spark.cores.max`, y la segunda instancia queda en `WAITING`. Es "concurrencia" que no lo es.
-
----
-
-## 10. Evolución de esquema (resumen; se diseña en su fase)
-
-Política por fuente:
-
-```yaml
-schema:
-  on_new_column: add | rescue | fail          # default: add (Bronze), rescue para JSON
-  on_missing_column: null | fail              # default: null
-  on_type_change: widen | rescue | fail       # default: fail (JDBC)
-  renames: { old_name: new_name }             # única forma fiable de expresar un renombrado
-```
-
-- **Nativo de Delta**: `mergeSchema` (añadir columnas), *type widening* (ampliar tipos compatibles; se verifica en su fase qué conversiones cubre 4.4), *column mapping* (renombrar/borrar sin reescribir).
-- **Hay que construirlo**: la comparación esquema-leído vs esquema-tabla, la decisión según la política, la columna `_rescued_data` y la auditoría del cambio (`schema_change` en el run).
-- **Renombrados**: sin metadatos externos, `a → b` es indistinguible de "se borró `a` y apareció `b`", porque el esquema solo tiene nombres y tipos, no identidad. Por eso existe `renames` en la config.
-- En Bronze-texto (todo `string`) los cambios de tipo **no existen**: aparecen en Silver como fallos de cast → cuarentena. Es otra ventaja de AD-07.
-
----
-
-## 11. Seguridad y governance
-
-| Tema | Required | Recommended | Enterprise | Future |
+| Layer | Holds | Does NOT hold / do | Write | Errors |
 |---|---|---|---|---|
-| Secretos | `secretRef: env:NAME` / `file:/run/secrets/x` + `SecretResolver`; redacción en logs y en el snapshot de config | Docker secrets en compose | Vault / KMS | — |
-| PII | Tags en la metadata de columna (`pii: email`) | Heredar la clasificación en cuarentena | Catálogo con clasificación automática | — |
-| Masking Silver | Pseudonimización determinista (HMAC-SHA256 con clave secreta), que mantiene los joins | Estrategias por tipo (hash, truncado, nulo) | Masking dinámico por rol en el motor de consulta | — |
-| Control de acceso | Permisos de FS + usuario PG de solo lectura sobre la fuente | Usuarios PG separados: fuente (RO) y control (RW) | Unity Catalog / Ranger | — |
-| Encriptación | — (FS local) | Documentar cifrado de disco | Cifrado en reposo del storage, TLS JDBC | Parquet modular encryption |
-| Audit logs | Plano de control (§13) | — | SIEM | — |
-| GDPR supresión | Procedimiento documentado: `DELETE` en Silver/Bronze + `VACUUM` tras la retención (Delta conserva los ficheros para time travel hasta el `VACUUM`) | Retención corta en Bronze y cuarentena | **Crypto-shredding** (clave por sujeto) | — |
+| **Landing** (files only) | The producer's drop directory. **The framework neither copies nor moves files**; it records what it processed. | Intermediate copies. Moving files would be a side effect that is not atomic with the Delta commit, and it would break replay. | Written by the producer | Unreadable file → `FAILED` record + policy (`fail` or `skip`) |
+| **Bronze** | Fidelity to the source. JDBC keeps native types; CSV/JSON are kept as `string` + `_rescued_data`. Minimal ingestion metadata: `_run_id`, `_batch_seq`, `_ingested_at`, `_source_file` (files only). | Typing of text, deduplication, renames, business logic | Idempotent append (`txnAppId`/`txnVersion`) | Structurally broken records → Bronze quarantine. Threshold exceeded → the batch is not committed. |
+| **Silver** | Current state per key, typed to the declared schema, `snake_case` names, pseudonymised PII, soft deletes (`_is_deleted`, `_deleted_at`) | Cross-source joins, aggregates, business rules | `MERGE` on the primary key with an ordering guard (`updated_at`), partitioned where writers fan in | Cast failures → Silver quarantine with the original Bronze record |
+| **Gold** | Out of scope | — | — | — |
 
-**Tensión Bronze inmutable ↔ GDPR:** Bronze no es inmutable a nivel físico. Es *append-only por convenio*. La supresión es una excepción auditada (`run_kind=ERASURE`) y exige `VACUUM` para ser efectiva, porque sin él los datos siguen en versiones anteriores. Esa es la respuesta que buscan en entrevista.
+### 6.4 Lineage
+
+- **Required (MVP)**: table + batch level. Every Bronze row carries `_run_id` and `_batch_seq`. Every batch records its input (watermark range or file list) and its output (table + **Delta version**).
+- **v2 improvement**: the LogStore records, for each commit entry, the `run_id` of the committing run (via a commit context set by the engine; ADR-0004 §Attribution). The mapping *Delta version ↔ run* then lives in the control plane directly, with no `DESCRIBE HISTORY` scans. `userMetadata` in the commit is kept as a redundant, self-describing copy.
+- **Future**: column-level lineage and OpenLineage events. The run/batch/input/output model maps 1:1 onto an OpenLineage `RunEvent`.
 
 ---
 
-## 12. Motor de ingesta y contrato de conector
+## 7. Stack, environment and resource budget
 
-### 12.1 Módulos
+### 7.1 Stack
 
-| Módulo | Contenido | Depende de |
+(Verified 2026-09-25 against Maven Central and the official docs; details in [ADR-0002](../adr/0002-technology-stack.md).)
+
+| Component | Version |
+|---|---|
+| Java | 17 (Temurin, inside WSL) |
+| Scala | 2.13.x (the minor Spark 4.1.3 is built with; pinned in P1) |
+| Apache Spark | 4.1.3 |
+| Delta Lake | 4.4.0 — `io.delta:delta-spark_4.1_2.13` (+ `delta-storage`, transitive) |
+| sbt | latest 1.x (pinned in `project/build.properties` in P1) |
+| PostgreSQL | 17 (`postgres:17`): source DB and control DB in one container, separate databases |
+| JDBC driver | `org.postgresql:postgresql` 42.7.x |
+| Connection pool (LogStore) | HikariCP. Justified by the LogStore's commit-path round trips (ADR-0004). |
+| Control-plane migrations | Flyway |
+| Config | circe + circe-yaml |
+| Tests | ScalaTest 3.2.x + Testcontainers (PostgreSQL; MinIO in E1) |
+| Logging | log4j2 (Spark's own) with `JsonTemplateLayout` |
+| Quality | scalafmt, `-Xlint` + selective `-Werror`, scoverage |
+| CI | GitHub Actions |
+| Object storage (extension) | MinIO + `hadoop-aws` matching Spark's Hadoop version (verified in E1) |
+
+### 7.2 Environment
+
+Target environment: WSL2 Ubuntu 24.04 on Windows 10 22H2 (build 19045.6466, firmware virtualisation enabled, 8 cores, 7.4 GB RAM, 131 GB free disk).
+
+Step-by-step installation and `.wslconfig`: **[`docs/setup/dev-environment.md`](../setup/dev-environment.md)**.
+
+### 7.3 Resource budget (updated for D3)
+
+WSL cap: `memory=5GB`, `swap=4GB`, `processors=6`. Outside WSL, Windows + the VS Code UI + a browser use about 2.4 GB.
+
+| Scenario | Processes inside WSL | Est. RAM | Where it runs |
+|---|---|---|---|
+| Daily development | VS Code server + Metals (~1.2) · sbt + forked test JVM (~1.5) · PostgreSQL (~0.3) | ~3.0 GB | Local |
+| LogStore stress test (P2), default N=3 | PostgreSQL (~0.4) · 3 writer JVMs, `local[1]`, 512 MB heap (~0.75 each) · sbt orchestrator (~0.8) · **Metals stopped** | ~3.5 GB | Local (N=3); CI with N=8 |
+| Engine multi-instance demo (P11) | PostgreSQL (~0.4) · 3 ingestion processes `local[2]` (~0.9 each) | ~3.1 GB | Local |
+| Same, on local Spark Standalone (optional variant) | master (~0.3) · worker with 2 cores / 2 GB for executors (~2.2) · 3 client-mode drivers (~0.5 each) · PostgreSQL (~0.4) | ~4.4 GB | Local, Metals stopped |
+| **E1 — multi-node** | MinIO (~0.4) · master (~0.3) · 2 workers × 1 GB (~2.4) · 2 drivers (~1.0) · PostgreSQL (~0.4) | ~4.5 GB | At the limit locally with small N; full size in CI |
+| **E2 — multi-cluster** | Two independent stacks | > budget | CI (GitHub-hosted runner) or cloud |
+
+Mitigations: swap as a safety net rather than something to rely on; configurable writer counts (`-Dstress.writers`, `-Dstress.commits`); heavy suites tagged and run in CI. Standard GitHub-hosted Linux runners for public repositories have considerably more memory than this laptop's WSL budget. The exact size is verified when E1/E4 start.
+
+---
+
+## 8. State, idempotency and recovery (summary)
+
+Full design: [ADR-0005](../adr/0005-batch-wal-and-idempotent-writes.md).
+
+- **Run ≠ Batch.** `run_id` (UUIDv7) identifies an *attempt*. `batch_seq` identifies a *logical unit of data* (watermark range or file set) and is allocated by the control plane per `txnAppId`. Idempotence is anchored to the batch.
+- **`txnAppId` = `<source_id>/<layer>`** (not per table). A backfill uses its own `<source_id>/<layer>/backfill/<backfill_id>`, so it can run concurrently with the incremental run on the same table (Type 2). `txnVersion` = `batch_seq`, monotonic per `txnAppId`.
+- **Protocol:** lease → recover pending batch → plan + persist (WAL) → read → write quarantine and data with `txnAppId`/`txnVersion` → one PostgreSQL transaction advances the watermark, marks the batch `COMMITTED` and the run `SUCCEEDED`, conditional on the lease epoch.
+- **Recovery:** if a `PLANNED` batch exists, check the table's `txn` for its `txnAppId`. If `version ≥ batch_seq`, *roll forward* the state. Otherwise *replay* exactly the persisted plan.
+- **Zombies:** a writer that lost its lease cannot advance the state (epoch check). If it still commits data, Delta discards any `txnVersion ≤` the recorded one; a concurrent commit with the same `txnAppId` raises `ConcurrentTransactionException` for one of the two. The residual window (v1 §9.3) closes much further than in v1.
+- **Incremental watermark:** the upper bound is fixed at planning time using the source clock (`now() − safety_margin`); a `lookback` handles late commits; Silver's ordering guard deduplicates.
+- **Files:** the plan *is* the file list. Identity is `path + size + mtime`. Reprocessing creates a new batch.
+- **Deletes:** [ADR-0009](../adr/0009-delete-detection.md).
+
+---
+
+## 9. Multi-writer concurrency (summary)
+
+Full design: [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md) (LogStore) and [ADR-0010](../adr/0010-concurrent-write-conflict-handling.md) (conflict handling).
+
+### 9.1 The LogStore in one paragraph
+
+Delta's ACID guarantees require three properties from the storage layer: **atomic visibility**, **mutual exclusion** and **consistent listing** (the `LogStore` Javadoc). A local POSIX filesystem gives atomic visibility (rename) and consistent listing, but no cross-process mutual exclusion. S3 gives atomic visibility (PUT) and strongly consistent listing; mutual exclusion comes from put-if-absent. `PostgresLogStore` takes mutual exclusion from PostgreSQL: a conditional `INSERT` of `(table, version)` is the linearisation point of each commit. It follows Delta's `BaseExternalLogStore` **prepare → commit → acknowledge** protocol:
+- write the temp file `T(N)`;
+- `INSERT` the entry `E(N, complete=false)`;
+- publish `N.json` atomically;
+- mark `complete=true`.
+
+Any reader or writer that finds an incomplete latest entry finishes publishing it.
+
+### 9.2 Deviations from `BaseExternalLogStore` (detail in ADR-0004)
+
+1. **Ported, not subclassed.** The changes below sit inside the base class's `write()` flow, which cannot be overridden piecemeal, and the base class ships in an artifact that pulls in the AWS SDK.
+2. **Atomic publish on POSIX.** The base class copies `T(N)` to `N.json` as a stream, which is atomic only on object stores. On `file://` it copies to a second temp file and then renames.
+3. **`isPartialWriteVisible`** is `true` on `file://` and `false` on `s3a://`, so Delta writes checkpoints via temp + rename on POSIX.
+4. **No silent swallowing of a foreign `N.json`.** The base class ignores every error after the `INSERT`. On a content mismatch between `N.json` and `T(N)`, ours raises a fatal error and taints the table.
+5. **Uncoordinated-writer detection** through a table adoption registry and gap detection.
+6. **Entries are kept** (commit audit trail) instead of expiring after one day.
+7. **PostgreSQL `now()`** instead of client clocks.
+8. **Run attribution** on each entry.
+9. **Latest entry by numeric version**, not by file-name sort.
+10. **No DDL from the data path**: the LogStore checks its schema version at startup and fails closed.
+
+### 9.3 Fail closed and safeguards
+
+- Every PostgreSQL error surfaces as an `IOException`, never as "no entry". There is no fallback path. Reads fail too, because the latest version cannot be guaranteed.
+- **At startup the engine refuses to run** unless `spark.delta.logStore.<scheme>.impl` points to `PostgresLogStore` for every scheme in the active lake profile.
+- **Tables must be registered.** They are registered when created through the LogStore, or adopted explicitly with `adopt-table`. A commit to an unregistered table is rejected, which also catches aliased paths.
+- **Gap detection:** a published `N.json` with no entry above the adoption version means a foreign writer. The table is marked `TAINTED` and writes are refused until an operator re-verifies it.
+- **Honest limit:** *preventing* an arbitrary external writer (someone else's misconfigured Spark job) needs storage access control, or protocol-level blocking as in `catalogManaged`. That is an enterprise feature; the design detects, fails closed and documents.
+
+### 9.4 Official alternatives in Delta 4.4 (compared in ADR-0004)
+
+| Option | Status | Why it is not the MVP choice |
 |---|---|---|
-| `core` | Modelo de dominio, config, validación, planificación pura, clasificación de errores, máquina de estados del run. **Sin Spark.** | cats/circe |
-| `engine` | Conectores, writers Delta, repositorios del plano de control (JDBC + Flyway), motor | `core`, Spark (provided), Delta |
-| `cli` | `Main`, parseo de argumentos, wiring y códigos de salida | `engine` |
-| `integration-tests` | Testcontainers, e2e, fallos inyectados, concurrencia | todos |
+| `S3DynamoDBLogStore` + MinIO + DynamoDB Local | Official, production-proven | `s3a` only by design; adds DynamoDB Local and the AWS SDK; duplicates the coordination store we already have in PostgreSQL. On `file://` it would have issues 2 and 4. It would be the production choice on AWS. |
+| `coordinatedCommits-preview` writer feature + custom `CommitCoordinatorClient` over PostgreSQL | Present in 4.4 (`CommitCoordinatorProvider.registerBuilder`), preview-named | Undocumented preview API while upstream converges on `catalogManaged`. Its protocol-level blocking of unaware writers is a real advantage, recorded as the benchmark for our safeguards. |
+| `catalogManaged` tables + Unity Catalog OSS (≥ 0.4) as commit coordinator | GA since Delta 4.0.1 | Requires running a catalog server; no path-based access; cannot be enabled on existing tables; `CREATE OR REPLACE` unsupported. **This is the industry direction** and a Future evolution. `TableLocator` keeps the door open. |
 
-La separación I/O ↔ lógica la **impone el compilador**: `core` no puede importar Spark.
+---
 
-### 12.2 Contrato de conector (borrador de diseño, no implementación)
+## 10. Schema evolution (summary)
+
+Per-source policy (`on_new_column`, `on_missing_column`, `on_type_change`, `renames`), unchanged from v1. The full ADR is written in its phase (P9).
+
+- **Native in Delta:** `mergeSchema`, type widening (the conversions 4.4 supports are verified in P9), column mapping.
+- **To build:** comparison of read schema vs table schema, the policy decision, `_rescued_data`, and the audit of the change.
+- **Renames** are indistinguishable from drop + add without external metadata, which is why `renames:` exists.
+- **New in v2 — concurrent schema change.** With Type 2, another writer may evolve the table's schema between our plan and our commit. Delta raises `MetadataChangedException`. The engine **re-plans**: it re-evaluates the policy against the new table schema, then retries or fails permanently (ADR-0010).
+
+---
+
+## 11. Security and governance
+
+| Topic | Required | Recommended | Enterprise | Future |
+|---|---|---|---|---|
+| Secrets | `secretRef: env:NAME` / `file:/run/secrets/x` + `SecretResolver`; redaction in logs and config snapshots. The LogStore reads the *name* of the password variable from Hadoop conf, never the value. | Docker secrets in compose | Vault / KMS | — |
+| PII | Column tags in metadata (`pii: email`) | Quarantine inherits the classification | Automatic classification in a catalog | — |
+| Silver masking | Deterministic pseudonymisation (HMAC-SHA256 with a secret key), which keeps joins possible | Per-type strategies | Dynamic masking by role | — |
+| Access control | Filesystem permissions; read-only PostgreSQL role on the source | Separate PostgreSQL roles: source (RO), control (RW), coordination (RW, only the two coordination tables) | Storage ACLs so that only the service identity can write `_delta_log/` (true prevention of uncoordinated writers); Unity Catalog / Ranger | — |
+| Encryption | — (local FS) | Document disk encryption; TLS to PostgreSQL | Encryption at rest, TLS everywhere | Parquet modular encryption |
+| Audit | Control plane + commit entries | — | SIEM | — |
+| GDPR erasure | Documented procedure: `DELETE` in Silver/Bronze + `VACUUM` after retention, since Delta keeps old files for time travel until `VACUUM` | Short retention in Bronze and quarantine | Crypto-shredding | — |
+
+---
+
+## 12. Engine and connector contract
+
+### 12.1 Modules
+
+(See [ADR-0012](../adr/0012-module-structure.md).)
+
+| Module | Content | Depends on |
+|---|---|---|
+| `core` | Domain model, config, validation, pure planning, error classification, run state machine. **No Spark.** | cats, circe |
+| `delta-pg-logstore` | `PostgresLogStore`, its schema, commit-context API. **Standalone and reusable**: no dependency on `core` or `engine`. | `delta-storage`, Hadoop client API (provided), PostgreSQL JDBC, HikariCP |
+| `engine` | Connectors, Delta writers, control-plane repositories, the engine, the conflict classifier | `core`, `delta-pg-logstore`, Spark (provided), Delta |
+| `cli` | `Main`, argument parsing, wiring, exit codes, startup enforcement | `engine` |
+| `integration-tests` | Testcontainers, e2e, fault injection, stress tests, verifier | all |
+
+### 12.2 Connector contract (design sketch, not implementation)
 
 ```scala
 trait SourceConnector[C <: ConnectorConfig] {
-  /** Identificador usado en YAML: `type: jdbc` */
-  def kind: String
-
-  /** Validación estática de su config. Sin I/O. Se ejecuta al arrancar para TODAS las fuentes. */
-  def validate(cfg: C): ValidatedNel[ConfigError, C]
-
-  /** Decide QUÉ leer. Determinista y serializable (se persiste como WAL). */
-  def plan(ctx: PlanContext, cfg: C, state: SourceState): Either[IngestError, BatchPlan]
-
-  /** Lee EXACTAMENTE lo que dice el plan. Replayable, sin efectos laterales. */
-  def read(ctx: ReadContext, cfg: C, plan: BatchPlan): Either[IngestError, ReadResult]
+  def kind: String                                                     // `type: jdbc` in YAML
+  def validate(cfg: C): ValidatedNel[ConfigError, C]                   // static, no I/O, run at startup
+  def plan(ctx: PlanContext, cfg: C, state: SourceState): Either[IngestError, BatchPlan]   // deterministic, serialisable (WAL)
+  def read(ctx: ReadContext, cfg: C, plan: BatchPlan): Either[IngestError, ReadResult]     // replayable, side-effect free
 }
-
-final case class ReadResult(
-  valid: DataFrame,        // registros válidos + columnas de metadatos de origen
-  corrupt: DataFrame,      // registros estructuralmente rotos (raw + motivo)
-  inputStats: InputStats   // ficheros/bytes leídos (medidos, no estimados)
-)
 ```
 
-**Garantías que exige el contrato, y por qué:**
-1. `plan` es **determinista y serializable**. Si no lo fuera, no se podría persistir el WAL ni hacer replay.
-2. `read(plan)` es **replayable y sin efectos laterales**: no mueve ficheros ni muta la fuente. Si no, la recuperación releería otra cosa.
-3. **El conector nunca escribe en el lake ni toca estado o auditoría.** Esa es responsabilidad exclusiva del motor. Así un conector nuevo no puede romper la consistencia.
-4. Los errores se devuelven **tipados** (`Transient` / `Permanent` / `Data`) o los clasifica el motor (p. ej. SQLState `08xxx` → transitorio, `28xxx` → permanente, `42P01` → permanente).
-5. Se registra en un `ConnectorRegistry` (factory por `kind`). Añadir un tipo = una clase + una línea de registro. El motor no cambia.
+Guarantees:
+- `plan` is deterministic and serialisable.
+- `read(plan)` is replayable and has no side effects.
+- **The connector never writes to the lake and never touches state or audit.**
+- Errors are typed.
+- A connector is registered through a `ConnectorRegistry`, so adding a type does not change the engine.
 
-### 12.3 Patrones y su razón concreta
+### 12.3 Patterns and their concrete reason
 
-| Patrón | Dónde | Razón |
+| Pattern | Where | Reason |
 |---|---|---|
-| Trait como contrato | `SourceConnector` | Extensibilidad sin tocar el motor |
-| Factory / registry | `ConnectorRegistry` | Resolver `type:` del YAML a una implementación |
-| Strategy | `WriteStrategy` (BronzeAppend, SilverMerge, SnapshotMerge) | La escritura varía por capa y modo de carga. La lectura ya la cubre el conector. |
-| Repository | `RunRepository`, `StateRepository`, `LeaseRepository`, `FileRegistry` | Aislar el SQL del plano de control y permitir fakes en memoria en los tests de `core`/`engine` |
-| Dependency inversion | El motor depende de los traits, no de JDBC/Delta concretos | Testabilidad e inyección de fallos |
-| Service layer | `IngestionService` orquesta el protocolo de §8.2 | Un único sitio con la lógica de consistencia |
-| — descartados — | Visitor, Abstract Factory, event bus, DI framework | No hay problema que resuelvan aquí. El wiring manual en `cli` basta. |
+| Trait as contract | `SourceConnector`; `CoordinationStore` inside the LogStore | Extensibility without touching the engine; the LogStore protocol is testable against a fault-injecting store |
+| Factory / registry | `ConnectorRegistry` | Resolve YAML `type:` to an implementation |
+| Strategy | `WriteStrategy` (BronzeAppend, SilverMerge, SnapshotMerge) | Writes differ by layer and load mode |
+| Repository | `RunRepository`, `StateRepository`, `LeaseRepository`, `FileRegistry` | Isolate control-plane SQL; in-memory fakes for unit tests |
+| Dependency inversion | Engine depends on traits, not on JDBC/Delta | Testability and fault injection |
+| Service layer | `IngestionService` runs the ADR-0005 protocol | One place for consistency logic |
+| — rejected — | Visitor, abstract factory, event bus, DI framework | No problem here that they solve |
 
-**Inyección de fallos**: el motor expone *hooks* con nombre (`AfterPlan`, `AfterQuarantineWrite`, `AfterBronzeCommit`, `BeforeStateCommit`…). En producción son un no-op; en los tests lanzan una excepción o hacen `halt`. Es la base de RNF-01.
+**Fault injection:** named hooks in the engine (`AfterPlan`, `AfterQuarantineWrite`, `AfterBronzeCommit`, `BeforeStateCommit`, …) and in the LogStore (`AfterTempWrite`, `AfterEntryInsert`, `DuringPublish`, `AfterPublish`, …). They are no-ops in production; in tests they throw or halt the JVM.
 
-### 12.4 Puerta al streaming
+### 12.4 Door to streaming
 
-`plan` ≈ `latestOffset`, el WAL ≈ offset log, el commit de estado ≈ commit log, y el append con `txn` ≈ `foreachBatch` idempotente. Un conector de streaming encajaría como adaptador. **La decisión que la cerraría** sería permitir que los conectores muevan ficheros o que el estado no esté indexado por batch. El contrato lo prohíbe expresamente.
+`plan` ≈ `latestOffset`; the WAL ≈ the offset log; the state commit ≈ the commit log; `txn` append ≈ an idempotent `foreachBatch`. The LogStore is transparent to streaming writers. Decisions that would close the door, and are forbidden by the contract: connectors moving files, or state not indexed by batch.
 
 ---
 
-## 13. Modelo conceptual de datos
+## 13. Conceptual data model
 
-### 13.1 Metadata (YAML, un fichero por fuente)
+### 13.1 Metadata (YAML, one file per source)
 
 ```yaml
-# conf/sources/sales.orders.yaml — ilustrativo
+# conf/sources/sales.orders.yaml — illustrative
 id: sales.orders
 enabled: true
 owner: team-sales
@@ -482,177 +463,231 @@ load:
   max_batch_range: 7d
 keys: [order_id]
 deletes: { strategy: key_reconciliation }
-schema: { on_new_column: add, on_missing_column: null, on_type_change: fail }
+schema: { on_new_column: add, on_missing_column: "null", on_type_change: fail }
 columns:
   customer_email: { pii: email, silver: { mask: hmac } }
 quality: { max_rejected_ratio: 0.01 }
 targets:
-  bronze: { path: bronze/sales/orders }
-  silver: { path: silver/sales/orders, partition_by: [] }
+  bronze: { table: bronze/sales/orders }                  # relative to the profile's lake URI
+  silver: { table: silver/sales/orders, partition_by: [_source_id] }   # fan-in target
 freshness_sla: 2h
 ```
 
-**¿Por qué YAML? (AD-01)** Es legible por perfiles no Scala, es el estándar de facto (dbt, Airbyte, dlt, Kubernetes), produce diffs revisables en PR (governance por git) y circe lo decodifica a tipos. **Alternativas:** HOCON/PureConfig es excelente para la *app config* en Scala, pero minoritario fuera de Scala. JSON no admite comentarios. Las tablas Delta dan una peor experiencia de desarrollo y pierden la revisión por PR (tienen sentido con cientos de fuentes y una UI, como evolución). Un DSL propio es sobreingeniería. **Versionado**: el hash SHA-256 de la config canonicalizada se registra en cada run y el contenido (con secretos redactados) se guarda en `config_snapshot`.
+Rationale for YAML, versioning (SHA-256 config hash + redacted snapshot per run): [ADR-0007](../adr/0007-metadata-format.md). Table paths are **relative to the profile's lake URI** (ADR-0011), which gives one canonical location per table.
 
-### 13.2 Plano de control (PostgreSQL) — 7 tablas
+### 13.2 Control plane — schema `control` (PostgreSQL)
 
-| Tabla | Columnas clave | Para qué (sin esta tabla no se puede…) |
+| Table | Key columns | Purpose |
 |---|---|---|
-| `ingestion_run` | `run_id` PK, `source_id`, `layer`, `run_kind`, `batch_seq`, `status`, `instance_id`, `app_version`, `config_hash`, `lease_epoch`, `started_at`, `finished_at`, `rows_read`, `rows_written`, `rows_rejected`, `bytes_read`, `retries`, `write_conflicts`, `error_class`, `error_message` | …responder todas las preguntas de auditoría de la sección 14 del brief |
-| `ingestion_batch` | (`source_id`, `layer`, `batch_seq`) PK, `run_kind`, `plan` (jsonb: rango o ficheros), `status` (PLANNED/COMMITTED/ABANDONED), `planned_by_run`, `committed_by_run`, `delta_table`, `delta_version`, `input_batch_seqs` (Silver → Bronze) | …recuperar tras un crash (WAL) y dar lineage input → output |
-| `source_state` | (`source_id`, `layer`) PK, `watermark` (jsonb tipado), `last_committed_batch_seq`, `updated_by_run` | …carga incremental |
-| `state_change_log` | `id`, `source_id`, `layer`, `before`, `after`, `reason`, `actor`, `run_id`, `at` | …auditar resets y forzados de estado |
-| `source_lease` | `source_id` PK, `holder_run_id`, `instance_id`, `epoch`, `acquired_at`, `expires_at` | …exclusión mutua con recuperación ante muerte |
-| `processed_file` | (`source_id`, `path`, `size`, `mtime`) PK, `batch_seq`, `status`, `error` | …ingesta exactamente-una-vez de ficheros |
-| `config_snapshot` | `config_hash` PK, `source_id`, `content` (jsonb redactado), `first_seen_at` | …saber qué config exacta usó cada run |
+| `ingestion_run` | `run_id` PK, `source_id`, `layer`, `run_kind`, `txn_app_id`, `batch_seq`, `status`, `instance_id`, `app_version`, `config_hash`, `lease_epoch`, `started_at`, `finished_at`, `rows_read`, `rows_written`, `rows_rejected`, `bytes_read`, `retries`, `write_conflicts`, `commit_contention`, `error_class`, `error_message` | Answer every audit question in the brief (§14) |
+| `ingestion_batch` | (`txn_app_id`, `batch_seq`) PK, `source_id`, `layer`, `run_kind`, `plan` (jsonb), `status` (PLANNED/COMMITTED/ABANDONED), `planned_by_run`, `committed_by_run`, `outputs` (jsonb: table → Delta version), `input_bronze_versions` (Silver only: `[from, to]`) | WAL for recovery; lineage input → output |
+| `source_state` | (`source_id`, `layer`) PK, `watermark` (typed jsonb; for Silver: the last applied **Bronze Delta version**), `last_committed_batch_seq`, `updated_by_run` | Incremental loading |
+| `state_change_log` | `id`, `source_id`, `layer`, `before`, `after`, `reason`, `actor`, `run_id`, `at` | Audit of resets and forced state |
+| `source_lease` | (`lease_key`) PK, `holder_run_id`, `instance_id`, `epoch`, `acquired_at`, `expires_at` | Mutual exclusion with crash recovery. Keys are `<source_id>/<layer>` or `backfill/<backfill_id>`. |
+| `processed_file` | (`source_id`, `path`, `size`, `mtime`) PK, `batch_seq`, `status`, `error` | Exactly-once file ingestion |
+| `config_snapshot` | `config_hash` PK, `source_id`, `content` (redacted jsonb), `first_seen_at` | Which exact config each run used |
 
-Vistas derivadas (sin almacenamiento extra): `v_source_freshness` (edad del último batch COMMITTED vs `freshness_sla`), `v_run_summary`.
+Derived views: `v_source_freshness`, `v_run_summary`, `v_table_commits` (joins commit entries to runs).
 
-**Deliberadamente no incluido:** tabla de métricas separada (las métricas son columnas del run: una fila por run basta), tabla de lineage separada (es `ingestion_batch`) y `duration` (se deriva de `finished_at − started_at`).
+### 13.3 Coordination — schema `delta_coordination` (owned by `delta-pg-logstore`)
 
-### 13.3 Cuarentena (Delta, una tabla por fuente y capa)
+| Table | Key columns | Purpose |
+|---|---|---|
+| `commit_entry` | (`table_uri`, `file_name`) PK, `version` (bigint), `temp_path`, `complete`, `created_at`, `completed_at` (PostgreSQL clock), `writer_instance`, `run_id` (nullable, best effort) | The put-if-absent that gives mutual exclusion; recovery; commit audit trail; Delta version ↔ run lineage |
+| `coordinated_table` | `table_uri` PK, `delta_table_id`, `registered_at`, `registered_version`, `status` (ACTIVE/TAINTED), `taint_reason` | Adoption registry: rejects unregistered or aliased paths; gap detection baseline |
 
-`_quarantine/<layer>/<source_id>`: `run_id`, `batch_seq`, `source_file`, `error_type`, `error_detail`, `raw_record` (string), `quarantined_at`.
+A separate schema and a separate role mean the LogStore can be extracted as a library, and it only has the privileges it needs.
 
-**Trade-off**: guardar el registro completo permite reprocesar y depurar, pero replica PII. Guardar solo metadata impide ambas cosas. **Recomendación**: registro completo + retención corta + misma clasificación de PII que la fuente. Los conteos agregados van en `ingestion_run`. Es una tabla por fuente para respetar AD-06 (un escritor por tabla).
+### 13.4 Quarantine (Delta, one table per source and layer)
+
+`_quarantine/<layer>/<source_id>`: `run_id`, `batch_seq`, `source_file`, `error_type`, `error_detail`, `raw_record`, `quarantined_at`. Full record + short retention + same PII classification as the source. With Type 2 the per-source table is no longer *required* for safety; it is kept because it simplifies retention and access control per source.
 
 ---
 
-## 14. Errores y reintentos (resumen)
+## 14. Errors and retries (summary)
 
-| Clase | Ejemplos | Reacción | Exit |
+| Class | Examples | Reaction | Exit |
 |---|---|---|---|
-| Transitorio | Conexión caída, timeout, SQLState `08xxx`/`40001`/`57014`, conflicto OCC en operación idempotente | Reintento **del paso** con backoff exponencial + jitter (máx. N). Agotado → fallo con estado consistente. | 3 |
-| Permanente | Credenciales, tabla inexistente, config inválida, cambio de esquema con `fail` | Fallo inmediato, sin reintentos | 4 |
-| Datos | Registros corruptos, fallos de cast | Cuarentena. Si `rejected/read > max_rejected_ratio` → **no se commitea el batch** | 0 / 5 |
-| Parcial | Crash entre commits | No existe a nivel tabla (commit Delta atómico). Entre sistemas lo resuelve el protocolo de §8.2. | — |
+| Transient | Connection lost, timeout, SQLState `08xxx`/`40001`/`57014`; **coordination store unavailable** | Retry the **step** with exponential backoff + jitter (max N), then fail with consistent state. Never bypass coordination. | 3 |
+| Conflict — retryable | `ConcurrentAppendException`, `ConcurrentDeleteReadException`, `ConcurrentDeleteDeleteException`, `ConcurrentWriteException` | Re-run the whole Delta operation on a fresh snapshot (bounded), counted in `write_conflicts` | 3 if exhausted |
+| Conflict — re-plan | `MetadataChangedException`, `ProtocolChangedException` | Re-evaluate the schema policy / protocol, then retry once or fail permanently | 4 |
+| Conflict — identity | `ConcurrentTransactionException` (same `txnAppId` committed concurrently) | Not retried: go to recovery (roll forward if `txn ≥ batch_seq`), otherwise fail permanently and alert | 4 |
+| Permanent | Credentials, missing table, invalid config, schema change under `fail`, LogStore misconfigured, table `TAINTED` | Immediate failure, no retries | 4 |
+| Data | Corrupt records, cast failures | Quarantine. Above `max_rejected_ratio`, the batch is not committed. | 0 / 5 |
 
-Los reintentos son *dentro* del run (paso a paso). El reintento del run completo es cosa del orquestador, guiado por el código de salida.
-
----
-
-## 15. Observabilidad (resumen)
-
-- **Required**: logs JSON (log4j2 `JsonTemplateLayout`) con MDC `run_id`/`source_id`/`batch_seq`, y métricas persistidas en `ingestion_run`. **Origen real de cada métrica**: `rows_written` sale de `operationMetrics` del commit Delta, `bytes_read` del tamaño de los ficheros planificados y `rows_rejected` del conteo de la cuarentena escrita. `rows_read = written + rejected`, validado como invariante en lugar de contar dos veces el DataFrame. `retries` y `write_conflicts` los cuenta el motor, `duration` se deriva y `source_freshness` es una vista.
-- **Extension (barata, recomendada)**: **Grafana leyendo directamente el plano de control PostgreSQL**. No necesita Prometheus porque los datos ya están ahí, y son dashboards reales con un contenedor extra.
-- **Future**: Prometheus Pushgateway (patrón correcto para jobs batch) u OpenTelemetry. Su coste es alto para el valor que añaden aquí.
+Full classification and reasoning: [ADR-0010](../adr/0010-concurrent-write-conflict-handling.md).
 
 ---
 
-## 16. Estructura inicial del repositorio
+## 15. Observability (summary)
+
+- **Required:** JSON logs (log4j2 `JsonTemplateLayout`) with `run_id` / `source_id` / `batch_seq` in the MDC; metrics persisted on `ingestion_run`. Where each metric comes from:
+  - `rows_written` — Delta commit `operationMetrics`
+  - `bytes_read` — planned file sizes
+  - `rows_rejected` — quarantine written
+  - `rows_read` — `written + rejected`, checked as an invariant
+  - `retries` — counted by the engine
+  - `write_conflicts` — logical conflicts surfaced by Delta and retried by the engine
+  - **`commit_contention`** — version collisions resolved internally by Delta, counted by the LogStore through the commit context
+  - `source_freshness` — a view
+- **Extension:** Grafana reading the control-plane PostgreSQL directly.
+- **Future:** Prometheus Pushgateway / OpenTelemetry.
+
+---
+
+## 16. Initial repository structure
 
 ```text
-ingestion-framework/
-├── build.sbt
-├── project/            build.properties · plugins.sbt · Dependencies.scala
+<repo>/
+├── build.sbt                     # ThisBuild / organization — the single identity placeholder (§21)
+├── project/                      # build.properties · plugins.sbt · Dependencies.scala
 ├── .scalafmt.conf
+├── .sdkmanrc                     # pins the JDK for `sdk env`
 ├── modules/
-│   ├── core/            src/{main,test}/scala/…   # dominio puro, sin Spark
-│   ├── engine/          src/{main,test}/scala/…   # Spark, Delta, conectores, repos
-│   │   └── src/main/resources/db/migration/       # Flyway (plano de control)
-│   ├── cli/             src/main/scala/…          # Main, wiring, exit codes
-│   └── integration-tests/ src/test/scala/…        # Testcontainers, e2e, fallos, concurrencia
+│   ├── core/                     # pure domain, no Spark
+│   ├── delta-pg-logstore/        # PostgresLogStore (standalone, reusable)
+│   │   └── src/main/resources/db/migration/delta_coordination/
+│   ├── engine/                   # Spark, Delta, connectors, repositories
+│   │   └── src/main/resources/db/migration/control/
+│   ├── cli/                      # Main, wiring, exit codes, startup enforcement
+│   └── integration-tests/        # Testcontainers, e2e, fault injection, stress + verifier
 ├── conf/
-│   ├── app/             local.yaml · test.yaml
-│   └── sources/         *.yaml (ejemplos reales usados en la demo)
-├── docker/              docker-compose.yml · postgres/init/*.sql
-├── scripts/             dev-setup.sh · run-local.sh · standalone-up.sh · demo-*.sh
+│   ├── app/                      # local.yaml · test.yaml · multinode.yaml
+│   └── sources/                  # example sources used by the demos
+├── docker/                       # docker-compose.yml (+ multinode overlay in E1) · postgres/init
+├── scripts/                      # run-local.sh · stress-logstore.sh · demo-*.sh
 ├── docs/
-│   ├── architecture/    00-architecture-discovery.md · diagramas
-│   ├── adr/             0001-… (un ADR por decisión AD-xx)
-│   └── runbooks/        recover-run.md · reset-state.md · gdpr-erasure.md
-├── .github/workflows/   ci.yml
-└── README.md
+│   ├── architecture/             # this document · diagrams
+│   ├── adr/                      # 0001 … 0012
+│   ├── setup/                    # dev-environment.md
+│   └── runbooks/                 # recover-run · reset-state · adopt-table · untaint-table · gdpr-erasure
+├── .github/workflows/ci.yml
+└── README.md                     # includes the spike results (lost commits without / with the LogStore)
 ```
 
-Nota: sbt 1.9+ desaconseja la configuración `IntegrationTest`. El estándar actual es un subproyecto separado, y de ahí `integration-tests`.
+sbt 1.9+ deprecates the `IntegrationTest` configuration; the current standard is a separate subproject.
 
 ---
 
-## 17. Estructura de fases mejorada
+## 17. Revised phase plan
 
-Cada fase termina con: código + tests verdes en CI + README actualizado + commit(s). **Cualquier punto de parada deja un repo coherente.**
+Every phase ends with code, green tests in CI, an updated README and commit(s). **Any stopping point leaves a coherent repository.**
 
-| Fase | Contenido | Tipo |
+| Phase | Content | Type |
 |---|---|---|
-| **P0** | Architecture & Requirements (este documento) + ADRs | MVP |
-| **P1** | Entorno (WSL2, Docker, JDK, sbt) · sbt multi-módulo · compose PostgreSQL (fuente + control) · smoke test Spark+Delta · **spike que evidencia el problema multi-JVM en FS local** · CI mínimo (fmt + compile + unit) | MVP |
-| **P2** | Modelo de metadata · decodificación YAML · validación acumulativa · secretos · config hash/snapshot | MVP |
-| **P3** | Plano de control: Flyway, repositorios, `run_id` UUIDv7, runs, **leases con epoch**, WAL de batches · tests de concurrencia de leases (N hilos, PG real) | MVP |
-| **P4** | Motor + contrato de conector + **conector de ficheros** → Bronze (ficheros nuevos, registro de procesados, append idempotente, hooks de fallo) · generador de ficheros con drift/corrupción | MVP |
-| **P5** | **Conector JDBC**: full + incremental por watermark (lookback, upper bound) · generador PostgreSQL con inserts/updates/deletes | MVP |
-| **P6** | **Correcto bajo fallo**: recuperación roll-forward/replay · reprocess · backfill · reset-state · tests con fallo inyectado en cada hook + e2e `kill -9` | MVP |
-| ⛳ | **Checkpoint A — mínimo demostrable** (+ pase de README) | |
-| **P7** | Validaciones técnicas · clasificación de errores · reintentos · cuarentena + umbral · códigos de salida | MVP |
-| **P8** | Evolución de esquema (políticas básicas + `renames`) | MVP |
-| **P9** | Silver: tipado, normalización, dedupe, `MERGE` con guarda de orden, soft deletes (snapshot + reconciliación), masking PII | MVP |
-| **P10** | Lineage y observabilidad: versiones Delta por batch, vistas de frescura, logs JSON · runner paralelo in-JVM (OCC real de Delta) | MVP |
-| **P11** | Documentación & portfolio v1: README, arquitectura, ADRs, runbooks, script de demo, limitaciones · tag `v1.0` | MVP |
-| ⛳ | **Checkpoint B — MVP-para-CV** | |
-| E1 | Demo multi-proceso en Spark Standalone (N `spark-submit`, `spark.cores.max`, script verificador) | Extensión |
-| E2 | Performance Engineering con medición antes/después (JDBC particionado, small files, `OPTIMIZE`/Z-order, poda de `MERGE`) | Extensión |
-| E3 | CI/CD completo (cobertura con umbral, integración en CI si no estaba, release del jar) | Extensión |
-| E4 | Grafana sobre el plano de control | Extensión |
-| E5 | Multi-escritor real entre procesos: MinIO + LogStore coordinado | Extensión |
-| E6 | Conector REST | Extensión |
-| E7 | SCD2 en Silver | Extensión |
-| — | Streaming, CDC, Gold, OpenLineage, lineage por columna | Futuro (no se diseña) |
+| **P0** | Architecture & requirements (this document) + ADRs | MVP |
+| **P1** | Environment (WSL2, Docker, JDK, sbt) · sbt multi-module skeleton · compose PostgreSQL (source + control DBs) · Spark + Delta smoke test · **stress harness + verifier** · **spike RED**: N JVMs on `file://` with the default LogStore → measured lost commits (natural race plus a widened-window variant using a delaying `FileSystem` wrapper, for deterministic reproduction) · minimal CI (fmt + compile + unit) | MVP |
+| **P2** | **PostgresLogStore** (highest risk, built first): coordination schema, protocol port, the 10 deviations, fail-closed behaviour, startup enforcement, adoption registry, gap/taint detection · fault injection at every protocol step · stress test with N writer processes + random `kill -9` + PostgreSQL restart · **spike GREEN** with the same harness · README results · verification items from §20 closed | MVP |
+| **P3** | Metadata model · YAML decoding · accumulating validation · secrets · config hash/snapshot · lake profiles and canonical table URIs | MVP |
+| **P4** | Control plane: Flyway, repositories, `run_id` UUIDv7, runs, **leases with epoch**, batch WAL, `txnAppId` allocation · lease concurrency tests (N threads, real PostgreSQL) | MVP |
+| **P5** | Engine + connector contract + **file connector** → Bronze (new files, processed-file registry, idempotent append, engine fault hooks, commit context → LogStore attribution) · file generator with drift/corruption · **Type 2 fan-in test**: two file sources → one Bronze table, concurrently | MVP |
+| **P6** | **JDBC connector**: full + incremental watermark (lookback, upper bound) · PostgreSQL generator with inserts/updates/deletes | MVP |
+| **P7** | **Correct under failure**: roll-forward/replay recovery · reprocess · **backfill concurrent with incremental on the same table** (Type 2) · reset-state · fault tests at every engine hook + e2e `kill -9` | MVP |
+| ⛳ | **Checkpoint A — minimum demonstrable**: files + JDBC → Bronze, full & incremental, idempotent, crash-recoverable, **multi-writer-safe tables (stress-verified)**, source leases, audited (+ README pass) | |
+| **P8** | Technical validations · error and **conflict classification** (retry vs re-plan) · retries · quarantine + threshold · exit codes | MVP |
+| **P9** | Schema evolution (basic policies + `renames` + concurrent schema change → re-plan) | MVP |
+| **P10** | Silver: typing, normalisation, dedupe, `MERGE` with ordering guard, **partitioning for concurrent `MERGE`**, Bronze-version cursor, soft deletes (snapshot + reconciliation), PII masking | MVP |
+| **P11** | Lineage + observability (commit ↔ run views, freshness, JSON logs, `write_conflicts`/`commit_contention`) · in-JVM parallel runner · **multi-instance engine demo**: N ingestion processes on shared Bronze/Silver tables + `OPTIMIZE` running concurrently, checked by a verifier | MVP |
+| **P12** | Documentation & portfolio v1: README, architecture, ADRs, runbooks, demo script, known limitations · tag `v1.0` | MVP |
+| ⛳ | **Checkpoint B — MVP-for-CV** | |
+| E1 | **Multi-node**: Docker Compose with Spark Standalone (master + 2 workers) + MinIO (`s3a`) + PostgreSQL; same stress harness and verifier; `spark.cores.max` pitfalls | Extension |
+| E2 | **Multi-cluster**: two independent Spark applications/clusters sharing MinIO and PostgreSQL; run in CI or cloud (documented cloud variant: S3 + managed PostgreSQL) | Extension |
+| E3 | Performance engineering with before/after measurement (partitioned JDBC reads, small files, `OPTIMIZE`/Z-order, `MERGE` pruning, LogStore commit latency) | Extension |
+| E4 | Full CI/CD (coverage threshold, heavy stress/multi-node suites in CI, release artifact) | Extension |
+| E5 | Grafana over the control plane | Extension |
+| E6 | REST connector | Extension |
+| E7 | SCD2 in Silver | Extension |
+| — | Streaming, CDC, Gold, OpenLineage, column-level lineage, **migration to `catalogManaged` tables with Unity Catalog OSS** | Future (not designed) |
 
-**Qué contiene el Checkpoint A (fin de P6):** ficheros + JDBC → Bronze, full e incremental, idempotente, recuperable ante crash, con exclusión entre instancias y auditado. Es ya un "framework de ingesta Bronze correcto" defendible en entrevista, aunque sin Silver.
+**Changes from v1:**
+- The LogStore enters as **P2**, before the engine, so every later phase is built and tested on verified multi-writer ground (risk-first).
+- Type 2 tests are woven into P5 (fan-in), P7 (backfill ∥ incremental), P10 (concurrent `MERGE`) and P11 (engine demo with concurrent `OPTIMIZE`).
+- Multi-instance moves into the MVP. Multi-node (E1) and multi-cluster (E2) replace the old "Standalone demo" extension.
+- The old "multi-writer on object storage" extension disappears: the design covers it; E1 demonstrates it.
+- MVP phases grow from 12 to 13.
 
-**Qué contiene el Checkpoint B (fin de P11):** la historia completa Source → Bronze → Silver.
-
-**Cambios frente a tu hipótesis:** P2 (datos) se reparte en P4/P5. Lineage y observabilidad se unen (P10). Testing avanzado entra en P6 y crece en cada fase. CI empieza en P1. Concurrencia: diseño en P3 y demo en E1. Performance pasa a extensión, con la medición como requisito.
+**Deviation from your instruction, to confirm.** The spike is split into **RED in P1** (loss demonstrated without the LogStore) and **GREEN in P2** (no loss with it), using the *same* harness and verifier. Doing both in P1 would mean writing the LogStore in the bootstrap phase without its fault-injection suite, either as throwaway code or as untested critical code. The README documents both results side by side, as you asked.
 
 ---
 
-## 18. Imprescindible vs nice-to-have
+## 18. Must-have vs nice-to-have
 
-| Imprescindible (MVP) | Nice-to-have |
+| Must-have (MVP) | Nice-to-have |
 |---|---|
-| Config YAML validada, secretos por referencia | Tablas de metadata / UI |
-| Conectores JDBC + ficheros (CSV, JSON) | Parquet con tests dedicados, REST |
-| Full + incremental + ficheros nuevos | Particionado JDBC afinado |
-| WAL de batch + escrituras idempotentes + recuperación | Hash de contenido de ficheros |
-| Lease + epoch + auditoría con `instance_id` | Demo multi-proceso, multi-escritor por tabla |
-| Cuarentena + umbral + clasificación de errores | Reintento configurable por clase de error |
-| Esquema: add / rescue / fail / renames | Type widening avanzado |
-| Silver SCD1 + soft deletes + masking | SCD2 |
-| Lineage tabla/batch + vistas de frescura | Grafana, OpenLineage |
-| CI: fmt, compile, unit, integración | Cobertura con umbral, releases |
+| Validated YAML config, secrets by reference | Metadata tables / UI |
+| JDBC + file connectors (CSV, JSON) | Dedicated Parquet tests, REST |
+| Full + incremental + new files | Tuned partitioned JDBC reads |
+| Batch WAL + idempotent writes + recovery | Content hashing of files |
+| Lease + epoch + audit with `instance_id` | — |
+| **PostgresLogStore + stress verifier + safeguards** | LogStore entry pruning, protocol-level writer blocking |
+| Quarantine + threshold + error/conflict classification | Per-class configurable retry policies |
+| Schema: add / rescue / fail / renames / concurrent change | Advanced type widening |
+| Silver SCD1 + soft deletes + masking + concurrent `MERGE` | SCD2 |
+| Table/batch lineage + freshness views | Grafana, OpenLineage |
+| CI: fmt, compile, unit, integration | Coverage threshold, releases, heavy suites |
+| Multi-instance demo | Multi-node (E1), multi-cluster (E2) |
 
 ---
 
-## 19. Comparación con herramientas existentes
+## 19. Comparison with existing tools
 
-| Herramienta | Qué resuelve y cómo | Igual que aquí | Distinto aquí, y por qué |
+| Tool | What it solves and how | Same here | Different here, and why |
 |---|---|---|---|
-| **Airbyte** | Cientos de conectores como contenedores que hablan un protocolo JSON. Estado por stream, plano de control en PostgreSQL. | Contrato de conector, estado por fuente, control en PG | Aquí el conector es una clase Scala in-process sobre Spark, no un contenedor. Airbyte no hace Silver ni transforma a escala. |
-| **dlt** | Librería Python: inferencia y evolución de esquema, incremental por cursor, **estado guardado en el propio destino** | Políticas de esquema, cursor incremental | dlt guarda el estado en el destino (un único escritor asumido). Aquí va en un plano de control porque hay multi-instancia (C2). |
-| **Apache NiFi** | Flujos visuales, back-pressure, **provenance por registro** | Auditoría y lineage | NiFi es flujo continuo con GUI y no es Spark. Aquí: batch, config en git, lineage a nivel batch. |
-| **Databricks Auto Loader** | Descubrimiento de ficheros nuevos (listing/notificaciones), checkpoint RocksDB, `_rescued_data`, evolución de esquema | Sin mover ficheros, registro de procesados, rescue column, Bronze texto | Aquí es batch y el registro vive en PG en vez de un checkpoint. Sin notificaciones cloud. |
-| **Frameworks internos de banca / grandes empresas** | Metadata por ingesta (tablas o ficheros), jobs Spark genéricos parametrizados, planificador corporativo (p. ej. Control-M), fuerte governance | Filosofía "configuración, no código", motor genérico, auditoría | Suelen asumir un solo ejecutor por fuente, que garantiza el planificador. Aquí la corrección bajo concurrencia la garantiza el propio motor. |
+| **Airbyte** | Hundreds of connectors as containers speaking a JSON protocol; per-stream state; PostgreSQL config/state DB | Connector contract, per-source state, control plane in PostgreSQL | In-process Scala connectors on Spark, not containers; Airbyte does no Silver and no scaled transformation |
+| **dlt** | Python library: schema inference/evolution, cursor-based incremental loads, **state stored in the destination** | Schema policies, cursor increments | dlt assumes a single writer per pipeline; here state lives in a control plane because of multi-instance and multi-writer operation |
+| **Apache NiFi** | Visual flows, back-pressure, **record-level provenance** | Audit and lineage | Continuous flow with a GUI, not Spark; here batch, config in git, batch-level lineage |
+| **Databricks Auto Loader** | New-file discovery, RocksDB checkpoint, `_rescued_data`, schema evolution | No file moves, processed-file registry, rescue column, Bronze as text | Batch; registry in PostgreSQL; no cloud notifications |
+| **Delta `S3DynamoDBLogStore` / `catalogManaged`** | Multi-writer commit coordination on object stores, via DynamoDB or a catalog | Same protocol family: external put-if-absent + publish | PostgreSQL as coordinator, works on `file://` and `s3a://`, attribution to runs; the catalog route is the future evolution |
+| **In-house frameworks at banks / large enterprises** | Per-ingestion metadata, generic parameterised Spark jobs, a corporate scheduler (e.g. Control-M), strong governance | "Configuration, not code", generic engine, audit | They usually rely on the scheduler to guarantee one writer. Here correctness under concurrency is guaranteed by the engine and storage layer themselves. |
 
-**Respuesta honesta a "¿por qué no usar una herramienta?":** en una empresa, para los conectores estándar, **usaría una** (Airbyte/dlt/Auto Loader). Este proyecto no compite con ellas. Es un ejercicio que implementa, y permite explicar, **lo que esas herramientas esconden**: exactly-once efectivo mediante WAL + commits idempotentes, leases con fencing, políticas de esquema y la frontera Bronze/Silver. Es justo lo que se pregunta en una entrevista de Data Platform, y justo lo que hay que entender para operar o depurar esas herramientas.
+**Honest answer to "why not use an existing tool?"** In a company, for standard connectors, I would use one. This project does not compete with them. It implements, and lets me explain, **what they hide**:
+- effective exactly-once through a WAL plus idempotent commits;
+- leases with fencing;
+- **how a lakehouse table format gets mutual exclusion from storage that doesn't give it**;
+- schema policies;
+- the Bronze/Silver boundary.
+
+That is what Data Platform interviews probe, and what you need in order to operate or debug those tools.
 
 ---
 
-## 20. Decisiones a tomar antes de escribir código
+## 20. Verification items (facts to confirm in code, with the phase that closes them)
 
-La mayoría las propongo y quedan en ADRs salvo objeción tuya (AD-01 … AD-11). Las que requieren tu input están en la sección siguiente. Además, en **P1** se verifican con un test: la versión exacta de sbt y Scala 2.13 que trae Spark 4.1.3, y el comportamiento de Delta multi-JVM en FS local (spike).
+| Item | Why it matters | Phase |
+|---|---|---|
+| Exact Scala 2.13 patch used by Spark 4.1.3; latest sbt 1.x | Binary compatibility | P1 |
+| Which files Delta 4.4 writes through `LogStore.write(overwrite=false)` (commits, `.crc` checksums, compacted logs…) and with `overwrite=true` (`_last_checkpoint`) | Key and "latest entry" semantics of `commit_entry` | P2 |
+| `OptimisticTransaction` retry path on `FileAlreadyExistsException` in 4.4 (logical conflict check, then retry at N+1) | The LogStore relies on it to turn version collisions into automatic retries | P2 |
+| The commit runs on the caller thread | Commit-context attribution of `run_id` | P2 |
+| LogStore instantiation lifecycle (per scheme / per `DeltaLog` / cached?) | JVM-wide connection pool sharing | P2 |
+| Reading `txn` versions for an `appId` (`Snapshot.transactions`, internal) | Roll-forward recovery; isolated behind an adapter | P5 |
+| Idempotent DML via `spark.databricks.delta.write.txnAppId`/`txnVersion` (internal session confs, present in 4.4) and their behaviour under concurrent sessions | Idempotent Silver `MERGE`; one `SparkSession` per concurrent task | P10 |
+| Change Data Feed read cost on append-only Bronze | Silver cursor by Bronze version | P10 |
+| Type-widening conversions supported by Delta 4.4 | Schema policy defaults | P9 |
+| `hadoop-aws` version matching Spark 4.1.3's Hadoop | `s3a://` profile | E1 |
+
+---
+
+## 21. Project identity (D6)
+
+- **Organization placeholder:** defined once, in `build.sbt`: `ThisBuild / organization := "io.github.changeme"`. Changing it is a one-line edit.
+- **Base package: one caveat.** A Scala package is declared in every source file and cannot be parameterised from sbt, so it can never live in "one place". The professional fix is to **not tie the package to the GitHub handle**: the package is derived from the project name (e.g. `metaingest.core`, `metaingest.engine`). The handle then appears **only** as the Maven `groupId` (`organization`). This decoupling is standard: a package names the software, a `groupId` names the publisher. If a handle-based package is ever wanted, it is a single package rename done with the IDE, not a design change.
+- **Repository name proposals:**
+
+| # | Name | Package | Pros | Cons |
+|---|---|---|---|---|
+| 1 | **`metaingest`** *(recommended)* | `metaingest` | Short and memorable; says "metadata-driven ingestion"; clean package name | Needs a descriptive GitHub tagline |
+| 2 | `lakehouse-ingestion-framework` | `lakehouse.ingestion` | Maximum keyword clarity for recruiters | Long; generic |
+| 3 | `medallion-ingest` | `medallion.ingest` | "Medallion" is instantly recognisable to Data Engineers | Suggests Gold is covered; slightly buzzword-driven |
+
+Names deliberately avoided: `delta-*` (suggests affiliation with the Delta Lake project or its trademark), `lakeflow` (a Databricks product), `autoloader` (a Databricks feature).
 
 ---
 
 ## Decisions Required From Me
 
-1. **D1 — Entorno de desarrollo** (bloqueante de P1; instalar WSL2 requiere admin y un reinicio):
-   - **(A, recomendada)** WSL2 Ubuntu + Docker Engine en WSL + JDK/sbt en WSL + **VS Code (Remote-WSL) con Metals**.
-   - (B) Igual que A, pero con **IntelliJ en Windows** (actualizar a 2025.x + plugin Scala) abriendo el proyecto en WSL. Mejor IDE para Scala, pero más RAM y más fricción de FS.
-   - (C) Windows nativo + Docker Desktop + `winutils`. No lo recomiendo.
-2. **D2 — Plano de control en PostgreSQL** (estado, leases, WAL, auditoría) frente a todo en Delta. Recomiendo PostgreSQL por el hallazgo de §0.2. Es la decisión estructural más importante del proyecto.
-3. **D3 — Acotar la concurrencia multi-escritor** (la decisión de simplificar es tuya):
-   - **(Recomendada)** MVP con un escritor por tabla (lease + validación de config) y OCC real demostrado in-JVM. Multi-proceso sobre la misma fuente demostrado con leases (E1). Multi-escritor entre procesos sobre la **misma tabla Delta** como extensión E5 (MinIO + LogStore coordinado).
-   - Alternativa: meter E5 en el MVP. Suma MinIO y el LogStore coordinado (~1 GB de RAM y una fase más) para demostrar OCC Delta entre procesos.
-4. **D4 — Versiones**: confirmar **Spark 4.1.3 + Delta 4.4.0** (recomendado) frente a Spark 4.2.0 (más nuevo, `.0`).
-5. **D5 — Plan de fases**: aprobar P0–P11 + E1–E7 y los checkpoints A/B, o indicar cambios.
-6. **D6 — Identidad del repo**: idioma del código y la documentación (**recomiendo inglés** para el repo y la conversación en español), tu usuario de GitHub (para el paquete, p. ej. `io.github.<usuario>.ingestion`) y el nombre del repositorio.
+1. **Confirm the revised phase plan (§17)**, including:
+   - the LogStore as P2, before the engine;
+   - the spike split into RED (P1) and GREEN (P2) with one harness (a deviation from your instruction);
+   - multi-instance in the MVP (P2 stress test + P11 engine demo), multi-node as E1, multi-cluster as E2.
+2. **Repository name** (§21): `metaingest` (recommended), `lakehouse-ingestion-framework` or `medallion-ingest`. The base package follows from it. Also confirm the base package is independent of the GitHub handle.
