@@ -167,19 +167,19 @@ The repository currently lives in `C:\Users\<windows-user>\<folder>\ingestion-fr
 
 ```bash
 mkdir -p ~/code
-git clone "/mnt/c/Users/<windows-user>/<folder>/ingestion-framework" ~/code/ingestion-framework
-cd ~/code/ingestion-framework
+git clone "/mnt/c/Users/<windows-user>/<folder>/ingestion-framework" ~/code/lakehouse-ingestion-framework
+cd ~/code/lakehouse-ingestion-framework
 git remote remove origin       # the Windows copy is not the remote; GitHub will be, later
 ```
 
-The final directory name follows the repository name chosen in D6. Renaming the folder later is harmless.
+The WSL directory takes the repository name (ADR-0012). The Windows folder keeps its old name; it is only the source of the clone. The clone checks out `main`.
 
 **Line endings.** The initial commit was made on Windows with `core.autocrlf=true`. P1 adds a `.gitattributes` (`* text=auto eol=lf`) and renormalises, so the repository stores LF from then on.
 
 ## Step 9 — VS Code + Metals
 
 1. On Windows, install the VS Code extension **WSL** (`ms-vscode-remote.remote-wsl`).
-2. In Ubuntu: `cd ~/code/ingestion-framework && code .` → VS Code reopens connected to WSL (the VS Code Server installs itself the first time).
+2. In Ubuntu: `cd ~/code/lakehouse-ingestion-framework && code .` → VS Code reopens connected to WSL (the VS Code Server installs itself the first time).
 3. In that WSL window, install **Scala (Metals)** (`scalameta.metals`). It will offer to import the sbt build once P1 creates it.
 4. Keep Metals lean on this machine. In the WSL window's settings (`settings.json`):
    ```json

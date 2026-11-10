@@ -25,7 +25,7 @@
 | D3 | Multi-writer concurrency | Custom **PostgreSQL-coordinated Delta LogStore** (same pattern as `S3DynamoDBLogStore`). The MVP covers *Type 2* concurrency: several processes writing the **same** Delta table. Correct by design for multi-instance, multi-node and multi-cluster. Multi-instance is demonstrated in the MVP; multi-node and multi-cluster are extensions. | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md), [ADR-0010](../adr/0010-concurrent-write-conflict-handling.md), [ADR-0011](../adr/0011-storage-profiles.md) |
 | D4 | Versions | Spark 4.1.3 · Delta 4.4.0 (`delta-spark_4.1_2.13`) · Java 17 · Scala 2.13 | [ADR-0002](../adr/0002-technology-stack.md) |
 | D5 | Phase plan | Structure approved; re-sequenced for D3 (§17). **Pending your confirmation.** | — |
-| D6 | Repository identity | Code, comments, commits and docs in English. Organization placeholder defined in one place. Repository name pending (§21). | [ADR-0012](../adr/0012-module-structure.md) |
+| D6 | Repository identity | Code, comments, commits and docs in English. Repository `lakehouse-ingestion-framework`, base package `lakehouse.ingestion`, independent of the GitHub handle. Organization placeholder defined in one place (§21). | [ADR-0012](../adr/0012-module-structure.md) |
 
 ---
 
@@ -538,7 +538,7 @@ Full classification and reasoning: [ADR-0010](../adr/0010-concurrent-write-confl
 ## 16. Initial repository structure
 
 ```text
-<repo>/
+lakehouse-ingestion-framework/
 ├── build.sbt                     # ThisBuild / organization — the single identity placeholder (§21)
 ├── project/                      # build.properties · plugins.sbt · Dependencies.scala
 ├── .scalafmt.conf
@@ -670,17 +670,18 @@ That is what Data Platform interviews probe, and what you need in order to opera
 
 ## 21. Project identity (D6)
 
-- **Organization placeholder:** defined once, in `build.sbt`: `ThisBuild / organization := "io.github.changeme"`. Changing it is a one-line edit.
-- **Base package: one caveat.** A Scala package is declared in every source file and cannot be parameterised from sbt, so it can never live in "one place". The professional fix is to **not tie the package to the GitHub handle**: the package is derived from the project name (e.g. `metaingest.core`, `metaingest.engine`). The handle then appears **only** as the Maven `groupId` (`organization`). This decoupling is standard: a package names the software, a `groupId` names the publisher. If a handle-based package is ever wanted, it is a single package rename done with the IDE, not a design change.
-- **Repository name proposals:**
+Decided at Phase 0 closure; recorded in [ADR-0012](../adr/0012-module-structure.md).
 
-| # | Name | Package | Pros | Cons |
-|---|---|---|---|---|
-| 1 | **`metaingest`** *(recommended)* | `metaingest` | Short and memorable; says "metadata-driven ingestion"; clean package name | Needs a descriptive GitHub tagline |
-| 2 | `lakehouse-ingestion-framework` | `lakehouse.ingestion` | Maximum keyword clarity for recruiters | Long; generic |
-| 3 | `medallion-ingest` | `medallion.ingest` | "Medallion" is instantly recognisable to Data Engineers | Suggests Gold is covered; slightly buzzword-driven |
+| Item | Value |
+|---|---|
+| **Repository** | `lakehouse-ingestion-framework` |
+| **Base package** | `lakehouse.ingestion` (`.core`, `.logstore`, `.engine`, `.cli`, `.it`) |
+| **Organization (`groupId`)** | `io.github.changeme`: a placeholder until the GitHub handle is decided, defined once in `build.sbt` |
+| **Artifacts** | `lakehouse-ingestion-<module>` |
 
-Names deliberately avoided: `delta-*` (suggests affiliation with the Delta Lake project or its trademark), `lakeflow` (a Databricks product), `autoloader` (a Databricks feature).
+- **The base package is independent of the GitHub handle.** A Scala package is declared in every source file and cannot be parameterised from sbt, so it can never live in "one place". The handle therefore appears **only** as the Maven `groupId`. This decoupling is standard: a package names the software, a `groupId` names the publisher.
+- **Why this name** over the shorter `metaingest` (the v2 recommendation): maximum keyword clarity for recruiters and reviewers, with no tagline needed to explain it. The accepted cost is a long, generic name.
+- Names deliberately avoided: `delta-*` (suggests affiliation with the Delta Lake project or its trademark), `lakeflow` (a Databricks product), `autoloader` (a Databricks feature).
 
 ---
 

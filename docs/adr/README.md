@@ -15,7 +15,7 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0009](0009-delete-detection.md) | Detecting deletes in the source | Accepted |
 | [0010](0010-concurrent-write-conflict-handling.md) | Handling concurrent write conflicts on shared Delta tables | Accepted |
 | [0011](0011-storage-profiles.md) | Lake storage profiles and canonical table identity | Accepted |
-| [0012](0012-module-structure.md) | sbt multi-module structure and project identity | Accepted (repository name pending) |
+| [0012](0012-module-structure.md) | sbt multi-module structure and project identity | Accepted |
 
 Superseded decisions: *AD-06 "one writer per Delta table"* (discovery v1) was replaced by ADR-0004 before being recorded as an ADR.
 
