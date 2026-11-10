@@ -26,6 +26,7 @@
 | D4 | Versions | Spark 4.1.3 · Delta 4.4.0 (`delta-spark_4.1_2.13`) · Java 17 · Scala 2.13 | [ADR-0002](../adr/0002-technology-stack.md) |
 | D5 | Phase plan | Structure approved; re-sequenced for D3 (§17). **Pending your confirmation.** | — |
 | D6 | Repository identity | Code, comments, commits and docs in English. Repository `lakehouse-ingestion-framework`, base package `lakehouse.ingestion`, independent of the GitHub handle. Organization placeholder defined in one place (§21). | [ADR-0012](../adr/0012-module-structure.md) |
+| D7 | Application security | Validated SQL identifiers and no concatenated SQL; file paths confined to allowed roots; least-privilege PostgreSQL roles; dependency vulnerability scanning in CI. Recommended: pinned non-root images, configurable TLS, safe YAML loading, a brief threat model. Woven into existing phases (§17). | [ADR-0013](../adr/0013-application-security-baseline.md) |
 
 ---
 
@@ -105,6 +106,8 @@
 | RNF-09 | **Secure**: no secret in configuration, logs or audit | Redaction test |
 | RNF-10 | **Resource bounded**: the MVP runs inside the WSL budget (§7.3) | `.wslconfig` limits and Spark memory settings |
 | RNF-11 | **Streaming-ready** (not implemented): no decision closes the door | Connector contract review |
+| **RNF-15** | **Hardened inputs**: identifiers and paths from configuration can neither inject SQL nor escape their allowed roots; runtime database roles have least privilege | Malicious-input corpus, symlink tests, privilege-denial tests (ADR-0013) |
+| **RNF-16** | **Supply chain**: no new dependency with a known high-severity vulnerability; images and actions pinned | CI dependency review; pinned-image check (ADR-0013) |
 
 ---
 
@@ -165,6 +168,7 @@
 | AD-09 | Deletes: `WHEN NOT MATCHED BY SOURCE` on full loads; periodic key reconciliation on incremental loads; CDC as a future option | [0009](../adr/0009-delete-detection.md) |
 | AD-10 | Tables addressed by path; no metastore (behind a `TableLocator` so a catalog can be added later) | [0011](../adr/0011-storage-profiles.md) |
 | AD-11 | sbt multi-module: `core` / `delta-pg-logstore` / `engine` / `cli` / `integration-tests` | [0012](../adr/0012-module-structure.md) |
+| **AD-16** | Application security baseline: validated SQL identifiers and no concatenated SQL, path confinement, least-privilege PostgreSQL roles, dependency scanning in CI | [0013](../adr/0013-application-security-baseline.md) |
 
 ---
 
@@ -276,11 +280,11 @@ Decisions that would have closed the door on multi-node or multi-cluster, and ar
 | JDBC driver | `org.postgresql:postgresql` 42.7.x |
 | Connection pool (LogStore) | HikariCP. Justified by the LogStore's commit-path round trips (ADR-0004). |
 | Control-plane migrations | Flyway |
-| Config | circe + circe-yaml |
+| Config | circe + circe-yaml (safe loading, ADR-0013) |
 | Tests | ScalaTest 3.2.x + Testcontainers (PostgreSQL; MinIO in E1) |
 | Logging | log4j2 (Spark's own) with `JsonTemplateLayout` |
 | Quality | scalafmt, `-Xlint` + selective `-Werror`, scoverage |
-| CI | GitHub Actions |
+| CI | GitHub Actions · sbt dependency submission + Dependabot alerts + dependency review (ADR-0013) |
 | Object storage (extension) | MinIO + `hadoop-aws` matching Spark's Hadoop version (verified in E1) |
 
 ### 7.2 Environment
@@ -379,15 +383,20 @@ Per-source policy (`on_new_column`, `on_missing_column`, `on_type_change`, `rena
 
 ## 11. Security and governance
 
+Two halves: **data governance** (secrets, PII, masking, GDPR) and **application security** (the application's own attack surface: config-supplied identifiers and paths, database privileges, supply chain). The second half was added at Phase 0 closure; its full design and test plan are in [ADR-0013](../adr/0013-application-security-baseline.md).
+
 | Topic | Required | Recommended | Enterprise | Future |
 |---|---|---|---|---|
 | Secrets | `secretRef: env:NAME` / `file:/run/secrets/x` + `SecretResolver`; redaction in logs and config snapshots. The LogStore reads the *name* of the password variable from Hadoop conf, never the value. | Docker secrets in compose | Vault / KMS | — |
 | PII | Column tags in metadata (`pii: email`) | Quarantine inherits the classification | Automatic classification in a catalog | — |
 | Silver masking | Deterministic pseudonymisation (HMAC-SHA256 with a secret key), which keeps joins possible | Per-type strategies | Dynamic masking by role | — |
-| Access control | Filesystem permissions; read-only PostgreSQL role on the source | Separate PostgreSQL roles: source (RO), control (RW), coordination (RW, only the two coordination tables) | Storage ACLs so that only the service identity can write `_delta_log/` (true prevention of uncoordinated writers); Unity Catalog / Ranger | — |
-| Encryption | — (local FS) | Document disk encryption; TLS to PostgreSQL | Encryption at rest, TLS everywhere | Parquet modular encryption |
+| Access control | Filesystem permissions. **Separate PostgreSQL roles with least privilege** (*Recommended* in v2): migrator (DDL, Flyway only), control, coordination (no `DELETE`, no DDL), maintenance, source (read-only). Denial tests. | — | Storage ACLs so that only the service identity can write `_delta_log/` (true prevention of uncoordinated writers); Unity Catalog / Ranger | — |
+| Input hardening | Config identifiers parsed into an allow-listed `SqlIdentifier`; no SQL assembled from config or data values (bind parameters; Spark JDBC predicates); source and target paths confined to their roots, symlinks included. Malicious-input tests. | Safe YAML loading (alias, depth and size limits; duplicate keys rejected) | — | — |
+| Supply chain | Dependency vulnerability scanning in CI (dependency submission, Dependabot alerts, PR gate on new high-severity findings) | Images pinned by digest and non-root; GitHub Actions pinned by SHA with a least-privilege token | Signed artifacts | Image scanning once the project builds its own images |
+| Encryption | — (local FS) | Document disk encryption; TLS configurable to PostgreSQL (and MinIO in E1) | Encryption at rest, TLS everywhere, mTLS | Parquet modular encryption |
 | Audit | Control plane + commit entries | — | SIEM | — |
 | GDPR erasure | Documented procedure: `DELETE` in Silver/Bronze + `VACUUM` after retention, since Delta keeps old files for time travel until `VACUUM` | Short retention in Bronze and quarantine | Crypto-shredding | — |
+| Threat model | — | Brief threat model in `docs/security/` (P12) | Formal threat modelling and penetration testing | — |
 
 ---
 
@@ -554,14 +563,15 @@ lakehouse-ingestion-framework/
 ├── conf/
 │   ├── app/                      # local.yaml · test.yaml · multinode.yaml
 │   └── sources/                  # example sources used by the demos
-├── docker/                       # docker-compose.yml (+ multinode overlay in E1) · postgres/init
+├── docker/                       # docker-compose.yml, images pinned by digest (+ multinode overlay in E1) · postgres/init (databases, roles)
 ├── scripts/                      # run-local.sh · stress-logstore.sh · demo-*.sh
 ├── docs/
 │   ├── architecture/             # this document · diagrams
-│   ├── adr/                      # 0001 … 0012
+│   ├── adr/                      # 0001 … 0013
 │   ├── setup/                    # dev-environment.md
+│   ├── security/                 # threat-model.md (P12)
 │   └── runbooks/                 # recover-run · reset-state · adopt-table · untaint-table · gdpr-erasure
-├── .github/workflows/ci.yml
+├── .github/workflows/            # ci.yml · dependency submission + review (ADR-0013)
 └── README.md                     # includes the spike results (lost commits without / with the LogStore)
 ```
 
@@ -576,20 +586,20 @@ Every phase ends with code, green tests in CI, an updated README and commit(s). 
 | Phase | Content | Type |
 |---|---|---|
 | **P0** | Architecture & requirements (this document) + ADRs | MVP |
-| **P1** | Environment (WSL2, Docker, JDK, sbt) · sbt multi-module skeleton · compose PostgreSQL (source + control DBs) · Spark + Delta smoke test · **stress harness + verifier** · **spike RED**: N JVMs on `file://` with the default LogStore → measured lost commits (natural race plus a widened-window variant using a delaying `FileSystem` wrapper, for deterministic reproduction) · minimal CI (fmt + compile + unit) | MVP |
-| **P2a** | **PostgresLogStore — protocol, one JVM** (highest risk, built first): the P2a verification items from §20 closed first, since the port depends on them · coordination schema and migrations · `CoordinationStore` trait (PostgreSQL and fault-injecting implementations) · protocol port with the 10 deviations · fail-closed behaviour · **all safeguards**: configuration guard (layer 1, as a library function the `cli` calls later), table registry and adoption, gap and publish-race detection → `TAINTED`, schema-version check at init · fault-injection suite **F1–F14** (ADR-0004 §7.1) against Testcontainers PostgreSQL. **Exit:** F1–F14 green in CI; the answers to the P2a items recorded in ADR-0004 §8. | MVP |
+| **P1** | Environment (WSL2, Docker, JDK, sbt) · sbt multi-module skeleton · compose PostgreSQL (source + control DBs) · Spark + Delta smoke test · **stress harness + verifier** · **spike RED**: N JVMs on `file://` with the default LogStore → measured lost commits (natural race plus a widened-window variant using a delaying `FileSystem` wrapper, for deterministic reproduction) · minimal CI (fmt + compile + unit) · *security:* PostgreSQL roles in the compose init script, dependency scanning in CI (submission + Dependabot alerts + PR review gate), images pinned by digest and non-root, Actions pinned by SHA with a least-privilege token | MVP |
+| **P2a** | **PostgresLogStore — protocol, one JVM** (highest risk, built first): the P2a verification items from §20 closed first, since the port depends on them · coordination schema and migrations · `CoordinationStore` trait (PostgreSQL and fault-injecting implementations) · protocol port with the 10 deviations · fail-closed behaviour · **all safeguards**: configuration guard (layer 1, as a library function the `cli` calls later), table registry and adoption, gap and publish-race detection → `TAINTED`, schema-version check at init · fault-injection suite **F1–F14** (ADR-0004 §7.1) against Testcontainers PostgreSQL · *security:* least-privilege coordination role (no `DELETE`, no DDL) with denial tests; bind parameters only. **Exit:** F1–F14 green in CI; the answers to the P2a items recorded in ADR-0004 §8. | MVP |
 | **P2b** | **PostgresLogStore — multi-process proof**: the P1 harness gains chaos (random `kill -9` of writers, PostgreSQL restart, concurrent `OPTIMIZE`) · verifier extended to killed writers (prefix property, ADR-0004 §7.2) · a writer process configured with the default LogStore is refused by the guard · **spike GREEN** with the same harness, including the widened-window variant · README results next to RED. **Exit:** zero anomalies over the same budget as RED; stress verifier green at N=3, K=200 locally and N=8, K=500 in CI. | MVP |
-| **P3** | Metadata model · YAML decoding · accumulating validation · secrets · config hash/snapshot · lake profiles and canonical table URIs | MVP |
-| **P4** | Control plane: Flyway, repositories, `run_id` UUIDv7, runs, **leases with epoch**, batch WAL, `txnAppId` allocation · lease concurrency tests (N threads, real PostgreSQL) | MVP |
-| **P5** | Engine + connector contract + **file connector** → Bronze (new files, processed-file registry, idempotent append, engine fault hooks, commit context → LogStore attribution) · file generator with drift/corruption · **Type 2 fan-in test**: two file sources → one Bronze table, concurrently | MVP |
-| **P6** | **JDBC connector**: full + incremental watermark (lookback, upper bound) · PostgreSQL generator with inserts/updates/deletes | MVP |
+| **P3** | Metadata model · YAML decoding · accumulating validation · secrets · config hash/snapshot · lake profiles and canonical table URIs · *security:* `SqlIdentifier` allow-list and static path validation with malicious-input tests, safe YAML loading, TLS options in profiles | MVP |
+| **P4** | Control plane: Flyway, repositories, `run_id` UUIDv7, runs, **leases with epoch**, batch WAL, `txnAppId` allocation · lease concurrency tests (N threads, real PostgreSQL) · *security:* control-role grants with denial tests, TLS-only PostgreSQL integration test | MVP |
+| **P5** | Engine + connector contract + **file connector** → Bronze (new files, processed-file registry, idempotent append, engine fault hooks, commit context → LogStore attribution) · file generator with drift/corruption · **Type 2 fan-in test**: two file sources → one Bronze table, concurrently · *security:* runtime path confinement (canonical paths, symlinks) with traversal tests | MVP |
+| **P6** | **JDBC connector**: full + incremental watermark (lookback, upper bound) · PostgreSQL generator with inserts/updates/deletes · *security:* quoted identifiers and DataFrame predicates only, SQL-injection integration test | MVP |
 | **P7** | **Correct under failure**: roll-forward/replay recovery · reprocess · **backfill concurrent with incremental on the same table** (Type 2) · reset-state · fault tests at every engine hook + e2e `kill -9` | MVP |
 | ⛳ | **Checkpoint A — minimum demonstrable**: files + JDBC → Bronze, full & incremental, idempotent, crash-recoverable, **multi-writer-safe tables (stress-verified)**, source leases, audited (+ README pass) | |
 | **P8** | Technical validations · error and **conflict classification** (retry vs re-plan) · retries · quarantine + threshold · exit codes | MVP |
 | **P9** | Schema evolution (basic policies + `renames` + concurrent schema change → re-plan) | MVP |
 | **P10** | Silver: typing, normalisation, dedupe, `MERGE` with ordering guard, **partitioning for concurrent `MERGE`**, Bronze-version cursor, soft deletes (snapshot + reconciliation), PII masking | MVP |
 | **P11** | Lineage + observability (commit ↔ run views, freshness, JSON logs, `write_conflicts`/`commit_contention`) · in-JVM parallel runner · **multi-instance engine demo**: N ingestion processes on shared Bronze/Silver tables + `OPTIMIZE` running concurrently, checked by a verifier | MVP |
-| **P12** | Documentation & portfolio v1: README, architecture, ADRs, runbooks, demo script, known limitations · tag `v1.0` | MVP |
+| **P12** | Documentation & portfolio v1: README, architecture, ADRs, runbooks, demo script, known limitations, **threat model** (`docs/security/`) · tag `v1.0` | MVP |
 | ⛳ | **Checkpoint B — MVP-for-CV** | |
 | E1 | **Multi-node**: Docker Compose with Spark Standalone (master + 2 workers) + MinIO (`s3a`) + PostgreSQL; same stress harness and verifier; `spark.cores.max` pitfalls | Extension |
 | E2 | **Multi-cluster**: two independent Spark applications/clusters sharing MinIO and PostgreSQL; run in CI or cloud (documented cloud variant: S3 + managed PostgreSQL) | Extension |
@@ -615,6 +625,7 @@ Every phase ends with code, green tests in CI, an updated README and commit(s). 
 - **All safeguards are built in P2a**, not P2b. F10–F13 test them (gap detection, publish race, unregistered table, schema version), so P2a's exit criterion cannot be met without them. The configuration guard (layer 1) is a pure configuration check, also deterministic, so it goes in P2a too. P2b only demonstrates the guard against a real misconfigured process.
 - **No downside found in the split.** Checkpoint A still requires P2b, and P3 does not start until P2b passes: a protocol that has not survived the stress test is not a foundation to build on.
 - MVP phases: 14.
+- **Application security** ([ADR-0013](../adr/0013-application-security-baseline.md)) is woven into P1, P2a, P3, P4, P5, P6 and P12 (the *security:* items above). There is no security phase: each control lands with the component it protects, and its tests land with it.
 - The spike split (**RED in P1**, **GREEN in P2b**, same harness and verifier) is confirmed. Doing both in P1 would mean writing the LogStore in the bootstrap phase without its fault-injection suite, either as throwaway code or as untested critical code.
 
 ---
@@ -635,6 +646,7 @@ Every phase ends with code, green tests in CI, an updated README and commit(s). 
 | Table/batch lineage + freshness views | Grafana, OpenLineage |
 | CI: fmt, compile, unit, integration | Coverage threshold, releases, heavy suites |
 | Multi-instance demo | Multi-node (E1), multi-cluster (E2) |
+| Validated SQL identifiers, path confinement, least-privilege roles, dependency scanning | TLS, image and Actions hardening, threat model (Recommended); image scanning |
 
 ---
 
@@ -674,6 +686,9 @@ That is what Data Platform interviews probe, and what you need in order to opera
 | Change Data Feed read cost on append-only Bronze | Silver cursor by Bronze version | P10 |
 | Type-widening conversions supported by Delta 4.4 | Schema policy defaults | P9 |
 | `hadoop-aws` version matching Spark 4.1.3's Hadoop | `s3a://` profile | E1 |
+| `dependency-review-action` evaluates the dependency snapshots submitted for sbt (it needs one for the base and one for the head commit) | The CI vulnerability gate (ADR-0013) | P1 |
+| The official `postgres` image runs as a non-root `user:` with a named volume | Non-root containers (ADR-0013) | P1 |
+| circe-yaml: which loader limits it exposes (aliases, depth, size), duplicate-key behaviour, and whether its YAML 1.2 module fits | Safe YAML loading (ADR-0013) | P3 |
 
 ---
 
