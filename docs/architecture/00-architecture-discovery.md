@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | v2 — decisions D1–D6 applied · awaiting confirmation of the revised phase plan |
-| **Date** | 2026-09-25 |
+| **Status** | v3 — **Phase 0 closed** · decisions D1–D7 applied · next phase: P1 |
+| **Date** | 2026-09-25 · closed 2026-11-10 |
 | **Scope** | Analysis and decisions prior to writing code. No implementation. |
 | **Decision records** | [`docs/adr/`](../adr/README.md) — this document summarises; the ADRs are authoritative |
 
@@ -13,6 +13,7 @@
 |---|---|
 | v1 | Initial discovery (Spanish). Proposed a single writer per Delta table (AD-06). |
 | v2 | Decisions D1–D6 applied. **AD-06 removed**: multi-writer tables are in the MVP through a PostgreSQL-coordinated Delta LogStore (ADR-0004). Phase plan re-sequenced around the LogStore, which is now the highest-risk component. Translated to English (D6). |
+| v3 | Phase 0 closed. Phase plan confirmed, with P2 split into P2a (protocol, one JVM) and P2b (multi-process proof). Application security baseline added (D7, ADR-0013). Repository name `lakehouse-ingestion-framework`, base package `lakehouse.ingestion` (ADR-0012). |
 
 ---
 
@@ -24,7 +25,7 @@
 | D2 | Control plane | PostgreSQL holds state, leases (with epoch), the batch write-ahead log and the audit trail. This is a design decision that holds in the cloud too, not a workaround for the local filesystem. | [ADR-0003](../adr/0003-control-plane-in-postgresql.md) |
 | D3 | Multi-writer concurrency | Custom **PostgreSQL-coordinated Delta LogStore** (same pattern as `S3DynamoDBLogStore`). The MVP covers *Type 2* concurrency: several processes writing the **same** Delta table. Correct by design for multi-instance, multi-node and multi-cluster. Multi-instance is demonstrated in the MVP; multi-node and multi-cluster are extensions. | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md), [ADR-0010](../adr/0010-concurrent-write-conflict-handling.md), [ADR-0011](../adr/0011-storage-profiles.md) |
 | D4 | Versions | Spark 4.1.3 · Delta 4.4.0 (`delta-spark_4.1_2.13`) · Java 17 · Scala 2.13 | [ADR-0002](../adr/0002-technology-stack.md) |
-| D5 | Phase plan | Structure approved; re-sequenced for D3 (§17). **Pending your confirmation.** | — |
+| D5 | Phase plan | Confirmed at closure: re-sequenced for D3, spike split RED (P1) / GREEN (P2b), P2 split into P2a and P2b (§17) | — |
 | D6 | Repository identity | Code, comments, commits and docs in English. Repository `lakehouse-ingestion-framework`, base package `lakehouse.ingestion`, independent of the GitHub handle. Organization placeholder defined in one place (§21). | [ADR-0012](../adr/0012-module-structure.md) |
 | D7 | Application security | Validated SQL identifiers and no concatenated SQL; file paths confined to allowed roots; least-privilege PostgreSQL roles; dependency vulnerability scanning in CI. Recommended: pinned non-root images, configurable TLS, safe YAML loading, a brief threat model. Woven into existing phases (§17). | [ADR-0013](../adr/0013-application-security-baseline.md) |
 
@@ -711,8 +712,12 @@ Decided at Phase 0 closure; recorded in [ADR-0012](../adr/0012-module-structure.
 
 ## Decisions Required From Me
 
-1. **Confirm the revised phase plan (§17)**, including:
-   - the LogStore as P2, before the engine;
-   - the spike split into RED (P1) and GREEN (P2) with one harness (a deviation from your instruction);
-   - multi-instance in the MVP (P2 stress test + P11 engine demo), multi-node as E1, multi-cluster as E2.
-2. **Repository name** (§21): `metaingest` (recommended), `lakehouse-ingestion-framework` or `medallion-ingest`. The base package follows from it. Also confirm the base package is independent of the GitHub handle.
+**Closed (2026-11-10).** Every Phase 0 decision is taken:
+
+| Decision | Resolution |
+|---|---|
+| Revised phase plan (§17) | Confirmed: LogStore before the engine; spike RED (P1) / GREEN (P2b) with one harness; multi-instance in the MVP, multi-node as E1, multi-cluster as E2. P2 split into P2a and P2b. |
+| Application security | Baseline added (D7, [ADR-0013](../adr/0013-application-security-baseline.md)), woven into existing phases |
+| Repository name (§21) | `lakehouse-ingestion-framework`; base package `lakehouse.ingestion`, independent of the GitHub handle |
+
+**Still open, not blocking Phase 0:** the GitHub handle. The placeholder `io.github.changeme` stays in `build.sbt`. P1's CI and the dependency scanning (ADR-0013) need the repository on GitHub, so the handle is needed during P1.
