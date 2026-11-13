@@ -18,6 +18,7 @@ import org.apache.spark.sql.SparkSession
  * waits at the start barrier. Then it makes `commits` blind appends with `txnAppId = writer-<i>`
  * and `txnVersion = 1..commits`, journaling each one after its write returns, and stops at the
  * first failure. Everything else, including which LogStore is used, comes from `-Dspark.*`.
+ * As it exits it records what its Delta and Hadoop actually resolved (`WriterProbe`).
  *
  * The exit code tells the orchestrator how far the writer got (`ExitCode`).
  */
@@ -73,12 +74,17 @@ object StressWriter {
       case Success(spark) =>
         try
           prepare(spark, config, run) match {
-            case Some(error) =>
+            case Left(error) =>
               report(id, "setup failed before the start barrier", error)
               ExitCode.SetupFailed
-            case None =>
+            case Right(probe) =>
               val started = System.nanoTime()
-              val code = commitAll(spark, config, run, journal)
+              val code =
+                try commitAll(spark, config, run, journal)
+                finally
+                  probe
+                    .copy(delayedRenames = DelayingLocalFs.delayedRenames)
+                    .write(run.probe(config.writer))
               val elapsed = (System.nanoTime() - started).nanos.toMillis
               println(s"$id: exit code $code after $elapsed ms")
               code
@@ -128,19 +134,22 @@ object StressWriter {
   }
 
   /**
-   * Loads the table before reporting ready, so that the first commits of all writers are not
-   * staggered by class loading and log replay; then waits for the start signal.
+   * Loads the table and resolves the probe before reporting ready, so that the first commits of
+   * all writers are not staggered by class loading and log replay; then waits for the start
+   * signal.
    */
   private def prepare(
       spark: SparkSession,
       config: WriterConfig,
       run: StressRun
-  ): Option[Throwable] =
+  ): Either[Throwable, WriterProbe] =
     Try {
       DeltaTable.forPath(spark, run.tableUri).toDF.schema
+      val probe = WriterProbe.resolve(spark, run.tableUri)
       Files.createFile(run.readyMarker(config.writer))
       awaitStart(run, config.startTimeout.fromNow)
-    }.failed.toOption
+      probe
+    }.toEither
 
   @tailrec
   private def awaitStart(run: StressRun, deadline: Deadline): Unit =

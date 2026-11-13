@@ -59,8 +59,42 @@ object StressReport {
         Seq("Writer commits in the log", s.writerCommitsInLog.toString),
         Seq("Commits acknowledged by writers", s.acknowledged.toString),
         Seq("Lost commits (acknowledged, not in the log)", s.lost.toString),
-        Seq("Orphan data files (on disk, never added)", s.orphanDataFiles.size.toString)
+        Seq("Orphan data files (on disk, never added)", s.orphanDataFiles.size.toString),
+        Seq(
+          "Commit files with a stale `.crc` sidecar",
+          if (s.checksumMismatches.isEmpty) "0"
+          else s"${s.checksumMismatches.size} (versions ${s.checksumMismatches.mkString(", ")})"
+        )
       )
+    )
+
+    val readerTable = table(
+      Seq("Reader", "How it reads", "Result"),
+      s.readers.map { case (reader, error) =>
+        Seq(reader.label, reader.description, error.fold("read the table")(e => s"failed: $e"))
+      }
+    )
+
+    val probeTable = table(
+      Seq(
+        "Writer",
+        "LogStore",
+        "Log FileSystem",
+        "HDFSLogStore lock",
+        "Commit FileContext",
+        "Delayed renames"
+      ),
+      s.writers.map { w =>
+        StressTable.writerId(w.writer) +: w.probe.fold(Seq.fill(5)("(no probe)")) { p =>
+          Seq(
+            code(p.logStore),
+            code(p.logFileSystem),
+            if (p.hdfsLogStoreLockTaken) "taken (per instance)" else "not taken",
+            code(p.commitFileContext),
+            p.delayedRenames.toString
+          )
+        }
+      }
     )
 
     val byKind = report.anomalies.groupBy(_.kind).toSeq.sortBy(_._1)
@@ -106,9 +140,20 @@ object StressReport {
         "`LocalSparkSuite.baseConf` (no UI, UTC, loopback, Delta session extension), or else " +
         "its Spark or Delta default. `-Dspark.*` options in the run table override both.",
       sparkTable,
+      "## Writer probes",
+      "What each writer JVM resolved for the table, recorded by the writer itself: the code " +
+        "path the result was measured on. `HDFSLogStore` takes its `synchronized (this)` lock " +
+        "only on a `RawLocalFileSystem`, and even then the lock is per instance, never across " +
+        "JVMs.",
+      probeTable,
       "## Result",
       verdict,
       summaryTable,
+      "## Readers",
+      "The verifier reads the commit files as bytes, without Delta or Hadoop. Delta readers " +
+        "then load the table each in its own way, and their anomalies are tagged with the " +
+        "reader. A lost commit does not show in either: the reader just does not see it.",
+      readerTable,
       "## Anomalies",
       anomalySection,
       "## Writers",

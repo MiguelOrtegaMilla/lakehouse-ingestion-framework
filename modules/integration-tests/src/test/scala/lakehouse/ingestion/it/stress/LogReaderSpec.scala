@@ -3,14 +3,17 @@ package lakehouse.ingestion.it.stress
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
 
+import scala.util.Using
+
 import lakehouse.ingestion.it.stress.LogModel._
 import lakehouse.ingestion.it.support.LocalSparkSuite
+import org.apache.hadoop.fs.{FileSystem, Path => HadoopPath}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /**
  * `LogReader` on a hand-written `_delta_log`: the log view must come from the commit files alone,
- * whatever Delta would make of them.
+ * whatever Delta, or Hadoop's checksum layer, would make of them.
  */
 final class LogReaderSpec extends AnyFunSuite with Matchers with LocalSparkSuite {
 
@@ -84,7 +87,33 @@ final class LogReaderSpec extends AnyFunSuite with Matchers with LocalSparkSuite
   }
 
   test("a path that is not a Delta table gives the reader's error, not an exception") {
-    val result = LogReader.tableView(spark, workDir.resolve("not-delta").toUri.toString)
-    result.isLeft shouldBe true
+    val uri = workDir.resolve("not-delta").toUri.toString
+    Reader.all.foreach(r => LogReader.tableView(spark, uri, r).isLeft shouldBe true)
+  }
+
+  test("a commit file with a stale .crc sidecar is still read, and reported as a mismatch") {
+    val table = workDir.resolve("stale-sidecar")
+    val log = table.resolve("_delta_log")
+    val original = """{"commitInfo":{"operation":"WRITE"}}""" + "\n"
+    val overwrite = """{"commitInfo":{"operation":"MERGE"}}""" + "\n"
+    // Hadoop's LocalFileSystem writes the sidecar `.<name>.crc` next to the file.
+    Seq(0L, 1L).foreach { v =>
+      val fs = FileSystem.getLocal(spark.sparkContext.hadoopConfiguration)
+      Using.resource(fs.create(new HadoopPath(log.resolve(commitFile(v)).toUri), true)) {
+        _.write(original.getBytes(UTF_8))
+      }
+    }
+    // Version 1 is overwritten behind the sidecar's back, as a racing rename does.
+    write(log, commitFile(1), overwrite)
+    Files.exists(log.resolve(s".${commitFile(1)}.crc")) shouldBe true
+
+    val view = LogReader.logView(spark, table)
+
+    view.checksumMismatches shouldBe Seq(1L)
+    view.commits.map(c => c.version -> c.operation) shouldBe Seq(
+      0L -> Some("WRITE"),
+      1L -> Some("MERGE")
+    )
+    view.unreadable shouldBe empty
   }
 }

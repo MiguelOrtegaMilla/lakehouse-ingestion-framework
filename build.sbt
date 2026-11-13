@@ -66,11 +66,27 @@ lazy val cli = module("cli", artifact = "cli")
   .dependsOn(engine)
   .settings(rules(forbidden = Nil))
 
+/**
+ * Stress runs (the LogStore spikes, ADR-0004 §7.3): tests tagged `StressTest`. They take minutes
+ * and start several JVMs, so `test` leaves them out and `sbt stress` runs only them. The
+ * configuration extends `Test`: same sources, classpath and forked JVM settings.
+ */
+lazy val Stress = config("stress").extend(Test)
+lazy val stressTag = "lakehouse.ingestion.it.Stress"
+lazy val excludeStress = Tests.Argument(TestFrameworks.ScalaTest, "-l", stressTag)
+
+addCommandAlias("stress", "integration-tests/Stress/test")
+
 /** Testcontainers, end-to-end, fault injection, stress harness and verifier. Never published. */
 lazy val integrationTests = module("integration-tests", artifact = "integration-tests")
   .dependsOn(core, deltaPgLogstore, engine, cli)
+  .configs(Stress)
   .settings(SparkTestJvm.settings)
+  .settings(inConfig(Stress)(Defaults.testTasks))
   .settings(
+    Test / testOptions += excludeStress,
+    Stress / testOptions := (Test / testOptions).value.filterNot(_ == excludeStress) :+
+      Tests.Argument(TestFrameworks.ScalaTest, "-n", stressTag),
     rules(forbidden = Nil),
     publish / skip := true,
     libraryDependencies ++= Seq(

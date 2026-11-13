@@ -8,8 +8,9 @@ import lakehouse.ingestion.it.stress.StressHarness.WriterOutcome
  *
  * The verifier does not trust the component under test. It reads the commit files directly
  * (`LogView`), takes the writers' word from their journals, and only then compares both with
- * what a Delta reader sees (`TableView`). A lost commit is visible only in the first comparison:
- * the Delta reader simply does not see it.
+ * what Delta readers see (`TableView`, once per `Reader`). A lost commit is visible only in the
+ * first comparison: a Delta reader simply does not see it. Each reader's anomalies name it, so
+ * a report can show one reader failing on a table that another reads without complaint.
  *
  * Each `(writer, txnVersion)` is in one of three states (`CommitState`), and each state has its
  * rule:
@@ -74,6 +75,7 @@ object Verifier {
 
     /** The table's rows for one commit do not match what the log says was committed. */
     final case class RowMismatch(
+        reader: Reader,
         writer: String,
         txnVersion: Long,
         expectedRows: Long,
@@ -81,24 +83,28 @@ object Verifier {
     ) extends Anomaly {
       val kind = "RowMismatch"
       def detail =
-        s"$writer txnVersion=$txnVersion: expected $expectedRows rows, found ${actual.rows} " +
+        s"[${reader.label}] $writer txnVersion=$txnVersion: expected $expectedRows rows, " +
+          s"found ${actual.rows} " +
           s"(${actual.distinctRowSeqs} distinct row_seq)"
     }
 
     /** The Delta reader's latest snapshot and the replayed commit files disagree on the files. */
-    final case class SnapshotDivergence(onlyInReader: Set[String], onlyInLog: Set[String])
-        extends Anomaly {
+    final case class SnapshotDivergence(
+        reader: Reader,
+        onlyInReader: Set[String],
+        onlyInLog: Set[String]
+    ) extends Anomaly {
       val kind = "SnapshotDivergence"
       def detail =
-        s"${onlyInReader.size} files only in the Delta reader " +
+        s"[${reader.label}] ${onlyInReader.size} files only in the Delta reader " +
           s"(${onlyInReader.toSeq.sorted.mkString(", ")}), ${onlyInLog.size} only in the " +
           s"commit files (${onlyInLog.toSeq.sorted.mkString(", ")})"
     }
 
     /** A Delta reader could not load the table at all. */
-    final case class UnreadableTable(error: String) extends Anomaly {
+    final case class UnreadableTable(reader: Reader, error: String) extends Anomaly {
       val kind = "UnreadableTable"
-      def detail = error
+      def detail = s"[${reader.label}] $error"
     }
 
     /** The journal contradicts the writer's exit code or itself: a harness bug. */
@@ -117,6 +123,8 @@ object Verifier {
       lost: Int,
       otherCommits: Seq[(Long, String)],
       orphanDataFiles: Seq[String],
+      checksumMismatches: Seq[Long],
+      readers: Seq[(Reader, Option[String])],
       writers: Seq[WriterOutcome]
   )
 
@@ -129,7 +137,7 @@ object Verifier {
       expected: Expected,
       writers: Seq[WriterOutcome],
       log: LogView,
-      table: Either[String, TableView],
+      tables: Seq[(Reader, Either[String, TableView])],
       disk: DiskView
   ): Report = {
     val states = writers.map(w => StressTable.writerId(w.writer) -> commitStates(w, expected))
@@ -139,10 +147,10 @@ object Verifier {
       writers.flatMap(journalAnomalies(_, expected)) ++
         logShapeAnomalies(log) ++
         commitAnomalies(expected, states.toMap, occurrences, log) ++
-        (table match {
-          case Left(error) => Seq(UnreadableTable(error))
-          case Right(view) => tableAnomalies(expected, occurrences, log, view)
-        })
+        tables.flatMap {
+          case (reader, Left(error)) => Seq(UnreadableTable(reader, error))
+          case (reader, Right(view)) => tableAnomalies(reader, expected, occurrences, log, view)
+        }
 
     val acked = states.map(_._2.values.count(_ == CommitState.Acked)).sum
     Report(
@@ -157,6 +165,8 @@ object Verifier {
           .sortBy(_.version)
           .map(c => c.version -> c.operation.getOrElse("(no commitInfo)")),
         orphanDataFiles = (disk.dataFiles -- log.everAdded).toSeq.sorted,
+        checksumMismatches = log.checksumMismatches,
+        readers = tables.map { case (reader, view) => reader -> view.left.toOption },
         writers = writers
       )
     )
@@ -254,6 +264,7 @@ object Verifier {
   }
 
   private def tableAnomalies(
+      reader: Reader,
       expected: Expected,
       occurrences: Map[(String, Long), Seq[Long]],
       log: LogView,
@@ -262,7 +273,10 @@ object Verifier {
     val logFiles = log.activeFiles
     val divergence =
       if (logFiles == table.activeFiles) Nil
-      else Seq(SnapshotDivergence(table.activeFiles -- logFiles, logFiles -- table.activeFiles))
+      else
+        Seq(
+          SnapshotDivergence(reader, table.activeFiles -- logFiles, logFiles -- table.activeFiles)
+        )
 
     val keys = (occurrences.keySet ++ table.rows.keySet).toSeq.sorted
     val rows = keys.flatMap { case key @ (writer, k) =>
@@ -271,7 +285,7 @@ object Verifier {
       val expectedDistinct = if (commits > 0) expected.rowsPerCommit.toLong else 0L
       val actual = table.rows.getOrElse(key, RowCount(0, 0))
       if (actual == RowCount(expectedRows, expectedDistinct)) None
-      else Some(RowMismatch(writer, k, expectedRows, actual))
+      else Some(RowMismatch(reader, writer, k, expectedRows, actual))
     }
 
     divergence ++ rows

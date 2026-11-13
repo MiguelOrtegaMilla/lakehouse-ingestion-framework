@@ -1,12 +1,14 @@
 package lakehouse.ingestion.it.stress
 
 import java.net.URI
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
 
 import scala.jdk.CollectionConverters._
 import scala.util.{Try, Using}
 
 import io.delta.tables.DeltaTable
+import lakehouse.ingestion.it.stress.LogModel.Reader
 import lakehouse.ingestion.it.stress.StressHarness.{HarnessFailure, Settings, WriterOutcome}
 import lakehouse.ingestion.it.stress.Verifier.Anomaly.{LostCommit, UnreadableTable, VersionGap}
 import lakehouse.ingestion.it.stress.Verifier.Expected
@@ -86,6 +88,8 @@ final class StressHarnessSpec
     report.summary.writerCommitsInLog shouldBe 5
     report.summary.otherCommits shouldBe Seq(0L -> "CREATE TABLE")
     report.summary.orphanDataFiles shouldBe empty
+    report.summary.checksumMismatches shouldBe empty
+    report.summary.readers shouldBe Reader.all.map(_ -> None)
   }
 
   test("the report states the writers' Spark settings with their reasons") {
@@ -122,9 +126,34 @@ final class StressHarnessSpec
     report.summary.orphanDataFiles should have size 1
     // Delta notices a gap. The RED spike's lost commits leave none: another writer's commit
     // takes the version, so a Delta reader has nothing to notice.
-    report.anomalies.collect { case UnreadableTable(e) => e }.loneElement should include(
-      "DELTA_VERSIONS_NOT_CONTIGUOUS"
-    )
+    report.anomalies.collect { case UnreadableTable(r, e) =>
+      r -> e.contains("DELTA_VERSIONS_NOT_CONTIGUOUS")
+    } shouldBe Reader.all.map(_ -> true)
+  }
+
+  test("a commit file whose .crc sidecar went stale fails the default reader only") {
+    val (original, settings, outcomes) = singleWriter
+    val run = copyOf(original, "stale-sidecar")
+    // Same length, other bytes, nothing the verifier reads: the sidecar no longer matches.
+    val commit = logDir(run.tableUri).resolve(f"${3}%020d.json")
+    val bytes = new String(Files.readAllBytes(commit), UTF_8)
+    // commitInfo's epoch-millis timestamp starts with 1 in this century; 2 keeps it valid JSON.
+    val altered = bytes.replaceFirst("\"timestamp\":1", "\"timestamp\":2")
+    altered should not equal bytes
+    Files.write(commit, altered.getBytes(UTF_8))
+
+    val report = LogReader.verify(spark, run, Expected.of(settings), outcomes)
+
+    report.summary.checksumMismatches shouldBe Seq(3L)
+    report.anomalies.loneElement match {
+      case UnreadableTable(reader, error) =>
+        reader shouldBe Reader.Default
+        error should include("ChecksumException")
+      case other => fail(s"unexpected anomaly: $other")
+    }
+    // The commit files themselves are intact, so nothing is lost and nothing else is wrong.
+    report.summary.lost shouldBe 0
+    report.summary.readers.toMap.apply(Reader.SidecarFree) shouldBe None
   }
 
   test("a writer that cannot start fails the run before the barrier, with its log") {

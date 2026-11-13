@@ -618,7 +618,10 @@ Every phase ends with code, green tests in CI, an updated README and commit(s). 
 | P1.1 | sbt multi-module skeleton, module boundary check, scalafmt, JDK pin | Done |
 | P1.2 | Local PostgreSQL (control + source databases) with a least-privilege bootstrap, tested through Testcontainers | Done |
 | P1.3 | Spark + Delta smoke test in the forked test JVM (Java 17 `--add-opens`, drift check against Spark's own list), including idempotent writes with `txnAppId`/`txnVersion` | Done |
-| P1.4 | Stress harness + verifier · **spike RED**: N JVMs on `file://` with the default LogStore, natural race and widened-window variant | Planned |
+| P1.4a | Stress harness: N writer JVMs, start barrier, acknowledgement journals, orphan watchdog | Done |
+| P1.4b | Stress verifier: raw log view, writer journals and Delta reader compared; anomaly classes; Markdown report | Done |
+| P1.4c | **Spike RED**: N JVMs on `file://` with the default LogStore, natural race and widened-window variant (`DelayingLocalFs`), writer probes as preconditions, `sbt stress` and `scripts/stress-logstore.sh`, reports in `target/stress/<run>/report.md` | Done |
+| P1.4d | RED write-up: ADR-0004 corrections (§1.2 lock, §3.4 `.crc` sidecars on `file://`), `DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE` against §3.6, and the RED result (what Delta detects and what it does not) | Planned |
 | P1.5 | Minimal CI (fmt + compile + tests) · dependency scanning · Actions pinned by SHA with a least-privilege token · Ryuk image pinning. **The repository goes public when P1.5 is done.** | Planned |
 
 The spike comes before the CI so that the CI starts out testing everything P1 builds, and so that the repository goes public with the RED result in it.

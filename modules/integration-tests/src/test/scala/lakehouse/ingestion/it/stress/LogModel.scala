@@ -26,11 +26,18 @@ object LogModel {
    * The Delta log as the raw commit files say, read without Delta's own log replay.
    *
    * @param versions every version that has a commit file, readable or not
+   * @param checksumMismatches versions whose commit file Hadoop's `LocalFileSystem` rejects: its
+   *   `.crc` sidecar does not match its bytes. An observation, not an anomaly. On `file://` a
+   *   commit overwritten by another writer usually leaves one, because `ChecksumFs` renames the
+   *   commit file and its sidecar in two steps, and the sidecar's rename does not overwrite.
+   *   It is not certain: when both sidecar renames also race, the last writer's sidecar wins and
+   *   matches the commit file it wrote.
    */
   final case class LogView(
       versions: Seq[Long],
       commits: Seq[Commit],
-      unreadable: Seq[UnreadableCommit]
+      unreadable: Seq[UnreadableCommit],
+      checksumMismatches: Seq[Long] = Nil
   ) {
 
     /** The data files of the latest version, replaying adds and removes in version order. */
@@ -44,6 +51,33 @@ object LogModel {
 
   /** Rows the table holds for one `(writer_id, txn_version)`. */
   final case class RowCount(rows: Long, distinctRowSeqs: Long)
+
+  /**
+   * A way of reading the table through Delta. The two differ only in Hadoop's local file system,
+   * which decides whether `.crc` sidecars are checked.
+   */
+  sealed abstract class Reader(val label: String, val description: String)
+
+  object Reader {
+
+    /** What any Spark job reading the table on `file://` gets by default. */
+    case object Default
+        extends Reader(
+          "default reader",
+          "Delta over Hadoop's `LocalFileSystem`, which checks the `.crc` sidecar of every file " +
+            "it reads"
+        )
+
+    /** What a reader on object storage gets: S3 and MinIO have no sidecars to check. */
+    case object SidecarFree
+        extends Reader(
+          "sidecar-free reader",
+          "Delta over `RawLocalFileSystem`, which ignores `.crc` sidecars, as every reader on " +
+            "object storage does: there are none"
+        )
+
+    val all: Seq[Reader] = Seq(Default, SidecarFree)
+  }
 
   /** The table as a Delta reader sees it: its latest snapshot. */
   final case class TableView(

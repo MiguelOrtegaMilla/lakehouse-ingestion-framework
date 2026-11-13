@@ -27,6 +27,12 @@ final class StressRun private (val root: Path) {
   /** Created by the orchestrator once every writer is ready: all of them start committing. */
   def startSignal: Path = root.resolve("barrier").resolve("start")
 
+  /** What the writer's Delta and Hadoop resolved (`WriterProbe`), written as it exits. */
+  def probe(writer: Int): Path = root.resolve("probes").resolve(s"${name(writer)}.properties")
+
+  /** The Markdown report of the run (`StressReport`), next to the evidence it summarises. */
+  def report: Path = root.resolve("report.md")
+
   /** Spark warehouse and other scratch space of one writer. */
   def scratch(writer: Int): Path = root.resolve("spark").resolve(name(writer))
 
@@ -35,7 +41,7 @@ final class StressRun private (val root: Path) {
 
 object StressRun {
 
-  private val Subdirectories = Seq("journals", "logs", "barrier", "spark")
+  private val Subdirectories = Seq("journals", "logs", "barrier", "probes", "spark")
 
   /** Creates a fresh run directory `<parent>/<label>`; fails if it already exists. */
   def create(parent: Path, label: String): StressRun = {

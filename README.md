@@ -36,6 +36,16 @@ sbt "integration-tests/testOnly lakehouse.ingestion.it.delta.*"   # Spark + Delt
 
 Tests that run Spark fork their own JVM with the Java 17 module options Spark needs (`project/SparkTestJvm.scala`), 1 GB of heap and UTC. `SparkJvmOptionsSpec` fails if a Spark upgrade changes those options and the build has not followed.
 
+## Stress runs
+
+Several writer JVMs commit to one Delta table at the same time. A verifier then checks the result against what each writer saw succeed ([ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md) §7). These runs take minutes, so `sbt test` leaves them out:
+
+```bash
+scripts/stress-logstore.sh   # runs `sbt stress` and lists the reports written (no Docker; ~3 GB of free memory)
+```
+
+Each run keeps its table, writer journals, logs and probes in `target/stress/<run>/`, next to its `report.md`.
+
 ## Local services
 
 One PostgreSQL 17 container hosts the control plane, the commit coordination store and a demo source database ([ADR-0003](docs/adr/0003-control-plane-in-postgresql.md)). The image is pinned by digest, and the container runs as a non-root user with no capabilities. It listens on `127.0.0.1` only.

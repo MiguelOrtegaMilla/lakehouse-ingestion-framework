@@ -41,12 +41,16 @@ object StressHarness {
     require(writers > 0 && commits > 0 && rowsPerCommit > 0, s"invalid settings: $this")
   }
 
-  /** How one writer ended: its exit code (`StressWriter.ExitCode`) and what it journaled. */
+  /**
+   * How one writer ended: its exit code (`StressWriter.ExitCode`), what it journaled, and what it
+   * resolved (`WriterProbe`; `None` if it never got past its setup).
+   */
   final case class WriterOutcome(
       writer: Int,
       exitCode: Int,
       journal: AckJournal.Contents,
-      log: Path
+      log: Path,
+      probe: Option[WriterProbe] = None
   )
 
   /** The run itself went wrong (a writer never got ready, a timeout), not what it measured. */
@@ -67,7 +71,13 @@ object StressHarness {
       val deadline = settings.runTimeout.fromNow
       writers.map { i =>
         val exitCode = awaitExit(stressRun, i, processes(i), deadline)
-        WriterOutcome(i, exitCode, AckJournal.read(stressRun.journal(i)), stressRun.log(i))
+        WriterOutcome(
+          i,
+          exitCode,
+          AckJournal.read(stressRun.journal(i)),
+          stressRun.log(i),
+          WriterProbe.read(stressRun.probe(i))
+        )
       }
     } finally processes.values.filter(_.isAlive).foreach(_.destroyForcibly())
   }

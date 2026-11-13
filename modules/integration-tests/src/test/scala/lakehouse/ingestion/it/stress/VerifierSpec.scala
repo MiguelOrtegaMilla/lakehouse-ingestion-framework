@@ -8,6 +8,7 @@ import lakehouse.ingestion.it.stress.StressHarness.WriterOutcome
 import lakehouse.ingestion.it.stress.StressWriter.ExitCode
 import lakehouse.ingestion.it.stress.Verifier.Anomaly._
 import lakehouse.ingestion.it.stress.Verifier.{CommitState, Expected, Report}
+import org.scalatest.LoneElement
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -15,7 +16,7 @@ import org.scalatest.matchers.should.Matchers
  * The verifier's rules on hand-built runs. Each anomaly class has a case that produces it and
  * nothing else, so a report naming a class can be trusted to mean that class.
  */
-final class VerifierSpec extends AnyFunSuite with Matchers {
+final class VerifierSpec extends AnyFunSuite with Matchers with LoneElement {
 
   private val expected = Expected(writers = 2, commits = 3, rowsPerCommit = 2)
   private val killedBySignal = 137
@@ -65,7 +66,7 @@ final class VerifierSpec extends AnyFunSuite with Matchers {
       expected,
       writers,
       log,
-      table.getOrElse(Right(consistentTable(log))),
+      Seq(Reader.Default -> table.getOrElse(Right(consistentTable(log)))),
       disk.getOrElse(DiskView(log.everAdded))
     )
 
@@ -179,9 +180,9 @@ final class VerifierSpec extends AnyFunSuite with Matchers {
     val report = run(allOk, log, table = Some(Right(tampered)))
 
     report.anomalies shouldBe Seq(
-      RowMismatch("writer-0", 1, 2, RowCount(1, 1)),
-      RowMismatch("writer-0", 2, 2, RowCount(2, 1)),
-      RowMismatch("writer-7", 1, 0, RowCount(2, 2))
+      RowMismatch(Reader.Default, "writer-0", 1, 2, RowCount(1, 1)),
+      RowMismatch(Reader.Default, "writer-0", 2, 2, RowCount(2, 1)),
+      RowMismatch(Reader.Default, "writer-7", 1, 0, RowCount(2, 2))
     )
   }
 
@@ -191,7 +192,9 @@ final class VerifierSpec extends AnyFunSuite with Matchers {
     val diverged = table.copy(activeFiles = table.activeFiles - file(0, 1) + "stale.parquet")
     val report = run(allOk, log, table = Some(Right(diverged)))
 
-    report.anomalies shouldBe Seq(SnapshotDivergence(Set("stale.parquet"), Set(file(0, 1))))
+    report.anomalies shouldBe Seq(
+      SnapshotDivergence(Reader.Default, Set("stale.parquet"), Set(file(0, 1)))
+    )
   }
 
   test("a table the Delta reader cannot load is UnreadableTable; the log checks still run") {
@@ -200,8 +203,33 @@ final class VerifierSpec extends AnyFunSuite with Matchers {
 
     report.anomalies shouldBe Seq(
       LostCommit("writer-0", 3),
-      UnreadableTable("DeltaIllegalStateException: gap")
+      UnreadableTable(Reader.Default, "DeltaIllegalStateException: gap")
     )
+  }
+
+  test("each reader is checked on its own, and its anomalies name it") {
+    val log = logOf(interleaved).copy(checksumMismatches = Seq(2L))
+    val report = Verifier.verify(
+      expected,
+      allOk,
+      log,
+      Seq(
+        Reader.Default -> Left("ChecksumException: Checksum error"),
+        Reader.SidecarFree -> Right(consistentTable(log))
+      ),
+      DiskView(log.everAdded)
+    )
+
+    report.anomalies shouldBe Seq(
+      UnreadableTable(Reader.Default, "ChecksumException: Checksum error")
+    )
+    report.anomalies.loneElement.detail should startWith("[default reader] ")
+    report.summary.readers shouldBe Seq(
+      Reader.Default -> Some("ChecksumException: Checksum error"),
+      Reader.SidecarFree -> None
+    )
+    // A stale sidecar is an observation: it adds no anomaly of its own.
+    report.summary.checksumMismatches shouldBe Seq(2L)
   }
 
   test("a journal that contradicts itself or its exit code is InconsistentJournal") {
