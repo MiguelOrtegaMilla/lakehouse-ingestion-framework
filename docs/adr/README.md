@@ -1,6 +1,6 @@
 # Architecture Decision Records
 
-Each ADR records one decision: its context, the decision, the alternatives considered and the consequences. ADRs are immutable once accepted. A change of mind is a new ADR that supersedes the old one.
+Each ADR records one decision: its context, the decision, the alternatives considered and the consequences. ADRs are immutable once accepted. A change of mind is a new ADR that supersedes the old one. A factual correction that leaves the decision unchanged is made in place, with a dated note that says what the text said before (for example ADR-0004 §1.2, corrected in P1.4d).
 
 | ADR | Title | Status |
 |---|---|---|

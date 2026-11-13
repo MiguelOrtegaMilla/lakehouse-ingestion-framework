@@ -46,6 +46,17 @@ scripts/stress-logstore.sh   # runs `sbt stress` and lists the reports written (
 
 Each run keeps its table, writer journals, logs and probes in `target/stress/<run>/`, next to its `report.md`.
 
+### Spike RED: Delta's default LogStore on `file://`
+
+Three writer JVMs append to one table with Delta's default configuration ([full write-up](docs/spikes/logstore-red.md)):
+
+| Variant | Runs that lost a commit its writer saw succeed |
+|---|---|
+| Natural race (3 × 200 commits, no fault injection) | **2 of 5** |
+| Widened window (a delay just before the rename that publishes the commit) | **5 of 5** |
+
+Delta notices nothing: the lost commit's file is replaced, not removed, so the log has no gap. On `file://`, Hadoop's `.crc` sidecar usually goes stale, and every reader that checks it then fails. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit. The fix is [ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md); its GREEN result comes in P2b.
+
 ## Local services
 
 One PostgreSQL 17 container hosts the control plane, the commit coordination store and a demo source database ([ADR-0003](docs/adr/0003-control-plane-in-postgresql.md)). The image is pinned by digest, and the container runs as a non-root user with no capabilities. It listens on `127.0.0.1` only.

@@ -26,9 +26,11 @@ A commit is the creation of `_delta_log/<N>.json` (N zero-padded to 20 digits). 
 
 | Storage | Atomic visibility | Mutual exclusion across processes | Consistent listing |
 |---|---|---|---|
-| Local POSIX FS, default `HDFSLogStore` | ✅ temp + rename | ❌ `RawLocalFileSystem.rename` overwrites. Delta guards it with a **JVM-static** `LOCAL_FS_WRITE_LOCK` whose own comment says it exists for exclusion "in our tests". | ✅ |
+| Local POSIX FS, default `HDFSLogStore` | ✅ temp + rename | ❌ It checks that `N.json` does not exist, then renames onto it with `rename(2)`, which replaces an existing file. Its only guard is `synchronized (this)`. That lock is per `HDFSLogStore` instance, so it never spans JVMs. Delta takes it only when the log's `FileSystem` is a `RawLocalFileSystem`; on `file://` it is a `LocalFileSystem`, so the lock is not taken at all. Its own comment says it exists "in our tests". ¹ | ✅ |
 | S3 / MinIO, default `S3SingleDriverLogStore` | ✅ PUT | ❌ (single driver only) | ✅ (S3 is strongly consistent; MinIO too) |
 | HDFS | ✅ | ✅ atomic rename-if-absent | ✅ |
+
+¹ *Corrected in P1.4d (2026-11-13).* This row first described a JVM-static `LOCAL_FS_WRITE_LOCK`. Delta 4.4.1's `HDFSLogStore` has no such lock; the facts above come from its code and from each writer's probe in the RED spike (§7.3). The decision is unchanged: if anything, the default is weaker than first stated.
 
 The docs say it outright: *"Delta Lake on local file system may not support concurrent transactional writes"*. For S3 multi-cluster writes the official answer is `S3DynamoDBLogStore`, which is *"only safe when all writers use this LogStore implementation as well as the same DynamoDB table and region"*.
 
@@ -134,6 +136,8 @@ sequenceDiagram
 | `s3a://` (S3, MinIO) | Server-side copy / PUT of `T(N)`'s bytes to `N.json` | An object becomes visible only when complete |
 | `file://` (POSIX) | Copy `T(N)` → `.tmp/N.json.<uuid>.pub`, then `rename` to `N.json` | `rename(2)` is atomic. It may *replace* an existing file, but that is harmless: exclusivity comes from PostgreSQL, and concurrent recoverers publish identical bytes. |
 
+**`.crc` sidecars on `file://`** *(added in P1.4d)*. Hadoop's checksummed local file system (`LocalFs` behind a `FileContext`, `LocalFileSystem` behind a `FileSystem`) writes a `.<name>.crc` sidecar next to every file it creates. A rename moves the file first and then its sidecar, in a second step that does not overwrite. So publishing through it is two renames, not one. With identical bytes the sidecars are identical too. Still, a crash between the two steps leaves `N.json` without its sidecar and a stray temporary sidecar behind. A foreign writer's `N.json` leaves a sidecar that no longer matches. Every checksum-verifying reader then fails on that file, which is what the RED spike observed (§7.3). Whether the publish goes through the raw local file system, so that commit files have no sidecar, and how F3 and F11 cover sidecars, is decided in P2a (§8).
+
 `isPartialWriteVisible` returns `true` for `file://` and `false` for `s3a://`. Delta uses it to decide whether checkpoints must be written via temp + rename.
 
 ### 3.5 Fail closed and safeguards
@@ -157,6 +161,7 @@ Mutual exclusion holds only if every writer maps the same table to the **same ke
 - For `file://`, resolve to the real path, so symlinks cannot alias.
 - One scheme per lake profile (ADR-0011): `s3://`, `s3n://` and `s3a://` must never be mixed.
 - Aliases that slip through are caught by the registry (layer 2): an aliased key is unregistered, so its commits are rejected.
+- Delta treats spellings as distinct too, though only at creation. `DeltaTable.create(...).location("file:///x")` fails with `DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE`. Delta compares the location as given with Hadoop's qualified form `file:/x` and refuses to choose between them (found in P1.4b: the stress table is created from the qualified form). This is a single check at creation; Delta does not reconcile spellings across writers. The coordination key must therefore always be the qualified form, never the string a caller passed. *(Added in P1.4d.)*
 
 ### 3.7 Attribution (commit context)
 
@@ -270,6 +275,12 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 - **GREEN (P2):** the same harness with `PostgresLogStore`, zero anomalies over the same budget, including the widened-window variant.
 - Both results go in the README, side by side.
 
+**RED result (P1.4c, 2026-11-13).** Full write-up: [docs/spikes/logstore-red.md](../spikes/logstore-red.md).
+- Over five runs, the natural race lost acknowledged commits in **2 of 5**; the widened window lost one in **5 of 5**. There was never a version gap: the lost commit's file is replaced, not removed. Delta detects a gap (`DELTA_VERSIONS_NOT_CONTIGUOUS`), but not an overwrite.
+- On `file://`, an overwrite usually leaves a stale `.crc` sidecar (§3.4). Every reader that checks it then fails, writers included. That is Hadoop's detection, by accident and after the fact: the writer was already told it succeeded. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit.
+- The fallback of the plan above was not needed: the natural race did reproduce.
+- GREEN must also show no stale sidecar, and both readers clean.
+
 ---
 
 ## 8. Open items (closed in P2)
@@ -278,4 +289,5 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 - Confirm the `OptimisticTransaction` retry path on `FileAlreadyExistsException`.
 - Confirm that the commit runs on the caller's thread (attribution, §3.7).
 - LogStore instantiation lifecycle, which decides how the JVM-wide HikariCP pool keyed by JDBC URL is shared.
+- How the `file://` publish handles Hadoop's `.crc` sidecars (§3.4): publish through the raw local file system, or through `LocalFs` with the second rename covered by recovery and by F3/F11. *(Added in P1.4d, from the RED spike.)*
 - Isolation level and statements: `INSERT … ON CONFLICT DO NOTHING RETURNING` vs catching SQLState `23505`; `READ COMMITTED` is sufficient because every decision is a single-row atomic statement.
