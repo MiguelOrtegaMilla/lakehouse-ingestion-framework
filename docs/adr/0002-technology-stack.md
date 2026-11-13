@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted (D4, 2026-09-25) |
+| **Status** | Accepted (D4, 2026-09-25) · **version rows for Scala, Spark, Delta and sbt superseded by [ADR-0014](0014-stack-versions-pinned-at-p1.md)** (P1, 2026-11-13) |
 | **Verified against** | spark.apache.org downloads and docs, Maven Central (`io.delta`), delta-io/delta GitHub releases — 2026-09-25 |
 
 ## Decision

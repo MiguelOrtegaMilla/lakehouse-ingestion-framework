@@ -24,7 +24,7 @@
 | D1 | Development environment | WSL2 (Ubuntu) + Docker Engine inside WSL + JDK 17/sbt in WSL + VS Code Remote-WSL with Metals. Code lives in the WSL filesystem. | [ADR-0001](../adr/0001-development-environment.md) |
 | D2 | Control plane | PostgreSQL holds state, leases (with epoch), the batch write-ahead log and the audit trail. This is a design decision that holds in the cloud too, not a workaround for the local filesystem. | [ADR-0003](../adr/0003-control-plane-in-postgresql.md) |
 | D3 | Multi-writer concurrency | Custom **PostgreSQL-coordinated Delta LogStore** (same pattern as `S3DynamoDBLogStore`). The MVP covers *Type 2* concurrency: several processes writing the **same** Delta table. Correct by design for multi-instance, multi-node and multi-cluster. Multi-instance is demonstrated in the MVP; multi-node and multi-cluster are extensions. | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md), [ADR-0010](../adr/0010-concurrent-write-conflict-handling.md), [ADR-0011](../adr/0011-storage-profiles.md) |
-| D4 | Versions | Spark 4.1.3 · Delta 4.4.0 (`delta-spark_4.1_2.13`) · Java 17 · Scala 2.13 | [ADR-0002](../adr/0002-technology-stack.md) |
+| D4 | Versions | Spark 4.1.4 · Delta 4.4.1 (`delta-spark_4.1_2.13`) · Java 17 · Scala 2.13.17 · sbt 1.13.1 — patch versions updated in P1 | [ADR-0002](../adr/0002-technology-stack.md), [ADR-0014](../adr/0014-stack-versions-pinned-at-p1.md) |
 | D5 | Phase plan | Confirmed at closure: re-sequenced for D3, spike split RED (P1) / GREEN (P2b), P2 split into P2a and P2b (§17) | — |
 | D6 | Repository identity | Code, comments, commits and docs in English. Repository `lakehouse-ingestion-framework`, base package `lakehouse.ingestion`, independent of the GitHub handle. Organization placeholder defined in one place (§21). | [ADR-0012](../adr/0012-module-structure.md) |
 | D7 | Application security | Validated SQL identifiers and no concatenated SQL; file paths confined to allowed roots; least-privilege PostgreSQL roles; dependency vulnerability scanning in CI. Recommended: pinned non-root images, configurable TLS, safe YAML loading, a brief threat model. Woven into existing phases (§17). | [ADR-0013](../adr/0013-application-security-baseline.md) |
@@ -268,15 +268,15 @@ Decisions that would have closed the door on multi-node or multi-cluster, and ar
 
 ### 7.1 Stack
 
-(Verified 2026-09-25 against Maven Central and the official docs; details in [ADR-0002](../adr/0002-technology-stack.md).)
+(Verified 2026-09-25 against Maven Central and the official docs; details in [ADR-0002](../adr/0002-technology-stack.md). Patch versions re-pinned in P1, 2026-11-13: [ADR-0014](../adr/0014-stack-versions-pinned-at-p1.md).)
 
 | Component | Version |
 |---|---|
 | Java | 17 (Temurin, inside WSL) |
-| Scala | 2.13.x (the minor Spark 4.1.3 is built with; pinned in P1) |
-| Apache Spark | 4.1.3 |
-| Delta Lake | 4.4.0 — `io.delta:delta-spark_4.1_2.13` (+ `delta-storage`, transitive) |
-| sbt | latest 1.x (pinned in `project/build.properties` in P1) |
+| Scala | 2.13.17 (the patch Spark 4.1.4 is built with) |
+| Apache Spark | 4.1.4 |
+| Delta Lake | 4.4.1 — `io.delta:delta-spark_4.1_2.13` (+ `delta-storage`, transitive) |
+| sbt | 1.13.1 (pinned in `project/build.properties`) |
 | PostgreSQL | 17 (`postgres:17`): source DB and control DB in one container, separate databases |
 | JDBC driver | `org.postgresql:postgresql` 42.7.x |
 | Connection pool (LogStore) | HikariCP. Justified by the LogStore's commit-path round trips (ADR-0004). |
@@ -677,7 +677,7 @@ That is what Data Platform interviews probe, and what you need in order to opera
 
 | Item | Why it matters | Phase |
 |---|---|---|
-| Exact Scala 2.13 patch used by Spark 4.1.3; latest sbt 1.x | Binary compatibility | P1 |
+| Exact Scala 2.13 patch used by Spark; latest sbt 1.x | Binary compatibility | P1 — **closed**: 2.13.17, 1.13.1 (ADR-0014) |
 | Which files Delta 4.4 writes through `LogStore.write(overwrite=false)` (commits, `.crc` checksums, compacted logs…) and with `overwrite=true` (`_last_checkpoint`) | Key and "latest entry" semantics of `commit_entry` | P2a |
 | `OptimisticTransaction` retry path on `FileAlreadyExistsException` in 4.4 (logical conflict check, then retry at N+1) | The LogStore relies on it to turn version collisions into automatic retries | P2a |
 | The commit runs on the caller thread | Commit-context attribution of `run_id` | P2a |
@@ -686,7 +686,7 @@ That is what Data Platform interviews probe, and what you need in order to opera
 | Idempotent DML via `spark.databricks.delta.write.txnAppId`/`txnVersion` (internal session confs, present in 4.4) and their behaviour under concurrent sessions | Idempotent Silver `MERGE`; one `SparkSession` per concurrent task | P10 |
 | Change Data Feed read cost on append-only Bronze | Silver cursor by Bronze version | P10 |
 | Type-widening conversions supported by Delta 4.4 | Schema policy defaults | P9 |
-| `hadoop-aws` version matching Spark 4.1.3's Hadoop | `s3a://` profile | E1 |
+| `hadoop-aws` version matching Spark's Hadoop (3.4.2, ADR-0014) | `s3a://` profile | E1 |
 | `dependency-review-action` evaluates the dependency snapshots submitted for sbt (it needs one for the base and one for the head commit) | The CI vulnerability gate (ADR-0013) | P1 |
 | The official `postgres` image runs as a non-root `user:` with a named volume | Non-root containers (ADR-0013) | P1 |
 | circe-yaml: which loader limits it exposes (aliases, depth, size), duplicate-key behaviour, and whether its YAML 1.2 module fits | Safe YAML loading (ADR-0013) | P3 |
@@ -701,7 +701,7 @@ Decided at Phase 0 closure; recorded in [ADR-0012](../adr/0012-module-structure.
 |---|---|
 | **Repository** | `lakehouse-ingestion-framework` |
 | **Base package** | `lakehouse.ingestion` (`.core`, `.logstore`, `.engine`, `.cli`, `.it`) |
-| **Organization (`groupId`)** | `io.github.changeme`: a placeholder until the GitHub handle is decided, defined once in `build.sbt` |
+| **Organization (`groupId`)** | `io.github.miguelortegamilla` (GitHub handle `MiguelOrtegaMilla`, decided in P1), defined once in `build.sbt` |
 | **Artifacts** | `lakehouse-ingestion-<module>` |
 
 - **The base package is independent of the GitHub handle.** A Scala package is declared in every source file and cannot be parameterised from sbt, so it can never live in "one place". The handle therefore appears **only** as the Maven `groupId`. This decoupling is standard: a package names the software, a `groupId` names the publisher.
@@ -720,4 +720,4 @@ Decided at Phase 0 closure; recorded in [ADR-0012](../adr/0012-module-structure.
 | Application security | Baseline added (D7, [ADR-0013](../adr/0013-application-security-baseline.md)), woven into existing phases |
 | Repository name (§21) | `lakehouse-ingestion-framework`; base package `lakehouse.ingestion`, independent of the GitHub handle |
 
-**Still open, not blocking Phase 0:** the GitHub handle. The placeholder `io.github.changeme` stays in `build.sbt`. P1's CI and the dependency scanning (ADR-0013) need the repository on GitHub, so the handle is needed during P1.
+**Closed in P1 (2026-11-13):** the GitHub handle, `MiguelOrtegaMilla`. The `groupId` is `io.github.miguelortegamilla` (ADR-0012).

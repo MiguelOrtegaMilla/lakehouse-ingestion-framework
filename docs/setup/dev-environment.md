@@ -202,4 +202,4 @@ git --version
 pwd                             # /home/<user>/code/…, NOT /mnt/c/…
 ```
 
-Not needed until P11 / E1: a Spark 4.1.3 binary distribution for Standalone demos. Development and tests download Spark as sbt dependencies.
+Not needed until P11 / E1: a Spark 4.1.4 binary distribution (ADR-0014) for Standalone demos. Development and tests download Spark as sbt dependencies.

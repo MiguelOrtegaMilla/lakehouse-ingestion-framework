@@ -47,7 +47,7 @@ The LogStore temp files are in `<table>/_delta_log/.tmp/` on the shared storage,
 
 ### 4. Object storage in extensions
 
-MinIO is strongly consistent for listings, which satisfies Delta's *consistent listing* requirement. `hadoop-aws` must match the Hadoop version bundled with Spark 4.1.3 (verified in E1). The same coordination DB and the same lake URI are shared by every cluster in E2.
+MinIO is strongly consistent for listings, which satisfies Delta's *consistent listing* requirement. `hadoop-aws` must match the Hadoop version bundled with the project's Spark version (ADR-0014: Hadoop 3.4.2) (verified in E1). The same coordination DB and the same lake URI are shared by every cluster in E2.
 
 ## Consequences
 

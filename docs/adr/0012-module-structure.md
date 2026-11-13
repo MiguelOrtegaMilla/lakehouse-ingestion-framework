@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Accepted (D6, 2026-09-25) · repository name and base package decided at Phase 0 closure (2026-11-10) |
+| **Status** | Accepted (D6, 2026-09-25) · repository name and base package decided at Phase 0 closure (2026-11-10) · GitHub handle decided in P1 (2026-11-13) |
 
 ## Decision
 
@@ -33,8 +33,8 @@
   | `cli` | `lakehouse.ingestion.cli` |
   | `integration-tests` | `lakehouse.ingestion.it` |
 
-- The GitHub handle appears in **one place**: `ThisBuild / organization := "io.github.changeme"` in `build.sbt` (the Maven `groupId`). The handle is still undecided; the placeholder stays until it is.
-- The **base package does not contain the handle**. A package names the software and a `groupId` names the publisher, so decoupling them is standard. It also makes the placeholder a one-line change, since Scala package declarations, repeated in every file, cannot be parameterised from sbt.
+- The GitHub handle appears in **one place**: `ThisBuild / organization := "io.github.miguelortegamilla"` in `build.sbt` (the Maven `groupId`). The handle is `MiguelOrtegaMilla`; the `groupId` is lower-case, as Maven convention and the Maven Central `io.github.<user>` namespace expect.
+- The **base package does not contain the handle**. A package names the software and a `groupId` names the publisher, so decoupling them is standard. It also made the placeholder a one-line change, since Scala package declarations, repeated in every file, cannot be parameterised from sbt.
 - **Artifact names** are prefixed with the project name (`lakehouse-ingestion-<module>`). The LogStore module keeps its descriptive directory name, but would be published as `lakehouse-ingestion-pg-logstore`, for the same reason the repository avoids `delta-*` names (implied affiliation with the Delta Lake project).
 
 ## Consequences

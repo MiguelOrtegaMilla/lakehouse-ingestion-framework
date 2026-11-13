@@ -5,7 +5,7 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-development-environment.md) | Development environment: WSL2 + Docker Engine + VS Code/Metals | Accepted |
-| [0002](0002-technology-stack.md) | Technology stack and versions | Accepted |
+| [0002](0002-technology-stack.md) | Technology stack and versions | Accepted · version rows superseded by ADR-0014 |
 | [0003](0003-control-plane-in-postgresql.md) | Control plane in PostgreSQL | Accepted |
 | [0004](0004-postgresql-coordinated-delta-logstore.md) | PostgreSQL-coordinated Delta LogStore for multi-writer tables — **highest-risk component** | Accepted |
 | [0005](0005-batch-wal-and-idempotent-writes.md) | Batch write-ahead log and idempotent Delta writes | Accepted |
@@ -17,8 +17,11 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0011](0011-storage-profiles.md) | Lake storage profiles and canonical table identity | Accepted |
 | [0012](0012-module-structure.md) | sbt multi-module structure and project identity | Accepted |
 | [0013](0013-application-security-baseline.md) | Application security baseline: SQL identifiers, path confinement, least privilege, supply chain | Accepted |
+| [0014](0014-stack-versions-pinned-at-p1.md) | Stack versions pinned at P1: Spark 4.1.4, Delta 4.4.1, Scala 2.13.17, sbt 1.13.1 | Accepted |
 
-Superseded decisions: *AD-06 "one writer per Delta table"* (discovery v1) was replaced by ADR-0004 before being recorded as an ADR.
+Superseded decisions:
+- *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
+- *AD-06 "one writer per Delta table"* (discovery v1) was replaced by ADR-0004 before being recorded as an ADR.
 
 Schema evolution (P9) gets its own ADR in its phase, once the policies are validated against Delta 4.4's type-widening support.
 
