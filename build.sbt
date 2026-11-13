@@ -29,6 +29,9 @@ ThisBuild / scalacOptions ++= Seq(
   "-Wconf:any:e,cat=deprecation:w"
 )
 
+// One log4j version in every classpath: Spark's (see Dependencies.log4jAlignment).
+ThisBuild / dependencyOverrides ++= log4jAlignment
+
 lazy val root = (project in file("."))
   .aggregate(core, deltaPgLogstore, engine, cli, integrationTests)
   .settings(
@@ -66,6 +69,7 @@ lazy val cli = module("cli", artifact = "cli")
 /** Testcontainers, end-to-end, fault injection, stress harness and verifier. Never published. */
 lazy val integrationTests = module("integration-tests", artifact = "integration-tests")
   .dependsOn(core, deltaPgLogstore, engine, cli)
+  .settings(SparkTestJvm.settings)
   .settings(
     rules(forbidden = Nil),
     publish / skip := true,
@@ -73,11 +77,11 @@ lazy val integrationTests = module("integration-tests", artifact = "integration-
       scalatest,
       testcontainers,
       postgresJdbc % Test,
+      sparkSqlTest,
+      deltaSparkTest,
       log4jSlf4j,
       log4jCore
     ),
-    // Own JVM for the suites: isolated heap and system properties (Spark-ready for P1.3).
-    Test / fork := true,
     // The suites use repository files (compose file, init scripts) through this path.
     Test / javaOptions += s"-Drepo.root=${(LocalRootProject / baseDirectory).value}"
   )

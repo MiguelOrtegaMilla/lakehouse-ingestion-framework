@@ -617,7 +617,7 @@ Every phase ends with code, green tests in CI, an updated README and commit(s). 
 |---|---|---|
 | P1.1 | sbt multi-module skeleton, module boundary check, scalafmt, JDK pin | Done |
 | P1.2 | Local PostgreSQL (control + source databases) with a least-privilege bootstrap, tested through Testcontainers | Done |
-| P1.3 | Spark + Delta smoke test in the forked test JVM (Java 17 `--add-opens`, drift check against Spark's own list), including idempotent writes with `txnAppId`/`txnVersion` | In progress |
+| P1.3 | Spark + Delta smoke test in the forked test JVM (Java 17 `--add-opens`, drift check against Spark's own list), including idempotent writes with `txnAppId`/`txnVersion` | Done |
 | P1.4 | Stress harness + verifier · **spike RED**: N JVMs on `file://` with the default LogStore, natural race and widened-window variant | Planned |
 | P1.5 | Minimal CI (fmt + compile + tests) · dependency scanning · Actions pinned by SHA with a least-privilege token · Ryuk image pinning. **The repository goes public when P1.5 is done.** | Planned |
 
