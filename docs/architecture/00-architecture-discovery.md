@@ -611,6 +611,18 @@ Every phase ends with code, green tests in CI, an updated README and commit(s). 
 | E7 | SCD2 in Silver | Extension |
 | — | Streaming, CDC, Gold, OpenLineage, column-level lineage, **migration to `catalogManaged` tables with Unity Catalog OSS** | Future (not designed) |
 
+**P1 breakdown** (decided during P1, 2026-11-13). Each part ends with a commit on `main`; until the CI exists, commits go straight to `main`.
+
+| Part | Content | Status |
+|---|---|---|
+| P1.1 | sbt multi-module skeleton, module boundary check, scalafmt, JDK pin | Done |
+| P1.2 | Local PostgreSQL (control + source databases) with a least-privilege bootstrap, tested through Testcontainers | Done |
+| P1.3 | Spark + Delta smoke test in the forked test JVM (Java 17 `--add-opens`, drift check against Spark's own list), including idempotent writes with `txnAppId`/`txnVersion` | In progress |
+| P1.4 | Stress harness + verifier · **spike RED**: N JVMs on `file://` with the default LogStore, natural race and widened-window variant | Planned |
+| P1.5 | Minimal CI (fmt + compile + tests) · dependency scanning · Actions pinned by SHA with a least-privilege token · Ryuk image pinning. **The repository goes public when P1.5 is done.** | Planned |
+
+The spike comes before the CI so that the CI starts out testing everything P1 builds, and so that the repository goes public with the RED result in it.
+
 **Changes from v1:**
 - The LogStore enters as **P2**, before the engine, so every later phase is built and tested on verified multi-writer ground (risk-first).
 - Type 2 tests are woven into P5 (fan-in), P7 (backfill ∥ incremental), P10 (concurrent `MERGE`) and P11 (engine demo with concurrent `OPTIMIZE`).
@@ -687,7 +699,7 @@ That is what Data Platform interviews probe, and what you need in order to opera
 | Change Data Feed read cost on append-only Bronze | Silver cursor by Bronze version | P10 |
 | Type-widening conversions supported by Delta 4.4 | Schema policy defaults | P9 |
 | `hadoop-aws` version matching Spark's Hadoop (3.4.2, ADR-0014) | `s3a://` profile | E1 |
-| `dependency-review-action` evaluates the dependency snapshots submitted for sbt (it needs one for the base and one for the head commit) | The CI vulnerability gate (ADR-0013) | P1 |
+| `dependency-review-action` evaluates the dependency snapshots submitted for sbt (it needs one for the base and one for the head commit) | The CI vulnerability gate (ADR-0013) | P1.5 |
 | The official `postgres` image runs as a non-root `user:` with a named volume | Non-root containers (ADR-0013) | P1 — **closed**: yes. The image creates the data directory with mode 1777, so `user: postgres` works on a fresh named volume; `cap_drop: ALL` and `no-new-privileges` also work. Tested by `PostgresBootstrapSpec`. |
 | circe-yaml: which loader limits it exposes (aliases, depth, size), duplicate-key behaviour, and whether its YAML 1.2 module fits | Safe YAML loading (ADR-0013) | P3 |
 
@@ -697,7 +709,7 @@ Follow-ups found while building a phase that belong to a later one. Each row say
 
 | Item | Status | Why it matters | Phase |
 |---|---|---|---|
-| Testcontainers pulls its Ryuk sidecar (`testcontainers/ryuk:0.14.0`) by tag, not by digest | Open (from P1.2). Pin it by digest through `ryuk.container.image` in `testcontainers.properties`, or record it as a documented exception to ADR-0013 §5 | Every image the build pulls should be pinned (RNF-16). Ryuk runs with the Docker socket mounted, so it is the most privileged container in the test run. | P1.4 |
+| Testcontainers pulls its Ryuk sidecar (`testcontainers/ryuk:0.14.0`) by tag, not by digest | Open (from P1.2). Pin it by digest through `ryuk.container.image` in `testcontainers.properties`, or record it as a documented exception to ADR-0013 §5 | Every image the build pulls should be pinned (RNF-16). Ryuk runs with the Docker socket mounted, so it is the most privileged container in the test run. | P1.5 |
 | Inside the PostgreSQL container, connections over the local Unix socket use `trust` (the image's default `pg_hba.conf`) | **Accepted** (P1.2). Only processes already running inside the container can reach that socket, and they run as the database user anyway. Every TCP connection, including those from the host on `127.0.0.1`, needs a password (`PostgresBootstrapSpec`). | A reviewer reading `pg_hba.conf` will ask. The threat model records it. | P12 (threat model) |
 | In the `sales` demo database, the bootstrap superuser stands in for the source system's owner and creates its tables | Open (from P1.2). Consider a dedicated `sales_owner` role that owns `public` in `sales`, so that neither the generator nor the tests need the superuser | Least privilege (ADR-0013 §3) also in the demo source, and a closer imitation of a real source system | P6 |
 
