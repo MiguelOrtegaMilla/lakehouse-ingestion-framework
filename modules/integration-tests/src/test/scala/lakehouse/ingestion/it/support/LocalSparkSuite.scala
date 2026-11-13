@@ -69,6 +69,12 @@ object LocalSparkSuite {
    * Small, deterministic, local: two cores, two shuffle partitions, no UI, UTC, loopback only,
    * and the warehouse inside the suite's scratch directory. Spark's own
    * scratch space (`spark.local.dir`) stays in `java.io.tmpdir`; Spark deletes it on `stop()`.
+   *
+   * `snapshotPartitions` is the number of partitions Delta uses to rebuild a table's state from
+   * its log, which every commit with a `txnAppId` needs. The default, 50, is sized for large
+   * logs: on a test table it is 50 near-empty tasks per commit (measured in P1.4: 8 s instead
+   * of about 1 s per commit on `local[1]`). It changes how the state is computed, not the commit
+   * protocol.
    */
   def baseConf(dir: Path, appName: String): Map[String, String] = Map(
     "spark.master" -> "local[2]",
@@ -76,6 +82,7 @@ object LocalSparkSuite {
     "spark.ui.enabled" -> "false",
     "spark.sql.shuffle.partitions" -> "2",
     "spark.default.parallelism" -> "2",
+    "spark.databricks.delta.snapshotPartitions" -> "2",
     "spark.sql.session.timeZone" -> "UTC",
     "spark.driver.host" -> "127.0.0.1",
     "spark.driver.bindAddress" -> "127.0.0.1",
