@@ -1,0 +1,8 @@
+# The repository stores LF only (dev-environment.md, step 8). Git converts on checkout
+# where a platform needs it; nothing in this project does.
+* text=auto eol=lf
+
+*.jar    binary
+*.png    binary
+*.gz     binary
+*.parquet binary
