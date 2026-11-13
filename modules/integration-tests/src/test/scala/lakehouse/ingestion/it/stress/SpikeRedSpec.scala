@@ -8,7 +8,14 @@ import java.time.{Instant, ZoneOffset}
 import scala.concurrent.duration._
 
 import io.delta.storage.HDFSLogStore
+import lakehouse.ingestion.it.stress.LogModel.Reader
 import lakehouse.ingestion.it.stress.StressHarness.Settings
+import lakehouse.ingestion.it.stress.Verifier.Anomaly.{
+  LostCommit,
+  RowMismatch,
+  SnapshotDivergence,
+  UnreadableTable
+}
 import lakehouse.ingestion.it.stress.Verifier.{Expected, Report}
 import lakehouse.ingestion.it.support.{LocalSparkSuite, StressTest}
 import org.apache.hadoop.fs.LocalFileSystem
@@ -30,7 +37,9 @@ import org.scalatest.matchers.should.Matchers
  *   - the widened window: `DelayingLocalFs` holds each commit-file rename after the last
  *     existence check, so concurrent writers reliably both rename. It must lose at least one
  *     acknowledged commit and leave no version gap: the losing commit file is replaced, not
- *     removed, which is why Delta itself notices nothing;
+ *     removed, which is why Delta itself notices nothing. A reader that checks no sidecars
+ *     must read the table without error and without the lost commits: the silent loss an
+ *     object store would give;
  *   - the natural race, measured only. Whether it loses a commit within the budget is the
  *     measurement, not a pass condition.
  *
@@ -66,7 +75,7 @@ final class SpikeRedSpec extends AnyFunSuite with Matchers with LocalSparkSuite 
       title: String,
       settings: Settings,
       commitFileContext: String
-  ): Report = {
+  ): (StressRun, Report) = {
     val run = StressRun.create(stressRoot, s"$stamp-red-$variant")
     StressTable.create(spark, run.tableUri)
     val outcomes = StressHarness.run(run, settings)
@@ -96,7 +105,7 @@ final class SpikeRedSpec extends AnyFunSuite with Matchers with LocalSparkSuite 
       // A contradiction in a journal is a harness bug in any variant, never a measurement.
       report.count("InconsistentJournal") shouldBe 0
     }
-    report
+    (run, report)
   }
 
   private def isClean(report: Report): Assertion =
@@ -104,7 +113,8 @@ final class SpikeRedSpec extends AnyFunSuite with Matchers with LocalSparkSuite 
 
   test("control: one writer without the delay leaves a clean table", StressTest) {
     val settings = Settings(writers = 1, commits = 10, rowsPerCommit = RowsPerCommit)
-    val report = spike("control-no-delay", "RED control — one writer, no delay", settings, LocalFs)
+    val (_, report) =
+      spike("control-no-delay", "RED control — one writer, no delay", settings, LocalFs)
 
     isClean(report)
     report.summary.checksumMismatches shouldBe empty
@@ -122,7 +132,7 @@ final class SpikeRedSpec extends AnyFunSuite with Matchers with LocalSparkSuite 
       rowsPerCommit = RowsPerCommit,
       extraJvmOptions = DelayingLocalFs.jvmOptions(WidenedDelay.toMillis)
     )
-    val report = spike(
+    val (_, report) = spike(
       "control-delay",
       "RED control — one writer, widened window",
       settings,
@@ -142,7 +152,7 @@ final class SpikeRedSpec extends AnyFunSuite with Matchers with LocalSparkSuite 
       rowsPerCommit = RowsPerCommit,
       extraJvmOptions = DelayingLocalFs.jvmOptions(WidenedDelay.toMillis)
     )
-    val report = spike(
+    val (run, report) = spike(
       "widened",
       "Spike RED — default LogStore on file://, widened window",
       settings,
@@ -153,7 +163,22 @@ final class SpikeRedSpec extends AnyFunSuite with Matchers with LocalSparkSuite 
       report.count("LostCommit") should be >= 1
       // The lost commit's file was replaced by another writer's, not removed.
       report.count("VersionGap") shouldBe 0
+
+      // A reader without sidecars to check, as on object storage, reads the table without any
+      // error and agrees with the commit files: the loss is silent.
+      report.summary.readers.toMap.apply(Reader.SidecarFree) shouldBe None
+      report.anomalies.filter(readerOf(_).contains(Reader.SidecarFree)) shouldBe empty
+      val lost = report.anomalies.collect { case LostCommit(w, k) => (w, k) }
+      val seen = LogReader.tableView(spark, run.tableUri, Reader.SidecarFree).map(_.rows.keySet)
+      seen.map(keys => lost.filter(keys)) shouldBe Right(Nil)
     }
+  }
+
+  private def readerOf(a: Verifier.Anomaly): Option[Reader] = a match {
+    case UnreadableTable(r, _) => Some(r)
+    case SnapshotDivergence(r, _, _) => Some(r)
+    case RowMismatch(r, _, _, _, _) => Some(r)
+    case _ => None
   }
 
   test("natural race: concurrent writers without the delay, measured only", StressTest) {
