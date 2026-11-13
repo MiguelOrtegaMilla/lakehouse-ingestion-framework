@@ -30,7 +30,28 @@ sbt compile             # compile all modules
 sbt checkBoundaries     # verify the module dependency rules
 sbt scalafmtCheckAll scalafmtSbtCheck   # formatting gate
 sbt scalafmtAll scalafmtSbt             # reformat
+sbt integration-tests/test              # integration tests (needs Docker)
 ```
+
+## Local services
+
+One PostgreSQL 17 container hosts the control plane, the commit coordination store and a demo source database ([ADR-0003](docs/adr/0003-control-plane-in-postgresql.md)). The image is pinned by digest, and the container runs as a non-root user with no capabilities. It listens on `127.0.0.1` only.
+
+```bash
+scripts/dev-secrets.sh                                    # once: a random password per role, in docker/secrets/ (git-ignored)
+docker compose -f docker/docker-compose.yml up -d --wait  # start; waits until the bootstrap has finished
+docker compose -f docker/docker-compose.yml down          # stop; data stays in the pgdata volume
+docker compose -f docker/docker-compose.yml down -v       # stop and delete the data
+```
+
+The bootstrap script (`docker/postgres/init/`) runs only on an empty volume. After changing it, recreate the volume with `down -v`.
+
+| Database | Contents | Roles that can connect |
+|---|---|---|
+| `ingestion_control` | Schemas `control` (control plane) and `delta_coordination` (commit coordination), both owned by `ingest_migrator` | `ingest_migrator` (DDL through migrations), `ingest_control`, `ingest_coordination`, `ingest_maintenance` |
+| `sales` | Demo source system for the JDBC connector | `sales_ro` (read-only) |
+
+Least-privilege roles: [ADR-0013](docs/adr/0013-application-security-baseline.md) §3. `PostgresBootstrapSpec` tests the bootstrap against the same image and scripts.
 
 ## License
 

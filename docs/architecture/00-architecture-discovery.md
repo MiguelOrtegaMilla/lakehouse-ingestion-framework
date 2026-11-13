@@ -688,7 +688,7 @@ That is what Data Platform interviews probe, and what you need in order to opera
 | Type-widening conversions supported by Delta 4.4 | Schema policy defaults | P9 |
 | `hadoop-aws` version matching Spark's Hadoop (3.4.2, ADR-0014) | `s3a://` profile | E1 |
 | `dependency-review-action` evaluates the dependency snapshots submitted for sbt (it needs one for the base and one for the head commit) | The CI vulnerability gate (ADR-0013) | P1 |
-| The official `postgres` image runs as a non-root `user:` with a named volume | Non-root containers (ADR-0013) | P1 |
+| The official `postgres` image runs as a non-root `user:` with a named volume | Non-root containers (ADR-0013) | P1 — **closed**: yes. The image creates the data directory with mode 1777, so `user: postgres` works on a fresh named volume; `cap_drop: ALL` and `no-new-privileges` also work. Tested by `PostgresBootstrapSpec`. |
 | circe-yaml: which loader limits it exposes (aliases, depth, size), duplicate-key behaviour, and whether its YAML 1.2 module fits | Safe YAML loading (ADR-0013) | P3 |
 
 ---

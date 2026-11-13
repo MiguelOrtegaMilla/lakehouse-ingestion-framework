@@ -68,7 +68,18 @@ lazy val integrationTests = module("integration-tests", artifact = "integration-
   .dependsOn(core, deltaPgLogstore, engine, cli)
   .settings(
     rules(forbidden = Nil),
-    publish / skip := true
+    publish / skip := true,
+    libraryDependencies ++= Seq(
+      scalatest,
+      testcontainers,
+      postgresJdbc % Test,
+      log4jSlf4j,
+      log4jCore
+    ),
+    // Own JVM for the suites: isolated heap and system properties (Spark-ready for P1.3).
+    Test / fork := true,
+    // The suites use repository files (compose file, init scripts) through this path.
+    Test / javaOptions += s"-Drepo.root=${(LocalRootProject / baseDirectory).value}"
   )
 
 def module(id: String, artifact: String): Project =

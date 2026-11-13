@@ -1,0 +1,59 @@
+# Local services for development and demos. Tests do not use this file: they start their own
+# containers with Testcontainers, from the same image and the same init scripts.
+#
+#   scripts/dev-secrets.sh                          # once: generate the role passwords
+#   docker compose -f docker/docker-compose.yml up -d --wait
+name: lakehouse-ingestion
+
+services:
+  postgres:
+    # Pinned by tag and digest (ADR-0013 §5). The integration tests read this line.
+    image: postgres:17.12-bookworm@sha256:40865bc877a289da75963d97d72b59633f639fc5af7a4e856bfa3714cae5b536
+    # Non-root (uid 999). The image creates the data directory with mode 1777, so a fresh named
+    # volume is writable by this user.
+    user: postgres
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_superuser_password
+    secrets:
+      - pg_superuser_password
+      - ingest_migrator_password
+      - ingest_control_password
+      - ingest_coordination_password
+      - ingest_maintenance_password
+      - sales_ro_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on an empty data directory: roles, databases, schemas.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Loopback only: the database is not reachable from the network.
+      - "127.0.0.1:${PG_HOST_PORT:-5432}:5432"
+    healthcheck:
+      # TCP on purpose: while the init scripts run, the temporary server listens only on the
+      # Unix socket, so a socket check would report "ready" before the bootstrap has finished.
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  pgdata:
+
+# One random password per role, generated locally by scripts/dev-secrets.sh and never committed.
+secrets:
+  pg_superuser_password:
+    file: ./secrets/pg_superuser_password
+  ingest_migrator_password:
+    file: ./secrets/ingest_migrator_password
+  ingest_control_password:
+    file: ./secrets/ingest_control_password
+  ingest_coordination_password:
+    file: ./secrets/ingest_coordination_password
+  ingest_maintenance_password:
+    file: ./secrets/ingest_maintenance_password
+  sales_ro_password:
+    file: ./secrets/sales_ro_password
