@@ -1,7 +1,9 @@
 package lakehouse.ingestion.it.stress
 
-import scala.jdk.CollectionConverters._
+import java.net.URI
 
+import io.delta.tables.DeltaTable
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.{Row, SparkSession}
 
@@ -32,12 +34,16 @@ object StressTable {
   /**
    * Creates the table at version 0, empty, before any writer starts. Writers then only append,
    * so they never race to create the table, which is a different problem from the one measured.
+   *
+   * The table is created from its schema alone. Saving an empty DataFrame instead would leave
+   * a data file on disk that no commit references, the same trace a lost commit leaves.
+   *
+   * The location is passed in Hadoop's qualified form (`file:/...`). Given `file:///...`,
+   * `CREATE TABLE` fails with `DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE`: Delta sees two spellings
+   * of one location, the canonical-identity problem of ADR-0004 §3.6.
    */
-  def create(spark: SparkSession, tableUri: String): Unit =
-    spark
-      .createDataFrame(Seq.empty[Row].asJava, schema)
-      .write
-      .format("delta")
-      .mode("errorifexists")
-      .save(tableUri)
+  def create(spark: SparkSession, tableUri: String): Unit = {
+    val location = new Path(URI.create(tableUri)).toString
+    DeltaTable.create(spark).location(location).addColumns(schema).execute(): Unit
+  }
 }

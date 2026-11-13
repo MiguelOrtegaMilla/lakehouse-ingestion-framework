@@ -1,0 +1,90 @@
+package lakehouse.ingestion.it.stress
+
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files, Path}
+
+import lakehouse.ingestion.it.stress.LogModel._
+import lakehouse.ingestion.it.support.LocalSparkSuite
+import org.scalatest.funsuite.AnyFunSuite
+import org.scalatest.matchers.should.Matchers
+
+/**
+ * `LogReader` on a hand-written `_delta_log`: the log view must come from the commit files alone,
+ * whatever Delta would make of them.
+ */
+final class LogReaderSpec extends AnyFunSuite with Matchers with LocalSparkSuite {
+
+  private def write(dir: Path, name: String, content: String): Unit = {
+    Files.createDirectories(dir)
+    Files.write(dir.resolve(name), content.getBytes(UTF_8)): Unit
+  }
+
+  private def commitFile(v: Long) = f"$v%020d.json"
+
+  test("reads txns, adds, removes and the operation from commit files only") {
+    val table = workDir.resolve("handwritten")
+    val log = table.resolve("_delta_log")
+    write(
+      log,
+      commitFile(0),
+      """{"commitInfo":{"operation":"WRITE","operationParameters":{"mode":"ErrorIfExists"}}}
+        |{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}
+        |{"metaData":{"id":"t","format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{}}}
+        |""".stripMargin
+    )
+    write(
+      log,
+      commitFile(1),
+      """{"commitInfo":{"operation":"WRITE"}}
+        |{"txn":{"appId":"writer-0","version":1,"lastUpdated":1}}
+        |{"add":{"path":"part%20one.parquet","size":1,"modificationTime":1,"dataChange":true}}
+        |""".stripMargin
+    )
+    write(
+      log,
+      commitFile(2),
+      """{"commitInfo":{"operation":"OPTIMIZE"}}
+        |{"remove":{"path":"part%20one.parquet","dataChange":false}}
+        |{"add":{"path":"part-two.parquet","size":1,"modificationTime":1,"dataChange":false}}
+        |""".stripMargin
+    )
+    write(log, commitFile(3), """{"commitInfo":{"operation":"WRITE"}}""" + "\n{\"txn\": {\n")
+    write(log, commitFile(4), "")
+    // No version 5. Neither of these is a commit file, and both must be ignored.
+    write(log, commitFile(6).replace(".json", ".00000000000000000007.compacted.json"), "garbage")
+    write(log, "00000000000000000006.checkpoint.parquet", "garbage")
+    write(log, commitFile(6), """{"commitInfo":{"operation":"WRITE"}}""" + "\n")
+
+    val view = LogReader.logView(spark, table)
+
+    view.versions shouldBe Seq(0L, 1L, 2L, 3L, 4L, 6L)
+    view.commits shouldBe Seq(
+      Commit(0, Nil, Nil, Nil, Some("WRITE")),
+      Commit(1, Seq(Txn("writer-0", 1)), Seq("part one.parquet"), Nil, Some("WRITE")),
+      Commit(2, Nil, Seq("part-two.parquet"), Seq("part one.parquet"), Some("OPTIMIZE")),
+      Commit(6, Nil, Nil, Nil, Some("WRITE"))
+    )
+    view.unreadable.map(_.version) shouldBe Seq(3L, 4L)
+    view.unreadable.map(_.detail).last shouldBe "no actions"
+    view.activeFiles shouldBe Set("part-two.parquet")
+  }
+
+  test("a directory without commit files gives an empty view") {
+    LogReader.logView(spark, workDir.resolve("nothing-here")) shouldBe LogView(Nil, Nil, Nil)
+  }
+
+  test("data files on disk exclude the log and hidden files, at any depth") {
+    val table = workDir.resolve("disk")
+    write(table, "part-a.parquet", "x")
+    write(table, ".part-a.parquet.crc", "x")
+    write(table.resolve("p=1"), "part-b.parquet", "x")
+    write(table.resolve("_delta_log"), commitFile(0), "{}")
+
+    LogReader.diskView(table) shouldBe DiskView(Set("part-a.parquet", "p=1/part-b.parquet"))
+  }
+
+  test("a path that is not a Delta table gives the reader's error, not an exception") {
+    val result = LogReader.tableView(spark, workDir.resolve("not-delta").toUri.toString)
+    result.isLeft shouldBe true
+  }
+}

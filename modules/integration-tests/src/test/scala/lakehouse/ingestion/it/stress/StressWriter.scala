@@ -88,18 +88,39 @@ object StressWriter {
   }
 
   /**
-   * Writer defaults, overridable by `-Dspark.*` JVM options. One core and one partition: each
-   * commit writes one data file, and N writers stay within the WSL memory budget (discovery
-   * §7.3).
+   * The settings in which a writer departs from `LocalSparkSuite.baseConf`, each with the reason.
+   * The session applies exactly these, and a stress report lists them, so a reported result
+   * states the configuration it was measured with.
    */
+  val SparkSettings: Seq[StressReport.Setting] = Seq(
+    StressReport.Setting(
+      "spark.master",
+      "local[1]",
+      "one core per writer: N writer JVMs fit the WSL memory budget (discovery §7.3)"
+    ),
+    StressReport.Setting(
+      "spark.default.parallelism",
+      "1",
+      "one partition per append, so each commit adds exactly one data file"
+    ),
+    StressReport.Setting("spark.sql.shuffle.partitions", "1", "same reason"),
+    StressReport.Setting(
+      "spark.databricks.delta.snapshotPartitions",
+      "1",
+      "partitions Delta uses to rebuild the table state from its log, which every commit with " +
+        "a txnAppId does. The default, 50, costs about 8 s per commit on local[1] instead of " +
+        "about 1 s (measured in P1.4a). It changes how the state is computed, not the commit " +
+        "protocol: the commit is still the LogStore write of N.json, with the same existence " +
+        "check and rename. A shorter commit cycle only raises the commit rate, and with it the " +
+        "chance of a collision."
+    )
+  )
+
+  /** Writer settings: `baseConf`, then `SparkSettings`, then any `-Dspark.*` JVM option. */
   private def session(config: WriterConfig, run: StressRun): SparkSession = {
     val id = StressTable.writerId(config.writer)
-    val defaults = LocalSparkSuite.baseConf(run.scratch(config.writer), appName = id) ++ Map(
-      "spark.master" -> "local[1]",
-      "spark.default.parallelism" -> "1",
-      "spark.sql.shuffle.partitions" -> "1",
-      "spark.databricks.delta.snapshotPartitions" -> "1"
-    )
+    val defaults = LocalSparkSuite.baseConf(run.scratch(config.writer), appName = id) ++
+      SparkSettings.map(s => s.key -> s.value)
     val overrides = sys.props.toMap.filter { case (k, _) => k.startsWith("spark.") }
     (defaults ++ overrides)
       .foldLeft(SparkSession.builder()) { case (b, (k, v)) => b.config(k, v) }
