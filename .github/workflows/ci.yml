@@ -1,0 +1,100 @@
+# Continuous integration (discovery §17, P1.5; ADR-0013 §4–5).
+#
+# Every third-party action is pinned by commit SHA, with its release as a comment;
+# scripts/check-pins.sh enforces it and .github/dependabot.yml proposes the updates.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: every job gets a read-only token unless it widens it itself.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  pins:
+    name: Pinned images and actions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: scripts/check-pins.sh
+
+  build:
+    name: Format, boundaries, compile and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The JDK comes from .sdkmanrc, the same pin as local development.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version-file: .sdkmanrc
+          cache: sbt
+      # The sbt launcher; the build's sbt version comes from project/build.properties.
+      - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+      # Unit and integration tests. The integration tests start PostgreSQL with Testcontainers
+      # (Docker is on the runner). Stress runs are tagged and left out (`sbt stress`).
+      - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries Test/compile test
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports
+          path: modules/*/target/test-reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Dependency scanning (ADR-0013 §4). GitHub does not read sbt builds, so the resolved graph is
+  # submitted; Dependabot alerts and the review below work from it. Both need the repository to
+  # be public, and the submission needs a write token, which pull requests from forks lack.
+  dependency-graph:
+    name: Dependency submission
+    if: >-
+      !github.event.repository.private &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # the dependency submission API requires it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version-file: .sdkmanrc
+          cache: sbt
+      - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+      - uses: scalacenter/sbt-dependency-submission@d84eef4c09e633bcf5f113bcad7fd5e9af1baee9 # v3.2.3
+
+  # The gate: a pull request may not introduce a dependency with a known vulnerability of high
+  # severity or above, in any scope. Existing alerts are triaged instead (ADR-0013 §4).
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    needs: dependency-graph
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: high
+          fail-on-scopes: runtime, development, unknown
+          # The snapshot for the pull request's head is submitted by the job above.
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 600

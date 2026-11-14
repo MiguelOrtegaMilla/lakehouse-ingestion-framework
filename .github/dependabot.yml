@@ -1,0 +1,15 @@
+# Actions are pinned by commit SHA (ADR-0013 §5); Dependabot proposes new releases, updating the
+# SHA and its release comment together. sbt is not a Dependabot ecosystem: library alerts come
+# from the dependency submission in ci.yml.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # Leave a new release two weeks to settle before proposing it.
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]

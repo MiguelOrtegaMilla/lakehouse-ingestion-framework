@@ -20,6 +20,7 @@ object Dependencies {
 
     val postgresJdbc = "42.7.14"
     val scalatest = "3.2.20"
+    // Upgrading: re-pin Ryuk in integration-tests' testcontainers.properties (ADR-0013 §5).
     val testcontainers = "2.0.5"
   }
 
