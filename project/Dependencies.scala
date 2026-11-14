@@ -19,6 +19,7 @@ object Dependencies {
     val log4j = "2.24.3"
 
     val postgresJdbc = "42.7.14"
+    val flyway = "13.12.2"
     val scalatest = "3.2.20"
     // Upgrading: re-pin Ryuk in integration-tests' testcontainers.properties (ADR-0013 §5).
     val testcontainers = "2.0.5"
@@ -64,6 +65,13 @@ object Dependencies {
   // through SLF4J, which this binding routes to log4j2.
   val scalatest = "org.scalatest" %% "scalatest" % Versions.scalatest % Test
   val testcontainers = "org.testcontainers" % "testcontainers" % Versions.testcontainers % Test
+
+  // Migrations (ADR-0002). Test-only until a module applies them itself (the control plane, P4):
+  // the LogStore ships its migrations as SQL and never runs them (ADR-0004, deviation 10).
+  val flywayTest: Seq[ModuleID] =
+    Seq("flyway-core", "flyway-database-postgresql").map(
+      "org.flywaydb" % _ % Versions.flyway % Test
+    )
   val log4jSlf4j = "org.apache.logging.log4j" % "log4j-slf4j2-impl" % Versions.log4j % Test
   val log4jCore = "org.apache.logging.log4j" % "log4j-core" % Versions.log4j % Test
 }
