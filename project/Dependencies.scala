@@ -19,6 +19,7 @@ object Dependencies {
     val log4j = "2.24.3"
 
     val postgresJdbc = "42.7.14"
+    val hikari = "7.1.0"
     val flyway = "13.12.2"
     val scalatest = "3.2.20"
     // Upgrading: re-pin Ryuk in integration-tests' testcontainers.properties (ADR-0013 §5).
@@ -38,6 +39,9 @@ object Dependencies {
   val hadoopClientApi = "org.apache.hadoop" % "hadoop-client-api" % Versions.hadoop % Provided
 
   val postgresJdbc = "org.postgresql" % "postgresql" % Versions.postgresJdbc
+
+  // The LogStore's connection pool (ADR-0004 §3.9). Its one dependency is slf4j-api.
+  val hikari = "com.zaxxer" % "HikariCP" % Versions.hikari
 
   /**
    * Pins every log4j2 module to Spark's version. log4j modules must all have one version, and
@@ -65,6 +69,11 @@ object Dependencies {
   // through SLF4J, which this binding routes to log4j2.
   val scalatest = "org.scalatest" %% "scalatest" % Versions.scalatest % Test
   val testcontainers = "org.testcontainers" % "testcontainers" % Versions.testcontainers % Test
+
+  // A TCP proxy in a container, to cut, delay or stall real connections in tests. Its image is
+  // pinned in integration-tests' testcontainers.properties.
+  val testcontainersToxiproxy =
+    "org.testcontainers" % "testcontainers-toxiproxy" % Versions.testcontainers % Test
 
   // Migrations (ADR-0002). Test-only until a module applies them itself (the control plane, P4):
   // the LogStore ships its migrations as SQL and never runs them (ADR-0004, deviation 10).

@@ -642,7 +642,7 @@ The spike comes before the CI so that the CI starts out testing everything P1 bu
 | P2a.2 | Build: `delta-storage` as `provided`, Unity Catalog's client libraries excluded from the LogStore module, a boundary rule that keeps them out | — | 1 | Done |
 | P2a.3 | Coordination schema: migration, its own schema version, grants per role | Denial tests (ADR-0013 §3) | 2 | Done |
 | P2a.4 | `CoordinationStore` trait, domain types, in-memory implementation, one contract suite for every implementation | — | 2 | Done |
-| P2a.5 | PostgreSQL implementation: lazy JVM-wide pool, settings and password reference, bounded timeouts, every error an `IOException` | F13; N threads, one winner | 2 | |
+| P2a.5 | PostgreSQL implementation: lazy JVM-wide pool, settings and password reference, bounded timeouts, every error an `IOException`. Its fault tests break real connections (a TCP proxy, `docker pause`, `docker stop`). | F13; N threads, one winner | 2 | Done |
 | P2a.6 | Canonical table identity: one function from any spelling of a table path to its coordination key | Spellings, symlinks | 3 | |
 | P2a.7 | Log file I/O on `file://`: durable temp file, hard-link publish, atomic replace, no sidecars | No partial file; both readers clean | 3 | |
 | P2a.8 | Write path: prepare, `INSERT`, publish, acknowledge; registration at version 0; fault hooks, selectable from configuration | F1, F5, F6, F9, F12, F15, F16 | 4 | |

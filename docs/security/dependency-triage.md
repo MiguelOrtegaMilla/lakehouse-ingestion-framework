@@ -22,7 +22,7 @@ The register of known vulnerabilities in this project's dependencies that are **
 
 ## Where the vulnerable packages come from
 
-The project's own runtime classpath is everything outside `provided` and test scope. Since P2a.2 it holds only `scala-library`, and **no package with an open alert**.
+The project's own runtime classpath is everything outside `provided` and test scope. It holds `scala-library` and, since P2a.5, what the LogStore needs to reach its database: the PostgreSQL JDBC driver, HikariCP, `slf4j-api` and `checker-qual`. **No package on it has an open alert**: none of them had a published advisory when it was added (2026-11-14).
 
 - At the baseline it also held `delta-storage`, the Unity Catalog client libraries that `delta-storage` pulls in, and through them log4j, slf4j-api and jsr305. log4j (T-08) was then the one group both on that classpath and with alerts.
 - [ADR-0016](../adr/0016-delta-storage-provided-to-the-logstore-module.md) made `delta-storage` `provided` in the LogStore module and excluded the Unity Catalog libraries there. `sbt checkBoundaries` keeps them out.

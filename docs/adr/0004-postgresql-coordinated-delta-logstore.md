@@ -232,9 +232,20 @@ Delta, not this project, creates the LogStore instances (§8, item 4):
 |---|---|
 | Constructor | Keeps the configuration and nothing else: no connection, no I/O. It runs often, and in tasks that never need PostgreSQL. |
 | Connection pool | One per JVM and per (JDBC URL, user), shared by every instance, created by the first operation that needs PostgreSQL. |
-| Settings | Carried in the Hadoop configuration, set as `spark.hadoop.*` when the application starts. Delta hands that configuration to the constructor and to every call, on the driver and in tasks. They are the JDBC URL, the user, the password reference, the pool size and the timeouts. The key names are fixed in P2a.5. |
+| Settings | Carried in the Hadoop configuration, set as `spark.hadoop.*` when the application starts. Delta hands that configuration to the constructor and to every call, on the driver and in tasks. They are the JDBC URL, the user, the password reference, the pool size and the timeouts: the keys are listed below. |
 | Password | By reference only, in the syntax of ADR-0007: `env:NAME` or `file:/path`. The JVM that opens the pool resolves it. The value never enters the Spark or Hadoop configuration, which Spark sends to executors and lists in its UI. |
 | Pool size | At most 4 connections (configurable), no idle minimum, idle connections closed after about a minute. The same in every JVM. |
+
+Settings, as fixed in P2a.5 (`CoordinationSettings`). Under Spark each key takes the prefix `spark.hadoop.`:
+
+| Key | Meaning | Default |
+|---|---|---|
+| `lakehouse.logstore.jdbc.url` | A `jdbc:postgresql:` URL. TLS options go here. It may not carry a password, nor the driver's own timeouts: the LogStore sets those. | Required |
+| `lakehouse.logstore.jdbc.user` | The role of the commit path | Required |
+| `lakehouse.logstore.jdbc.passwordRef` | `env:NAME` or `file:/path` | Required |
+| `lakehouse.logstore.pool.maxSize` | Connections this JVM may hold | 4 |
+| `lakehouse.logstore.timeout.connectMs` | Wait for a connection, new or from the pool | 5000 |
+| `lakehouse.logstore.timeout.statementMs` | One statement, including a wait for a lock. The socket gives up two seconds later, for a server or a network that no longer answers. | 10000 |
 
 Why 4: a thread uses one connection for one short statement at a time, so a JVM needs as many as the tables it commits to or refreshes at once. An idle JVM holds none. The budget to respect is `JVMs that reach PostgreSQL × pool maximum`, below PostgreSQL's `max_connections` minus what the control plane and the sources use. The largest planned run, 8 stress writers in CI, takes 32 of the default 100.
 
@@ -412,4 +423,9 @@ Decided in [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-
 
 ### Item 6 — Isolation level and statements
 
-Direction decided on 2026-11-14: `INSERT … ON CONFLICT DO NOTHING` followed by a comparison of `temp_path`, instead of catching SQLState `23505`. The statement can then be repeated when its outcome is unknown (§3.2, F15). It closes in P2a.5, with the isolation level: registering a table at version 0 writes two rows, so "every decision is a single-row atomic statement" does not hold as first written.
+Closed in P2a.5 (2026-11-14), with `PostgresCoordinationStore`.
+- **Statements.** Every operation of the store is one statement, or an `INSERT … ON CONFLICT DO NOTHING` followed by a read. No SQLState `23505` is caught. The entry's `temp_path` tells a writer whether a version is its own, so a claim can be repeated when its outcome is unknown (§3.2, F15).
+- **Isolation.** Each statement runs in its own transaction at `READ COMMITTED`, which is enough. `ON CONFLICT DO NOTHING` waits for a concurrent insert of the same key to commit or roll back before it answers, so the primary key puts the claims in one order. The read that follows finds the committed row, because nothing on the commit path deletes.
+- **"Every decision is a single-row atomic statement" holds.** Registering a table and taking its first version are two operations, and need not be one: a registered table without entries is a harmless state, and the foreign key rules out the opposite order. *(On 2026-11-14 this item said that registration at version 0 broke that statement. It does not.)*
+- **Waiting is bounded.** The server cancels a statement after `statement_timeout`, which also covers a wait for a lock; a `lock_timeout` of the same length would never fire first.
+- **Shown against a real PostgreSQL** by `PostgresCoordinationFaultSpec`: a claim held in flight by another transaction, with both outcomes; a reply to the `INSERT` lost on a cut connection, and the claim repeated; a frozen and a stopped server.

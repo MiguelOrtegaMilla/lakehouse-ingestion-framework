@@ -4,7 +4,7 @@
 #   - every image in Testcontainers' configuration:     name:tag@sha256:<digest>
 #   - every `uses:` in .github/ workflows and actions:  owner/repo@<40-hex commit SHA> # <release>
 # Testcontainers images in code come from these two places only: the postgres image is read from
-# the compose file (BootstrappedPostgres) and Ryuk from testcontainers.properties.
+# the compose file (BootstrappedPostgres); Ryuk and Toxiproxy from testcontainers.properties.
 # Usage: scripts/check-pins.sh [repository root]
 set -euo pipefail
 

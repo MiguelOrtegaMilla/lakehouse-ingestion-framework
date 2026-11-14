@@ -25,13 +25,22 @@ object CoordinationSchema {
    * its own history. It must not try to create the schema: the bootstrap did, and the migrator
    * could not.
    */
-  def migrate(pg: BootstrappedPostgres): MigrateResult =
+  def migrate(pg: BootstrappedPostgres): MigrateResult = flyway(pg).migrate()
+
+  /** Drops everything the migrations created, history included; the schema itself stays. */
+  def drop(pg: BootstrappedPostgres): Unit = flyway(pg).clean(): Unit
+
+  private def flyway(pg: BootstrappedPostgres): Flyway =
     Flyway
       .configure()
       .dataSource(pg.jdbcUrl(Database), Migrator, pg.password(Migrator))
       .locations(Location)
       .defaultSchema(Schema)
       .createSchemas(false)
+      // Dropping is for tests only; Flyway refuses it unless asked.
+      .cleanDisabled(false)
       .load()
-      .migrate()
+
+  /** The role the commit path connects as (ADR-0013 §3). */
+  val CommitPathRole = "ingest_coordination"
 }
