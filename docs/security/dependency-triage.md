@@ -179,6 +179,12 @@ The fix for most of this register is a newer Spark.
 
 Moving the stack is a decision for ADR-0014, not for this register.
 
+**Decision (2026-11-14): stay on Spark 4.1.4** (ADR-0014 unchanged). The Spark 4.2.1 option stays open as a possible future revision:
+
+- **When to reconsider:** at each review of this register.
+- **What to repeat then:** the measurement above, against the advisory database of that date and the latest Spark and Delta releases.
+- **What else to weigh against the alerts it would remove:** a move would change Scala to 2.13.18 and Hadoop to 3.5.0, and the P1 smoke tests and the LogStore spike would have to be re-run.
+
 ## Review triggers
 
 Review the register on **2027-02-14** at the latest. Review it earlier when:
