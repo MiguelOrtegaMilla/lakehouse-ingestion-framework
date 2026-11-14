@@ -28,6 +28,11 @@ object ModuleBoundaries {
     val deltaSpark: Forbidden = Forbidden("io.delta", "delta-spark")
     val anyDelta: Forbidden = Forbidden("io.delta")
     val hadoop: Forbidden = Forbidden("org.apache.hadoop")
+    // Delta's Unity Catalog client libraries, which `delta-storage` depends on (ADR-0016).
+    val unityCatalog: Forbidden = Forbidden("io.unitycatalog")
+    // Every log4j module, the API included: a library logs through slf4j-api and leaves the
+    // logging backend to the application that runs it.
+    val log4j: Forbidden = Forbidden("org.apache.logging.log4j")
     val jdbc: Seq[Forbidden] =
       Seq(Forbidden("org.postgresql"), Forbidden("com.zaxxer"), Forbidden("org.flywaydb"))
   }

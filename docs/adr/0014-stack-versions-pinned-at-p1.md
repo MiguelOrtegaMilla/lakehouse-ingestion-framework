@@ -59,4 +59,4 @@ No changes to `delta-storage`, the `LogStore` API, `OptimisticTransaction`, the 
 - Discovery §20 item "Exact Scala 2.13 patch used by Spark; latest sbt 1.x" is closed.
 - **Procedure for the next patch upgrade:** release notes, plus a diff of the commit path (`delta-storage`, `OptimisticTransaction`, `SnapshotManagement`), plus a LogStore suite run. The same review as above, recorded in a new ADR.
 - `hadoop-aws` in E1 must match Hadoop 3.4.2.
-- `delta-storage` 4.4.x declares compile dependencies on `unitycatalog-client` and `unitycatalog-hadoop`, which bring `log4j-core` in. That is acceptable for the engine, because Spark ships log4j anyway. For an extractable library module it is noise. P2a decides whether `delta-pg-logstore` excludes them.
+- `delta-storage` 4.4.x declares compile dependencies on `unitycatalog-client` and `unitycatalog-hadoop`, which bring `log4j-core` in. That is acceptable for the engine, because Spark ships log4j anyway. For an extractable library module it is noise. P2a decides whether `delta-pg-logstore` excludes them. *(Decided in [ADR-0016](0016-delta-storage-provided-to-the-logstore-module.md), 2026-11-14.)*

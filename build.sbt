@@ -45,11 +45,15 @@ lazy val core = module("core", artifact = "core")
 
 /**
  * PostgreSQL-coordinated Delta LogStore (ADR-0004). Depends on no other project module, so it
- * can be extracted as a library; sees only the LogStore API, never Spark.
+ * can be extracted as a library; sees only the LogStore API, never Spark, and brings neither
+ * Unity Catalog's client libraries nor a logging backend with it (ADR-0016).
  */
 lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
   .settings(
-    rules(forbidden = Seq(Forbid.spark, Forbid.deltaSpark), allowProjectDependencies = false),
+    rules(
+      forbidden = Seq(Forbid.spark, Forbid.deltaSpark, Forbid.unityCatalog, Forbid.log4j),
+      allowProjectDependencies = false
+    ),
     libraryDependencies ++= Seq(deltaStorage, hadoopClientApi)
   )
 
