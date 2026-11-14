@@ -71,9 +71,11 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 |---|---|---|
 | `ingest_migrator` | Owns schemas `control` and `delta_coordination`; DDL | Flyway only. Never at runtime. |
 | `ingest_control` | DML on `control`; read access to commit entries for the lineage views (`v_table_commits`) | Engine |
-| `ingest_coordination` | `SELECT`, `INSERT`, `UPDATE` on `commit_entry` and `coordinated_table`. **No `DELETE`, no DDL, no access to `control`.** | `PostgresLogStore` |
-| `ingest_maintenance` | `DELETE` on the coordination tables | Entry pruning and registry reset (F9), in maintenance mode and runbooks |
+| `ingest_coordination` | `SELECT` and `INSERT` on `coordinated_table`, `commit_entry` and `table_taint`. `UPDATE` only of `complete` and `completed_at` on `commit_entry`. `SELECT` on `schema_version`. **No `DELETE`, no other `UPDATE`, no DDL, no access to `control`.** ¹ | `PostgresLogStore` |
+| `ingest_maintenance` | `SELECT` and `DELETE` on `commit_entry`, `table_taint` and `coordinated_table`. `SELECT` on `schema_version`. Nothing else. ¹ | Entry pruning and registry reset (F9), in maintenance mode and runbooks |
 | `<source>_ro` | `SELECT` on the source tables | JDBC connector |
+
+¹ *Updated in P2a.3 (2026-11-14) to the privileges the migration grants, which are narrower than first written. The rows said "`SELECT`, `INSERT`, `UPDATE` on `commit_entry` and `coordinated_table`" and "`DELETE` on the coordination tables". The commit path can now only add rows and mark an entry complete: it cannot rewrite an entry, change a registration or clear a taint. The decision is unchanged.*
 
 - **Why a separate maintenance role:** a bug on the commit path cannot erase a commit entry, because the role it runs as is not allowed to.
 - **Where it lives:**
@@ -82,7 +84,7 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
   - passwords are secret references (ADR-0007).
 - ADR-0004 deviation 10 ("no DDL from the data path") is now **enforced by the database**, not only by the code.
 - **Tests:**
-  - P2a: as `ingest_coordination`, `CREATE TABLE`, `DELETE FROM commit_entry` and any read of `control` fail with SQLState `42501`.
+  - P2a: as `ingest_coordination`, `CREATE TABLE`, `DELETE FROM commit_entry` and any read of `control` fail with SQLState `42501` (`CoordinationSchemaSpec`, with the rest of what each role is denied).
   - P4: `ingest_control` cannot write `delta_coordination`.
 
 ### 4. Dependency vulnerability scanning in CI (Required)
