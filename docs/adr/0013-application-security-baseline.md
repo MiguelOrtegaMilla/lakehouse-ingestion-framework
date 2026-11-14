@@ -96,7 +96,7 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 - **Why gate on introduced vulnerabilities rather than all of them:**
   - The Spark and Hadoop transitive tree carries known CVEs, mostly in `provided` scope, that this project cannot fix.
   - A gate on all of them would be permanently red, and a permanently red check gets ignored.
-  - Existing alerts are triaged instead. Accepted ones are documented with a reason and a review date.
+  - Existing alerts are triaged instead. Accepted ones are documented with a reason and a review date in the [dependency triage register](../security/dependency-triage.md).
 - **Prerequisite.** The repository must be on GitHub and **public**: dependency review is not available on private repositories of a personal account. The repository (`MiguelOrtegaMilla/lakehouse-ingestion-framework`) exists and becomes public when P1's CI is in place.
 - **Workflow.** The gate acts on pull requests, so changes reach `main` through PRs.
 
