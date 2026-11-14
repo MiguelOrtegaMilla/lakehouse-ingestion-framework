@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phase 1 (bootstrap) complete; Phase 2a (PostgreSQL-backed LogStore) is next.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phase 1 (bootstrap) complete; Phase 2a (PostgreSQL-backed LogStore) is in progress.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -34,6 +34,7 @@ sbt scalafmtCheckAll scalafmtSbtCheck   # formatting gate
 sbt scalafmtAll scalafmtSbt             # reformat
 sbt integration-tests/test              # integration tests (needs Docker)
 sbt "integration-tests/testOnly lakehouse.ingestion.it.delta.*"   # Spark + Delta smoke test only (no Docker)
+sbt "integration-tests/testOnly lakehouse.ingestion.it.logstore.*"   # what Delta asks of a LogStore (no Docker)
 ```
 
 Tests that run Spark fork their own JVM with the Java 17 module options Spark needs (`project/SparkTestJvm.scala`), 1 GB of heap and UTC. `SparkJvmOptionsSpec` fails if a Spark upgrade changes those options and the build has not followed.
