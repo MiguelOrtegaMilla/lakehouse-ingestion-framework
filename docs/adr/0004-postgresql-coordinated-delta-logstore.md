@@ -7,7 +7,8 @@
 | **Supersedes** | AD-06 of discovery v1 ("one writer per Delta table") |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.4, §3.5, §3.8, §3.9 (new), §4, §6, §7. Each change is dated in place and says what the text said before. |
+| **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. Those passages keep their original text and point to it. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -113,7 +114,7 @@ sequenceDiagram
   else no E(N-1) and N-1 > registered_version and N-1.json exists
     W->>PG: TAINT table (uncoordinated commit N-1) · fail closed
   end
-  W->>FS: write T(N) = _delta_log/.tmp/N.json.<uuid> (fully, forced to disk, closed)
+  W->>FS: write T(N) = _delta_log/.tmp/N.json.<uuid> (fully, close)
   W->>PG: INSERT E(N, T(N), complete=false)  ◀── linearisation point
   alt unique violation
     W-->>W: throw FileAlreadyExistsException (Delta checks conflicts, retries at N+1)
@@ -122,7 +123,7 @@ sequenceDiagram
   W->>PG: UPDATE E(N) SET complete=true, completed_at=now() WHERE temp_path=T(N)
 ```
 
-- **Durability point:** the committed `INSERT`. From then on version N belongs to this writer, even if it crashes. Any later reader or writer finishes publishing it. `T(N)` is forced to disk before the `INSERT`, so an entry never points at a file the storage could still lose.
+- **Durability point:** the committed `INSERT`. From then on version N belongs to this writer, even if it crashes. Any later reader or writer finishes publishing it.
 - **A taken version** is reported with `java.nio.file.FileAlreadyExistsException`. It is the only exception Delta answers with a conflict check and a retry at the next version. Hadoop's exception of the same name just fails the commit (§8, item 2).
 - **Errors after the `INSERT`** *(amended in P2a, 2026-11-14)*:
   - Delta reads the status of `N.json` as soon as `write` returns (§8, item 2). A `write` that returns before the file is visible therefore fails the transaction with a `FileNotFoundException`, although the commit is durable. Swallowing a publish error produces exactly that.
@@ -153,24 +154,13 @@ sequenceDiagram
 | Scheme | How `N.json` is published | Why it gives atomic visibility |
 |---|---|---|
 | `s3a://` (S3, MinIO) | Server-side copy / PUT of `T(N)`'s bytes to `N.json` | An object becomes visible only when complete |
-| `file://` (POSIX) | Hard link `N.json` → `T(N)`, with `java.nio` (`Files.createLink`), not through Hadoop | `link(2)` is one system call. The name appears with the complete file behind it, and the call fails if `N.json` already exists. `rename(2)` gives the first property and not the second. |
+| `file://` (POSIX) | Copy `T(N)` → `.tmp/N.json.<uuid>.pub`, then `rename` to `N.json` | `rename(2)` is atomic. It may *replace* an existing file, but that is harmless: exclusivity comes from PostgreSQL, and concurrent recoverers publish identical bytes. |
 
-**Why a hard link** *(decided in P2a, 2026-11-14; closes the open item of §8)*. The row above said: "Copy `T(N)` → `.tmp/N.json.<uuid>.pub`, then `rename` to `N.json`", on the grounds that replacing an existing file is harmless because exclusivity comes from PostgreSQL. That holds between coordinated writers. It does not hold against a foreign one:
-- **Publish race (layer 4, F11).** A rename would replace a foreign writer's `N.json` and destroy the evidence. Checking first leaves a window between the check and the rename. The link makes it one atomic test. "Already exists" leads to a comparison with `T(N)`: equal bytes mean another recoverer published the same commit; different bytes are `UncoordinatedWriteDetected`.
-- **No second step.** There is no state between unpublished and published, so F3 has no middle to crash in, and no second temporary file to collect.
-- **No silent fallback.** Hadoop's `RawLocalFileSystem.rename` copies the file when the rename fails, and a copy is not atomic. `Files.createLink` fails instead.
-- **Two names, one file.** `T(N)` and `N.json` are the same file until the temp GC removes the first name. The commit's modification time is the time `T(N)` was written. That precedes its `INSERT`, which precedes the writing of `T(N+1)`, so modification times stay ordered by version.
-- **Requirement.** The file system must support hard links: ext4, XFS and NFS do; some FUSE and Windows-mounted file systems do not. Startup probes the lake root and refuses to run without them (§3.5 layer 1).
-- **Durability.** `T(N)` is forced to disk before the `INSERT`, and the `_delta_log` directory after the link.
+> **The `file://` row is superseded by [ADR-0015](0015-hard-link-publish-on-local-file-systems.md)** (2026-11-14): `N.json` is published as a hard link to `T(N)`, which is atomic and fails if the file exists.
 
 **`.crc` sidecars on `file://`** *(added in P1.4d)*. Hadoop's checksummed local file system (`LocalFs` behind a `FileContext`, `LocalFileSystem` behind a `FileSystem`) writes a `.<name>.crc` sidecar next to every file it creates. A rename moves the file first and then its sidecar, in a second step that does not overwrite. So publishing through it is two renames, not one. With identical bytes the sidecars are identical too. Still, a crash between the two steps leaves `N.json` without its sidecar and a stray temporary sidecar behind. A foreign writer's `N.json` leaves a sidecar that no longer matches. Every checksum-verifying reader then fails on that file, which is what the RED spike observed (§7.3).
 
-**Coordinated commit files have no sidecar** *(decided in P2a, 2026-11-14)*. `T(N)` is written and linked without Hadoop's checksummed file system, so neither name gets one.
-- Hadoop reads a file without a sidecar unchecked and without an error (`ChecksumFileSystem.ChecksumFSInputChecker`, Hadoop 3.4.2). Both kinds of reader, with and without checksums, read the table.
-- What is given up is Hadoop's CRC check of commit files on a local disk. Object stores never had it.
-- F3 asserts, at every crash point, that there is no partial `N.json` and no sidecar.
-- F11 asserts that the foreign `N.json` and its sidecar are left as found. They still match each other, so the table stays readable for forensics.
-- A `.N.json.crc` next to a commit this LogStore published can only come from a foreign writer. How it is handled is fixed with the implementation (P2a.7).
+How the publish deals with sidecars was left to P2a (§8). [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) decides it: coordinated commit files have none.
 
 `isPartialWriteVisible` returns `true` for `file://` and `false` for `s3a://`. Delta uses it to decide whether checkpoints must be written via temp + rename. Answering `true` has two more effects, found in P2a.1 (§8, items 1 and 4):
 - files that are not commits reach `write` with `overwrite=false` (a V2 checkpoint in JSON). They need an atomic write, and no coordination entry (deviation 9);
@@ -186,7 +176,7 @@ Writes with `overwrite=true` (`_last_checkpoint`, `_last_vacuum_info`) must be a
 
 | Layer | Mechanism | Catches |
 |---|---|---|
-| 1 — Startup enforcement (`cli`) | The engine refuses to start (exit 4) unless `spark.delta.logStore.<scheme>.impl` is `PostgresLogStore` for every scheme of the active lake profile, the coordination schema version matches, and a probe on the lake root resolves to this LogStore. *(P2a)* Also unless the scheme is one this LogStore implements (§2) and, on `file://`, the lake root supports hard links (§3.4). | Our own processes misconfigured: the realistic risk |
+| 1 — Startup enforcement (`cli`) | The engine refuses to start (exit 4) unless `spark.delta.logStore.<scheme>.impl` is `PostgresLogStore` for every scheme of the active lake profile, the coordination schema version matches, and a probe on the lake root resolves to this LogStore. *(P2a)* Also unless the scheme is one this LogStore implements (§2) and, on `file://`, the lake root supports hard links (ADR-0015). | Our own processes misconfigured: the realistic risk |
 | 2 — Table registry | A table is registered at creation (version 0 through this LogStore) or explicitly adopted (`adopt-table` at its current version, recording `metaData.id`). Commits to unregistered `table_uri`s are rejected. | Aliased paths (§3.6); tables created outside the framework |
 | 3 — Gap detection | A published `N.json` above `registered_version` without an entry → `TAINTED`; writes refused until an operator verifies and re-adopts (runbook) | A foreign writer's commit |
 | 4 — Publish-race detection | If `N.json` already exists when publishing our entry and its bytes differ from `T(N)` → fatal `UncoordinatedWriteDetected`, `TAINTED` | A foreign writer racing our own commit N, which the base class would lose silently |
@@ -222,7 +212,7 @@ The engine wraps each Delta write in `CommitContext.withRun(runId) { … }`, a t
 | Before `T(N)` is closed | Partial temp file, no entry | Nobody; temp GC | Commit N never happened; the Delta txn failed |
 | After `T(N)`, before `INSERT` | Orphan temp | Temp GC | Same as above |
 | After `INSERT`, before publish | Entry incomplete, no `N.json` | Next `listFrom` (any reader) or the writer of N+1 | **Commit N is durable** and becomes visible |
-| During publish (`file://`) | The link is one system call: either the row above or the row below. *(P2a; before: "Entry incomplete, `.pub` temp, no `N.json`")* | Same | Published atomically by the recoverer |
+| During publish (`file://`) | Entry incomplete, `.pub` temp, no `N.json`. *(Superseded by ADR-0015: a hard link has no such state; it is the row above or the row below.)* | Same | Published atomically by the recoverer |
 | After publish, before ack | Entry incomplete, `N.json` present | Same (identical bytes → mark complete) | Complete |
 | After ack | Entry complete | — | Complete |
 | Any, and `T(N)` is later lost *(P2a, F17)* | Entry incomplete, no `T(N)`, no `N.json` | Nobody can: the bytes are gone | Reads and writes fail closed, naming the entry, until an operator resolves it |
@@ -273,7 +263,7 @@ Why 4: a thread uses one connection for one short statement at a time, so a JVM 
 | # | Base class behaviour (v4.4.0) | `PostgresLogStore` | Reason |
 |---|---|---|---|
 | 1 | Reused by **inheritance**; ships in `delta-storage-s3-dynamodb` (pulls in the AWS SDK) | **Ported** into a class extending `HadoopFileSystemLogStore` (`delta-storage`, already on the classpath) | Deviations 4 and 5 sit inside the private flow of `write()`, which a subclass cannot change. Avoids AWS dependencies. |
-| 2 | Publish = streaming copy `fs.create(dst, overwrite=false)` + `IOUtils.copy` | `file://`: hard link, which fails if `N.json` exists (§3.4; *before P2a:* copy to a second temp + `rename`); `s3a://`: copy | The streaming copy is atomic only on object stores. On POSIX a concurrent reader could see a partial `N.json`, which violates property 1. |
+| 2 | Publish = streaming copy `fs.create(dst, overwrite=false)` + `IOUtils.copy` | `file://`: copy to a second temp + `rename` *(superseded by ADR-0015: a hard link)*; `s3a://`: copy | The streaming copy is atomic only on object stores. On POSIX a concurrent reader could see a partial `N.json`, which violates property 1. |
 | 3 | `isPartialWriteVisible` always `false` | `true` on `file://`, `false` on `s3a://` | So that Delta writes checkpoints via temp + rename on POSIX |
 | 4 | After `putExternalEntry`, **every** `Throwable` from publish/ack is logged and ignored — including a `FileAlreadyExistsException` caused by a foreign `N.json` | A content mismatch with an existing `N.json` is **fatal** + taint. A failed ack is ignored (recovery will finish). A failed publish is retried and then reported with a dedicated exception (§3.2; *before P2a:* ignored). | Otherwise, with a foreign writer, our commit is lost silently while Delta believes it succeeded. And Delta 4.4 reads `N.json` as soon as `write` returns, so an ignored publish error fails the transaction anyway, with a misleading `FileNotFoundException`. |
 | 5 | No detection of uncoordinated commits: a missing entry for N-1 falls back to `fs.exists(N-1.json)` | Registry + gap detection + `TAINTED` state | Safeguard requirement |
@@ -366,7 +356,7 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 
   If the natural race does not reproduce within a reasonable budget, the widened variant is the evidence, and the README states it honestly.
 - **GREEN (P2):** the same harness with `PostgresLogStore`, zero anomalies over the same budget, including the widened-window variant.
-  - *(P2a, 2026-11-14)* `DelayingLocalFs` delays a rename, and the hard-link publish (§3.4) never renames a commit file. Left as it is, the widened variant would pass without testing anything.
+  - *(P2a, 2026-11-14)* `DelayingLocalFs` delays a rename, and the hard-link publish (ADR-0015) never renames a commit file. Left as it is, the widened variant would pass without testing anything.
   - GREEN therefore widens the LogStore's own windows, with a delay at its fault hooks: between the existence check and the `INSERT`, and between the `INSERT` and the publish.
   - The writers are separate JVMs, so the hooks can be selected from configuration (P2a.8).
 - Both results go in the README, side by side.
@@ -420,7 +410,7 @@ Yes: for appends with a `txnAppId`, `MERGE`, `DELETE` and `OPTIMIZE`. `OPTIMIZE`
 
 ### Item 5 — How the `file://` publish handles Hadoop's `.crc` sidecars
 
-Decided on 2026-11-14: a hard link, outside Hadoop's checksummed file system, so that coordinated commit files have no sidecar (§3.4). *(Item added in P1.4d, from the RED spike.)* It closes with its implementation and tests in P2a.7.
+Decided in [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14): a hard link, outside Hadoop's checksummed file system, so that coordinated commit files have no sidecar. *(Item added in P1.4d, from the RED spike.)* It closes with its implementation and tests in P2a.7.
 
 ### Item 6 — Isolation level and statements
 
