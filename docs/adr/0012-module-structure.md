@@ -17,6 +17,7 @@
 | `integration-tests` | Testcontainers, e2e, fault injection, stress harness + verifier | all |
 
 - **The dependency rules are enforced by the build graph**, so the compiler rejects a Spark import in `core`.
+- *[ADR-0016](0016-delta-storage-provided-to-the-logstore-module.md) (2026-11-14) refines the `delta-pg-logstore` row: `delta-storage` is `provided` too, and comes without its Unity Catalog dependencies.*
 - Integration tests live in a separate subproject: sbt 1.9+ deprecates the `IntegrationTest` configuration.
 
 ### Project identity (D6)

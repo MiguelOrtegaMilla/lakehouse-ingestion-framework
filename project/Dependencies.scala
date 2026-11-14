@@ -29,7 +29,11 @@ object Dependencies {
   val deltaSpark = "io.delta" % "delta-spark_4.1_2.13" % Versions.delta % Provided
 
   // The LogStore API only; `delta-pg-logstore` must not see Spark or delta-spark (ADR-0012).
-  val deltaStorage = "io.delta" % "delta-storage" % Versions.delta
+  // `provided`, like the Hadoop API: the Delta runtime that loads the LogStore supplies it. Its
+  // dependencies on Unity Catalog's client libraries are left out: the LogStore API does not use
+  // them, and they bring a logging backend (ADR-0016).
+  val deltaStorage = ("io.delta" % "delta-storage" % Versions.delta % Provided)
+    .excludeAll(ExclusionRule(organization = "io.unitycatalog"))
   val hadoopClientApi = "org.apache.hadoop" % "hadoop-client-api" % Versions.hadoop % Provided
 
   val postgresJdbc = "org.postgresql" % "postgresql" % Versions.postgresJdbc

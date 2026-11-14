@@ -22,18 +22,13 @@ The register of known vulnerabilities in this project's dependencies that are **
 
 ## Where the vulnerable packages come from
 
-The project's own runtime classpath is small. It is everything outside `provided` and test scope:
+The project's own runtime classpath is everything outside `provided` and test scope. Since P2a.2 it holds only `scala-library`, and **no package with an open alert**.
 
-- `delta-storage`;
-- the Unity Catalog client libraries `delta-storage` pulls in;
-- log4j;
-- slf4j-api;
-- jsr305;
-- scala-library.
+- At the baseline it also held `delta-storage`, the Unity Catalog client libraries that `delta-storage` pulls in, and through them log4j, slf4j-api and jsr305. log4j (T-08) was then the one group both on that classpath and with alerts.
+- [ADR-0016](../adr/0016-delta-storage-provided-to-the-logstore-module.md) made `delta-storage` `provided` in the LogStore module and excluded the Unity Catalog libraries there. `sbt checkBoundaries` keeps them out.
+- The alerts did not go away with them: the same packages are still in the graph through Spark and Delta.
 
-Only **log4j** (T-08) is both on that classpath and carries alerts.
-
-Everything else with alerts belongs to the **Spark and Delta runtime**, declared `provided`:
+Everything with alerts belongs to the **Spark and Delta runtime**, declared `provided`:
 
 - the Spark installation supplies those jars at run time;
 - the project only compiles and tests against them.
@@ -47,7 +42,7 @@ Everything else with alerts belongs to the **Spark and Delta runtime**, declared
 | T-05 | `zookeeper` | 3.9.4 | 2 (0/2/0/0) | `spark-core` | No (`provided`) |
 | T-06 | `lz4-java` | 1.8.0 | 8 (0/3/4/1) | `spark-core` | No (`provided`) |
 | T-07 | `snappy-java` | 1.1.10.8 / 1.1.10.4 | 3 (0/2/1/0) | `spark-core`, Parquet; `hadoop-client-api` | No (`provided`) |
-| T-08 | `log4j-api`, `log4j-core`, `log4j-layout-template-json` | 2.24.3 | 7 (0/0/7/0) | Spark; `delta-storage` → Unity Catalog client | **Yes** (aligned to Spark's version) |
+| T-08 | `log4j-api`, `log4j-core`, `log4j-layout-template-json` | 2.24.3 | 7 (0/0/7/0) | Spark; `delta-spark` → `delta-storage` → Unity Catalog client | No (`provided`) since P2a.2; yes at the baseline |
 
 ## Exposure model
 
@@ -157,9 +152,9 @@ These conditions hold for every entry. If one of them changes, it is a review tr
 
 ### T-08 log4j 2.24.3: accept
 
-- **How it enters.** This is the only group on the project's own runtime classpath:
-  - `delta-storage` pulls in the Unity Catalog client libraries, which bring log4j 2.25.3;
-  - `Dependencies.log4jAlignment` pins every log4j module to Spark's 2.24.3, because that is the version that runs under `spark-submit`.
+- **How it enters.** Through Spark, and through the Unity Catalog client libraries that `delta-storage` pulls in, which ask for log4j 2.25.3.
+  - Until P2a.2 the LogStore module declared `delta-storage` at compile scope, which made this the only group on the project's own runtime classpath. ADR-0016 changed the scope to `provided` and excluded those libraries from the module.
+  - `Dependencies.log4jAlignment` pins every log4j module to Spark's 2.24.3 on the classpaths that still have it, because that is the version that runs under `spark-submit`.
 - **Exposure.** The advisories concern components this project does not configure: `XmlLayout`, `Log4j1XmlLayout`, `Rfc5424Layout`, `SocketAppender` TLS hostname verification, and the encoding of non-finite floats in `JsonTemplateLayout` and `MapMessage`. The only log4j configuration in the repository (`log4j2-test.properties`) is a console appender with a `PatternLayout`.
 - **What changes it.** P11 adds JSON logs. If they use `JsonTemplateLayout` or `MapMessage`, GHSA-w35j-pv5h-q9q9 and GHSA-qv9r-c865-cp47 become reachable, because metrics such as rates can be `NaN` or infinite. That is a review trigger.
 - **Fixed in:** 2.25.4, except `log4j-api`, which needs 2.25.5. Spark 4.2.1 ships 2.25.4.

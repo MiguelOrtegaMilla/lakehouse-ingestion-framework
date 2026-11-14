@@ -161,14 +161,14 @@
 | AD-04 | `run_id` = UUIDv7 (attempt) ≠ `batch_seq` (logical unit of data) | [0005](../adr/0005-batch-wal-and-idempotent-writes.md) |
 | AD-05 | Per-(source, layer) lease with expiry, heartbeat and epoch fencing | [0006](../adr/0006-source-leases-with-epoch-fencing.md) |
 | ~~AD-06~~ | ~~One writer per Delta table~~ — **removed (D3)** | — |
-| **AD-13** | Multi-writer Delta tables through a PostgreSQL-coordinated LogStore | [0004](../adr/0004-postgresql-coordinated-delta-logstore.md) |
+| **AD-13** | Multi-writer Delta tables through a PostgreSQL-coordinated LogStore | [0004](../adr/0004-postgresql-coordinated-delta-logstore.md) · [0015](../adr/0015-hard-link-publish-on-local-file-systems.md) (publish on `file://`) |
 | **AD-14** | Conflict classification (retry vs re-plan), Silver partitioning for concurrent `MERGE`, Silver cursor = Bronze Delta version | [0010](../adr/0010-concurrent-write-conflict-handling.md) |
 | **AD-15** | Lake storage profiles (`file://` single machine, `s3a://` multi-node/multi-cluster) and canonical table identity | [0011](../adr/0011-storage-profiles.md) |
 | AD-07 | Bronze keeps text formats as `string` + rescue column; typing happens in Silver | [0008](../adr/0008-layer-responsibilities.md) |
 | AD-08 | Bronze append · Silver `MERGE` | [0008](../adr/0008-layer-responsibilities.md) |
 | AD-09 | Deletes: `WHEN NOT MATCHED BY SOURCE` on full loads; periodic key reconciliation on incremental loads; CDC as a future option | [0009](../adr/0009-delete-detection.md) |
 | AD-10 | Tables addressed by path; no metastore (behind a `TableLocator` so a catalog can be added later) | [0011](../adr/0011-storage-profiles.md) |
-| AD-11 | sbt multi-module: `core` / `delta-pg-logstore` / `engine` / `cli` / `integration-tests` | [0012](../adr/0012-module-structure.md) |
+| AD-11 | sbt multi-module: `core` / `delta-pg-logstore` / `engine` / `cli` / `integration-tests` | [0012](../adr/0012-module-structure.md) · [0016](../adr/0016-delta-storage-provided-to-the-logstore-module.md) (the LogStore module's dependencies) |
 | **AD-16** | Application security baseline: validated SQL identifiers and no concatenated SQL, path confinement, least-privilege PostgreSQL roles, dependency scanning in CI | [0013](../adr/0013-application-security-baseline.md) |
 
 ---
@@ -410,7 +410,7 @@ Two halves: **data governance** (secrets, PII, masking, GDPR) and **application 
 | Module | Content | Depends on |
 |---|---|---|
 | `core` | Domain model, config, validation, pure planning, error classification, run state machine. **No Spark.** | cats, circe |
-| `delta-pg-logstore` | `PostgresLogStore`, its schema, commit-context API. **Standalone and reusable**: no dependency on `core` or `engine`. | `delta-storage`, Hadoop client API (provided), PostgreSQL JDBC, HikariCP |
+| `delta-pg-logstore` | `PostgresLogStore`, its schema, commit-context API. **Standalone and reusable**: no dependency on `core` or `engine`. | `delta-storage` and Hadoop client API (both provided, ADR-0016), PostgreSQL JDBC, HikariCP |
 | `engine` | Connectors, Delta writers, control-plane repositories, the engine, the conflict classifier | `core`, `delta-pg-logstore`, Spark (provided), Delta |
 | `cli` | `Main`, argument parsing, wiring, exit codes, startup enforcement | `engine` |
 | `integration-tests` | Testcontainers, e2e, fault injection, stress tests, verifier | all |
@@ -568,7 +568,7 @@ lakehouse-ingestion-framework/
 ├── scripts/                      # run-local.sh · stress-logstore.sh · demo-*.sh
 ├── docs/
 │   ├── architecture/             # this document · diagrams
-│   ├── adr/                      # 0001 … 0015
+│   ├── adr/                      # 0001 … 0016
 │   ├── setup/                    # dev-environment.md
 │   ├── spikes/                   # logstore-red.md (P1) · logstore-green.md (P2b)
 │   ├── security/                 # threat-model.md (P12)
@@ -632,7 +632,7 @@ The spike comes before the CI so that the CI starts out testing everything P1 bu
 | Part | Content | Scenarios | PR | Status |
 |---|---|---|---|---|
 | P2a.1 | What Delta 4.4.1 asks of a LogStore, pinned by a characterisation suite over a recording LogStore (`DeltaLogStoreContractSpec`): files written and their `overwrite`, the retry path, the committing thread, instance lifecycle, LogStores created in Spark tasks. ADR-0004 amended with the answers and with the decisions below. No production code. | The four P2a items of §20 | 1 | Done |
-| P2a.2 | Build: `delta-storage` as `provided`, Unity Catalog's client libraries excluded from the LogStore module, a boundary rule that keeps them out | — | 1 | |
+| P2a.2 | Build: `delta-storage` as `provided`, Unity Catalog's client libraries excluded from the LogStore module, a boundary rule that keeps them out | — | 1 | Done |
 | P2a.3 | Coordination schema: migration, its own schema version, grants per role | Denial tests (ADR-0013 §3) | 2 | |
 | P2a.4 | `CoordinationStore` trait, domain types, in-memory implementation, one contract suite for every implementation | — | 2 | |
 | P2a.5 | PostgreSQL implementation: lazy JVM-wide pool, settings and password reference, bounded timeouts, every error an `IOException` | F13; N threads, one winner | 2 | |
@@ -651,6 +651,7 @@ Decisions taken with the breakdown, recorded in ADR-0004 unless another ADR is n
 - **`s3a://` is not implemented in P2a**: the interface is, and other schemes are refused at startup (§2).
 - **One behaviour in every JVM**: a LogStore created in a Spark task that lists `_delta_log` does the coordinated read, with the password resolved by reference in that JVM (§3.9).
 - **A known limit of detection**: a foreign writer that replaces a commit after it was published (§3.5).
+- **`delta-storage` is `provided` to the LogStore module**, without Unity Catalog's client libraries ([ADR-0016](../adr/0016-delta-storage-provided-to-the-logstore-module.md)).
 - **GREEN widens the LogStore's own window**: the delay of the RED spike sits on a rename the LogStore no longer makes (§7.3).
 
 **Changes from v1:**

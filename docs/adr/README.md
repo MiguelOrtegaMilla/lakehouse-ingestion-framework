@@ -19,6 +19,7 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0013](0013-application-security-baseline.md) | Application security baseline: SQL identifiers, path confinement, least privilege, supply chain | Accepted |
 | [0014](0014-stack-versions-pinned-at-p1.md) | Stack versions pinned at P1: Spark 4.1.4, Delta 4.4.1, Scala 2.13.17, sbt 1.13.1 | Accepted |
 | [0015](0015-hard-link-publish-on-local-file-systems.md) | Commit files on `file://` are published with a hard link | Accepted |
+| [0016](0016-delta-storage-provided-to-the-logstore-module.md) | The LogStore module takes `delta-storage` as `provided`, without Unity Catalog's client libraries | Accepted |
 
 Superseded decisions:
 - *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
