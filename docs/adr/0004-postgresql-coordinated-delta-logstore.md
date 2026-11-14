@@ -97,6 +97,8 @@ coordinated_table(
 )
 ```
 
+*As built (P2a.3, 2026-11-14):* the migration `V1__coordination_schema.sql` of `delta-pg-logstore`, described in discovery §13.3. It holds the same information in a slightly different form: the entry's key is `(table_uri, version)`, a taint is a row of a `table_taint` table, and the schema version has a one-row table.
+
 ### 3.2 Write path — `write(path, actions, overwrite=false)` for commit N
 
 ```mermaid

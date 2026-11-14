@@ -39,6 +39,9 @@ final class BootstrappedPostgres private (
   def connectAsSuperuser(database: String): Connection =
     connect(BootstrappedPostgres.Superuser, database)
 
+  /** The secret of `role` in this instance, for code that opens its own connections. */
+  def password(role: String): String = passwords(role)
+
   /** Runs a command inside the container as the container user; returns trimmed stdout. */
   def exec(command: String*): String = container.execInContainer(command: _*).getStdout.trim
 

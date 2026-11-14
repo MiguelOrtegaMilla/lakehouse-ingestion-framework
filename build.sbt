@@ -101,7 +101,7 @@ lazy val integrationTests = module("integration-tests", artifact = "integration-
       deltaSparkTest,
       log4jSlf4j,
       log4jCore
-    ),
+    ) ++ flywayTest,
     // The suites use repository files (compose file, init scripts) through this path.
     Test / javaOptions += s"-Drepo.root=${(LocalRootProject / baseDirectory).value}"
   )
