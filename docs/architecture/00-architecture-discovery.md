@@ -648,9 +648,11 @@ The spike comes before the CI so that the CI starts out testing everything P1 bu
 | P2a.8 | Write path: prepare, `INSERT`, publish, acknowledge; registration at version 0; fault hooks, selectable from configuration | F1, F5, F6, F9, F12, F15, F16 | 4 | |
 | P2a.9 | Read path and recovery; first Delta smoke test on the LogStore | F2, F3, F4, F7, F8, F14, F17 | 4 | |
 | P2a.10 | Uncoordinated-writer detection: gap and publish race → `TAINTED` | F10, F11 | 5 | |
-| P2a.11 | Operator operations (adopt, re-adopt, registry reset, temp GC) and the configuration guard (layer 1) | The rest of F1 and F9 | 5 | |
+| P2a.11 | Operator operations (adopt, re-adopt, registry reset, temp GC) and the configuration guard (layer 1). The grant re-adoption needs, maintenance updating `registered_version`, arrives as migration V2. | The rest of F1 and F9 | 5 | |
 | P2a.12 | Attribution: `CommitContext`, `writer_instance`, contention counter | — | 5 | |
 | P2a.13 | Delta end to end on the LogStore (idempotent append, `MERGE`, `OPTIMIZE`, checkpoint, `VACUUM`); scenario ↔ test matrix; README; review | F1–F17 green in CI | 6 | |
+
+**Migrations are append-only:** one that has reached `main` is never edited; a change is a new version.
 
 Decisions taken with the breakdown, recorded in ADR-0004 unless another ADR is named:
 - **Publish on `file://` with a hard link**, outside Hadoop's checksummed file system: atomic, exclusive, and no `.crc` sidecar ([ADR-0015](../adr/0015-hard-link-publish-on-local-file-systems.md), which supersedes the publish of ADR-0004 §3.4).
