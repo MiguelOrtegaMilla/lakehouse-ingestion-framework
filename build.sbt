@@ -54,7 +54,7 @@ lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
       forbidden = Seq(Forbid.spark, Forbid.deltaSpark, Forbid.unityCatalog, Forbid.log4j),
       allowProjectDependencies = false
     ),
-    libraryDependencies ++= Seq(deltaStorage, hadoopClientApi)
+    libraryDependencies ++= Seq(deltaStorage, hadoopClientApi, scalatest)
   )
 
 /** Connectors, writers, control-plane repositories, engine service. */
@@ -83,7 +83,9 @@ addCommandAlias("stress", "integration-tests/Stress/test")
 
 /** Testcontainers, end-to-end, fault injection, stress harness and verifier. Never published. */
 lazy val integrationTests = module("integration-tests", artifact = "integration-tests")
-  .dependsOn(core, deltaPgLogstore, engine, cli)
+  // `test->test`: the LogStore module's contract suites and test doubles are reused here against
+  // real services.
+  .dependsOn(core, deltaPgLogstore % "compile->compile;test->test", engine, cli)
   .configs(Stress)
   .settings(SparkTestJvm.settings)
   .settings(inConfig(Stress)(Defaults.testTasks))

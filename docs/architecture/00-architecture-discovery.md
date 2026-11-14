@@ -641,7 +641,7 @@ The spike comes before the CI so that the CI starts out testing everything P1 bu
 | P2a.1 | What Delta 4.4.1 asks of a LogStore, pinned by a characterisation suite over a recording LogStore (`DeltaLogStoreContractSpec`): files written and their `overwrite`, the retry path, the committing thread, instance lifecycle, LogStores created in Spark tasks. ADR-0004 amended with the answers and with the decisions below. No production code. | The four P2a items of §20 | 1 | Done |
 | P2a.2 | Build: `delta-storage` as `provided`, Unity Catalog's client libraries excluded from the LogStore module, a boundary rule that keeps them out | — | 1 | Done |
 | P2a.3 | Coordination schema: migration, its own schema version, grants per role | Denial tests (ADR-0013 §3) | 2 | Done |
-| P2a.4 | `CoordinationStore` trait, domain types, in-memory implementation, one contract suite for every implementation | — | 2 | |
+| P2a.4 | `CoordinationStore` trait, domain types, in-memory implementation, one contract suite for every implementation | — | 2 | Done |
 | P2a.5 | PostgreSQL implementation: lazy JVM-wide pool, settings and password reference, bounded timeouts, every error an `IOException` | F13; N threads, one winner | 2 | |
 | P2a.6 | Canonical table identity: one function from any spelling of a table path to its coordination key | Spellings, symlinks | 3 | |
 | P2a.7 | Log file I/O on `file://`: durable temp file, hard-link publish, atomic replace, no sidecars | No partial file; both readers clean | 3 | |
