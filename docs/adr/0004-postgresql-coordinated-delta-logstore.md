@@ -7,7 +7,7 @@
 | **Supersedes** | AD-06 of discovery v1 ("one writer per Delta table") |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
-| **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. Those passages keep their original text and point to it. |
+| **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
 | **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. Each change is dated in place and says what the text said before. |
 
 ---
@@ -125,13 +125,9 @@ sequenceDiagram
 
 - **Durability point:** the committed `INSERT`. From then on version N belongs to this writer, even if it crashes. Any later reader or writer finishes publishing it.
 - **A taken version** is reported with `java.nio.file.FileAlreadyExistsException`. It is the only exception Delta answers with a conflict check and a retry at the next version. Hadoop's exception of the same name just fails the commit (§8, item 2).
-- **Errors after the `INSERT`** *(amended in P2a, 2026-11-14)*:
-  - Delta reads the status of `N.json` as soon as `write` returns (§8, item 2). A `write` that returns before the file is visible therefore fails the transaction with a `FileNotFoundException`, although the commit is durable. Swallowing a publish error produces exactly that.
-  - So a failed publish is retried inside `write`, a bounded number of times. If `N.json` is still not visible, `write` throws a dedicated `IOException` that says what happened: version N is committed and its publication is pending. The next reader or writer publishes it (F16).
-  - The caller cannot tell that case from a failed commit by the exception alone, so it must not replay blindly. The engine never does: before replaying a batch it reads the table's `txn` version (ADR-0005).
-  - A failed acknowledgement is still logged and swallowed. `N.json` is visible, so the commit is complete for Delta, and recovery marks the entry.
-  - **Fatal integrity errors are never swallowed** (deviation 4).
-  - *Before:* "transient errors in publish/ack are logged and swallowed, as in the base class, because the commit is already durable and recovery will finish it."
+- **Errors after the `INSERT`:** transient errors in publish/ack are logged and swallowed, as in the base class, because the commit is already durable and recovery will finish it. **Fatal integrity errors are never swallowed** (deviation 4).
+
+  > **Superseded for a failed publish by [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md)** (2026-11-14): it is retried and then reported with a dedicated exception, because Delta reads `N.json` as soon as `write` returns (§8, item 2). A failed acknowledgement is still swallowed.
 - **An `INSERT` whose outcome is unknown** *(added in P2a, 2026-11-14)*. If the connection drops during the statement, the entry may or may not exist. The `INSERT` is therefore repeatable:
   - it is an `INSERT … ON CONFLICT DO NOTHING`, followed by a read of the entry;
   - the writer compares the entry's `temp_path` with its own, which contains a UUID only this attempt knows;
@@ -265,7 +261,7 @@ Why 4: a thread uses one connection for one short statement at a time, so a JVM 
 | 1 | Reused by **inheritance**; ships in `delta-storage-s3-dynamodb` (pulls in the AWS SDK) | **Ported** into a class extending `HadoopFileSystemLogStore` (`delta-storage`, already on the classpath) | Deviations 4 and 5 sit inside the private flow of `write()`, which a subclass cannot change. Avoids AWS dependencies. |
 | 2 | Publish = streaming copy `fs.create(dst, overwrite=false)` + `IOUtils.copy` | `file://`: copy to a second temp + `rename` *(superseded by ADR-0015: a hard link)*; `s3a://`: copy | The streaming copy is atomic only on object stores. On POSIX a concurrent reader could see a partial `N.json`, which violates property 1. |
 | 3 | `isPartialWriteVisible` always `false` | `true` on `file://`, `false` on `s3a://` | So that Delta writes checkpoints via temp + rename on POSIX |
-| 4 | After `putExternalEntry`, **every** `Throwable` from publish/ack is logged and ignored — including a `FileAlreadyExistsException` caused by a foreign `N.json` | A content mismatch with an existing `N.json` is **fatal** + taint. A failed ack is ignored (recovery will finish). A failed publish is retried and then reported with a dedicated exception (§3.2; *before P2a:* ignored). | Otherwise, with a foreign writer, our commit is lost silently while Delta believes it succeeded. And Delta 4.4 reads `N.json` as soon as `write` returns, so an ignored publish error fails the transaction anyway, with a misleading `FileNotFoundException`. |
+| 4 | After `putExternalEntry`, **every** `Throwable` from publish/ack is logged and ignored — including a `FileAlreadyExistsException` caused by a foreign `N.json` | Transient errors ignored (recovery will finish) *(superseded for a failed publish by ADR-0017: retried, then reported)*. A content mismatch with an existing `N.json` is **fatal** + taint. | Otherwise, with a foreign writer, our commit is lost silently while Delta believes it succeeded |
 | 5 | No detection of uncoordinated commits: a missing entry for N-1 falls back to `fs.exists(N-1.json)` | Registry + gap detection + `TAINTED` state | Safeguard requirement |
 | 6 | Complete entries expire (DynamoDB TTL, default 1 day) | Kept (commit audit trail). Optional pruning keeps the latest entry per table and anything younger than ≥ 1 day. | PostgreSQL storage is cheap. Entries serve lineage. The 1-day floor keeps the base class's safety argument. |
 | 7 | `expireTime` computed with the client clock | PostgreSQL `now()` | Clock skew across nodes and clusters |
@@ -331,7 +327,7 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 | F13 | Coordination schema missing or wrong version at init | LogStore init fails; engine exits 4 |
 | F14 | Latest complete entry > latest listed `N.json` | Read fails closed |
 | F15 | Connection lost during the `INSERT`: its outcome is unknown | The repeated `INSERT` and the `temp_path` comparison settle it (§3.2): the writer owns N and publishes it, or gets `FileAlreadyExistsException`. Never two owners, never an owner that believes it lost. If PostgreSQL stays down: `IOException`, and a later reader publishes N if the entry landed. |
-| F16 | Publish fails after the `INSERT`, without a crash (storage error) | Retried; then a dedicated `IOException` ("committed, publication pending"), never a normal return. The first `listFrom` publishes N. |
+| F16 | Publish fails after the `INSERT`, without a crash (storage error) | Retried; then a dedicated `IOException` ("committed, publication pending"), never a normal return (ADR-0017). The first `listFrom` publishes N. |
 | F17 | Incomplete entry whose `T(N)` no longer exists | Recovery cannot publish. Reads and writes fail closed with an error that names the entry; nothing is published and the entry stays incomplete, for an operator to resolve. |
 
 *F15–F17 were added in P2a (2026-11-14), from the review of Delta 4.4.1's commit path (§8). The suite is F1–F17.*
@@ -395,7 +391,7 @@ Items 1–4 were closed in P2a.1 (2026-11-14) by reading Delta at tag `v4.4.1`. 
 
 - `doCommitRetryIteratively` catches `java.nio.file.FileAlreadyExistsException` from `LogStore.write`. It then lists the log for the winning commits (through `listFrom`, on the committing thread), checks each for a logical conflict, and retries at the next free version. A conflict fails the transaction instead (for example `MetadataChangedException`).
 - Hadoop's `org.apache.hadoop.fs.FileAlreadyExistsException` is not caught: the commit fails with it. The exception type is part of the contract.
-- **Found here:** as soon as `write` returns, Delta reads the file status of `N.json` (`FileSystemBasedCommitCoordinatorClient.commit`). A LogStore that returns before the file is visible fails the transaction with a `FileNotFoundException`. This changed §3.2 and deviation 4, and added F16.
+- **Found here:** as soon as `write` returns, Delta reads the file status of `N.json` (`FileSystemBasedCommitCoordinatorClient.commit`). A LogStore that returns before the file is visible fails the transaction with a `FileNotFoundException`. It led to [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) and to F16.
 
 ### Item 3 — The commit runs on the caller's thread
 
