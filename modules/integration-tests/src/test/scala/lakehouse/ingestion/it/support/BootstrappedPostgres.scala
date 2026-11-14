@@ -10,7 +10,7 @@ import scala.util.Using
 
 import com.github.dockerjava.api.command.CreateContainerCmd
 import com.github.dockerjava.api.model.Capability
-import org.testcontainers.containers.GenericContainer
+import org.testcontainers.containers.{GenericContainer, Network}
 import org.testcontainers.containers.wait.strategy.Wait
 import org.testcontainers.utility.{DockerImageName, MountableFile}
 
@@ -45,6 +45,25 @@ final class BootstrappedPostgres private (
   /** Runs a command inside the container as the container user; returns trimmed stdout. */
   def exec(command: String*): String = container.execInContainer(command: _*).getStdout.trim
 
+  /**
+   * Freezes every process of the server, as `docker pause` does: connections stay open, and
+   * nothing answers.
+   */
+  def pause(): Unit = docker.pauseContainerCmd(container.getContainerId).exec(): Unit
+
+  def unpause(): Unit = docker.unpauseContainerCmd(container.getContainerId).exec(): Unit
+
+  /** Shuts the server down, as `docker stop` does. The container and its data stay. */
+  def halt(): Unit = docker.stopContainerCmd(container.getContainerId).exec(): Unit
+
+  /**
+   * Starts a halted server again. It returns before the server accepts connections, and the
+   * port published on the host may have changed: `jdbcUrl` is only good until the first `halt`.
+   */
+  def restart(): Unit = docker.startContainerCmd(container.getContainerId).exec(): Unit
+
+  private def docker = container.getDockerClient
+
   def stop(): Unit = container.stop()
 }
 
@@ -62,7 +81,11 @@ object BootstrappedPostgres {
       "sales_ro"
     )
 
-  private val Port = 5432
+  /** The server's port inside its container and on a Docker network. */
+  val Port = 5432
+
+  /** The server's host name on the Docker network it is started in, if any. */
+  val NetworkAlias = "postgres"
   private val InitDir = "/docker-entrypoint-initdb.d"
   private val SuperuserSecret = "pg_superuser"
   // Mode 0644: the container runs as uid 999, the files are copied in as root.
@@ -70,7 +93,8 @@ object BootstrappedPostgres {
 
   final class Container(image: DockerImageName) extends GenericContainer[Container](image)
 
-  def start(): BootstrappedPostgres = {
+  /** @param network a Docker network to join, where other containers reach it as `NetworkAlias` */
+  def start(network: Option[Network] = None): BootstrappedPostgres = {
     val root = repoRoot()
     val passwords = (RuntimeRoles :+ Superuser).map(_ -> randomPassword()).toMap
 
@@ -102,6 +126,7 @@ object BootstrappedPostgres {
       )
     }
 
+    network.foreach(n => container.withNetwork(n).withNetworkAliases(NetworkAlias))
     container.start()
     new BootstrappedPostgres(container, passwords)
   }

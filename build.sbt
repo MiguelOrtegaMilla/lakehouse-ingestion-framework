@@ -54,7 +54,7 @@ lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
       forbidden = Seq(Forbid.spark, Forbid.deltaSpark, Forbid.unityCatalog, Forbid.log4j),
       allowProjectDependencies = false
     ),
-    libraryDependencies ++= Seq(deltaStorage, hadoopClientApi, scalatest)
+    libraryDependencies ++= Seq(deltaStorage, hadoopClientApi, postgresJdbc, hikari, scalatest)
   )
 
 /** Connectors, writers, control-plane repositories, engine service. */
@@ -98,6 +98,7 @@ lazy val integrationTests = module("integration-tests", artifact = "integration-
     libraryDependencies ++= Seq(
       scalatest,
       testcontainers,
+      testcontainersToxiproxy,
       postgresJdbc % Test,
       sparkSqlTest,
       deltaSparkTest,
