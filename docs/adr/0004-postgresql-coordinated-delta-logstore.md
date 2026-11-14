@@ -6,7 +6,8 @@
 | **Risk** | ⚠️ **Highest-risk component of the project** (R0). A defect here corrupts tables. |
 | **Supersedes** | AD-06 of discovery v1 ("one writer per Delta table") |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
-| **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. |
+| **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.4, §3.5, §3.8, §3.9 (new), §4, §6, §7. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -20,7 +21,7 @@ The `LogStore` Javadoc (`@since 1.0.0`, a `DeveloperApi`) makes Delta's ACID gua
 2. **Mutual exclusion**: only one writer can create (or rename) a file at the final destination.
 3. **Consistent listing**: once a file is written in a directory, every later listing returns it.
 
-A commit is the creation of `_delta_log/<N>.json` (N zero-padded to 20 digits). Delta's `OptimisticTransaction` relies on property 2. When `write(N.json, overwrite=false)` throws `FileAlreadyExistsException`, it checks the winning commit for logical conflicts and retries at N+1 if there are none. This retry path is to be confirmed in 4.4 code during P2 (§20 of the discovery).
+A commit is the creation of `_delta_log/<N>.json` (N zero-padded to 20 digits). Delta's `OptimisticTransaction` relies on property 2. When `write(N.json, overwrite=false)` throws `FileAlreadyExistsException`, it checks the winning commit for logical conflicts and retries at N+1 if there are none. Confirmed for 4.4.1 in P2a.1 (§8, item 2).
 
 ### 1.2 Why the defaults are insufficient
 
@@ -57,6 +58,11 @@ spark.delta.logStore.s3a.impl=<basePackage>.logstore.PostgresLogStore
 ```
 
 It follows the **prepare → commit → acknowledge** protocol of Delta's `BaseExternalLogStore`. That protocol is production-proven through `S3DynamoDBLogStore`; the implementation here is a **port with ten justified deviations** (§4), not a subclass. It lives in its own module, `delta-pg-logstore`, with no dependency on the rest of the project (ADR-0012), and it owns the PostgreSQL schema `delta_coordination`.
+
+**Schemes implemented** *(decided in P2a, 2026-11-14)*. The protocol is the same for every scheme; only the publish step differs (§3.4), and it sits behind an interface.
+- P2a implements and tests it for `file://`.
+- The `s3a://` implementation arrives in E1, where MinIO exists to test it. Correctness-critical code does not ship untested.
+- Until then the LogStore refuses every scheme but `file` at startup (fail closed, §3.5 layer 1).
 
 ---
 
@@ -107,7 +113,7 @@ sequenceDiagram
   else no E(N-1) and N-1 > registered_version and N-1.json exists
     W->>PG: TAINT table (uncoordinated commit N-1) · fail closed
   end
-  W->>FS: write T(N) = _delta_log/.tmp/N.json.<uuid> (fully, close)
+  W->>FS: write T(N) = _delta_log/.tmp/N.json.<uuid> (fully, forced to disk, closed)
   W->>PG: INSERT E(N, T(N), complete=false)  ◀── linearisation point
   alt unique violation
     W-->>W: throw FileAlreadyExistsException (Delta checks conflicts, retries at N+1)
@@ -116,8 +122,21 @@ sequenceDiagram
   W->>PG: UPDATE E(N) SET complete=true, completed_at=now() WHERE temp_path=T(N)
 ```
 
-- **Durability point:** the committed `INSERT`. From then on version N belongs to this writer, even if it crashes. Any later reader or writer finishes publishing it.
-- **Errors after the `INSERT`:** transient errors in publish/ack are logged and swallowed, as in the base class, because the commit is already durable and recovery will finish it. **Fatal integrity errors are never swallowed** (deviation 4).
+- **Durability point:** the committed `INSERT`. From then on version N belongs to this writer, even if it crashes. Any later reader or writer finishes publishing it. `T(N)` is forced to disk before the `INSERT`, so an entry never points at a file the storage could still lose.
+- **A taken version** is reported with `java.nio.file.FileAlreadyExistsException`. It is the only exception Delta answers with a conflict check and a retry at the next version. Hadoop's exception of the same name just fails the commit (§8, item 2).
+- **Errors after the `INSERT`** *(amended in P2a, 2026-11-14)*:
+  - Delta reads the status of `N.json` as soon as `write` returns (§8, item 2). A `write` that returns before the file is visible therefore fails the transaction with a `FileNotFoundException`, although the commit is durable. Swallowing a publish error produces exactly that.
+  - So a failed publish is retried inside `write`, a bounded number of times. If `N.json` is still not visible, `write` throws a dedicated `IOException` that says what happened: version N is committed and its publication is pending. The next reader or writer publishes it (F16).
+  - The caller cannot tell that case from a failed commit by the exception alone, so it must not replay blindly. The engine never does: before replaying a batch it reads the table's `txn` version (ADR-0005).
+  - A failed acknowledgement is still logged and swallowed. `N.json` is visible, so the commit is complete for Delta, and recovery marks the entry.
+  - **Fatal integrity errors are never swallowed** (deviation 4).
+  - *Before:* "transient errors in publish/ack are logged and swallowed, as in the base class, because the commit is already durable and recovery will finish it."
+- **An `INSERT` whose outcome is unknown** *(added in P2a, 2026-11-14)*. If the connection drops during the statement, the entry may or may not exist. The `INSERT` is therefore repeatable:
+  - it is an `INSERT … ON CONFLICT DO NOTHING`, followed by a read of the entry;
+  - the writer compares the entry's `temp_path` with its own, which contains a UUID only this attempt knows;
+  - its own path means the version is its own, whichever attempt inserted the row; another path means the version is taken.
+
+  If PostgreSQL stays unreachable, `write` fails with an `IOException`. A later reader publishes the commit if the entry did land (F15).
 
 ### 3.3 Read path — `listFrom(path)` on `_delta_log`
 
@@ -134,11 +153,30 @@ sequenceDiagram
 | Scheme | How `N.json` is published | Why it gives atomic visibility |
 |---|---|---|
 | `s3a://` (S3, MinIO) | Server-side copy / PUT of `T(N)`'s bytes to `N.json` | An object becomes visible only when complete |
-| `file://` (POSIX) | Copy `T(N)` → `.tmp/N.json.<uuid>.pub`, then `rename` to `N.json` | `rename(2)` is atomic. It may *replace* an existing file, but that is harmless: exclusivity comes from PostgreSQL, and concurrent recoverers publish identical bytes. |
+| `file://` (POSIX) | Hard link `N.json` → `T(N)`, with `java.nio` (`Files.createLink`), not through Hadoop | `link(2)` is one system call. The name appears with the complete file behind it, and the call fails if `N.json` already exists. `rename(2)` gives the first property and not the second. |
 
-**`.crc` sidecars on `file://`** *(added in P1.4d)*. Hadoop's checksummed local file system (`LocalFs` behind a `FileContext`, `LocalFileSystem` behind a `FileSystem`) writes a `.<name>.crc` sidecar next to every file it creates. A rename moves the file first and then its sidecar, in a second step that does not overwrite. So publishing through it is two renames, not one. With identical bytes the sidecars are identical too. Still, a crash between the two steps leaves `N.json` without its sidecar and a stray temporary sidecar behind. A foreign writer's `N.json` leaves a sidecar that no longer matches. Every checksum-verifying reader then fails on that file, which is what the RED spike observed (§7.3). Whether the publish goes through the raw local file system, so that commit files have no sidecar, and how F3 and F11 cover sidecars, is decided in P2a (§8).
+**Why a hard link** *(decided in P2a, 2026-11-14; closes the open item of §8)*. The row above said: "Copy `T(N)` → `.tmp/N.json.<uuid>.pub`, then `rename` to `N.json`", on the grounds that replacing an existing file is harmless because exclusivity comes from PostgreSQL. That holds between coordinated writers. It does not hold against a foreign one:
+- **Publish race (layer 4, F11).** A rename would replace a foreign writer's `N.json` and destroy the evidence. Checking first leaves a window between the check and the rename. The link makes it one atomic test. "Already exists" leads to a comparison with `T(N)`: equal bytes mean another recoverer published the same commit; different bytes are `UncoordinatedWriteDetected`.
+- **No second step.** There is no state between unpublished and published, so F3 has no middle to crash in, and no second temporary file to collect.
+- **No silent fallback.** Hadoop's `RawLocalFileSystem.rename` copies the file when the rename fails, and a copy is not atomic. `Files.createLink` fails instead.
+- **Two names, one file.** `T(N)` and `N.json` are the same file until the temp GC removes the first name. The commit's modification time is the time `T(N)` was written. That precedes its `INSERT`, which precedes the writing of `T(N+1)`, so modification times stay ordered by version.
+- **Requirement.** The file system must support hard links: ext4, XFS and NFS do; some FUSE and Windows-mounted file systems do not. Startup probes the lake root and refuses to run without them (§3.5 layer 1).
+- **Durability.** `T(N)` is forced to disk before the `INSERT`, and the `_delta_log` directory after the link.
 
-`isPartialWriteVisible` returns `true` for `file://` and `false` for `s3a://`. Delta uses it to decide whether checkpoints must be written via temp + rename.
+**`.crc` sidecars on `file://`** *(added in P1.4d)*. Hadoop's checksummed local file system (`LocalFs` behind a `FileContext`, `LocalFileSystem` behind a `FileSystem`) writes a `.<name>.crc` sidecar next to every file it creates. A rename moves the file first and then its sidecar, in a second step that does not overwrite. So publishing through it is two renames, not one. With identical bytes the sidecars are identical too. Still, a crash between the two steps leaves `N.json` without its sidecar and a stray temporary sidecar behind. A foreign writer's `N.json` leaves a sidecar that no longer matches. Every checksum-verifying reader then fails on that file, which is what the RED spike observed (§7.3).
+
+**Coordinated commit files have no sidecar** *(decided in P2a, 2026-11-14)*. `T(N)` is written and linked without Hadoop's checksummed file system, so neither name gets one.
+- Hadoop reads a file without a sidecar unchecked and without an error (`ChecksumFileSystem.ChecksumFSInputChecker`, Hadoop 3.4.2). Both kinds of reader, with and without checksums, read the table.
+- What is given up is Hadoop's CRC check of commit files on a local disk. Object stores never had it.
+- F3 asserts, at every crash point, that there is no partial `N.json` and no sidecar.
+- F11 asserts that the foreign `N.json` and its sidecar are left as found. They still match each other, so the table stays readable for forensics.
+- A `.N.json.crc` next to a commit this LogStore published can only come from a foreign writer. How it is handled is fixed with the implementation (P2a.7).
+
+`isPartialWriteVisible` returns `true` for `file://` and `false` for `s3a://`. Delta uses it to decide whether checkpoints must be written via temp + rename. Answering `true` has two more effects, found in P2a.1 (§8, items 1 and 4):
+- files that are not commits reach `write` with `overwrite=false` (a V2 checkpoint in JSON). They need an atomic write, and no coordination entry (deviation 9);
+- Delta holds its per-`DeltaLog` lock around each commit, so threads of one JVM never contend inside the LogStore for the same table.
+
+Writes with `overwrite=true` (`_last_checkpoint`, `_last_vacuum_info`) must be atomic on `file://` too: a temporary file, then a rename that replaces.
 
 ### 3.5 Fail closed and safeguards
 
@@ -148,11 +186,21 @@ sequenceDiagram
 
 | Layer | Mechanism | Catches |
 |---|---|---|
-| 1 — Startup enforcement (`cli`) | The engine refuses to start (exit 4) unless `spark.delta.logStore.<scheme>.impl` is `PostgresLogStore` for every scheme of the active lake profile, the coordination schema version matches, and a probe on the lake root resolves to this LogStore | Our own processes misconfigured: the realistic risk |
+| 1 — Startup enforcement (`cli`) | The engine refuses to start (exit 4) unless `spark.delta.logStore.<scheme>.impl` is `PostgresLogStore` for every scheme of the active lake profile, the coordination schema version matches, and a probe on the lake root resolves to this LogStore. *(P2a)* Also unless the scheme is one this LogStore implements (§2) and, on `file://`, the lake root supports hard links (§3.4). | Our own processes misconfigured: the realistic risk |
 | 2 — Table registry | A table is registered at creation (version 0 through this LogStore) or explicitly adopted (`adopt-table` at its current version, recording `metaData.id`). Commits to unregistered `table_uri`s are rejected. | Aliased paths (§3.6); tables created outside the framework |
 | 3 — Gap detection | A published `N.json` above `registered_version` without an entry → `TAINTED`; writes refused until an operator verifies and re-adopts (runbook) | A foreign writer's commit |
 | 4 — Publish-race detection | If `N.json` already exists when publishing our entry and its bytes differ from `T(N)` → fatal `UncoordinatedWriteDetected`, `TAINTED` | A foreign writer racing our own commit N, which the base class would lose silently |
 | — Limit | *Preventing* an arbitrary external writer needs storage access control (only the service identity may write `_delta_log/`), or protocol-level blocking (`catalogManaged`, §5) | Documented as **Enterprise** |
+
+**A foreign commit that detection misses** *(added in P2a, 2026-11-14)*. Layers 3 and 4 do not catch every foreign write:
+- A foreign writer checks that `N.json` does not exist, then we publish `N.json`, then it renames its own file over ours. A rename replaces.
+- Version N has an entry, so layer 3 sees no gap. Layer 4 compares only at the moment we publish, and that moment has passed.
+- Our commit is lost, its writer was told it succeeded, and the log looks healthy. This is the lost commit of the RED spike, with one writer of each kind.
+- The table is tainted only when that writer commits again: its next version has no entry.
+- The window is the same few microseconds as the spike's natural race, and it needs a process that runs without this LogStore, which layer 1 exists to prevent.
+- `T(N)` keeps the lost commit's bytes until the temp GC, so an operator can compare them with `N.json`. Nothing compares them automatically.
+
+Closing it would take a check of every published commit against its entry, or the storage access control above. It is recorded as a known limit.
 
 ### 3.6 Canonical table identity
 
@@ -165,7 +213,7 @@ Mutual exclusion holds only if every writer maps the same table to the **same ke
 
 ### 3.7 Attribution (commit context)
 
-The engine wraps each Delta write in `CommitContext.withRun(runId) { … }`, a thread-local API exposed by the LogStore module. The LogStore stores `run_id` on the entry and increments a per-run `commit_contention` counter each time the `INSERT` hits a unique violation. This relies on the commit executing on the caller's thread, which is verified in P2. If it does not hold, `run_id` is recovered from the commit's `userMetadata` instead. Attribution is **best effort** and never fails a commit.
+The engine wraps each Delta write in `CommitContext.withRun(runId) { … }`, a thread-local API exposed by the LogStore module. The LogStore stores `run_id` on the entry and increments a per-run `commit_contention` counter each time the `INSERT` hits a unique violation. This relies on the commit executing on the caller's thread. P2a.1 verified it for appends with a `txnAppId`, `MERGE`, `DELETE` and `OPTIMIZE` (§8, item 3), so the `userMetadata` fallback is not needed. Attribution is **best effort** and never fails a commit.
 
 ### 3.8 Recovery semantics summary
 
@@ -174,11 +222,49 @@ The engine wraps each Delta write in `CommitContext.withRun(runId) { … }`, a t
 | Before `T(N)` is closed | Partial temp file, no entry | Nobody; temp GC | Commit N never happened; the Delta txn failed |
 | After `T(N)`, before `INSERT` | Orphan temp | Temp GC | Same as above |
 | After `INSERT`, before publish | Entry incomplete, no `N.json` | Next `listFrom` (any reader) or the writer of N+1 | **Commit N is durable** and becomes visible |
-| During publish (`file://`) | Entry incomplete, `.pub` temp, no `N.json` | Same | Published atomically by the recoverer |
+| During publish (`file://`) | The link is one system call: either the row above or the row below. *(P2a; before: "Entry incomplete, `.pub` temp, no `N.json`")* | Same | Published atomically by the recoverer |
 | After publish, before ack | Entry incomplete, `N.json` present | Same (identical bytes → mark complete) | Complete |
 | After ack | Entry complete | — | Complete |
+| Any, and `T(N)` is later lost *(P2a, F17)* | Entry incomplete, no `T(N)`, no `N.json` | Nobody can: the bytes are gone | Reads and writes fail closed, naming the entry, until an operator resolves it |
 
 Temp GC deletes `.tmp/` files whose entry is complete, or that have no entry and are older than a safety window. It runs only in maintenance mode, never on the commit path.
+
+### 3.9 Instances, configuration and connections *(added in P2a.1, 2026-11-14)*
+
+Delta, not this project, creates the LogStore instances (§8, item 4):
+- one per `DeltaLog`, that is per table, and per scheme;
+- a new one whenever a `DeltaLog` is rebuilt, for example after its cache entry expires (60 minutes without use);
+- more inside Spark tasks, for some commands (table below);
+- always by reflection, through the constructor that takes one Hadoop `Configuration`;
+- never closed: the `LogStore` API has no lifecycle method.
+
+**Consequences for the design**
+
+| Aspect | Decision |
+|---|---|
+| Constructor | Keeps the configuration and nothing else: no connection, no I/O. It runs often, and in tasks that never need PostgreSQL. |
+| Connection pool | One per JVM and per (JDBC URL, user), shared by every instance, created by the first operation that needs PostgreSQL. |
+| Settings | Carried in the Hadoop configuration, set as `spark.hadoop.*` when the application starts. Delta hands that configuration to the constructor and to every call, on the driver and in tasks. They are the JDBC URL, the user, the password reference, the pool size and the timeouts. The key names are fixed in P2a.5. |
+| Password | By reference only, in the syntax of ADR-0007: `env:NAME` or `file:/path`. The JVM that opens the pool resolves it. The value never enters the Spark or Hadoop configuration, which Spark sends to executors and lists in its UI. |
+| Pool size | At most 4 connections (configurable), no idle minimum, idle connections closed after about a minute. The same in every JVM. |
+
+Why 4: a thread uses one connection for one short statement at a time, so a JVM needs as many as the tables it commits to or refreshes at once. An idle JVM holds none. The budget to respect is `JVMs that reach PostgreSQL × pool maximum`, below PostgreSQL's `max_connections` minus what the control plane and the sources use. The largest planned run, 8 stress writers in CI, takes 32 of the default 100.
+
+**LogStores created in Spark tasks.** In local mode a task is a thread of the driver JVM. In a cluster it runs on an executor, in another process and usually on another machine. Delta's classic connector creates a LogStore inside a task in four places. The first three are pinned by `DeltaLogStoreContractSpec`; the project never generates symlink manifests.
+
+| Command | What the task calls | Needs PostgreSQL |
+|---|---|---|
+| `VACUUM` | `listFrom` on the table directory and its partition directories. Hidden directories, `_delta_log` among them, are skipped. | No |
+| `DESCRIBE HISTORY` | `read` of commit files | No |
+| Resolving a timestamp to a version (time travel by timestamp) over a history longer than twice `spark.databricks.delta.history.maxKeysPerList`: 2000 commits by default | `listFrom` on `_delta_log` | **Yes** |
+| Generating a symlink manifest | `write` of manifest files with `overwrite=true`, outside `_delta_log` | No |
+
+**Decision: one behaviour in every JVM.** `listFrom` on a `_delta_log` path is the coordinated read of §3.3, wherever it runs. There is no executor mode.
+- **Why not skip coordination in tasks.** The module cannot see Spark (ADR-0012), so it has no reliable way to tell an executor from a driver, and in local mode they are one JVM. Two behaviours behind one method is also how a read path ends up without its consistency check.
+- **Who connects.** Commits always run on the driver, on the caller's thread. A call that does not touch `_delta_log` never opens the pool. So an executor connects only for the timestamp search above, with the pool described in the first table.
+- **Credentials on executors.** The reference travels in the configuration; each executor resolves it in its own JVM. In a cluster the secret file is therefore mounted at the same path on every worker, or the variable is set in every worker's environment (E1 documents the mount).
+- **If a worker cannot resolve the reference or reach PostgreSQL,** the task fails with an `IOException` that names the reference, never its value. It never falls back to a plain listing (fail closed, §3.5).
+- **The engine does not use that path.** Silver follows Bronze by version, not by timestamp (discovery §17, P10). A deployment that wants to keep the search on the driver can raise `maxKeysPerList`.
 
 ---
 
@@ -187,9 +273,9 @@ Temp GC deletes `.tmp/` files whose entry is complete, or that have no entry and
 | # | Base class behaviour (v4.4.0) | `PostgresLogStore` | Reason |
 |---|---|---|---|
 | 1 | Reused by **inheritance**; ships in `delta-storage-s3-dynamodb` (pulls in the AWS SDK) | **Ported** into a class extending `HadoopFileSystemLogStore` (`delta-storage`, already on the classpath) | Deviations 4 and 5 sit inside the private flow of `write()`, which a subclass cannot change. Avoids AWS dependencies. |
-| 2 | Publish = streaming copy `fs.create(dst, overwrite=false)` + `IOUtils.copy` | `file://`: copy to a second temp + `rename`; `s3a://`: copy | The streaming copy is atomic only on object stores. On POSIX a concurrent reader could see a partial `N.json`, which violates property 1. |
+| 2 | Publish = streaming copy `fs.create(dst, overwrite=false)` + `IOUtils.copy` | `file://`: hard link, which fails if `N.json` exists (§3.4; *before P2a:* copy to a second temp + `rename`); `s3a://`: copy | The streaming copy is atomic only on object stores. On POSIX a concurrent reader could see a partial `N.json`, which violates property 1. |
 | 3 | `isPartialWriteVisible` always `false` | `true` on `file://`, `false` on `s3a://` | So that Delta writes checkpoints via temp + rename on POSIX |
-| 4 | After `putExternalEntry`, **every** `Throwable` from publish/ack is logged and ignored — including a `FileAlreadyExistsException` caused by a foreign `N.json` | Transient errors ignored (recovery will finish). A content mismatch with an existing `N.json` is **fatal** + taint. | Otherwise, with a foreign writer, our commit is lost silently while Delta believes it succeeded |
+| 4 | After `putExternalEntry`, **every** `Throwable` from publish/ack is logged and ignored — including a `FileAlreadyExistsException` caused by a foreign `N.json` | A content mismatch with an existing `N.json` is **fatal** + taint. A failed ack is ignored (recovery will finish). A failed publish is retried and then reported with a dedicated exception (§3.2; *before P2a:* ignored). | Otherwise, with a foreign writer, our commit is lost silently while Delta believes it succeeded. And Delta 4.4 reads `N.json` as soon as `write` returns, so an ignored publish error fails the transaction anyway, with a misleading `FileNotFoundException`. |
 | 5 | No detection of uncoordinated commits: a missing entry for N-1 falls back to `fs.exists(N-1.json)` | Registry + gap detection + `TAINTED` state | Safeguard requirement |
 | 6 | Complete entries expire (DynamoDB TTL, default 1 day) | Kept (commit audit trail). Optional pruning keeps the latest entry per table and anything younger than ≥ 1 day. | PostgreSQL storage is cheap. Entries serve lineage. The 1-day floor keeps the base class's safety argument. |
 | 7 | `expireTime` computed with the client clock | PostgreSQL `now()` | Clock skew across nodes and clusters |
@@ -217,10 +303,12 @@ Temp GC deletes `.tmp/` files whose entry is complete, or that have no entry and
 ## 6. Consequences
 
 **Positive**
-- Type 2 concurrency is correct on `file://` and `s3a://` with one mechanism. Only drivers talk to PostgreSQL and every driver uses the same store, so it holds unchanged across multi-instance, multi-node and multi-cluster deployments.
+- Type 2 concurrency is correct on `file://` and `s3a://` with one mechanism (the `s3a://` publish is implemented in E1, §2). Commits are always written by a driver, and every JVM that reads or writes a `_delta_log` through the LogStore uses the same store, so it holds unchanged across multi-instance, multi-node and multi-cluster deployments. ²
 - Delta's optimistic concurrency semantics are preserved. The LogStore supplies the primitive (exclusive creation of version N); `OptimisticTransaction` resolves logical conflicts.
 - A commit audit trail and Delta version ↔ run lineage come for free.
 - The module is reusable outside this project: an interview-grade artifact on its own.
+
+² *Corrected in P2a.1 (2026-11-14).* This said "Only drivers talk to PostgreSQL and every driver uses the same store". Delta also creates LogStores inside Spark tasks, and one of those paths lists `_delta_log` (§3.9). The decision is unchanged. What is new is a deployment requirement: in a cluster, the workers need the coordination secret and a route to PostgreSQL for that path.
 
 **Negative / accepted**
 - We own a correctness-critical component. Mitigated by the port of a proven protocol, fault injection and a stress verifier.
@@ -252,6 +340,11 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 | F12 | Commit to an unregistered or aliased `table_uri` | Rejected |
 | F13 | Coordination schema missing or wrong version at init | LogStore init fails; engine exits 4 |
 | F14 | Latest complete entry > latest listed `N.json` | Read fails closed |
+| F15 | Connection lost during the `INSERT`: its outcome is unknown | The repeated `INSERT` and the `temp_path` comparison settle it (§3.2): the writer owns N and publishes it, or gets `FileAlreadyExistsException`. Never two owners, never an owner that believes it lost. If PostgreSQL stays down: `IOException`, and a later reader publishes N if the entry landed. |
+| F16 | Publish fails after the `INSERT`, without a crash (storage error) | Retried; then a dedicated `IOException` ("committed, publication pending"), never a normal return. The first `listFrom` publishes N. |
+| F17 | Incomplete entry whose `T(N)` no longer exists | Recovery cannot publish. Reads and writes fail closed with an error that names the entry; nothing is published and the entry stays incomplete, for an operator to resolve. |
+
+*F15–F17 were added in P2a (2026-11-14), from the review of Delta 4.4.1's commit path (§8). The suite is F1–F17.*
 
 ### 7.2 Stress test + verifier (multi-process)
 
@@ -273,6 +366,9 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 
   If the natural race does not reproduce within a reasonable budget, the widened variant is the evidence, and the README states it honestly.
 - **GREEN (P2):** the same harness with `PostgresLogStore`, zero anomalies over the same budget, including the widened-window variant.
+  - *(P2a, 2026-11-14)* `DelayingLocalFs` delays a rename, and the hard-link publish (§3.4) never renames a commit file. Left as it is, the widened variant would pass without testing anything.
+  - GREEN therefore widens the LogStore's own windows, with a delay at its fault hooks: between the existence check and the `INSERT`, and between the `INSERT` and the publish.
+  - The writers are separate JVMs, so the hooks can be selected from configuration (P2a.8).
 - Both results go in the README, side by side.
 
 **RED result (P1.4c, 2026-11-13).** Full write-up: [docs/spikes/logstore-red.md](../spikes/logstore-red.md).
@@ -283,11 +379,49 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 
 ---
 
-## 8. Open items (closed in P2)
+## 8. Open items and their answers
 
-- Inventory of the files Delta 4.4 writes through `LogStore.write(overwrite=false)` (commits, `.crc` checksums, compacted log files, …) and with `overwrite=true` (`_last_checkpoint`), and how each maps onto `commit_entry` and "latest entry".
-- Confirm the `OptimisticTransaction` retry path on `FileAlreadyExistsException`.
-- Confirm that the commit runs on the caller's thread (attribution, §3.7).
-- LogStore instantiation lifecycle, which decides how the JVM-wide HikariCP pool keyed by JDBC URL is shared.
-- How the `file://` publish handles Hadoop's `.crc` sidecars (§3.4): publish through the raw local file system, or through `LocalFs` with the second rename covered by recovery and by F3/F11. *(Added in P1.4d, from the RED spike.)*
-- Isolation level and statements: `INSERT … ON CONFLICT DO NOTHING RETURNING` vs catching SQLState `23505`; `READ COMMITTED` is sufficient because every decision is a single-row atomic statement.
+Items 1–4 were closed in P2a.1 (2026-11-14) by reading Delta at tag `v4.4.1`. Each answer is pinned by a test of `DeltaLogStoreContractSpec`, which runs Delta over a LogStore that records every call. A Delta upgrade that changes one of them fails that suite (ADR-0014, upgrade procedure).
+
+**Scope.** The answers describe Delta's classic connector, which works through `DeltaLog` and therefore through the registered LogStore. Delta 4.4 also ships a connector built on Delta Kernel, switched by `spark.databricks.delta.v2.enableMode` (default `AUTO`):
+- with `delta-spark_4.1`, `AUTO` uses it only for streaming reads of tables managed by Unity Catalog, which this project does not have;
+- with `delta-spark_4.2`, `AUTO` also routes change-feed reads to it. A move to Spark 4.2 must first establish how that connector lists the log, and whether it goes through the LogStore.
+
+### Item 1 — Which files Delta writes through `LogStore.write`
+
+| File | `overwrite` | Notes |
+|---|---|---|
+| `N.json`, a commit | `false` | The only file that needs mutual exclusion. `VACUUM` commits too: `VACUUM START` and `VACUUM END`. |
+| `N.checkpoint.<uuid>.json`, the top-level file of a V2 checkpoint in JSON | `!isPartialWriteVisible` | `false` on `file://` with deviation 3. Delta wants an atomic write, not exclusion: the name holds a UUID. |
+| `_last_checkpoint` | `true` | |
+| `_last_vacuum_info` | `true` | Written when a `VACUUM` ends |
+
+- **Not through the LogStore:** Delta's version checksums `N.crc` (Spark's `CheckpointFileManager`), Parquet checkpoints and V2 sidecars (Spark write jobs), deletion vectors.
+- **Outside `_delta_log`:** symlink manifests (`overwrite=true`); the project does not generate them.
+- **Not applicable here:** backfills of coordinated commits (`overwrite=false`), which exist only on tables with a commit coordinator.
+- **Mapping onto `commit_entry`:** only names matching `<20 digits>.json` directly under `_delta_log` get an entry, and "latest entry" ranges over those alone (deviation 9). Every other `overwrite=false` write is an atomic write without an entry.
+
+### Item 2 — The retry path of `OptimisticTransaction`
+
+- `doCommitRetryIteratively` catches `java.nio.file.FileAlreadyExistsException` from `LogStore.write`. It then lists the log for the winning commits (through `listFrom`, on the committing thread), checks each for a logical conflict, and retries at the next free version. A conflict fails the transaction instead (for example `MetadataChangedException`).
+- Hadoop's `org.apache.hadoop.fs.FileAlreadyExistsException` is not caught: the commit fails with it. The exception type is part of the contract.
+- **Found here:** as soon as `write` returns, Delta reads the file status of `N.json` (`FileSystemBasedCommitCoordinatorClient.commit`). A LogStore that returns before the file is visible fails the transaction with a `FileNotFoundException`. This changed §3.2 and deviation 4, and added F16.
+
+### Item 3 — The commit runs on the caller's thread
+
+Yes: for appends with a `txnAppId`, `MERGE`, `DELETE` and `OPTIMIZE`. `OPTIMIZE` runs its compaction jobs on a thread pool, and the commit still comes back to the caller. Thread-local attribution (§3.7) stands.
+
+### Item 4 — LogStore instantiation lifecycle
+
+- One instance per `DeltaLog` and scheme; a new one when the `DeltaLog` leaves Delta's cache; more inside Spark tasks (`VACUUM`, `DESCRIBE HISTORY`, timestamp resolution over long histories).
+- The constructor's `Configuration`, and the one passed with each call, carry `spark.hadoop.*` settings with the prefix stripped, and every Spark setting under its full name, session settings included. Tasks receive the same configuration.
+- Design consequences, the pool and the decision on executors: §3.9.
+- **Found here:** with `isPartialWriteVisible = true`, Delta takes the `DeltaLog`'s lock around each commit (`spark.databricks.delta.commitLock.enabled` defaults to that answer). Inside one JVM, a second thread committing to the same table waits in Delta and never reaches the LogStore. Contention inside a JVM is therefore tested against the LogStore's own API (P2a), and contention between processes by the stress harness (P2b).
+
+### Item 5 — How the `file://` publish handles Hadoop's `.crc` sidecars
+
+Decided on 2026-11-14: a hard link, outside Hadoop's checksummed file system, so that coordinated commit files have no sidecar (§3.4). *(Item added in P1.4d, from the RED spike.)* It closes with its implementation and tests in P2a.7.
+
+### Item 6 — Isolation level and statements
+
+Direction decided on 2026-11-14: `INSERT … ON CONFLICT DO NOTHING` followed by a comparison of `temp_path`, instead of catching SQLState `23505`. The statement can then be repeated when its outcome is unknown (§3.2, F15). It closes in P2a.5, with the isolation level: registering a table at version 0 writes two rows, so "every decision is a single-row atomic statement" does not hold as first written.
