@@ -58,7 +58,7 @@ jobs:
           if-no-files-found: ignore
 
   # Dependency scanning (ADR-0013 §4). GitHub does not read sbt builds, so the resolved graph is
-  # submitted; Dependabot alerts and the review below work from it. Both need the repository to
+  # submitted (scripts/dependency-snapshot.sh); Dependabot alerts and the review below work from it. Both need the repository to
   # be public, and the submission needs a write token, which pull requests from forks lack.
   dependency-graph:
     name: Dependency submission
@@ -80,7 +80,31 @@ jobs:
           java-version-file: .sdkmanrc
           cache: sbt
       - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
-      - uses: scalacenter/sbt-dependency-submission@d84eef4c09e633bcf5f113bcad7fd5e9af1baee9 # v3.2.3
+      - name: Test the manifest merge
+        run: python3 -I -B -m unittest discover -s scripts
+      # One manifest for the whole build: per-project manifests all point at build.sbt, and
+      # dependency review then saw unchanged libraries as removed and added
+      # (scripts/merge_dependency_manifests.py).
+      - name: Generate the dependency snapshot
+        env:
+          # On a pull request GITHUB_SHA is the merge commit; dependency review looks up the head.
+          SNAPSHOT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SNAPSHOT_REF: ${{ github.ref }}
+          # The correlator the scalacenter action used, so that this snapshot replaces the one
+          # already on main instead of being added next to it.
+          SNAPSHOT_CORRELATOR: CI_dependency-graph___scalacenter_sbt-dependency-submission
+        run: scripts/dependency-snapshot.sh "$RUNNER_TEMP/dependency-snapshot.json"
+      - name: Submit the dependency snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          curl --fail-with-body --silent --show-error --retry 3
+          --request POST
+          --header "Authorization: Bearer $GH_TOKEN"
+          --header "Accept: application/vnd.github+json"
+          --header "X-GitHub-Api-Version: 2022-11-28"
+          --data "@$RUNNER_TEMP/dependency-snapshot.json"
+          "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/dependency-graph/snapshots"
 
   # The gate: a pull request may not introduce a dependency with a known vulnerability of high
   # severity or above, in any scope. Existing alerts are triaged instead (ADR-0013 §4).
