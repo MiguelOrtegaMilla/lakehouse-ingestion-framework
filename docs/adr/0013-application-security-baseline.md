@@ -87,7 +87,11 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 
 ### 4. Dependency vulnerability scanning in CI (Required)
 
-- **Alerts.** The `scalacenter/sbt-dependency-submission` action submits the resolved sbt dependency graph to GitHub, which turns on Dependabot alerts. GitHub does not parse sbt builds by itself; the submission API is how sbt projects get a dependency graph.
+- **Alerts.** CI submits the resolved sbt dependency graph to GitHub, which turns on Dependabot alerts. GitHub does not parse sbt builds by itself; the submission API is how sbt projects get a dependency graph.
+  - The graph is resolved by the Scala Center's `sbt-github-dependency-submission` plugin (`scripts/dependency-snapshot.sh`), and submitted as **one manifest for the whole build**.
+  - *Why not the `scalacenter/sbt-dependency-submission` action as is* (amended in P1.5, after the first pull request): the action submits one manifest per sbt project, all pointing at `build.sbt`. A library used by several projects (174 of 218 here) is then listed under that file with different scopes: runtime where it ships, development in the test-only project. GitHub does not keep those entries apart, and which scope it records changes between two submissions of the same graph. Dependency review reported every such library as removed and added, so the first pull request, a documentation change, failed on vulnerabilities already on `main`.
+  - The merge (`scripts/merge_dependency_manifests.py`, with unit tests) keeps one entry per package: runtime if any project uses it at runtime, development otherwise. The check itself is unchanged.
+  - Trade-off: the plugin version is pinned in the script, where Dependabot does not update it; it is bumped by hand.
 - **Gate.** `actions/dependency-review-action` fails a pull request that **introduces** a dependency with a known vulnerability of severity *high* or above.
 - **Why gate on introduced vulnerabilities rather than all of them:**
   - The Spark and Hadoop transitive tree carries known CVEs, mostly in `provided` scope, that this project cannot fix.
