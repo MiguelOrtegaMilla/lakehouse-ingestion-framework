@@ -1,6 +1,6 @@
 package lakehouse.ingestion.it.logstore
 
-import java.io.IOException
+import java.io.{FileNotFoundException, IOException}
 import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{FileAlreadyExistsException, Files, Path => LocalPath}
 import java.util.concurrent.Executors
@@ -26,15 +26,16 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /**
- * The write path of `PostgresLogStore` against a real PostgreSQL, with the faults of ADR-0004
- * §7.1 made for real where they can be: the connection is cut by a TCP proxy between the
+ * The write and read paths of `PostgresLogStore` against a real PostgreSQL, with the faults of
+ * ADR-0004 §7.1 made for real where they can be: the connection is cut by a TCP proxy between the
  * LogStore and the database, a reply is held back until the connection is cut under it, and
  * the log directory is made to refuse a new name. Only a writer that dies is still a fault
  * hook that throws, since the test runs in the writer's JVM.
  *
  * What is on the server is read over a second route that the faults do not touch.
- * `PostgresLogStoreWriteSpec` has every case of the write path, with a store that fails on
- * request; these are the scenarios themselves, on the database the LogStore runs on.
+ * `PostgresLogStoreWriteSpec` and `PostgresLogStoreReadSpec` have every case of both paths,
+ * with a store that fails on request; these are the scenarios themselves, on the database the
+ * LogStore runs on.
  */
 final class PostgresLogStoreFaultSpec
     extends AnyFunSuite
@@ -81,8 +82,23 @@ final class PostgresLogStoreFaultSpec
     def commit(version: Long, by: PostgresLogStore = writer())(actions: Seq[String]): Unit =
       by.write(hadoop(commitFile(version)), actions.iterator.asJava, false, conf)
 
+    /** The names a reader is given when it lists the log from version `from` on. */
+    def list(from: Long = 0, by: PostgresLogStore = writer()): Seq[String] =
+      by.listFrom(hadoop(commitFile(from)), conf).asScala.map(_.getPath.getName).toSeq
+
     def committed(version: Long): Seq[String] =
       Files.readAllLines(commitFile(version)).asScala.toSeq
+
+    /** A writer that reaches `point` while committing `version`, and dies there. */
+    def crashAt(point: FaultPoint, version: Long): Unit =
+      a[SimulatedCrash] should be thrownBy
+        commit(version, writer(LogStores.crashAt(point)))(append(version)): Unit
+
+    /** Hadoop's checksum sidecars anywhere under the log. */
+    def sidecars: Seq[LocalPath] =
+      Using.resource(Files.walk(log)) {
+        _.iterator.asScala.filter(_.getFileName.toString.endsWith(".crc")).toList
+      }
 
     def withCommits(last: Long): Lake = {
       commit(0)(Creation)
@@ -290,6 +306,135 @@ final class PostgresLogStoreFaultSpec
     }
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // The read path and recovery
+  // ---------------------------------------------------------------------------------------------
+
+  test("F2: a commit taken and not published is published by the first reader of the log") {
+    withLake { lake =>
+      lake.withCommits(last = 0)
+      lake.crashAt(FaultPoint.AfterInsert, version = 1)
+      lake.onServer(1).value.complete shouldBe false
+      Files.exists(lake.commitFile(1)) shouldBe false
+
+      lake.list() shouldBe Seq(commit(0), commit(1))
+
+      lake.committed(1) shouldBe append(1)
+      lake.onServer(1).value.complete shouldBe true
+    }
+  }
+
+  test("F3: wherever a writer dies, the log holds the whole commit or none of it, and no sidecar") {
+    FaultPoint.All.foreach { point =>
+      withClue(s"a writer that dies at $point: ") {
+        withLake { lake =>
+          lake.withCommits(last = 0)
+
+          lake.crashAt(point, version = 1)
+
+          val published = Files.exists(lake.commitFile(1))
+          published shouldBe (point == FaultPoint.AfterPublish)
+          if (published) lake.committed(1) shouldBe append(1)
+          lake.sidecars shouldBe empty
+
+          val committed = point != FaultPoint.BeforeInsert
+          lake.list() shouldBe (if (committed) Seq(commit(0), commit(1)) else Seq(commit(0)))
+          lake.onServer(1).map(_.complete) shouldBe Option.when(committed)(true)
+          if (committed) lake.committed(1) shouldBe append(1)
+          lake.sidecars shouldBe empty
+        }
+      }
+    }
+  }
+
+  test("F4: a commit published and not acknowledged is acknowledged by a reader, and not touched") {
+    withLake { lake =>
+      lake.withCommits(last = 0)
+      lake.crashAt(FaultPoint.AfterPublish, version = 1)
+      lake.onServer(1).value.complete shouldBe false
+      def onDisk =
+        (
+          Files.readAllBytes(lake.commitFile(1)).toSeq,
+          Files.getLastModifiedTime(lake.commitFile(1))
+        )
+      val before = onDisk
+
+      lake.list() shouldBe Seq(commit(0), commit(1))
+
+      lake.onServer(1).value.complete shouldBe true
+      onDisk shouldBe before
+    }
+  }
+
+  test("F7: with PostgreSQL out of reach the log is not listed, and is again when it is back") {
+    withLake { lake =>
+      lake.withCommits(last = 1)
+      val reader = lake.writer()
+
+      pg.faulty.disable()
+      val (attempt, elapsed) =
+        try timed(lake.list(by = reader))
+        finally pg.faulty.enable()
+
+      attempt.failed.get shouldBe an[IOException]
+      // Not the exception that tells Delta the table does not exist.
+      attempt.failed.get should not be a[FileNotFoundException]
+      elapsed should be < 20.seconds
+
+      lake.list(by = reader) shouldBe Seq(commit(0), commit(1))
+    }
+  }
+
+  test("F8: processes that find the same unfinished commit at once all get the log, with it") {
+    withLake { lake =>
+      lake.withCommits(last = 0)
+      lake.crashAt(FaultPoint.AfterInsert, version = 1)
+      // Each reader has a store, and so a connection pool, of its own: as separate processes.
+      val stores = Seq.fill(Readers)(new PostgresCoordinationStore(settings))
+
+      val listings =
+        try Concurrently.atOnce(stores)(store => lake.list(by = LogStores.over(store)))
+        finally stores.foreach(_.close())
+
+      listings.distinct shouldBe Seq(Seq(commit(0), commit(1)))
+      lake.committed(1) shouldBe append(1)
+      val entry = lake.onServer(1).value
+      entry.complete shouldBe true
+      Files.isSameFile(lake.log.resolve(entry.tempPath), lake.commitFile(1)) shouldBe true
+    }
+  }
+
+  test("F14: a latest commit that is recorded as published and is not in the log stops readers") {
+    withLake { lake =>
+      lake.withCommits(last = 2)
+      Files.delete(lake.commitFile(2))
+
+      val missing = the[CommitMissingException] thrownBy lake.list()
+
+      missing.version shouldBe 2L
+    }
+  }
+
+  test("F17: an unfinished commit whose temporary file is gone stops readers and writers") {
+    withLake { lake =>
+      lake.withCommits(last = 0)
+      lake.crashAt(FaultPoint.AfterInsert, version = 1)
+      val unfinished = lake.onServer(1).value
+      Files.delete(lake.log.resolve(unfinished.tempPath))
+
+      val reading = the[UnpublishableCommitException] thrownBy lake.list()
+      val writing = the[UnpublishableCommitException] thrownBy lake.commit(2)(append(2))
+
+      Seq(reading, writing).foreach { lost =>
+        (lost.version, lost.tempPath) shouldBe ((1L, unfinished.tempPath))
+      }
+      Seq(1L, 2L).foreach(version => Files.exists(lake.commitFile(version)) shouldBe false)
+      // The entry is left as it is, for an operator.
+      lake.onServer(1) shouldBe Some(unfinished)
+      lake.onServer(2) shouldBe None
+    }
+  }
+
   private def entryOnServer(table: TableUri, version: Long): Option[EntryRow] =
     Using.resource(pg.observe(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)) {
       observer =>
@@ -353,6 +498,10 @@ object PostgresLogStoreFaultSpec {
   final private case class EntryRow(tempPath: String, complete: Boolean, writerInstance: String)
 
   private val SlowReplies = "slow-replies"
+
+  private val Readers = 8
+
+  private def commit(version: Long): String = f"$version%020d.json"
 
   /** Attempts far enough apart for a test to mend the connection between two of them. */
   private val Patient = RetryPolicy(attempts = 5, firstPause = 250.millis)

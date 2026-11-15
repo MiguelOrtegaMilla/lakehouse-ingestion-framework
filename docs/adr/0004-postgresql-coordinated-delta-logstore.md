@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -142,7 +142,7 @@ sequenceDiagram
 - **A claim that loses** removes its temporary file at once: no entry points at it. A claim whose outcome stays unknown leaves it, since the entry may exist.
 - **The claim is repeated** up to three times, 100 ms and 200 ms apart, and so is a publish that fails (ADR-0017).
 - **Files that are not commits** are written to a temporary file and given their name in one step, without an entry. A commit is never overwritten, whatever `overwrite` says.
-- **Not ported yet:** the per-JVM `PathLock` of §4. It only spares duplicate recoveries, so it is decided with the read path (P2a.9).
+- **Not ported yet:** the per-JVM `PathLock` of §4. It only spares duplicate recoveries, so it is decided with the read path (P2a.9). *(Decided there: not ported, §3.3.)*
 
 ### 3.3 Read path — `listFrom(path)` on `_delta_log`
 
@@ -153,6 +153,13 @@ sequenceDiagram
 5. Gap check: a listed `N.json` above `registered_version` with no entry means a foreign writer. **Taint the table** and log at ERROR. Reads may proceed so that forensics are possible. Writes are refused (§3.5).
 
 `VACUUM` also calls `listFrom` on data directories. As in the base class, recovery and checks only apply to `_delta_log` paths.
+
+*As built (P2a.9, 2026-11-15):* `PostgresLogStore.listFrom` and `CommitProtocol.bringUpToDate`. What the implementation fixed:
+- **One question to the registry for each listing of a log**, the latest entry, and none for any other directory. A table without entries is listed as it is: it is not coordinated, or has no commit yet.
+- **Step 4 looks for the file itself.** If the latest entry is complete, its commit file must exist; the listing is not searched for it, because a listing that starts after that version does not hold it. The error is `CommitMissingException`, and never `FileNotFoundException`, which Delta reads as "no such table".
+- **A recovery must acknowledge.** Publishing the commit of an unfinished entry is followed by marking the entry complete, repeated like the claim, and a recovery that cannot do it fails: the reader gets no listing and the writer writes nothing. This is the base class's `fixDeltaLog`, and it is what makes looking at the latest entry enough: nothing is ever written after an entry that is not complete. Only a writer's own acknowledgement may fail (§3.2), since its entry is the latest.
+- **`read` is unchanged.** Delta reads a file after it has listed it.
+- **The per-JVM `PathLock` of §4 is not ported.** Without it, readers of one JVM that find the same unfinished commit each publish and acknowledge it. The publish replaces nothing and an entry is completed once, so the duplicates cost a system call and a statement each, in a situation that follows a crash. F8 runs sixteen of them at once.
 
 ### 3.4 Atomic publish — the storage-specific part
 
@@ -299,7 +306,7 @@ Why 4: a thread uses one connection for one short statement at a time, so a JVM 
 | 9 | Latest entry = last by `fileName` sort (DynamoDB range key) | Latest by numeric `version`, among commit files only | Robust to non-commit files that also pass through `write(overwrite=false)` (inventory in P2) |
 | 10 | Creates its store table on first use (`tryEnsureTableExists`) | Schema created by migrations; at init the LogStore checks the schema version and **fails closed** if it is missing or wrong | Least privilege: no DDL from the data path; explicit upgrades |
 
-**Kept as is:** the protocol and its linearisation point; step 1 (`N-1` must be published before writing `N`); the "old entries for table still exist" check at version 0 (a table deleted and recreated at the same path); the per-JVM `PathLock` as an *optimisation* against duplicate recoveries (correctness never depends on it); read retries for S3 `RemoteFileChangedException` during concurrent recoveries (`s3a` only).
+**Kept as is:** the protocol and its linearisation point; step 1 (`N-1` must be published before writing `N`); the "old entries for table still exist" check at version 0 (a table deleted and recreated at the same path); the per-JVM `PathLock` as an *optimisation* against duplicate recoveries (correctness never depends on it) *(P2a.9, 2026-11-15: not ported after all, for the reason in §3.3; this list said it was kept)*; read retries for S3 `RemoteFileChangedException` during concurrent recoveries (`s3a` only).
 
 ---
 

@@ -6,7 +6,7 @@ import java.nio.file.{FileAlreadyExistsException, Files, Path => LocalPath}
 import java.util
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.Executors
 
 import scala.collection.mutable
 import scala.concurrent.duration._
@@ -14,7 +14,7 @@ import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
-import lakehouse.ingestion.logstore.ScratchDirectories
+import lakehouse.ingestion.logstore.{Concurrently, ScratchDirectories}
 import lakehouse.ingestion.logstore.storage.PublishResult._
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{ChecksumException, FileSystem, Path}
@@ -226,7 +226,7 @@ final class LocalLogStorageSpec extends AnyFunSuite with Matchers with ScratchDi
     val target = log.resolve(commit(0))
     val temp = writeTemp(target, Seq("add a"))
 
-    val results = atOnce(Seq.fill(Contenders)(temp))(publish(_, target))
+    val results = Concurrently.atOnce(Seq.fill(Contenders)(temp))(publish(_, target))
 
     results.count(_ == Published) shouldBe 1
     results.filterNot(_ == Published).distinct shouldBe Seq(AlreadyPublished)
@@ -238,7 +238,7 @@ final class LocalLogStorageSpec extends AnyFunSuite with Matchers with ScratchDi
     val target = log.resolve(commit(0))
     val temps = (1 to Contenders).map(writer => writeTemp(target, Seq(s"the commit of $writer")))
 
-    val results = atOnce(temps)(publish(_, target))
+    val results = Concurrently.atOnce(temps)(publish(_, target))
 
     val winners = temps.zip(results).collect { case (temp, Published) => temp }
     winners should have size 1
@@ -374,23 +374,6 @@ final class LocalLogStorageSpec extends AnyFunSuite with Matchers with ScratchDi
       looks should be > 100L
       seen
     } finally reader.shutdownNow(): Unit
-  }
-
-  /** Runs `call` for every input on its own thread, all released at the same moment. */
-  private def atOnce[A, B](inputs: Seq[A])(call: A => B): Seq[B] = {
-    val pool = Executors.newFixedThreadPool(inputs.size)
-    implicit val threads: ExecutionContext = ExecutionContext.fromExecutor(pool)
-    val start = new CountDownLatch(1)
-    try {
-      val calls = inputs.map { input =>
-        Future {
-          start.await(WaitSeconds, TimeUnit.SECONDS)
-          call(input)
-        }
-      }
-      start.countDown()
-      Await.result(Future.sequence(calls), WaitSeconds.seconds)
-    } finally pool.shutdownNow(): Unit
   }
 }
 

@@ -40,7 +40,8 @@ final private[logstore] class TableLog(
  *
  * A writer that dies after step 2 leaves an entry that is not complete. Whoever finds it
  * finishes the commit with `finish`, which is steps 3 and 4 again: both can be repeated, by
- * anybody, any number of times.
+ * anybody, any number of times. Readers find it too: `bringUpToDate` runs before every
+ * listing of the log.
  *
  * Before any of that the registry must allow the write (§3.5, layer 2), and the commit before
  * this one must be published: a version is never written on top of one that is not visible.
@@ -121,8 +122,35 @@ final private[logstore] class CommitProtocol(
   }
 
   /**
+   * Makes the log on the storage agree with the registry before the log is listed (ADR-0004
+   * §3.3). A commit exists from the moment its version is taken, so a reader that looked at
+   * the storage alone could miss the latest one: that of a writer that died, or of one that is
+   * about to publish.
+   *
+   *  - If the latest entry is not complete, its commit is published and acknowledged.
+   *  - If it is complete, its file must be in the log. Otherwise the reader would be given an
+   *    older table for the current one.
+   *
+   * A table without entries is left as it is: it is not coordinated, or has no commit yet.
+   *
+   * @throws CommitMissingException the file of the latest commit is not in the log
+   */
+  @throws[IOException]
+  def bringUpToDate(log: TableLog): Unit =
+    store.latestEntry(log.table).foreach { latest =>
+      if (!latest.complete) finish(log, latest)
+      else if (!log.exists(log.commitFile(latest.version)))
+        throw new CommitMissingException(latest.table, latest.version)
+    }
+
+  /**
    * Publishes and acknowledges the commit of an entry that is not complete. It is what the
-   * writer of the entry was about to do when it stopped.
+   * writer of the entry was about to do when it stopped, and any number of readers and writers
+   * may do it at once: the publish replaces nothing, and an entry is completed only once.
+   *
+   * Here the acknowledgement must succeed. Unfinished work is looked for at the latest entry
+   * only, which is right as long as nothing is ever written after an entry that is not
+   * complete. (A writer's own acknowledgement may fail: its entry is the latest.)
    *
    * @throws UncoordinatedWriteException another file is under the commit's name
    * @throws UnpublishableCommitException the entry's temporary file is gone
@@ -131,7 +159,10 @@ final private[logstore] class CommitProtocol(
   def finish(log: TableLog, entry: CommitEntry): Unit = {
     val target = log.commitFile(entry.version)
     settle(publish(log, entry, target), entry, target)
-    acknowledge(entry)
+    val found = retry(s"mark version ${entry.version} of ${entry.table} complete") {
+      store.complete(entry.table, entry.version, entry.tempPath)
+    }
+    if (!found) warnOfMissingEntry(entry)
   }
 
   /**
@@ -242,13 +273,7 @@ final private[logstore] class CommitProtocol(
    * logged and goes no further: whoever finds the entry incomplete finishes it (ADR-0017).
    */
   private def acknowledge(entry: CommitEntry): Unit =
-    try
-      if (!store.complete(entry.table, entry.version, entry.tempPath))
-        logger.warn(
-          "Version {} of {} is published, and its coordination entry is gone",
-          entry.version,
-          entry.table
-        )
+    try if (!store.complete(entry.table, entry.version, entry.tempPath)) warnOfMissingEntry(entry)
     catch {
       case e: IOException =>
         logger.warn(
@@ -257,6 +282,14 @@ final private[logstore] class CommitProtocol(
           e
         )
     }
+
+  /** Only maintenance removes an entry, and not while the table is being written. */
+  private def warnOfMissingEntry(entry: CommitEntry): Unit =
+    logger.warn(
+      "Version {} of {} is published, and its coordination entry is gone",
+      entry.version,
+      entry.table
+    )
 
   /** Removes a temporary file that no entry points at. If it stays, it is only litter. */
   private def discard(log: TableLog, temp: Path): Unit =

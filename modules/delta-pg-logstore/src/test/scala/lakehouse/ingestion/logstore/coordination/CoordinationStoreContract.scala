@@ -2,11 +2,8 @@ package lakehouse.ingestion.logstore.coordination
 
 import java.io.IOException
 import java.util.UUID
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
 
-import scala.concurrent.duration._
-import scala.concurrent.{Await, ExecutionContext, Future}
-
+import lakehouse.ingestion.logstore.Concurrently
 import lakehouse.ingestion.logstore.coordination.RegisterResult.{AlreadyRegistered, Registered}
 import lakehouse.ingestion.logstore.coordination.TakeResult.{NotRegistered, Taken, TakenBy}
 import org.scalatest.funsuite.AnyFunSuite
@@ -158,7 +155,7 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
     val table = registered()
     val claims = (1 to Writers).map(_ => claim(table, 0L))
 
-    val results = atOnce(claims)(store.take)
+    val results = Concurrently.atOnce(claims)(store.take)
 
     val winners = claims.zip(results).collect { case (claim, Taken) => claim }
     winners should have size 1
@@ -172,7 +169,7 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
     val table = newTable()
     val versions = (1 to Writers).map(_.toLong)
 
-    val results = atOnce(versions)(version => store.register(table, version, None))
+    val results = Concurrently.atOnce(versions)(version => store.register(table, version, None))
 
     val winners = versions.zip(results).collect { case (version, Registered) => version }
     winners should have size 1
@@ -187,23 +184,6 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
     table
   }
 
-  /** Runs `call` for every input on its own thread, all released at the same moment. */
-  private def atOnce[A, B](inputs: Seq[A])(call: A => B): Seq[B] = {
-    val pool = Executors.newFixedThreadPool(inputs.size)
-    implicit val threads: ExecutionContext = ExecutionContext.fromExecutor(pool)
-    val start = new CountDownLatch(1)
-    try {
-      val calls = inputs.map { input =>
-        Future {
-          start.await(WaitSeconds, TimeUnit.SECONDS)
-          call(input)
-        }
-      }
-      start.countDown()
-      Await.result(Future.sequence(calls), WaitSeconds.seconds)
-    } finally pool.shutdownNow(): Unit
-  }
-
   implicit private class Defined[A](option: Option[A]) {
 
     /** The value, or a failed test. */
@@ -214,7 +194,6 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
 object CoordinationStoreContract {
 
   private val Writers = 16
-  private val WaitSeconds = 30L
 
   /**
    * A table no other test uses. A store never looks at what a key says, so these tests need no

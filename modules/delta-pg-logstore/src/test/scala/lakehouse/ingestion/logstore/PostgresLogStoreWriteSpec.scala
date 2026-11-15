@@ -2,7 +2,7 @@ package lakehouse.ingestion.logstore
 
 import java.io.IOException
 import java.nio.file.attribute.PosixFilePermissions
-import java.nio.file.{FileAlreadyExistsException, Files, Path => LocalPath}
+import java.nio.file.{FileAlreadyExistsException, Files}
 
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -16,7 +16,7 @@ import lakehouse.ingestion.logstore.storage.{
   PublishResult
 }
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.fs.Path
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -24,66 +24,14 @@ import org.scalatest.matchers.should.Matchers
  * The write path of `PostgresLogStore` (ADR-0004 §3.2), through the method Delta calls, on a
  * real table directory.
  *
- * The coordination store is the in-memory one, behind `FaultyCoordinationStore` so that a test
- * can choose which call fails and how. A writer that dies is a fault hook that throws
- * `SimulatedCrash`, and the writer that comes after it is a new LogStore. The scenarios named
- * F1 to F17 are those of ADR-0004 §7.1; the integration tests repeat the ones about the
- * database against a real PostgreSQL whose connection is cut.
+ * The table and its coordination store are `LakeFixture`'s. The scenarios named F1 to F17 are
+ * those of ADR-0004 §7.1; the integration tests repeat them against a real PostgreSQL whose
+ * connection is cut.
  */
-final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with ScratchDirectories {
+final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with LakeFixture {
 
+  import LakeFixture._
   import PostgresLogStoreWriteSpec._
-
-  private val conf = new Configuration()
-  private val fs = FileSystem.getLocal(conf)
-
-  /** A table directory with an empty `_delta_log`, and the store its writers coordinate in. */
-  final private class Lake {
-    val memory = new InMemoryCoordinationStore
-    val store = new FaultyCoordinationStore(memory)
-    val directory: LocalPath = Files.createDirectories(newDirectory().resolve("lake/orders"))
-    val log: LocalPath = Files.createDirectory(directory.resolve("_delta_log"))
-    val table: TableUri = TableIdentity.of(hadoop(directory), fs)
-
-    /** A new writer: a LogStore of its own, as a new process has. */
-    def writer(
-        hooks: Option[FaultHooks] = None,
-        storageOf: FileSystem => LogStorage = LogStorage.of
-    ): PostgresLogStore = LogStores.over(store, hooks, storageOf = storageOf)
-
-    def commitFile(version: Long): LocalPath = log.resolve(f"$version%020d.json")
-
-    def commit(version: Long, by: PostgresLogStore = writer())(actions: Seq[String]): Unit =
-      by.write(hadoop(commitFile(version)), actions.iterator.asJava, false, conf)
-
-    def committed(version: Long): Seq[String] =
-      Files.readAllLines(commitFile(version)).asScala.toSeq
-
-    def entry(version: Long): Option[CommitEntry] = memory.entry(table, version)
-
-    def tempOf(entry: CommitEntry): LocalPath = log.resolve(entry.tempPath)
-
-    /** The temporary files in the log, whether an entry points at them or not. */
-    def temps: Seq[LocalPath] = {
-      val tempDirectory = log.resolve(".tmp")
-      if (!Files.isDirectory(tempDirectory)) Nil
-      else Using.resource(Files.list(tempDirectory))(_.iterator.asScala.toList)
-    }
-
-    /** Versions 0 to `last`, committed without incident. */
-    def withCommits(last: Long): Lake = {
-      commit(0)(Creation)
-      (1L to last).foreach(version => commit(version)(append(version)))
-      this
-    }
-
-    /** A writer that takes `version` and dies at `point`. */
-    def crashedAt(point: FaultPoint, version: Long): CommitEntry = {
-      a[SimulatedCrash] should be thrownBy
-        commit(version, writer(LogStores.crashAt(point)))(append(version))
-      entry(version).getOrElse(fail(s"the writer died at $point without an entry"))
-    }
-  }
 
   // ---------------------------------------------------------------------------------------------
   // A commit without incident
@@ -232,7 +180,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
   test("a table registered by a creator that died before its first commit can be created") {
     val lake = new Lake
     a[SimulatedCrash] should be thrownBy
-      lake.commit(0, lake.writer(LogStores.crashAt(FaultPoint.BeforeInsert)))(Creation)
+      lake.commit(0, lake.logStore(LogStores.crashAt(FaultPoint.BeforeInsert)))(Creation)
     lake.memory.registration(lake.table).value.registeredVersion shouldBe Registration.NotYetCreated
     lake.entry(0) shouldBe None
 
@@ -331,7 +279,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     val tempsBefore = lake.temps
 
     a[SimulatedCrash] should be thrownBy
-      lake.commit(1, lake.writer(LogStores.crashAt(FaultPoint.BeforeInsert)))(append(1))
+      lake.commit(1, lake.logStore(LogStores.crashAt(FaultPoint.BeforeInsert)))(append(1))
 
     lake.entry(1) shouldBe None
     Files.exists(lake.commitFile(1)) shouldBe false
@@ -349,7 +297,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
   test("F5: while the store cannot be reached, a commit fails and writes nothing") {
     val lake = new Lake().withCommits(last = 0)
     val tempsBefore = lake.temps
-    val writer = lake.writer()
+    val writer = lake.logStore()
 
     lake.store.down()
     val failure = the[IOException] thrownBy lake.commit(1, writer)(append(1))
@@ -371,7 +319,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     val takesBefore = lake.store.calls.count(_ == Take)
     val storeFailsNow = LogStores.at(FaultPoint.BeforeInsert)(lake.store.down())
 
-    val failure = the[IOException] thrownBy lake.commit(1, lake.writer(storeFailsNow))(append(1))
+    val failure = the[IOException] thrownBy lake.commit(1, lake.logStore(storeFailsNow))(append(1))
 
     failure should not be a[FileAlreadyExistsException]
     lake.store.calls.count(_ == Take) - takesBefore shouldBe LogStores.Impatient.attempts
@@ -445,7 +393,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     val lake = new Lake().withCommits(last = 0)
     val storage = new FailingPublishes(failures = 1)
 
-    lake.commit(1, lake.writer(storageOf = _ => storage))(append(1))
+    lake.commit(1, lake.logStore(storageOf = _ => storage))(append(1))
 
     storage.publishes shouldBe 2
     lake.committed(1) shouldBe append(1)
@@ -484,7 +432,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     }
 
     val detected =
-      the[UncoordinatedWriteException] thrownBy lake.commit(1, lake.writer(foreignWriterWins))(
+      the[UncoordinatedWriteException] thrownBy lake.commit(1, lake.logStore(foreignWriterWins))(
         append(1)
       )
 
@@ -522,7 +470,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
   test("a file that is not a commit is written whole and replaced whole, without the registry") {
     val lake = new Lake
     val pointer = lake.log.resolve("_last_checkpoint")
-    val writer = lake.writer()
+    val writer = lake.logStore()
 
     Seq("""{"version":10}""", """{"version":20}""").foreach { content =>
       writer.write(hadoop(pointer), Iterator(content).asJava, true, conf)
@@ -537,7 +485,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     val lake = new Lake
     val checkpoint =
       lake.log.resolve("00000000000000000010.checkpoint.3a0d1b5e-2f5b-4d42-9d0e-5f6c1a2b3c4d.json")
-    val writer = lake.writer()
+    val writer = lake.logStore()
 
     writer.write(hadoop(checkpoint), Iterator("the checkpoint").asJava, false, conf)
     val again = the[FileAlreadyExistsException] thrownBy
@@ -554,7 +502,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     val lake = new Lake().withCommits(last = 0)
 
     val refused = the[IOException] thrownBy
-      lake.writer().write(hadoop(lake.commitFile(0)), Iterator("rewritten").asJava, true, conf)
+      lake.logStore().write(hadoop(lake.commitFile(0)), Iterator("rewritten").asJava, true, conf)
 
     refused.getMessage should include("never rewritten")
     lake.committed(0) shouldBe Creation
@@ -566,7 +514,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     val replaced = new Configuration(conf)
     replaced.set("fs.file.impl", classOf[LogStorageSpec.RenamingElsewhere].getName)
     replaced.setBoolean("fs.file.impl.disable.cache", true)
-    val writer = lake.writer()
+    val writer = lake.logStore()
 
     Seq(lake.commitFile(0), lake.log.resolve("_last_checkpoint")).foreach { file =>
       an[UnsupportedTableLocationException] should be thrownBy
@@ -581,7 +529,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
 
   test("on a local disk a file written in place can be read half written, and Delta is told") {
     val lake = new Lake
-    lake.writer().isPartialWriteVisible(hadoop(lake.commitFile(0)), conf) shouldBe true
+    lake.logStore().isPartialWriteVisible(hadoop(lake.commitFile(0)), conf) shouldBe true
   }
 
   test("the LogStore Delta creates needs its settings for a commit, and not before") {
@@ -614,28 +562,9 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Scr
     lake.entry(0).value.complete shouldBe true
   }
 
-  implicit private class Defined[A](option: Option[A]) {
-
-    /** The value, or a failed test. */
-    def value: A = option.getOrElse(fail("expected a value, found None"))
-  }
 }
 
 object PostgresLogStoreWriteSpec {
-
-  private val TableId = "5a0d1a66-0bb5-4d1c-8a8b-6a1f6f5a3c11"
-
-  /** The actions of a table's first commit, as Delta writes them. */
-  private val Creation: Seq[String] = Seq(
-    """{"commitInfo":{"timestamp":1763200000000,"operation":"CREATE TABLE","engineInfo":"Apache-Spark/4.1.4 Delta-Lake/4.4.1"}}""",
-    """{"metaData":{"id":"""" + TableId + """","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{},"createdTime":1763200000000}}""",
-    """{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"""
-  )
-
-  private def append(version: Long): Seq[String] =
-    Seq(s"""{"add":{"path":"part-$version.parquet","dataChange":true}}""")
-
-  private def hadoop(path: LocalPath): Path = new Path(LocalLogStorage.Scheme, null, path.toString)
 
   /** A storage whose first publishes fail, as one with a passing fault does. */
   final private class FailingPublishes(failures: Int) extends LogStorage {
