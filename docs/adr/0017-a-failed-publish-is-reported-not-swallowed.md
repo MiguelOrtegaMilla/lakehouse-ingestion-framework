@@ -38,3 +38,10 @@ After the `INSERT`:
 - **The caller sees a failed commit that will nevertheless appear.** It cannot tell that from an ordinary failure by catching `IOException` alone, so it must check before replaying. The engine always does: before replaying a batch it reads the table's `txn` version (ADR-0005). The dedicated exception lets the error classifier name the case (P8).
 - Scenario **F16** tests it (ADR-0004 §7.1): a publish that fails without a crash, the exception, and the next `listFrom` publishing the commit.
 - The number of retries, the backoff and the exception's name are fixed with the implementation (P2a.8).
+
+## As built (P2a.8, 2026-11-15)
+
+- The exception is `CommitPublicationPendingException`. It carries the table and the version.
+- A publish is tried three times, 100 ms and then 200 ms apart (`RetryPolicy.Default`): a storage that stays broken fails the commit in well under a second.
+- The same policy repeats the claim of a version when its outcome is unknown (ADR-0004 §3.2, F15).
+- A publish that finds another file under the commit's name, or its own temporary file gone, is not a pending commit and is not retried: it is reported as `UncoordinatedWriteException` or `UnpublishableCommitException`.

@@ -59,6 +59,7 @@ lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
       hadoopClientApi,
       postgresJdbc,
       hikari,
+      slf4jApi,
       scalatest,
       scalaReflectTest,
       hadoopClientRuntimeTest

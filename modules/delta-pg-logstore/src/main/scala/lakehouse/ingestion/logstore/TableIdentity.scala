@@ -43,7 +43,9 @@ final class UnsupportedTableLocationException(message: String, cause: Throwable 
 object TableIdentity {
 
   private val Scheme = "file"
-  private val LogDirectory = "_delta_log"
+
+  /** The name Delta gives the log directory of a table. */
+  val LogDirectory = "_delta_log"
 
   /**
    * The key of the table at `tablePath`.

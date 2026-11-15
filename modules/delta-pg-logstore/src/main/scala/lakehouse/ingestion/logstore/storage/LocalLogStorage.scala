@@ -102,6 +102,8 @@ final class LocalLogStorage private[storage] (toDisk: LocalPath => Unit) extends
     }
   }
 
+  override def discard(temp: Path): Unit = Files.deleteIfExists(local(temp)): Unit
+
   /** Writes the new file `file`. A write that fails removes what it wrote of it. */
   private def writeNew(file: LocalPath, lines: Iterator[String]): Unit = {
     // If the file exists this fails, and there is nothing of this call's to remove.
