@@ -47,3 +47,15 @@ The `s3a://` publish of ADR-0004 §3.4 is unchanged, and so is the rest of the p
 - **The spike's delay no longer applies.** `DelayingLocalFs` delays a rename the LogStore never makes, so GREEN widens the LogStore's own window instead (ADR-0004 §7.3).
 - A `.N.json.crc` next to a commit this LogStore published can only come from a foreign writer. How it is handled is fixed with the implementation.
 - Implemented and tested in P2a.7 (discovery §17).
+
+## As built (P2a.7, 2026-11-15)
+
+`LocalLogStorage` implements the decision, behind the `LogStorage` interface that the `s3a://` publish will also implement. What the implementation fixed:
+
+- **What is forced to disk.** The temporary file and the directory that holds its name, before the `INSERT`. The `_delta_log` directory after the link, and also when the link was already there: the process that made it may have died before forcing it, and the caller is about to mark the entry complete.
+- **What a publish can find.** The name is free; it holds this commit already (the same file, or the same bytes); it holds other bytes, which only a writer outside the protocol can have put there; or the temporary file is gone (F17). Nothing is changed in the last two cases.
+- **Files that are replaced** (`_last_checkpoint`, `_last_vacuum_info`) are written to a temporary file and renamed over the old one. On a table adopted from Delta's default LogStore the old file has a sidecar, which would not match the new content. It is deleted first: the old file without a sidecar is readable, the new file under the old sidecar is not.
+- **A sidecar next to a commit is not looked for, and never removed.** With a foreign commit under the name, the commit and its sidecar are left as found. A sidecar without its commit would take a foreign commit that somebody then deleted. A commit published under it fails every reader that verifies checksums, loudly, as in the RED spike.
+- **No `java.nio.file.FileAlreadyExistsException` leaves the storage.** Delta reads it as "this version is taken". A file in the way of a temporary file or of a rename is reported as a plain `IOException`.
+- **One operating-system user.** Linux refuses a hard link to a file that the caller neither owns nor may write (`fs.protected_hardlinks`, which the usual distributions turn on). A reader that finds an unpublished commit publishes it, so every process that reads or writes a table needs write access to its temporary files. Running them all as one user is the simple way; a reader under another user fails closed on a commit it cannot publish.
+- **`file://` must be Hadoop's own.** The path in a `file:` URI is taken for a path of the operating system, here and in the table's key. `LogStorage.of` therefore refuses a `file://` served by anything but Hadoop's local file system, checksummed or raw (ADR-0004 §3.5, layer 1).
