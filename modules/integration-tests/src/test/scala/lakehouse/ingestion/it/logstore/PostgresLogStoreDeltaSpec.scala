@@ -6,6 +6,7 @@ import java.nio.file.{Files, Path => LocalPath, Paths}
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
+import io.delta.storage.HDFSLogStore
 import lakehouse.ingestion.it.support.{
   BootstrappedPostgres,
   CoordinationSchema,
@@ -180,6 +181,30 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Loc
     versionOf(path) shouldBe 1L
     countOf(path) shouldBe 20L
   }
+  test("a commit made without the LogStore is in what Delta reads, and stops what Delta writes") {
+    val path = create("tainted")
+    append(path, 10L, 20L)
+    // Another process, with Delta's default LogStore, commits version 2.
+    val hadoopConf = spark.sessionState.newHadoopConf()
+    new HDFSLogStore(hadoopConf)
+      .write(new Path(commitFile(path, 2).toUri), Iterator(EmptyCommit).asJava, false, hadoopConf)
+
+    // Delta's read finds it, and goes on: the commit is in the log.
+    versionOf(path) shouldBe 2L
+    countOf(path) shouldBe 20L
+    val reason = store.registration(keyOf(path)).flatMap(_.taintReason)
+    reason.getOrElse(fail("the table is not tainted")) should include("version 2")
+
+    // Delta's next commit is refused by the LogStore, and nothing is written.
+    val failure = intercept[Exception](append(path, 20L, 30L))
+    causesOf(failure).exists(_.isInstanceOf[TableTaintedException]) shouldBe true
+    versionOf(path) shouldBe 2L
+    Files.exists(commitFile(path, 3)) shouldBe false
+  }
+
+  /** `error` and everything that caused it. */
+  private def causesOf(error: Throwable): List[Throwable] =
+    Iterator.iterate(error)(_.getCause).takeWhile(_ != null).toList
 }
 
 object PostgresLogStoreDeltaSpec {

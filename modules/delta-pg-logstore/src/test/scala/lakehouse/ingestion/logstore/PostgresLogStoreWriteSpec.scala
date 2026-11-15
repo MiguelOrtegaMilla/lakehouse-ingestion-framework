@@ -234,19 +234,6 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
     lake.committed(1) shouldBe append(1)
   }
 
-  test("a commit without an entry stops the next writer: somebody writes without the LogStore") {
-    val lake = new Lake().withCommits(last = 0)
-    Files.write(lake.commitFile(1), Seq("a foreign commit").asJava)
-    val tempsBefore = lake.temps
-
-    val detected = the[UncoordinatedWriteException] thrownBy lake.commit(2)(append(2))
-
-    detected.version shouldBe 1L
-    Files.exists(lake.commitFile(2)) shouldBe false
-    lake.entry(2) shouldBe None
-    lake.temps shouldBe tempsBefore
-  }
-
   test("a commit that is neither in the log nor in the registry stops the next writer") {
     val lake = new Lake().withCommits(last = 0)
 
@@ -423,25 +410,6 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
     lake.commit(2)(append(2))
     lake.committed(1) shouldBe append(1)
     lake.entry(1).value.complete shouldBe true
-  }
-
-  test("a foreign file under the commit's name when it is published is reported, not replaced") {
-    val lake = new Lake().withCommits(last = 0)
-    val foreignWriterWins = LogStores.at(FaultPoint.AfterInsert) {
-      Files.write(lake.commitFile(1), Seq("a foreign commit").asJava): Unit
-    }
-
-    val detected =
-      the[UncoordinatedWriteException] thrownBy lake.commit(1, lake.logStore(foreignWriterWins))(
-        append(1)
-      )
-
-    detected.version shouldBe 1L
-    lake.committed(1) shouldBe Seq("a foreign commit")
-    // Our commit is not lost: its entry and its bytes are there for whoever sorts this out.
-    val ours = lake.entry(1).value
-    ours.complete shouldBe false
-    Files.readAllLines(lake.tempOf(ours)).asScala shouldBe append(1)
   }
 
   // ---------------------------------------------------------------------------------------------

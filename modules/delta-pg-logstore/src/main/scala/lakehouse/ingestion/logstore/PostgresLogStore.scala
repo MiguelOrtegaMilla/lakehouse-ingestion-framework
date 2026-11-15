@@ -103,6 +103,8 @@ final class PostgresLogStore private[logstore] (
    * Lists a directory from the name of `path` on, as Hadoop does. If the directory is a table's
    * log, the log is first brought up to date with the registry (ADR-0004 §3.3), in whatever
    * JVM this runs: a driver, or a task that resolves a timestamp over a long history (§3.9).
+   * Then the listing is checked for a commit made without this LogStore, which taints the
+   * table and does not stop the reader.
    * `VACUUM` lists data directories through here too; those are not coordinated, and never
    * need the database.
    *
@@ -112,10 +114,19 @@ final class PostgresLogStore private[logstore] (
    */
   override def listFrom(path: Path, hadoopConf: Configuration): java.util.Iterator[FileStatus] = {
     val fs = path.getFileSystem(hadoopConf)
-    Option(fs.makeQualified(path).getParent)
-      .filter(_.getName == TableIdentity.LogDirectory)
-      .foreach(directory => protocol.bringUpToDate(tableLog(directory, fs, storageOf(fs))))
-    super.listFrom(path, hadoopConf)
+    Option(fs.makeQualified(path).getParent).filter(_.getName == TableIdentity.LogDirectory) match {
+      case None => super.listFrom(path, hadoopConf)
+      case Some(directory) =>
+        val log = tableLog(directory, fs, storageOf(fs))
+        val latestEntry = protocol.bringUpToDate(log)
+        val listed = super.listFrom(path, hadoopConf).asScala.toVector
+        // The listing is complete: a commit in it without an entry now is not ours.
+        listed
+          .flatMap(file => commitVersion(file.getPath))
+          .maxOption
+          .foreach(protocol.detectForeignCommit(log, latestEntry, _))
+        listed.iterator.asJava
+    }
   }
 
   override def isPartialWriteVisible(path: Path, hadoopConf: Configuration): java.lang.Boolean =

@@ -12,6 +12,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.{Try, Using}
 
 import eu.rekawek.toxiproxy.model.ToxicDirection
+import io.delta.storage.HDFSLogStore
 import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, ProxiedPostgres}
 import lakehouse.ingestion.logstore._
 import lakehouse.ingestion.logstore.coordination.{
@@ -28,8 +29,9 @@ import org.scalatest.matchers.should.Matchers
 /**
  * The write and read paths of `PostgresLogStore` against a real PostgreSQL, with the faults of
  * ADR-0004 §7.1 made for real where they can be: the connection is cut by a TCP proxy between the
- * LogStore and the database, a reply is held back until the connection is cut under it, and
- * the log directory is made to refuse a new name. Only a writer that dies is still a fault
+ * LogStore and the database, a reply is held back until the connection is cut under it, the
+ * log directory is made to refuse a new name, and the writer without the LogStore is Delta's
+ * default one. Only a writer that dies is still a fault
  * hook that throws, since the test runs in the writer's JVM.
  *
  * What is on the server is read over a second route that the faults do not touch.
@@ -435,6 +437,71 @@ final class PostgresLogStoreFaultSpec
     }
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // Writers without the LogStore
+  // ---------------------------------------------------------------------------------------------
+
+  test("F10: a commit made with Delta's default LogStore taints the table in the database") {
+    withLake { lake =>
+      lake.withCommits(last = 1)
+      foreignCommit(lake, 2)
+
+      // The reader that finds it is not stopped.
+      lake.list() shouldBe Seq(commit(0), commit(1), commit(2))
+
+      val reason = taintOnServer(lake.table).value
+      reason should include("version 2")
+      val refused = the[TableTaintedException] thrownBy lake.commit(3)(append(3))
+      refused.reason shouldBe reason
+      Files.exists(lake.commitFile(3)) shouldBe false
+      lake.onServer(3) shouldBe None
+    }
+  }
+
+  test("F11: a foreign commit that lands between our INSERT and our publish is detected") {
+    withLake { lake =>
+      lake.withCommits(last = 0)
+      val foreignWriterWins = LogStores.at(FaultPoint.AfterInsert)(foreignCommit(lake, 1))
+
+      val detected =
+        the[UncoordinatedWriteException] thrownBy
+          lake.commit(1, lake.writer(foreignWriterWins))(append(1))
+
+      detected.version shouldBe 1L
+      taintOnServer(lake.table).value should include("version 1")
+      // The foreign commit and its sidecar are left as found.
+      lake.committed(1) shouldBe ForeignActions
+      lake.sidecars.map(_.getFileName.toString) shouldBe Seq(s".${commit(1)}.crc")
+      // Our commit is kept: its entry on the server, its bytes on disk.
+      val ours = lake.onServer(1).value
+      ours.complete shouldBe false
+      Files.readAllLines(lake.log.resolve(ours.tempPath)).asScala shouldBe append(1)
+
+      a[TableTaintedException] should be thrownBy lake.commit(2)(append(2))
+    }
+  }
+
+  /** Commits `version` as a process without this LogStore does: with Delta's default one. */
+  private def foreignCommit(lake: Lake, version: Long): Unit =
+    new HDFSLogStore(conf)
+      .write(hadoop(lake.commitFile(version)), ForeignActions.iterator.asJava, false, conf)
+
+  /** Why the table is tainted, as the server has it. */
+  private def taintOnServer(table: TableUri): Option[String] =
+    Using.resource(pg.observe(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)) {
+      observer =>
+        Using.resource(
+          observer.prepareStatement(
+            "SELECT reason FROM delta_coordination.table_taint WHERE table_uri = ?"
+          )
+        ) { statement =>
+          statement.setString(1, table.value)
+          Using.resource(statement.executeQuery())(rows =>
+            Option.when(rows.next())(rows.getString(1))
+          )
+        }
+    }
+
   private def entryOnServer(table: TableUri, version: Long): Option[EntryRow] =
     Using.resource(pg.observe(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)) {
       observer =>
@@ -500,6 +567,9 @@ object PostgresLogStoreFaultSpec {
   private val SlowReplies = "slow-replies"
 
   private val Readers = 8
+
+  private val ForeignActions =
+    Seq("""{"commitInfo":{"operation":"WRITE","engineInfo":"another writer"}}""")
 
   private def commit(version: Long): String = f"$version%020d.json"
 

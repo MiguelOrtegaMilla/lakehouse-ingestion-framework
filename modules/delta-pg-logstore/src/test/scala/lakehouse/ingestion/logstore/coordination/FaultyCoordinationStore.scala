@@ -19,6 +19,7 @@ final class FaultyCoordinationStore(underlying: CoordinationStore) extends Coord
 
   private val journal = new ConcurrentLinkedQueue[Operation]
   private var queued = Map.empty[Operation, List[Fault]]
+  private var afterwards = Map.empty[Operation, () => Unit]
   @volatile private var unreachable = false
 
   /** Every call fails without reaching the store, until `up`. */
@@ -29,6 +30,14 @@ final class FaultyCoordinationStore(underlying: CoordinationStore) extends Coord
   /** The next calls of `operation` fail with `faults`, one each and in this order. */
   def failNext(operation: Operation, faults: Fault*): Unit = synchronized {
     queued += operation -> (queued.getOrElse(operation, Nil) ++ faults)
+  }
+
+  /**
+   * Runs `effect` once, right after the next call of `operation` has got its answer and before
+   * the caller sees it: whatever another process does in that instant.
+   */
+  def afterNext(operation: Operation)(effect: => Unit): Unit = synchronized {
+    afterwards += operation -> (() => effect)
   }
 
   /** Every call made so far, in order, whether it failed or not. */
@@ -70,7 +79,14 @@ final class FaultyCoordinationStore(underlying: CoordinationStore) extends Coord
         }
     }
     fault match {
-      case None => run
+      case None =>
+        val answer = run
+        synchronized {
+          val effect = afterwards.get(operation)
+          afterwards -= operation
+          effect
+        }.foreach(_.apply())
+        answer
       case Some(Unreachable) =>
         throw new IOException(s"injected fault: $operation did not reach the store")
       case Some(ReplyLost) =>

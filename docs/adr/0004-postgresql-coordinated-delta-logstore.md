@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -203,6 +203,13 @@ Writes with `overwrite=true` (`_last_checkpoint`, `_last_vacuum_info`) must be a
 - `T(N)` keeps the lost commit's bytes until the temp GC, so an operator can compare them with `N.json`. Nothing compares them automatically.
 
 Closing it would take a check of every published commit against its entry, or the storage access control above. It is recorded as a known limit.
+
+*As built (P2a.10, 2026-11-15):* layers 3 and 4, in `CommitProtocol`. What the implementation fixed:
+- **Where a gap is looked for.** A reader compares the highest commit in its listing with the latest entry it read before listing. A writer looks at the commit before the one it writes. Commits below the latest entry are not examined: pruning (deviation 6) may have removed their entries, and a version can only be taken after one that has an entry.
+- **No false alarm from a commit in flight.** A coordinated commit has its entry before it has its file, so a commit that appears in a listing after the latest entry was read may be a new coordinated one. Its entry is looked for again once the listing is done, and only its absence counts.
+- **Who is stopped.** A reader that finds a gap goes on, as §3.3 says. A writer that finds one stops with `UncoordinatedWriteException`. So does whoever finds a foreign file under the name of a commit it is publishing, a reader included: the registry says the version is one commit and the log holds another, and a reader has no table to be given until an operator resolves the entry.
+- **The taint** records the version, what was found and the process that found it. A tainted table is not examined again. If the taint cannot be recorded the outcome is the same, and the next reader or writer that meets the commit records it.
+- **Nothing foreign is touched**: neither the commit nor its sidecar (ADR-0015).
 
 ### 3.6 Canonical table identity
 
