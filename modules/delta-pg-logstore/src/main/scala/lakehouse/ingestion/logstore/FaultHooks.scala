@@ -3,7 +3,6 @@ package lakehouse.ingestion.logstore
 import java.io.IOException
 
 import org.apache.hadoop.conf.Configuration
-import org.slf4j.LoggerFactory
 
 /**
  * A point of the commit protocol where a test makes a writer stop, wait or fail (ADR-0004
@@ -34,8 +33,6 @@ trait FaultHooks {
 
 object FaultHooks {
 
-  private val logger = LoggerFactory.getLogger(classOf[FaultHooks])
-
   val Off: FaultHooks = _ => ()
 
   /** The setting that makes a writer wait at `point`; under Spark, with `spark.hadoop.` first. */
@@ -48,22 +45,22 @@ object FaultHooks {
    */
   @throws[IOException]
   def from(conf: Configuration): FaultHooks = {
-    val delays = FaultPoint.All.flatMap { point =>
+    val delays = delaysIn(conf).toMap
+    if (delays.isEmpty) Off else point => delays.get(point).foreach(Thread.sleep)
+  }
+
+  /**
+   * The waits a configuration asks for, in milliseconds, in the order of the protocol. A
+   * LogStore announces them when it is created, so that none stays on unnoticed.
+   */
+  @throws[IOException]
+  def delaysIn(conf: Configuration): Seq[(FaultPoint, Long)] =
+    FaultPoint.All.flatMap { point =>
       Option(conf.get(delayKey(point))).map(_.trim).filter(_.nonEmpty).map { text =>
         val millis = text.toLongOption.filter(_ >= 0).getOrElse {
           throw new IOException(s"${delayKey(point)} must be a number of milliseconds, 0 or more")
         }
         point -> millis
       }
-    }.toMap
-
-    if (delays.isEmpty) Off
-    else {
-      logger.warn(
-        "Every commit waits at {}: fault hooks are configured, which is for tests only",
-        delays.map { case (point, millis) => s"${point.key} (${millis} ms)" }.mkString(", ")
-      )
-      point => delays.get(point).foreach(Thread.sleep)
     }
-  }
 }

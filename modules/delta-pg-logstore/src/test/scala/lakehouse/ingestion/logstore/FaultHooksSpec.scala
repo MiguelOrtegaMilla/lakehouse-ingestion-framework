@@ -38,6 +38,20 @@ final class FaultHooksSpec extends AnyFunSuite with Matchers {
     } should be < 100L
   }
 
+  test("the waits a configuration asks for can be listed, in the order of the protocol") {
+    FaultHooks.delaysIn(new Configuration()) shouldBe empty
+
+    val conf = new Configuration()
+    conf.setLong(FaultHooks.delayKey(FaultPoint.AfterPublish), 0L)
+    conf.setLong(FaultHooks.delayKey(FaultPoint.BeforeInsert), 120L)
+
+    // A wait of zero is still a fault setting that somebody left there.
+    FaultHooks.delaysIn(conf) shouldBe Seq(
+      FaultPoint.BeforeInsert -> 120L,
+      FaultPoint.AfterPublish -> 0L
+    )
+  }
+
   test("a delay that is not a number of milliseconds is an error that names the setting") {
     Seq("soon", "-5", "1.5").foreach { text =>
       val conf = new Configuration()
