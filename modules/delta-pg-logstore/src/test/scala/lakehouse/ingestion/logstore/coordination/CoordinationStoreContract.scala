@@ -216,8 +216,11 @@ object CoordinationStoreContract {
   private val Writers = 16
   private val WaitSeconds = 30L
 
-  /** A table no other test uses. */
-  def newTable(): TableUri = TableUri(s"file:/contract/${UUID.randomUUID()}")
+  /**
+   * A table no other test uses. A store never looks at what a key says, so these tests need no
+   * directory behind it; the keys of real paths are `TableIdentitySpec`'s subject.
+   */
+  def newTable(): TableUri = new TableUri(s"file:/contract/${UUID.randomUUID()}")
 
   /** A claim on `version` with a temporary path of its own, as each write attempt has. */
   def claim(table: TableUri, version: Long): Claim =

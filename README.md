@@ -32,12 +32,13 @@ sbt compile             # compile all modules
 sbt checkBoundaries     # verify the module dependency rules
 sbt scalafmtCheckAll scalafmtSbtCheck   # formatting gate
 sbt scalafmtAll scalafmtSbt             # reformat
+sbt delta-pg-logstore/test              # the LogStore module's unit tests (no Docker)
 sbt integration-tests/test              # integration tests (needs Docker)
 sbt "integration-tests/testOnly lakehouse.ingestion.it.delta.*"   # Spark + Delta smoke test only (no Docker)
 sbt "integration-tests/testOnly lakehouse.ingestion.it.logstore.*"   # what Delta asks of a LogStore (no Docker)
 ```
 
-Tests that run Spark fork their own JVM with the Java 17 module options Spark needs (`project/SparkTestJvm.scala`), 1 GB of heap and UTC. `SparkJvmOptionsSpec` fails if a Spark upgrade changes those options and the build has not followed.
+Tests that run Spark fork their own JVM with the Java 17 module options Spark needs (`project/SparkTestJvm.scala`), 1 GB of heap and UTC. `SparkJvmOptionsSpec` fails if a Spark upgrade changes those options and the build has not followed. The LogStore module's tests also run in a JVM of their own, because they use Hadoop's local file system.
 
 ## Continuous integration
 

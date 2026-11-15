@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -198,6 +198,16 @@ Mutual exclusion holds only if every writer maps the same table to the **same ke
 - One scheme per lake profile (ADR-0011): `s3://`, `s3n://` and `s3a://` must never be mixed.
 - Aliases that slip through are caught by the registry (layer 2): an aliased key is unregistered, so its commits are rejected.
 - Delta treats spellings as distinct too, though only at creation. `DeltaTable.create(...).location("file:///x")` fails with `DELTA_AMBIGUOUS_PATHS_IN_CREATE_TABLE`. Delta compares the location as given with Hadoop's qualified form `file:/x` and refuses to choose between them (found in P1.4b: the stress table is created from the qualified form). This is a single check at creation; Delta does not reconcile spellings across writers. The coordination key must therefore always be the qualified form, never the string a caller passed. *(Added in P1.4d.)*
+
+*As built (P2a.6, 2026-11-15):* `TableIdentity.of` is the one function that makes a key, and code outside the module has no other way to get one. On `file://`:
+- The key is Hadoop's qualified form of the table's real directory, such as `file:/home/user/lake/bronze/orders`.
+- Links are resolved for the part of the path that exists. A table that is about to be created has its key already, and creating it does not change the key.
+- A location with no single key is refused:
+  - a `_delta_log` that is itself a symbolic link, through which two table directories would share one log under two keys;
+  - a link whose target does not exist, whose key would change when the target is created;
+  - another scheme (§2), or a URI that names a host.
+- A `file:` URI has no user info to strip. That rule belongs to the `s3a://` key (E1).
+- Two paths can reach one directory without a link between them, as when a file system is mounted twice. Resolving paths cannot see that; layer 2 catches the second path (§3.5).
 
 ### 3.7 Attribution (commit context)
 
