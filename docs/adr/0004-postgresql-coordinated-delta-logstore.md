@@ -385,7 +385,7 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
   - *(P2a, 2026-11-14)* `DelayingLocalFs` delays a rename, and the hard-link publish (ADR-0015) never renames a commit file. Left as it is, the widened variant would pass without testing anything.
   - GREEN therefore widens the LogStore's own windows, with a delay at its fault hooks: between the existence check and the `INSERT`, and between the `INSERT` and the publish.
   - The writers are separate JVMs, so the hooks can be selected from configuration (P2a.8).
-  - *As built (P2a.8, 2026-11-15):* three points, `beforeInsert`, `afterInsert` and `afterPublish`, each with a setting `lakehouse.logstore.fault.<point>.delayMs` (under Spark, with the `spark.hadoop.` prefix). A configuration can only make a writer wait. Stopping or failing a writer at a point takes hooks that only tests can install.
+  - *As built (P2a.8, 2026-11-15):* three points, `beforeInsert`, `afterInsert` and `afterPublish`, each with a setting `lakehouse.logstore.fault.<point>.delayMs` (under Spark, with the `spark.hadoop.` prefix). A configuration can only make a writer wait. Stopping or failing a writer at a point takes hooks that only tests can install. Every LogStore warns, when it is created, of each fault hook its configuration turns on, with the point and the wait: one left on in a deployment cannot go unnoticed.
 - Both results go in the README, side by side.
 
 **RED result (P1.4c, 2026-11-13).** Full write-up: [docs/spikes/logstore-red.md](../spikes/logstore-red.md).

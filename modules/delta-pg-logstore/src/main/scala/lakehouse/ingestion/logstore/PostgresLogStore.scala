@@ -15,6 +15,7 @@ import lakehouse.ingestion.logstore.coordination.{
 import lakehouse.ingestion.logstore.storage.{LogStorage, PublishResult}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.slf4j.LoggerFactory
 
 /**
  * A Delta `LogStore` that takes the mutual exclusion of commits from PostgreSQL, so that
@@ -34,6 +35,9 @@ import org.apache.hadoop.fs.{FileSystem, Path}
  * configuration and does nothing else. The first commit reads the settings and takes the
  * JVM's shared coordination store; a wrong setting fails that commit, not the constructor.
  *
+ * '''Fault hooks.''' The one thing the constructor does say, at WARN and every time, is which
+ * fault hooks the configuration turns on. They are for tests, and slow every commit down.
+ *
  * Reading the log is still Hadoop's plain listing here: the coordinated read arrives with
  * recovery.
  *
@@ -50,6 +54,8 @@ final class PostgresLogStore private[logstore] (
 ) extends HadoopFileSystemLogStore(initHadoopConf) {
 
   import PostgresLogStore._
+
+  warnOfConfiguredFaults(initHadoopConf)
 
   /** The constructor Delta calls. */
   def this(initHadoopConf: Configuration) =
@@ -100,6 +106,8 @@ final class PostgresLogStore private[logstore] (
 
 object PostgresLogStore {
 
+  private val logger = LoggerFactory.getLogger(classOf[PostgresLogStore])
+
   private val CommitFileName = """(\d+)\.json""".r
 
   /**
@@ -141,6 +149,29 @@ object PostgresLogStore {
       // The file has its name, or will not get one: the temporary name is of no more use.
       finally storage.discard(temp)
   }
+
+  /**
+   * Says which fault hooks `conf` turns on, one warning for each. A setting that cannot be read
+   * is announced too, and fails the first commit, not the creation of the LogStore.
+   */
+  private def warnOfConfiguredFaults(conf: Configuration): Unit =
+    try
+      FaultHooks.delaysIn(conf).foreach { case (point, millis) =>
+        logger.warn(
+          "Fault hook on by configuration: every commit waits {} ms at {} ({}). " +
+            "Fault hooks are for tests only.",
+          millis,
+          point.key,
+          FaultHooks.delayKey(point)
+        )
+      }
+    catch {
+      case e: IOException =>
+        logger.warn(
+          "A fault hook setting cannot be used, and every commit will fail on it: {}",
+          e.getMessage
+        )
+    }
 
   /** The store that every LogStore of this JVM with these settings shares (ADR-0004 §3.9). */
   private def sharedCoordination(conf: Configuration): CoordinationStore =
