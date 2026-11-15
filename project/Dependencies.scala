@@ -38,6 +38,13 @@ object Dependencies {
     .excludeAll(ExclusionRule(organization = "io.unitycatalog"))
   val hadoopClientApi = "org.apache.hadoop" % "hadoop-client-api" % Versions.hadoop % Provided
 
+  // The classes behind the Hadoop API, for the LogStore module's own tests on Hadoop's local
+  // file system. At run time Spark supplies them. reload4j, a logging backend the artifact
+  // declares, is left out: the module has none, in its tests either (ADR-0016).
+  val hadoopClientRuntimeTest =
+    ("org.apache.hadoop" % "hadoop-client-runtime" % Versions.hadoop % Test)
+      .exclude("ch.qos.reload4j", "reload4j")
+
   val postgresJdbc = "org.postgresql" % "postgresql" % Versions.postgresJdbc
 
   // The LogStore's connection pool (ADR-0004 §3.9). Its one dependency is slf4j-api.
@@ -68,6 +75,8 @@ object Dependencies {
   // Test-only. log4j2 is the only logging backend, as in Spark (ADR-0002): Testcontainers logs
   // through SLF4J, which this binding routes to log4j2.
   val scalatest = "org.scalatest" %% "scalatest" % Versions.scalatest % Test
+  // For a test that asks a compiled class how it was declared. ScalaTest brings it anyway.
+  val scalaReflectTest = "org.scala-lang" % "scala-reflect" % Versions.scala % Test
   val testcontainers = "org.testcontainers" % "testcontainers" % Versions.testcontainers % Test
 
   // A TCP proxy in a container, to cut, delay or stall real connections in tests. Its image is

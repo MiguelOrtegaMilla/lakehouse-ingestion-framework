@@ -54,7 +54,20 @@ lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
       forbidden = Seq(Forbid.spark, Forbid.deltaSpark, Forbid.unityCatalog, Forbid.log4j),
       allowProjectDependencies = false
     ),
-    libraryDependencies ++= Seq(deltaStorage, hadoopClientApi, postgresJdbc, hikari, scalatest)
+    libraryDependencies ++= Seq(
+      deltaStorage,
+      hadoopClientApi,
+      postgresJdbc,
+      hikari,
+      scalatest,
+      scalaReflectTest,
+      hadoopClientRuntimeTest
+    ),
+    // The tests use Hadoop's local file system, which keeps JVM-wide state and a shutdown hook:
+    // they get a JVM of their own, not sbt's.
+    Test / fork := true,
+    // The module brings no logging backend (ADR-0016). slf4j says so on stderr at every start.
+    Test / javaOptions += "-Dslf4j.internal.verbosity=ERROR"
   )
 
 /** Connectors, writers, control-plane repositories, engine service. */
