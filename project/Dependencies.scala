@@ -17,6 +17,8 @@ object Dependencies {
     val hadoop = "3.4.2"
     // The log4j line bundled with Spark 4.1.4 (spark-parent `log4j.version`).
     val log4j = "2.24.3"
+    // The SLF4J line bundled with Spark 4.1.4 (spark-parent `slf4j.version`).
+    val slf4j = "2.0.17"
 
     val postgresJdbc = "42.7.14"
     val hikari = "7.1.0"
@@ -49,6 +51,11 @@ object Dependencies {
 
   // The LogStore's connection pool (ADR-0004 §3.9). Its one dependency is slf4j-api.
   val hikari = "com.zaxxer" % "HikariCP" % Versions.hikari
+
+  // What the LogStore logs through: the API only, never a backend (ADR-0016). `provided`
+  // because Spark supplies it; HikariCP brings the same artifact at compile scope, so this
+  // declares the use more than it changes a classpath.
+  val slf4jApi = "org.slf4j" % "slf4j-api" % Versions.slf4j % Provided
 
   /**
    * Pins every log4j2 module to Spark's version. log4j modules must all have one version, and

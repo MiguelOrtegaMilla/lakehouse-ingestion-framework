@@ -331,6 +331,20 @@ final class LocalLogStorageSpec extends AnyFunSuite with Matchers with ScratchDi
     filesUnder(log).filter(_.getFileName.toString.endsWith(".crc")) shouldBe empty
   }
 
+  test("a discarded temporary file is gone; the file it was published as stays") {
+    val log = newLog()
+    val target = log.resolve("00000000000000000010.checkpoint.json")
+    val temp = writeTemp(target, Seq("the checkpoint"))
+    publish(temp, target) shouldBe Published
+
+    storage.discard(hadoop(temp))
+
+    filesUnder(log) shouldBe Seq(target)
+    Seq(checked, unchecked).foreach(linesOf(_, target) shouldBe Seq("the checkpoint"))
+    // Discarding what is not there is not an error: two writers may clean up the same litter.
+    storage.discard(hadoop(temp))
+  }
+
   test("a file written in place on a local disk can be read before it is complete") {
     storage.partialWritesVisible shouldBe true
   }

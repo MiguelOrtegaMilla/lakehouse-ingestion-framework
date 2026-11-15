@@ -56,6 +56,14 @@ trait LogStorage {
    */
   @throws[IOException]
   def replace(temp: Path, target: Path): Unit
+
+  /**
+   * Removes the temporary file `temp` if it is there. For one that nothing will ever ask for:
+   * its version went to another writer, or its content has its final name and needs no other.
+   * Never for the temporary file of a coordination entry.
+   */
+  @throws[IOException]
+  def discard(temp: Path): Unit
 }
 
 object LogStorage {

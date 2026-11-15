@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -136,6 +136,13 @@ sequenceDiagram
   - its own path means the version is its own, whichever attempt inserted the row; another path means the version is taken.
 
   If PostgreSQL stays unreachable, `write` fails with an `IOException`. A later reader publishes the commit if the entry did land (F15).
+
+*As built (P2a.8, 2026-11-15):* `PostgresLogStore.write` and `CommitProtocol`. What the implementation fixed:
+- **Before anything is written**, the registry must allow the write. A table that is not registered is refused unless the commit is version 0, which registers it, with the `metaData.id` read from that commit. A tainted table is refused. So is a write at or below the version a table was adopted at, and a version 0 for a table whose commits the registry already knows (F9, widened to adopted tables). Each refusal is a `WriteRefusedException`.
+- **A claim that loses** removes its temporary file at once: no entry points at it. A claim whose outcome stays unknown leaves it, since the entry may exist.
+- **The claim is repeated** up to three times, 100 ms and 200 ms apart, and so is a publish that fails (ADR-0017).
+- **Files that are not commits** are written to a temporary file and given their name in one step, without an entry. A commit is never overwritten, whatever `overwrite` says.
+- **Not ported yet:** the per-JVM `PathLock` of §4. It only spares duplicate recoveries, so it is decided with the read path (P2a.9).
 
 ### 3.3 Read path — `listFrom(path)` on `_delta_log`
 
@@ -378,6 +385,7 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
   - *(P2a, 2026-11-14)* `DelayingLocalFs` delays a rename, and the hard-link publish (ADR-0015) never renames a commit file. Left as it is, the widened variant would pass without testing anything.
   - GREEN therefore widens the LogStore's own windows, with a delay at its fault hooks: between the existence check and the `INSERT`, and between the `INSERT` and the publish.
   - The writers are separate JVMs, so the hooks can be selected from configuration (P2a.8).
+  - *As built (P2a.8, 2026-11-15):* three points, `beforeInsert`, `afterInsert` and `afterPublish`, each with a setting `lakehouse.logstore.fault.<point>.delayMs` (under Spark, with the `spark.hadoop.` prefix). A configuration can only make a writer wait. Stopping or failing a writer at a point takes hooks that only tests can install.
 - Both results go in the README, side by side.
 
 **RED result (P1.4c, 2026-11-13).** Full write-up: [docs/spikes/logstore-red.md](../spikes/logstore-red.md).
