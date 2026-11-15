@@ -46,6 +46,12 @@ final private[logstore] class TableLog(
  * Before any of that the registry must allow the write (§3.5, layer 2), and the commit before
  * this one must be published: a version is never written on top of one that is not visible.
  *
+ * A commit that some writer made without this protocol is detected in three places, and taints
+ * the table each time (§3.5, layers 3 and 4): in the log without an entry, when a reader lists
+ * it or when a writer is about to write after it; and under the name of a commit that is being
+ * published. The first leaves readers alone. The other two stop the writer, or the reader that
+ * was finishing the commit: the registry and the log then disagree on what the version is.
+ *
  * @param writerInstance who this writer is, for the entries it makes
  */
 final private[logstore] class CommitProtocol(
@@ -133,15 +139,45 @@ final private[logstore] class CommitProtocol(
    *
    * A table without entries is left as it is: it is not coordinated, or has no commit yet.
    *
+   * @return the version of the latest entry, if the table has entries
    * @throws CommitMissingException the file of the latest commit is not in the log
    */
   @throws[IOException]
-  def bringUpToDate(log: TableLog): Unit =
-    store.latestEntry(log.table).foreach { latest =>
-      if (!latest.complete) finish(log, latest)
-      else if (!log.exists(log.commitFile(latest.version)))
-        throw new CommitMissingException(latest.table, latest.version)
+  def bringUpToDate(log: TableLog): Option[Long] = {
+    val latest = store.latestEntry(log.table)
+    latest.foreach { entry =>
+      if (!entry.complete) finish(log, entry)
+      else if (!log.exists(log.commitFile(entry.version)))
+        throw new CommitMissingException(entry.table, entry.version)
     }
+    latest.map(_.version)
+  }
+
+  /**
+   * Looks, in what a listing of the log returned, for a commit that no writer of this protocol
+   * made, and taints the table if there is one (ADR-0004 §3.3, step 5; §3.5, layer 3). The
+   * reader goes on: the log can still be read, and somebody has to look at it.
+   *
+   * A coordinated commit has its entry before it has its file. A commit file above the latest
+   * entry is therefore a foreign one, or one whose entry was made after `latestKnown` was
+   * read. So the entry is looked for again, now that the listing is done, and only its absence
+   * counts. Commits below the latest entry are not examined: maintenance may prune their
+   * entries, and a commit can only be taken after one that has an entry.
+   *
+   * @param latestKnown the version of the latest entry before the listing (`bringUpToDate`)
+   * @param highestListed the highest commit version in the listing
+   */
+  @throws[IOException]
+  def detectForeignCommit(log: TableLog, latestKnown: Option[Long], highestListed: Long): Unit =
+    if (latestKnown.forall(_ < highestListed))
+      // A table that is not registered is not coordinated: nothing is expected of its log.
+      store.registration(log.table).foreach { registration =>
+        val foreign =
+          !registration.isTainted &&
+            highestListed > registration.registeredVersion &&
+            store.entry(log.table, highestListed).isEmpty
+        if (foreign) detected(log.table, highestListed, NoEntry): Unit
+      }
 
   /**
    * Publishes and acknowledges the commit of an entry that is not complete. It is what the
@@ -233,12 +269,7 @@ final private[logstore] class CommitProtocol(
       case Some(_) => ()
       case None =>
         val inLog = log.exists(log.commitFile(previous))
-        if (inLog && previous > adoptedAt)
-          throw new UncoordinatedWriteException(
-            table,
-            previous,
-            "the commit has no coordination entry, so a writer without this LogStore made it"
-          )
+        if (inLog && previous > adoptedAt) throw detected(table, previous, NoEntry)
         // Otherwise it is the last commit made before the table was coordinated.
         if (!inLog)
           throw new IOException(
@@ -258,7 +289,7 @@ final private[logstore] class CommitProtocol(
     published match {
       case PublishResult.Published | PublishResult.AlreadyPublished => ()
       case PublishResult.ForeignFile =>
-        throw new UncoordinatedWriteException(
+        throw detected(
           entry.table,
           entry.version,
           s"$target is not the commit that took the version (its bytes are in " +
@@ -283,6 +314,35 @@ final private[logstore] class CommitProtocol(
         )
     }
 
+  /**
+   * Taints the table: a commit that this protocol did not make is in its log, so every write
+   * is refused from now on, until an operator has verified the table and adopted it again
+   * (ADR-0004 §3.5). It is said at ERROR, and recorded with who found it.
+   *
+   * If the taint cannot be recorded, the detection stands: a writer stops on it all the same,
+   * and the next reader or writer that meets the commit records it.
+   *
+   * @return the detection, for a writer to throw
+   */
+  private def detected(
+      table: TableUri,
+      version: Long,
+      found: String
+  ): UncoordinatedWriteException = {
+    val detection = new UncoordinatedWriteException(table, version, found)
+    logger.error(
+      "{}. The table is tainted: it refuses writes until an operator verifies and re-adopts it.",
+      detection.getMessage
+    )
+    try store.taint(table, s"version $version: $found (found by $writerInstance)")
+    catch {
+      case e: IOException =>
+        detection.addSuppressed(e)
+        logger.error(s"The taint of $table could not be recorded", e)
+    }
+    detection
+  }
+
   /** Only maintenance removes an entry, and not while the table is being written. */
   private def warnOfMissingEntry(entry: CommitEntry): Unit =
     logger.warn(
@@ -303,6 +363,10 @@ final private[logstore] class CommitProtocol(
 private[logstore] object CommitProtocol {
 
   private val logger = LoggerFactory.getLogger(classOf[CommitProtocol])
+
+  /** What is wrong with a commit that is in the log and has no entry above the adoption. */
+  private val NoEntry =
+    "the commit has no coordination entry, so a writer without this LogStore made it"
 
   /** The directory of temporary files, inside `_delta_log`. */
   val TempDirectory = ".tmp"
