@@ -60,6 +60,19 @@ final class UncoordinatedWriteException(val table: TableUri, val version: Long, 
     extends IOException(s"uncoordinated write detected on $table at version $version: $found")
 
 /**
+ * The latest commit of the table is recorded as published, and its file is not in the log. The
+ * file was deleted, or this is not the storage the table's writers use, or the table was
+ * dropped by deleting its directory. A reader would be given an older table for the current
+ * one, so nothing is read.
+ */
+final class CommitMissingException(val table: TableUri, val version: Long)
+    extends IOException(
+      s"version $version of $table is committed and acknowledged, and its file is not in the " +
+        "log: it was deleted, or this is not the storage its writers use. If the table was " +
+        "dropped, reset its registry"
+    )
+
+/**
  * The entry of a commit points at a temporary file that no longer exists, and the commit is not
  * published: its bytes are gone. Nothing can publish it, and nothing may take its version.
  */

@@ -14,7 +14,7 @@ import lakehouse.ingestion.logstore.coordination.{
 }
 import lakehouse.ingestion.logstore.storage.{LogStorage, PublishResult}
 import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
 import org.slf4j.LoggerFactory
 
 /**
@@ -38,8 +38,9 @@ import org.slf4j.LoggerFactory
  * '''Fault hooks.''' The one thing the constructor does say, at WARN and every time, is which
  * fault hooks the configuration turns on. They are for tests, and slow every commit down.
  *
- * Reading the log is still Hadoop's plain listing here: the coordinated read arrives with
- * recovery.
+ * '''Reading.''' Delta finds a table's versions by listing its log, so `listFrom` is where a
+ * reader meets the protocol: before the listing, a commit that was taken and not published is
+ * published. `read` is Hadoop's, unchanged: Delta reads a file after it has listed it.
  *
  * @param coordinationOf the coordination store for a configuration
  * @param storageOf the storage for a file system, or its refusal
@@ -92,12 +93,29 @@ final class PostgresLogStore private[logstore] (
           s"refusing to overwrite the commit $file: a commit is never rewritten"
         )
       case Some(version) =>
-        val directory = file.getParent
-        val log = new TableLog(TableIdentity.of(directory.getParent, fs), directory, fs, storage)
-        protocol.commit(log, version, file, actions.asScala)
+        protocol.commit(tableLog(file.getParent, fs, storage), version, file, actions.asScala)
       case None =>
         writeWhole(storage, file, actions.asScala, overwrite)
     }
+  }
+
+  /**
+   * Lists a directory from the name of `path` on, as Hadoop does. If the directory is a table's
+   * log, the log is first brought up to date with the registry (ADR-0004 §3.3), in whatever
+   * JVM this runs: a driver, or a task that resolves a timestamp over a long history (§3.9).
+   * `VACUUM` lists data directories through here too; those are not coordinated, and never
+   * need the database.
+   *
+   * @throws java.io.FileNotFoundException the directory does not exist: for Delta, no table
+   * @throws java.io.IOException the coordination store did not answer, or the log cannot be
+   *   brought up to date: nothing is listed (fail closed)
+   */
+  override def listFrom(path: Path, hadoopConf: Configuration): java.util.Iterator[FileStatus] = {
+    val fs = path.getFileSystem(hadoopConf)
+    Option(fs.makeQualified(path).getParent)
+      .filter(_.getName == TableIdentity.LogDirectory)
+      .foreach(directory => protocol.bringUpToDate(tableLog(directory, fs, storageOf(fs))))
+    super.listFrom(path, hadoopConf)
   }
 
   override def isPartialWriteVisible(path: Path, hadoopConf: Configuration): java.lang.Boolean =
@@ -122,6 +140,10 @@ object PostgresLogStore {
         case _ => None
       }
     }
+
+  /** The table whose log is `directory`, a `_delta_log`. */
+  private def tableLog(directory: Path, fs: FileSystem, storage: LogStorage): TableLog =
+    new TableLog(TableIdentity.of(directory.getParent, fs), directory, fs, storage)
 
   /**
    * Writes a file that is not a commit: whole, and without a coordination entry. Its temporary
