@@ -212,12 +212,14 @@ final class PostgresLogStoreEndToEndSpec
     idsOf(path) shouldBe (0L until 60L)
     (0L to 5L).map(entry(path, _).complete) shouldBe Seq.fill(6)(true)
 
-    // Collecting temporary files after the cleanup: a known limit. The file of a commit that
-    // Delta expired looks like the only copy of a commit that was lost, and is kept.
+    // The temporary files of the commits that Delta expired go the same way: they are below
+    // the checkpoint that Delta's pointer names, and are not taken for commits that were lost.
     val fates = maintenance.collectTemps(new Path(path), fs)
     def fateOf(version: Long): TempFate = fates(entry(path, version).tempPath.stripPrefix(".tmp/"))
-    (0L to 3L).map(fateOf) shouldBe Seq.fill(4)(TempFate.KeptOnlyCopy)
+    (0L to 3L).map(fateOf) shouldBe Seq.fill(4)(TempFate.RemovedExpired)
     (4L to 5L).map(fateOf) shouldBe Seq.fill(2)(TempFate.RemovedPublished)
+    tempsOf(path) shouldBe empty
+    DeltaLog.clearCache()
     idsOf(path) shouldBe (0L until 60L)
   }
 

@@ -1,6 +1,7 @@
 package lakehouse.ingestion.logstore
 
 import java.io.{FileNotFoundException, IOException}
+import java.nio.charset.StandardCharsets.UTF_8
 import java.util
 
 import scala.annotation.tailrec
@@ -44,6 +45,13 @@ object TempFate {
   /** Removed: its commit is published, so the file had a second name it no longer needs. */
   case object RemovedPublished extends TempFate { val removed = true }
 
+  /**
+   * Removed: its commit is recorded as published, is below the table's last checkpoint, and is
+   * no longer in the log. Delta's log cleanup removed the commit, and the checkpoint holds
+   * everything it said.
+   */
+  case object RemovedExpired extends TempFate { val removed = true }
+
   /** Removed: no entry points at it, and it is older than any commit could take. */
   case object RemovedOrphan extends TempFate { val removed = true }
 
@@ -51,8 +59,9 @@ object TempFate {
   case object KeptUnfinished extends TempFate { val removed = false }
 
   /**
-   * Kept: its entry is complete, and the commit file is missing or is another file. It is the
-   * only copy of a commit that was lost, and somebody will want to see it.
+   * Kept: its entry is complete, and the commit file is another file, or is missing where
+   * Delta's log cleanup does not explain it. It is the only copy of a commit that was lost, and
+   * somebody will want to see it.
    */
   case object KeptOnlyCopy extends TempFate { val removed = false }
 
@@ -190,6 +199,12 @@ final class TableMaintenance(
    * Removes the temporary files of a table that nothing needs any more (ADR-0004 §3.8):
    *
    *  - the file of a commit that is published, which the commit file is a second name of;
+   *  - the file of a commit that Delta's log cleanup has removed from the log. Delta removes
+   *    the commits below the last checkpoint once they are older than the log retention, thirty
+   *    days by default. Such a file is told from the only copy of a commit that was lost by
+   *    where it is: below the version in `_last_checkpoint`, which is the line Delta's cleanup
+   *    itself never crosses. It must also be older than `orphansOlderThan`, so that a commit
+   *    somebody deleted by mistake a moment ago is still there to be put back;
    *  - a file that no entry points at and that is older than `orphansOlderThan`: what a writer
    *    left when it died before taking its version (scenario F1), or when it was writing a file
    *    that is not a commit.
@@ -206,17 +221,23 @@ final class TableMaintenance(
   ): Map[String, TempFate] = {
     val target = new Target(tablePath, fs)
     val now = System.currentTimeMillis()
+    def isOld(temp: FileStatus): Boolean =
+      now - temp.getModificationTime >= orphansOlderThan.toMillis
+    // Read once, before the files: a checkpoint written meanwhile only makes this cautious.
+    val lastCheckpoint = target.lastCheckpoint
+
     target.temps.map { temp =>
       val name = temp.getPath.getName
       val fate = target.entryPointingAt(name) match {
         case Some(entry) if !entry.complete => TempFate.KeptUnfinished
         case Some(entry) =>
-          if (target.sameContent(temp.getPath, target.commitFile(entry.version)))
-            TempFate.RemovedPublished
+          val commit = target.commitFile(entry.version)
+          val expired = lastCheckpoint.exists(entry.version < _) && isOld(temp)
+          if (target.sameContent(temp.getPath, commit)) TempFate.RemovedPublished
+          else if (expired && !fs.exists(commit)) TempFate.RemovedExpired
           else TempFate.KeptOnlyCopy
         case None =>
-          if (now - temp.getModificationTime >= orphansOlderThan.toMillis) TempFate.RemovedOrphan
-          else TempFate.KeptRecent
+          if (isOld(temp)) TempFate.RemovedOrphan else TempFate.KeptRecent
       }
       if (fate.removed) target.storage.discard(temp.getPath)
       name -> fate
@@ -238,6 +259,19 @@ final class TableMaintenance(
       list(log).flatMap(file => PostgresLogStore.commitVersion(file.getPath)).maxOption
 
     def temps: Seq[FileStatus] = list(tempDirectory).filter(_.isFile)
+
+    /**
+     * The version of the table's last checkpoint, as Delta's pointer to it says: Delta's log
+     * cleanup removes commits below that version and no others. `None` if there is no pointer,
+     * or if it is not written the way Delta writes it: then nothing is taken for expired.
+     */
+    def lastCheckpoint: Option[Long] =
+      try
+        new String(bytesOf(new Path(log, LastCheckpointFile)), UTF_8) match {
+          case LastCheckpointVersion(digits) => digits.toLongOption
+          case _ => None
+        }
+      catch { case _: FileNotFoundException => None }
 
     /** The entry whose temporary file is the one named `name`, if there is one. */
     def entryPointingAt(name: String): Option[CommitEntry] = {
@@ -280,6 +314,15 @@ object TableMaintenance {
 
   /** The temporary file of a commit: `<digits>.json.<unique>`. */
   private val TempOfCommit = """(\d+)\.json\..+""".r
+
+  /** Delta's pointer to the last checkpoint of a table, in its `_delta_log`. */
+  private val LastCheckpointFile = "_last_checkpoint"
+
+  /**
+   * The version in that pointer. The module has no JSON parser and needs none for this: Delta
+   * writes `version` as the first field. A pointer of any other shape gives no version.
+   */
+  private val LastCheckpointVersion = """(?s)^\{"version":(\d+)[,}].*""".r
 
   /**
    * How many times a table is examined before the operation gives up: its entries changed

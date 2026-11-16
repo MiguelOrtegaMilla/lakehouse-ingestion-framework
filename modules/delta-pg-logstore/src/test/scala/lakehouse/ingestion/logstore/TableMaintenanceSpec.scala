@@ -1,5 +1,6 @@
 package lakehouse.ingestion.logstore
 
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.attribute.FileTime
 import java.nio.file.{Files, Path => LocalPath}
 import java.time.Instant
@@ -530,6 +531,76 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     fates(gone.getFileName.toString) shouldBe TempFate.KeptOnlyCopy
     Files.readAllLines(replaced).asScala shouldBe append(1)
     Files.readAllLines(gone).asScala shouldBe append(2)
+  }
+
+  /** The name of the temporary file of `version`, as the collection reports it. */
+  private def tempNameOf(lake: Lake, version: Long): String =
+    lake.tempOf(lake.entry(version).value).getFileName.toString
+
+  /** Delta's pointer to a checkpoint of the table at `version`, written as Delta writes it. */
+  private def checkpointAt(lake: Lake, version: Long): Unit =
+    Files.write(
+      lake.log.resolve("_last_checkpoint"),
+      s"""{"version":$version,"size":4,"sizeInBytes":12345,"numOfAddFiles":2}""".getBytes(UTF_8)
+    ): Unit
+
+  test("the temporary file of a commit that Delta's log cleanup expired is collected") {
+    val lake = new Lake().withCommits(last = 4)
+    val temps = (0L to 4L).map(tempNameOf(lake, _))
+    checkpointAt(lake, version = 3)
+    // What the cleanup does a month later: the commits below the checkpoint leave the log.
+    lake.temps.foreach(age(_, by = 40.days))
+    (0L to 2L).foreach(version => Files.delete(lake.commitFile(version)))
+
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+
+    temps.map(fates) shouldBe
+      Seq.fill(3)(TempFate.RemovedExpired) ++ Seq.fill(2)(TempFate.RemovedPublished)
+    lake.temps shouldBe empty
+    // The table goes on from its checkpoint.
+    lake.commit(5)(append(5))
+    lake.list(from = 3).filter(_.endsWith(".json")) shouldBe (3L to 5L).map(commit)
+  }
+
+  test("a commit that is gone is not taken for expired unless a checkpoint is above it") {
+    val lake = new Lake().withCommits(last = 3)
+    val temps = (0L to 3L).map(tempNameOf(lake, _))
+    lake.temps.foreach(age(_, by = 40.days))
+    (1L to 3L).foreach(version => Files.delete(lake.commitFile(version)))
+    def fates(): Map[String, TempFate] =
+      maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+
+    // No checkpoint: nothing explains a commit that is missing.
+    temps.drop(1).map(fates()) shouldBe Seq.fill(3)(TempFate.KeptOnlyCopy)
+
+    // A pointer that is not written the way Delta writes one says nothing.
+    Files.write(lake.log.resolve("_last_checkpoint"), """{"size":4,"version":3}""".getBytes(UTF_8))
+    temps.drop(1).map(fates()) shouldBe Seq.fill(3)(TempFate.KeptOnlyCopy)
+
+    // Delta's cleanup removes what is below the checkpoint: not its own version, nor above.
+    checkpointAt(lake, version = 2)
+    temps.drop(1).map(fates()) shouldBe
+      Seq(TempFate.RemovedExpired, TempFate.KeptOnlyCopy, TempFate.KeptOnlyCopy)
+    Files.readAllLines(lake.log.resolve(".tmp").resolve(temps(3))).asScala shouldBe append(3)
+  }
+
+  test("below a checkpoint, a commit that went missing a moment ago or was replaced is kept") {
+    val lake = new Lake().withCommits(last = 3)
+    val temps = (0L to 3L).map(tempNameOf(lake, _))
+    checkpointAt(lake, version = 3)
+    // Not the cleanup's doing: that one removes commits a month old, and does not replace any.
+    Files.delete(lake.commitFile(1))
+    Files.delete(lake.commitFile(2))
+    Files.write(lake.commitFile(2), ForeignActions.asJava)
+
+    val young = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    Seq(temps(1), temps(2)).map(young) shouldBe Seq.fill(2)(TempFate.KeptOnlyCopy)
+
+    // A month later the first could be the cleanup's, and its bytes are in the checkpoint.
+    lake.temps.foreach(age(_, by = 40.days))
+    val old = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    Seq(temps(1), temps(2)).map(old) shouldBe
+      Seq(TempFate.RemovedExpired, TempFate.KeptOnlyCopy)
   }
 
   test("a writer that stopped after taking its version finds its commit finished and collected") {

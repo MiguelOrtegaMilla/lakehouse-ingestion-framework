@@ -65,7 +65,7 @@ commits.contention
 | `adopt` | A table made without the LogStore: it is registered at the version its log is at |
 | `readopt` | A table that is tainted, or whose registry and log disagree, once somebody has looked at its log and accepts it as it stands |
 | `reset` | A table that was dropped: its registry is removed, so that one can be created at its path again |
-| `collectTemps` | Any table: removes the temporary files of published commits, and the orphans of writers that died |
+| `collectTemps` | Any table: removes the temporary files of published commits, of commits that Delta's log cleanup has expired, and the orphans of writers that died |
 
 The states that call for each are in ADR-0004 §3.5 and §3.8.
 
@@ -124,8 +124,7 @@ Around the scenarios:
 
 **Found by the review of P2a, and open**
 
-- **The schema version is checked once.** A store checks it before its first operation. A process that is running when a later migration is applied does not notice until it restarts.
+- **The schema version is checked once.** A store checks it before its first operation. A process that is running when a later migration is applied does not notice until it restarts. With V3 it does not go on unnoticed for long: its next claim names no generation, and the database refuses it.
 - **A taint is not held to a generation.** A reader that stalls between finding a foreign commit and recording it, while the table is dropped, its registry reset and a table created in its place, taints the new table: closed, and a false alarm. (A writer's claim is held to the registration it read; see above.)
-- **Temporary files of commits that Delta expired are kept.** Delta's log cleanup removes commits below a checkpoint once they are older than the log retention (thirty days by default). A temporary file that was not collected before then looks like the only copy of a lost commit: `collectTemps` keeps it and reports it. Collect more often than the retention.
 - **The table id in the registry is informative.** A table created through the LogStore is registered with the `metaData.id` of the first writer that tried to create it. If that writer lost version 0 to another, the id in the registry is not the table's. Nothing reads it; the log is the source.
 - **`collectTemps` is not built for large logs.** It asks the registry once for each temporary file, and compares a file with its commit by reading both.
