@@ -10,7 +10,13 @@ import scala.jdk.CollectionConverters._
 
 import io.delta.storage.HDFSLogStore
 import lakehouse.ingestion.logstore.coordination.FaultyCoordinationStore.ReadLatestEntry
-import lakehouse.ingestion.logstore.coordination.{Readoption, Registration}
+import lakehouse.ingestion.logstore.coordination.{
+  CommitEntry,
+  Readoption,
+  Registration,
+  RegistryMaintenance,
+  TableUri
+}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -36,6 +42,31 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
 
   private def registrationOf(lake: Lake): Option[Registration] =
     lake.memory.registration(lake.table)
+
+  /** The registry of `lake`, where `first` happens just before its unfinished entries are read. */
+  private def registryWhere(lake: Lake)(first: => Unit): RegistryMaintenance =
+    new RegistryMaintenance {
+      private val registry = lake.memory
+
+      override def registration(table: TableUri): Option[Registration] =
+        registry.registration(table)
+
+      override def entry(table: TableUri, version: Long): Option[CommitEntry] =
+        registry.entry(table, version)
+
+      override def unfinished(table: TableUri): Seq[CommitEntry] = {
+        first
+        registry.unfinished(table)
+      }
+
+      override def adopt(table: TableUri, version: Long, id: Option[String]): Boolean =
+        registry.adopt(table, version, id)
+
+      override def readopt(table: TableUri, version: Long, id: Option[String]): Option[Readoption] =
+        registry.readopt(table, version, id)
+
+      override def forget(table: TableUri): Boolean = registry.forget(table)
+    }
 
   private def age(file: LocalPath, by: FiniteDuration): Unit =
     Files.setLastModifiedTime(
@@ -164,6 +195,23 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None) shouldBe
       Readopted(lake.table, 1L, Readoption(None, Nil))
     lake.entry(1).value.complete shouldBe true
+  }
+
+  test("a commit that a reader publishes while the table is adopted again keeps its entry") {
+    val lake = new Lake().withCommits(last = 1)
+    lake.crashAt(FaultPoint.AfterInsert, version = 2)
+    // The operation has seen a log that ends at version 1. Before it asks the registry for
+    // unfinished entries, a reader publishes version 2 and acknowledges it.
+    val registry = registryWhere(lake)(lake.list(): Unit)
+
+    val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
+
+    // The table is adopted as its log is now, and version 2 is still a commit of ours.
+    readopted shouldBe Readopted(lake.table, 2L, Readoption(None, Nil))
+    lake.entry(2).value.complete shouldBe true
+    lake.list() shouldBe (0L to 2L).map(commit)
+    registrationOf(lake).value.isTainted shouldBe false
+    lake.commit(3)(append(3))
   }
 
   test("a table is not adopted again if it is not registered, or if its log is gone") {
