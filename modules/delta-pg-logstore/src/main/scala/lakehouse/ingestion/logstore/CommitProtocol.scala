@@ -73,6 +73,8 @@ final private[logstore] class CommitProtocol(
    *   It is the one exception Delta answers by checking for conflicts and trying the next
    *   version (ADR-0004 §8, item 2).
    * @throws WriteRefusedException the registry does not allow the write
+   * @throws CommitMissingException the commit before this one is recorded as published, and
+   *   its file is not in the log
    * @throws CommitPublicationPendingException the version is this writer's, and its file
    *   could not be published (ADR-0017)
    * @throws java.io.IOException anything else, the coordination store not answering included:
@@ -293,7 +295,12 @@ final private[logstore] class CommitProtocol(
       // Its writer stopped after taking the version. The commit exists, so it is published
       // before anything is written after it.
       case Some(unfinished) if !unfinished.complete => finish(log, unfinished)
-      case Some(_) => ()
+      // Recorded as published, so it must be in the log: what stops a reader (`bringUpToDate`)
+      // stops a writer that holds the table in memory and has not listed its log since. A
+      // version written after the hole would become the latest entry, and no reader would be
+      // told any more which commit is gone.
+      case Some(_) =>
+        if (!log.exists(log.commitFile(previous))) throw new CommitMissingException(table, previous)
       case None =>
         val inLog = log.exists(log.commitFile(previous))
         if (inLog && previous > adoptedAt) throw detected(table, previous, NoEntry)
