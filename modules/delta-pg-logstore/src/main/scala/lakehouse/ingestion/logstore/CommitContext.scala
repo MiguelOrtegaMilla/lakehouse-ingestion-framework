@@ -18,7 +18,8 @@ import java.util.{Objects, UUID}
  *
  * While the block runs, each commit that `PostgresLogStore` writes on the same thread records
  * the run in its coordination entry, and each version such a commit loses to another writer is
- * counted here.
+ * counted here. Of those, the ones lost at the `INSERT` are counted apart: they are the times
+ * that two writers were inside the same commit at once.
  *
  * '''The thread is the caller's.''' Delta writes a commit on the thread that called the
  * operation (ADR-0004 §8, item 3), and that thread alone is in the context. A thread started
@@ -33,7 +34,8 @@ import java.util.{Objects, UUID}
  */
 final class CommitContext private (val runId: UUID) {
 
-  private val lostVersions = new LongAdder
+  private val lostInLog = new LongAdder
+  private val lostAtInsert = new LongAdder
 
   /**
    * Runs `body` with this thread's commits attributed to the run. Inside another context, this
@@ -53,9 +55,21 @@ final class CommitContext private (val runId: UUID) {
    * time, Delta looked for a logical conflict with the winner and, finding none, tried the
    * next version: this is the cost of sharing a table, not a failure (ADR-0010).
    */
-  def contention: Long = lostVersions.sum()
+  def contention: Long = lostInLog.sum() + lostAtInsert.sum()
 
-  private[logstore] def versionLost(): Unit = lostVersions.increment()
+  /**
+   * How many of those versions the writer lost at the `INSERT`: when it looked, the version's
+   * commit was not in the log, so it prepared its own commit and claimed the version, and the
+   * claim found another writer's. The two writers were inside the commit of one version at the
+   * same time, which is the moment a LogStore without mutual exclusion loses a commit. The
+   * rest of `contention` are versions whose commit was already in the log when the writer
+   * looked: it was merely behind, as it would be on any LogStore.
+   */
+  def contentionAtInsert: Long = lostAtInsert.sum()
+
+  /** @param atInsert whether the claim found the version taken, and not the look at the log */
+  private[logstore] def versionLost(atInsert: Boolean): Unit =
+    if (atInsert) lostAtInsert.increment() else lostInLog.increment()
 
   override def toString: String = s"CommitContext($runId)"
 }
