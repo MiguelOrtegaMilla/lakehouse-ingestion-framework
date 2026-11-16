@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -251,6 +251,13 @@ Mutual exclusion holds only if every writer maps the same table to the **same ke
 ### 3.7 Attribution (commit context)
 
 The engine wraps each Delta write in `CommitContext.withRun(runId) { … }`, a thread-local API exposed by the LogStore module. The LogStore stores `run_id` on the entry and increments a per-run `commit_contention` counter each time the `INSERT` hits a unique violation. This relies on the commit executing on the caller's thread. P2a.1 verified it for appends with a `txnAppId`, `MERGE`, `DELETE` and `OPTIMIZE` (§8, item 3), so the `userMetadata` fallback is not needed. Attribution is **best effort** and never fails a commit.
+
+*As built (P2a.12, 2026-11-16):* `CommitContext`.
+- **One context for a run, kept for all its writes.** `CommitContext.forRun(runId)` once, `attribute { … }` around each Delta write, `contention` when the run ends. The text above spells it `CommitContext.withRun(runId) { … }`: a run makes several writes (quarantine, then data, ADR-0005), and a counter for the run has to outlive each of them.
+- **Every version lost is counted**, not only the ones lost at the `INSERT`, which is what the text above says. A writer usually learns that its version is gone from the commit file, before it inserts anything (§3.2), because the winner has published by then. Which of the two it meets depends on how far the winner had got, so both count.
+- **The thread-local is not inherited** by threads started inside the block. A pool outlives the block, and a later commit under the wrong run is worse than a commit under none.
+- A commit that its writer took and another process finished (§3.3) keeps the run of the writer that took it.
+- The counter is in memory, in the context: the LogStore knows nothing of the engine's run table, where the engine writes it (`ingestion_run.commit_contention`).
 
 ### 3.8 Recovery semantics summary
 
