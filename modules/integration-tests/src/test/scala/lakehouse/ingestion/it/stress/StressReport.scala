@@ -40,8 +40,15 @@ object StressReport {
   /**
    * @param run what was run and on what: `environment` and `harness`
    * @param spark the Spark settings that depart from Spark's and Delta's defaults, with reasons
+   * @param notes what the run is for and how far its result goes, one paragraph each
    */
-  def markdown(title: String, run: Seq[Setting], spark: Seq[Setting], report: Report): String = {
+  def markdown(
+      title: String,
+      run: Seq[Setting],
+      spark: Seq[Setting],
+      report: Report,
+      notes: Seq[String] = Nil
+  ): String = {
     val s = report.summary
     val verdict =
       if (report.isClean) "**No anomalies.**"
@@ -113,10 +120,11 @@ object StressReport {
         "Delayed renames",
         "Startup guard",
         "Fault hook waits",
-        "Versions lost to other writers"
+        "Versions lost to other writers",
+        "Of them, at the INSERT"
       ),
       s.writers.map { w =>
-        StressTable.writerId(w.writer) +: w.probe.fold(Seq.fill(8)("(no probe)")) { p =>
+        StressTable.writerId(w.writer) +: w.probe.fold(Seq.fill(9)("(no probe)")) { p =>
           Seq(
             code(p.logStore),
             code(p.logFileSystem),
@@ -125,7 +133,8 @@ object StressReport {
             p.delayedRenames.toString,
             if (p.guarded) "passed" else "not asked",
             p.faultWaits.map { case (point, waits) => s"$point: $waits" }.mkString(", "),
-            p.contention.toString
+            p.contention.toString,
+            p.contentionAtInsert.toString
           )
         }
       }
@@ -165,8 +174,9 @@ object StressReport {
 
     // Sections are joined, not written as one stripMargin literal: the tables' lines start
     // with '|', which stripMargin would strip.
-    Seq(
-      s"# $title",
+    val purpose = if (notes.isEmpty) Nil else "## What this run shows" +: notes
+
+    (Seq(s"# $title") ++ purpose ++ Seq(
       "## Run",
       runTable,
       "## Spark settings",
@@ -178,10 +188,14 @@ object StressReport {
       "What each writer JVM resolved for the table, recorded by the writer itself: the code " +
         "path the result was measured on. `HDFSLogStore` takes its `synchronized (this)` lock " +
         "only on a `RawLocalFileSystem`, and even then the lock is per instance, never across " +
-        "JVMs. The last three columns are about `PostgresLogStore`: whether the writer had to " +
+        "JVMs. The last four columns are about `PostgresLogStore`: whether the writer had to " +
         "pass its startup guard before touching the table; how many times it waited at each " +
-        "fault hook that its configuration turned on; and how many times one of its commits " +
-        "found its version taken by another writer, after which Delta tried the next version.",
+        "fault hook that its configuration turned on; how many times one of its commits found " +
+        "its version taken by another writer, after which Delta tried the next version; and " +
+        "how many of those it lost at the `INSERT`. A version lost at the `INSERT` was not in " +
+        "the log when the writer looked: two writers were committing it at the same time, " +
+        "which is when a LogStore without mutual exclusion loses a commit. The others were in " +
+        "the log already, and the writer was only behind.",
       probeTable,
       "## Result",
       verdict,
@@ -205,7 +219,7 @@ object StressReport {
       writerTable,
       "## Commits without a writer txn",
       otherCommits
-    ).map(_.stripSuffix("\n")).mkString("", "\n\n", "\n")
+    )).map(_.stripSuffix("\n")).mkString("", "\n\n", "\n")
   }
 
   private def code(s: String): String = s"`$s`"

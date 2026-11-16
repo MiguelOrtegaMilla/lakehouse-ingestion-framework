@@ -36,6 +36,9 @@ import org.apache.spark.sql.delta.storage.{DelegatingLogStore, LogStoreAdaptor}
  * @param contention how many times a commit of this writer found its version taken by another
  *   writer; Delta then tried the next version. Counted by `PostgresLogStore`, so always 0 on
  *   another LogStore
+ * @param contentionAtInsert how many of those versions it lost at the `INSERT`: the commit was
+ *   not in the log when the writer looked, and its claim found another writer's. Those are the
+ *   times that two writers were committing one version at once
  * @param faultWaits how many times this JVM waited at each of `PostgresLogStore`'s fault hooks
  *   because its configuration turned the hook on, in the order of the protocol
  */
@@ -47,6 +50,7 @@ final case class WriterProbe(
     guarded: Boolean = false,
     runId: String = "",
     contention: Long = 0,
+    contentionAtInsert: Long = 0,
     faultWaits: Seq[(String, Long)] = WriterProbe.NoWaits
 ) {
 
@@ -63,6 +67,7 @@ final case class WriterProbe(
     p.setProperty("guarded", guarded.toString)
     p.setProperty("runId", runId)
     p.setProperty("contention", contention.toString)
+    p.setProperty("contentionAtInsert", contentionAtInsert.toString)
     faultWaits.foreach { case (point, waits) =>
       p.setProperty(s"faultWaits.$point", waits.toString)
     }
@@ -115,6 +120,7 @@ object WriterProbe {
         get("guarded").toBoolean,
         get("runId"),
         get("contention").toLong,
+        get("contentionAtInsert").toLong,
         FaultPoint.All.map(point => point.key -> get(s"faultWaits.${point.key}").toLong)
       )
     }

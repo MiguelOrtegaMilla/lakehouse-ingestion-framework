@@ -114,6 +114,7 @@ object StressWriter {
                       delayedRenames = DelayingLocalFs.delayedRenames,
                       runId = commits.runId.toString,
                       contention = commits.contention,
+                      contentionAtInsert = commits.contentionAtInsert,
                       faultWaits = WriterProbe.faultWaitsOfThisJvm
                     )
                     .write(run.probe(config.writer))
