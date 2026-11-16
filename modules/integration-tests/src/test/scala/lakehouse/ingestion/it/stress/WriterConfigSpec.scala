@@ -9,10 +9,12 @@ import org.scalatest.matchers.should.Matchers
 
 final class WriterConfigSpec extends AnyFunSuite with Matchers {
 
-  private val config = WriterConfig(Paths.get("/tmp/run"), 2, 200, 10, 150.seconds)
+  private val config = WriterConfig(Paths.get("/tmp/run"), 2, 200, 10, 150.seconds, guard = true)
 
   test("survives the round trip through the command line") {
     WriterConfig.fromArgs(config.toArgs) shouldBe Right(config)
+    val unguarded = config.copy(guard = false)
+    WriterConfig.fromArgs(unguarded.toArgs) shouldBe Right(unguarded)
   }
 
   test("rejects malformed, unknown, missing and out-of-range arguments") {
@@ -25,7 +27,8 @@ final class WriterConfigSpec extends AnyFunSuite with Matchers {
       without("commits") -> "missing arguments: commits",
       replaced("commits", "0") -> "commits must be a positive integer",
       replaced("writer", "-1") -> "writer must be a non-negative integer",
-      replaced("rows-per-commit", "ten") -> "rows-per-commit must be a positive integer"
+      replaced("rows-per-commit", "ten") -> "rows-per-commit must be a positive integer",
+      replaced("guard", "maybe") -> "guard must be true or false"
     )
     cases.foreach { case (args, expected) =>
       WriterConfig.fromArgs(args).left.map(_.startsWith(expected)) shouldBe Left(true)

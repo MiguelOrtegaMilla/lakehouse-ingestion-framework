@@ -38,6 +38,23 @@ final class FaultHooksSpec extends AnyFunSuite with Matchers {
     } should be < 100L
   }
 
+  test("every wait that a configuration caused is counted, at its own point") {
+    val conf = new Configuration()
+    conf.setLong(FaultHooks.delayKey(FaultPoint.AfterInsert), 1L)
+    val hooks = FaultHooks.from(conf)
+    // The count is the JVM's: other tests wait too.
+    val before = FaultPoint.All.map(FaultHooks.waitsAt)
+
+    (1 to 3).foreach(_ => FaultPoint.All.foreach(hooks.at))
+    // Hooks that a configuration did not select wait for nothing, and count nothing.
+    FaultPoint.All.foreach(FaultHooks.Off.at)
+
+    val counted = FaultPoint.All.map(FaultHooks.waitsAt).zip(before).map { case (now, then) =>
+      now - then
+    }
+    counted shouldBe Seq(0L, 3L, 0L)
+  }
+
   test("the waits a configuration asks for can be listed, in the order of the protocol") {
     FaultHooks.delaysIn(new Configuration()) shouldBe empty
 

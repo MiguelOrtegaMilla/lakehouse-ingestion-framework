@@ -12,13 +12,17 @@ import scala.concurrent.duration._
  * `SparkConf` loads by itself (that is also how `spark-submit` hands settings to a driver).
  *
  * @param startTimeout how long the writer waits at the start barrier before giving up
+ * @param guard whether the writer, before it touches the table, must find itself set up to
+ *   coordinate its commits (`StartupGuard`), and refuse to run otherwise. A writer that is to
+ *   run on Delta's default LogStore, as in the RED spike, is not asked.
  */
 final case class WriterConfig(
     runDir: Path,
     writer: Int,
     commits: Int,
     rowsPerCommit: Int,
-    startTimeout: FiniteDuration
+    startTimeout: FiniteDuration,
+    guard: Boolean
 ) {
 
   def toArgs: Seq[String] = Seq(
@@ -26,7 +30,8 @@ final case class WriterConfig(
     s"${WriterConfig.Writer}=$writer",
     s"${WriterConfig.Commits}=$commits",
     s"${WriterConfig.RowsPerCommit}=$rowsPerCommit",
-    s"${WriterConfig.StartTimeoutSeconds}=${startTimeout.toSeconds}"
+    s"${WriterConfig.StartTimeoutSeconds}=${startTimeout.toSeconds}",
+    s"${WriterConfig.Guard}=$guard"
   )
 }
 
@@ -37,8 +42,9 @@ object WriterConfig {
   private val Commits = "commits"
   private val RowsPerCommit = "rows-per-commit"
   private val StartTimeoutSeconds = "start-timeout-seconds"
+  private val Guard = "guard"
 
-  private val Keys = Set(RunDir, Writer, Commits, RowsPerCommit, StartTimeoutSeconds)
+  private val Keys = Set(RunDir, Writer, Commits, RowsPerCommit, StartTimeoutSeconds, Guard)
 
   def fromArgs(args: Seq[String]): Either[String, WriterConfig] = {
     val pairs = args.map(_.split("=", 2).toList)
@@ -61,6 +67,14 @@ object WriterConfig {
         commits <- positive(Commits)
         rows <- positive(RowsPerCommit)
         timeout <- positive(StartTimeoutSeconds)
-      } yield WriterConfig(Paths.get(values(RunDir)), writer, commits, rows, timeout.seconds)
+        guard <- values(Guard).toBooleanOption.toRight(s"$Guard must be true or false")
+      } yield WriterConfig(
+        Paths.get(values(RunDir)),
+        writer,
+        commits,
+        rows,
+        timeout.seconds,
+        guard
+      )
   }
 }

@@ -7,13 +7,15 @@ import java.util.Properties
 
 import scala.util.Using
 
+import lakehouse.ingestion.logstore.{FaultHooks, FaultPoint}
 import org.apache.hadoop.fs.{FileContext, RawLocalFileSystem}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.delta.storage.{DelegatingLogStore, LogStoreAdaptor}
 
 /**
- * What one writer JVM actually used to commit, recorded by the writer itself (RED preconditions).
+ * What one writer JVM actually used to commit, recorded by the writer itself: the preconditions
+ * of a spike, RED or GREEN.
  *
  * A spike result means something only if the writers ran the code path it claims to measure.
  * The settings say what was asked for; the probe says what the writer's own Delta and Hadoop
@@ -27,12 +29,25 @@ import org.apache.spark.sql.delta.storage.{DelegatingLogStore, LogStoreAdaptor}
  * @param commitFileContext the `AbstractFileSystem` behind the `FileContext` that
  *   `HDFSLogStore.write` publishes `N.json` through: `LocalFs`, or `DelayingLocalFs`
  * @param delayedRenames commit-file renames `DelayingLocalFs` delayed in this JVM
+ * @param guarded whether the writer was asked to pass the startup guard before it touched the
+ *   table (`WriterConfig.guard`); one that was and is here, passed
+ * @param runId the run the writer attributed its commits to (`CommitContext`). On
+ *   `PostgresLogStore` it is in the coordination entry of each of its commits
+ * @param contention how many times a commit of this writer found its version taken by another
+ *   writer; Delta then tried the next version. Counted by `PostgresLogStore`, so always 0 on
+ *   another LogStore
+ * @param faultWaits how many times this JVM waited at each of `PostgresLogStore`'s fault hooks
+ *   because its configuration turned the hook on, in the order of the protocol
  */
 final case class WriterProbe(
     logStore: String,
     logFileSystem: String,
     commitFileContext: String,
-    delayedRenames: Long
+    delayedRenames: Long,
+    guarded: Boolean = false,
+    runId: String = "",
+    contention: Long = 0,
+    faultWaits: Seq[(String, Long)] = WriterProbe.NoWaits
 ) {
 
   /** `HDFSLogStore.write`'s own condition for entering its `synchronized` block. */
@@ -45,11 +60,24 @@ final case class WriterProbe(
     p.setProperty("logFileSystem", logFileSystem)
     p.setProperty("commitFileContext", commitFileContext)
     p.setProperty("delayedRenames", delayedRenames.toString)
+    p.setProperty("guarded", guarded.toString)
+    p.setProperty("runId", runId)
+    p.setProperty("contention", contention.toString)
+    faultWaits.foreach { case (point, waits) =>
+      p.setProperty(s"faultWaits.$point", waits.toString)
+    }
     Using.resource(Files.newBufferedWriter(file, UTF_8): Writer)(p.store(_, "writer probe"))
   }
 }
 
 object WriterProbe {
+
+  /** No wait at any fault hook: what every writer has until it commits. */
+  val NoWaits: Seq[(String, Long)] = FaultPoint.All.map(_.key -> 0L)
+
+  /** The waits of this JVM so far, as `FaultHooks` counted them. */
+  def faultWaitsOfThisJvm: Seq[(String, Long)] =
+    FaultPoint.All.map(point => point.key -> FaultHooks.waitsAt(point))
 
   /** The setup half of the probe, resolved exactly as a commit to `tableUri` resolves it. */
   def resolve(spark: SparkSession, tableUri: String): WriterProbe = {
@@ -83,7 +111,11 @@ object WriterProbe {
         get("logStore"),
         get("logFileSystem"),
         get("commitFileContext"),
-        get("delayedRenames").toLong
+        get("delayedRenames").toLong,
+        get("guarded").toBoolean,
+        get("runId"),
+        get("contention").toLong,
+        FaultPoint.All.map(point => point.key -> get(s"faultWaits.${point.key}").toLong)
       )
     }
 }

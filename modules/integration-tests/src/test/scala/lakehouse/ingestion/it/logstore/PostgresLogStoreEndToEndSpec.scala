@@ -129,8 +129,7 @@ final class PostgresLogStoreEndToEndSpec
       Seq("WRITE", "MERGE", "UPDATE", "DELETE")
     spark.read.format("delta").option("versionAsOf", 1L).load(path).count() shouldBe 15L
 
-    // Each commit has its temporary file, and nothing else is left there: the other files
-    // Delta writes through the LogStore, such as checksums, leave none behind.
+    // Each commit has its temporary file, and nothing else is there.
     tempsOf(path) shouldBe (0L to 3L).map(entry(path, _).tempPath.stripPrefix(".tmp/")).toSet
   }
 
