@@ -53,23 +53,36 @@ object LogReader {
     )
   )
 
-  /** Reads the views of a finished run, through every `Reader`, and verifies them. */
+  /**
+   * Reads the views of a finished run, through every `Reader`, and verifies them.
+   *
+   * The readers read first. On `PostgresLogStore` a read publishes a commit that a writer left
+   * taken and not published, and what is verified is the table that the next reader gets. The
+   * commit files and the registry are looked at after that.
+   *
+   * @param registry reads the registry of the table, for a run on `PostgresLogStore`
+   */
   def verify(
       spark: SparkSession,
       run: StressRun,
       expected: Verifier.Expected,
-      writers: Seq[StressHarness.WriterOutcome]
-  ): Verifier.Report =
+      writers: Seq[StressHarness.WriterOutcome],
+      registry: Option[() => RegistryView] = None
+  ): Verifier.Report = {
+    val tables = Reader.all.map(r => r -> tableView(spark, run.tableUri, r))
     Verifier.verify(
       expected,
       writers,
       logView(spark, run.tableDir),
-      Reader.all.map(r => r -> tableView(spark, run.tableUri, r)),
-      diskView(run.tableDir)
+      tables,
+      diskView(run.tableDir),
+      registry.map(_.apply())
     )
+  }
 
   def logView(spark: SparkSession, tableDir: Path): LogView = {
-    val commitFiles = listCommitFiles(tableDir.resolve("_delta_log"))
+    val logDir = tableDir.resolve("_delta_log")
+    val commitFiles = listCommitFiles(logDir)
     if (commitFiles.isEmpty) LogView(Nil, Nil, Nil)
     else {
       import spark.implicits._
@@ -94,10 +107,45 @@ object LogReader {
         versions = commitFiles.keys.toSeq.sorted,
         commits = parsed.collect { case Right(c) => c },
         unreadable = parsed.collect { case Left(u) => u },
-        checksumMismatches = checksumMismatches(spark, commitFiles)
+        checksumMismatches = checksumMismatches(spark, commitFiles),
+        commitSidecars = commitFiles.toSeq.collect {
+          case (v, p) if Files.exists(sidecarOf(p)) => v
+        }.sorted,
+        staleSidecars = staleSidecars(spark, logDir, commitFiles.values.toSet)
       )
     }
   }
+
+  /** Where Hadoop's checksummed file system keeps the checksums of `file`. */
+  private def sidecarOf(file: Path): Path = file.resolveSibling(s".${file.getFileName}.crc")
+
+  /** Whether `file` is the sidecar of a file that is there. A sidecar has none of its own. */
+  private def isSidecar(file: Path): Boolean = {
+    val name = file.getFileName.toString
+    name.startsWith(".") && name.endsWith(".crc") &&
+    Files.exists(file.resolveSibling(name.substring(1, name.length - ".crc".length)))
+  }
+
+  /**
+   * The files of the log, commits apart, whose sidecar does not match them, at any depth. A
+   * file without a sidecar is not looked at: nothing checks it, so nothing can refuse it.
+   */
+  private def staleSidecars(
+      spark: SparkSession,
+      logDir: Path,
+      commitFiles: Set[Path]
+  ): Seq[String] =
+    Using.resource(new LocalFileSystem()) { fs =>
+      fs.initialize(URI.create("file:///"), spark.sparkContext.hadoopConfiguration)
+      Using.resource(Files.walk(logDir)) { paths =>
+        paths.iterator.asScala
+          .filter(p => Files.isRegularFile(p) && !commitFiles(p) && !isSidecar(p))
+          .filter(p => Files.exists(sidecarOf(p)) && !readsCleanly(fs, new HadoopPath(p.toUri)))
+          .map(p => relative(logDir, p))
+          .toList
+          .sorted
+      }
+    }
 
   /**
    * The versions whose commit file Hadoop's `LocalFileSystem` refuses to read because its `.crc`

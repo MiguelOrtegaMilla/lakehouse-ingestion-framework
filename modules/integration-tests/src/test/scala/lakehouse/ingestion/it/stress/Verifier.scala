@@ -19,6 +19,14 @@ import lakehouse.ingestion.it.stress.StressHarness.WriterOutcome
  *   - `Unknown`: the attempt in flight when the writer stopped (it failed, or the writer was
  *     killed). It may be absent, or present exactly once.
  *   - `NotAttempted`: it must be absent.
+ *
+ * A run on `PostgresLogStore` is also checked against its registry, read after the readers have
+ * read the table (`RegistryView`). What the LogStore promises on top of Delta is then a rule
+ * here: every commit has a complete entry and every entry its commit, the table is not tainted,
+ * each writer's commits are attributed to its own run, no commit file has a `.crc` sidecar, and
+ * no other file of the log has one that does not match it. A run without a registry, on
+ * Delta's default LogStore, is held to none of these: there a sidecar is ordinary, and a stale
+ * one is reported as an observation.
  */
 object Verifier {
 
@@ -112,6 +120,58 @@ object Verifier {
       val kind = "InconsistentJournal"
       def detail = s"$writer: $reason"
     }
+
+    /** The run was to be coordinated, and the registry does not know the table. */
+    case object TableNotRegistered extends Anomaly {
+      val kind = "TableNotRegistered"
+      def detail = "the coordination registry has no registration for the table"
+    }
+
+    /** A commit made outside the LogStore was detected on the table: it refuses writes. */
+    final case class TaintedTable(reason: String) extends Anomaly {
+      val kind = "TaintedTable"
+      def detail = s"the table is tainted: $reason"
+    }
+
+    /**
+     * An entry that is still not complete after the table was read. A read publishes and
+     * acknowledges a commit that its writer left taken, so this one could not be finished.
+     */
+    final case class UnfinishedEntry(version: Long) extends Anomaly {
+      val kind = "UnfinishedEntry"
+      def detail = s"the entry of version $version is not complete"
+    }
+
+    /** A commit file, above the version the table is registered at, that nobody took. */
+    final case class CommitWithoutEntry(version: Long) extends Anomaly {
+      val kind = "CommitWithoutEntry"
+      def detail = s"version $version is in the log and has no coordination entry"
+    }
+
+    /** An entry recorded as published whose commit file is not in the log. */
+    final case class EntryWithoutCommit(version: Long) extends Anomaly {
+      val kind = "EntryWithoutCommit"
+      def detail = s"version $version has a complete entry and no commit file"
+    }
+
+    /** A writer's commit whose entry is not attributed to that writer's own run. */
+    final case class MisattributedCommit(version: Long, writer: String, reason: String)
+        extends Anomaly {
+      val kind = "MisattributedCommit"
+      def detail = s"version $version, a commit of $writer: $reason"
+    }
+
+    /** A commit file with a `.crc` sidecar, on a table whose commits are published without. */
+    final case class SidecarOnCommit(version: Long) extends Anomaly {
+      val kind = "SidecarOnCommit"
+      def detail = s"the commit file of version $version has a .crc sidecar"
+    }
+
+    /** A file of the log, other than a commit, whose `.crc` sidecar does not match it. */
+    final case class StaleSidecar(file: String) extends Anomaly {
+      val kind = "StaleSidecar"
+      def detail = s"the .crc sidecar of _delta_log/$file does not match the file"
+    }
   }
 
   import Anomaly._
@@ -125,7 +185,10 @@ object Verifier {
       orphanDataFiles: Seq[String],
       checksumMismatches: Seq[Long],
       readers: Seq[(Reader, Option[String])],
-      writers: Seq[WriterOutcome]
+      writers: Seq[WriterOutcome],
+      commitSidecars: Seq[Long] = Nil,
+      staleSidecars: Seq[String] = Nil,
+      registry: Option[RegistryView] = None
   )
 
   final case class Report(anomalies: Seq[Anomaly], summary: Summary) {
@@ -133,12 +196,17 @@ object Verifier {
     def count(kind: String): Int = anomalies.count(_.kind == kind)
   }
 
+  /**
+   * @param registry the registry of the table, for a run on `PostgresLogStore`; `None` for a
+   *   run that was not coordinated, which is then held to none of the registry's rules
+   */
   def verify(
       expected: Expected,
       writers: Seq[WriterOutcome],
       log: LogView,
       tables: Seq[(Reader, Either[String, TableView])],
-      disk: DiskView
+      disk: DiskView,
+      registry: Option[RegistryView] = None
   ): Report = {
     val states = writers.map(w => StressTable.writerId(w.writer) -> commitStates(w, expected))
     val occurrences = txnOccurrences(log)
@@ -150,7 +218,8 @@ object Verifier {
         tables.flatMap {
           case (reader, Left(error)) => Seq(UnreadableTable(reader, error))
           case (reader, Right(view)) => tableAnomalies(reader, expected, occurrences, log, view)
-        }
+        } ++
+        registry.toSeq.flatMap(coordinationAnomalies(_, log, writers))
 
     val acked = states.map(_._2.values.count(_ == CommitState.Acked)).sum
     Report(
@@ -167,9 +236,99 @@ object Verifier {
         orphanDataFiles = (disk.dataFiles -- log.everAdded).toSeq.sorted,
         checksumMismatches = log.checksumMismatches,
         readers = tables.map { case (reader, view) => reader -> view.left.toOption },
-        writers = writers
+        writers = writers,
+        commitSidecars = log.commitSidecars,
+        staleSidecars = log.staleSidecars,
+        registry = registry
       )
     )
+  }
+
+  /**
+   * What a run on `PostgresLogStore` must leave, beyond what Delta itself promises: the
+   * registry and the log say the same, and the log files are as the LogStore writes them.
+   */
+  private def coordinationAnomalies(
+      registry: RegistryView,
+      log: LogView,
+      writers: Seq[WriterOutcome]
+  ): Seq[Anomaly] = {
+    val entries = registry.entries.map(e => e.version -> e).toMap
+    val inLog = log.versions.toSet
+
+    val registration = registry.registeredVersion match {
+      case None => Seq(TableNotRegistered)
+      case Some(registeredAt) =>
+        // Commits up to the version a table was adopted at were made before it was coordinated.
+        log.versions.sorted.collect {
+          case version if version > registeredAt && !entries.contains(version) =>
+            CommitWithoutEntry(version)
+        }
+    }
+    val unfinished = registry.entries.collect {
+      case e if !e.complete => UnfinishedEntry(e.version)
+    }
+    val withoutCommit = registry.entries.collect {
+      case e if e.complete && !inLog(e.version) => EntryWithoutCommit(e.version)
+    }
+
+    registration ++
+      registry.taint.map(TaintedTable(_)) ++
+      unfinished ++
+      withoutCommit ++
+      attributionAnomalies(entries, log, writers) ++
+      log.commitSidecars.sorted.map(SidecarOnCommit(_)) ++
+      log.staleSidecars.sorted.map(StaleSidecar(_))
+  }
+
+  /**
+   * Every commit of a writer is attributed to a run, no run has commits of two writers, and a
+   * writer that reported its run has all of its commits under that one. Two processes that
+   * commit to one table at the same time must never be confused in the registry.
+   */
+  private def attributionAnomalies(
+      entries: Map[Long, RegistryEntry],
+      log: LogView,
+      writers: Seq[WriterOutcome]
+  ): Seq[Anomaly] = {
+    val attributed = for {
+      commit <- log.commits.sortBy(_.version)
+      txn <- commit.txns.headOption.toSeq
+      entry <- entries.get(commit.version).toSeq
+    } yield (commit.version, txn.appId, entry.runId)
+
+    val writersOfRun = attributed
+      .collect { case (_, writer, Some(run)) => run -> writer }
+      .groupMap(_._1)(_._2)
+      .view
+      .mapValues(_.toSet)
+      .toMap
+    val reported = writers.flatMap { w =>
+      w.probe.map(_.runId).filter(_.nonEmpty).map(StressTable.writerId(w.writer) -> _)
+    }.toMap
+
+    attributed.flatMap {
+      case (version, writer, None) =>
+        Some(MisattributedCommit(version, writer, "its entry names no run"))
+      case (version, writer, Some(run)) =>
+        val others = writersOfRun(run) - writer
+        if (others.nonEmpty)
+          Some(
+            MisattributedCommit(
+              version,
+              writer,
+              s"run $run also has commits of ${others.toSeq.sorted.mkString(", ")}"
+            )
+          )
+        else
+          reported.get(writer).filter(_ != run).map { own =>
+            MisattributedCommit(
+              version,
+              writer,
+              s"its entry names run $run, the writer ran as $own"
+            )
+          }
+    }
   }
 
   /**
@@ -182,8 +341,11 @@ object Verifier {
     val acked = outcome.journal.acked.toSet
     val inFlight = outcome.journal.failure.map(_.txnVersion).orElse {
       outcome.exitCode match {
-        // A clean exit leaves nothing in flight; a setup failure never started a commit.
-        case StressWriter.ExitCode.Ok | StressWriter.ExitCode.SetupFailed => None
+        // A clean exit leaves nothing in flight; a writer that failed its setup, or that
+        // refused to run, never started a commit.
+        case StressWriter.ExitCode.Ok | StressWriter.ExitCode.SetupFailed |
+            StressWriter.ExitCode.Refused =>
+          None
         case _ => Some(outcome.journal.acked.maxOption.getOrElse(0L) + 1)
       }
     }
@@ -205,7 +367,8 @@ object Verifier {
       case StressWriter.ExitCode.Ok =>
         acked.size == expected.commits && w.journal.failure.isEmpty
       case StressWriter.ExitCode.CommitFailed => w.journal.failure.nonEmpty
-      case StressWriter.ExitCode.SetupFailed => acked.isEmpty && w.journal.failure.isEmpty
+      case StressWriter.ExitCode.SetupFailed | StressWriter.ExitCode.Refused =>
+        acked.isEmpty && w.journal.failure.isEmpty
       case _ => w.journal.failure.isEmpty
     }
     Seq(

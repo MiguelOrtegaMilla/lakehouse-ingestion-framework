@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. P2a.13 (2026-11-16): §3.2, §3.5, §3.8 and §7.1, from the review of P2a. After P2a (2026-11-16): §3.1, §3.2 and §3.5, the generation of a registration; §3.8, the temporary files of expired commits. P2b.1 (2026-11-16): §3.5 and §7.3, as built. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. P2a.13 (2026-11-16): §3.2, §3.5, §3.8 and §7.1, from the review of P2a. After P2a (2026-11-16): §3.1, §3.2 and §3.5, the generation of a registration; §3.8, the temporary files of expired commits. P2b.1 (2026-11-16): §3.5 and §7.3, as built. P2b.2 (2026-11-16): §7.2, as built. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -455,6 +455,18 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
   - row counts per `(writer, k)` match what was written; no duplicates;
   - no orphan incomplete entries; `DESCRIBE HISTORY` consistent with the entries.
 - **Sizes:** N=3, K=200 locally; N=8, K=500 in CI (ADR-0001 resource budget).
+
+*As built (P2b.2, 2026-11-16):* the verifier of the RED spike (`Verifier`), extended for a coordinated run.
+- **The readers read first**, then the commit files and the registry are looked at: a read publishes a commit that a writer left taken, and what is verified is the table the next reader gets.
+- **The registry is read with plain SQL**, on a connection of the verifier's own and on the path that a run does not break. The verifier does not ask the LogStore's store what the LogStore did.
+- **Rules of a coordinated run**, each an anomaly class of its own:
+  - the table is registered and not tainted;
+  - every commit file above the registered version has an entry, every entry is complete, and every complete entry has its commit file;
+  - each writer's commits are attributed to a run, no run has commits of two writers, and a writer that reported its run has all its commits under it. Two processes on one table must never be confused in the registry.
+- **Sidecars.** On a commit file there must be none: a commit is published as a hard link, never through Hadoop's checksummed file system (ADR-0015), so a sidecar there was written by somebody else. On the other files of the log one may exist, since Delta writes its version checksums through that file system; it must match the file.
+- **A run on Delta's default LogStore is held to none of these.** There a sidecar next to every commit is ordinary, and the counts are reported as observations: the RED results mean what they meant.
+- **`DESCRIBE HISTORY` is not compared with the entries.** It is derived from the commit files, which the verifier reads itself and compares with the entries.
+- The rule for a writer that was killed (a prefix, and its commit in flight absent or present once) dates from P1.4b.
 
 ### 7.3 Spike (before / after, same harness)
 

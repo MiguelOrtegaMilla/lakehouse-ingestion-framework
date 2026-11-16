@@ -116,4 +116,41 @@ final class LogReaderSpec extends AnyFunSuite with Matchers with LocalSparkSuite
     )
     view.unreadable shouldBe empty
   }
+
+  test("a sidecar on a commit file is always listed; on another file of the log, if it is stale") {
+    val table = workDir.resolve("sidecars")
+    val log = table.resolve("_delta_log")
+    val commit = """{"commitInfo":{"operation":"WRITE"}}""" + "\n"
+    val fs = FileSystem.getLocal(spark.sparkContext.hadoopConfiguration)
+    // Through Hadoop's checksummed file system, which leaves a sidecar that matches.
+    def withSidecar(name: String, content: String): Unit =
+      Using.resource(fs.create(new HadoopPath(log.resolve(name).toUri), true)) {
+        _.write(content.getBytes(UTF_8))
+      }
+
+    // A commit as PostgresLogStore publishes it, and one as Delta's default LogStore does.
+    write(log, commitFile(0), commit)
+    withSidecar(commitFile(1), commit)
+    // The other files of a log: with a sidecar, without one, and below the log directory.
+    withSidecar("00000000000000000001.crc", """{"tableSizeBytes":1}""")
+    withSidecar("_last_checkpoint", """{"version":1,"size":2}""")
+    withSidecar("_sidecars/part-0.parquet", "PAR1 one")
+    write(log, "00000000000000000000.crc", """{"tableSizeBytes":0}""")
+    write(log.resolve(".tmp"), s"${commitFile(0)}.3f2a", commit)
+
+    val intact = LogReader.logView(spark, table)
+    intact.commitSidecars shouldBe Seq(1L)
+    intact.staleSidecars shouldBe empty
+    intact.checksumMismatches shouldBe empty
+
+    // Two of them are rewritten behind their sidecars' backs.
+    write(log, "_last_checkpoint", """{"version":7,"size":2}""")
+    write(log.resolve("_sidecars"), "part-0.parquet", "PAR1 two")
+
+    val stale = LogReader.logView(spark, table)
+    stale.staleSidecars shouldBe Seq("_last_checkpoint", "_sidecars/part-0.parquet")
+    // The commit's own sidecar still matches: it is listed for being there, and is not stale.
+    stale.commitSidecars shouldBe Seq(1L)
+    stale.checksumMismatches shouldBe empty
+  }
 }
