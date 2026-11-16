@@ -46,11 +46,11 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     """INSERT INTO delta_coordination.table_taint (table_uri, reason) VALUES (?, ?)
       |ON CONFLICT DO NOTHING""".stripMargin
 
-  test("the migration builds version 1 of the schema, and applying it again changes nothing") {
+  test("the migrations build version 2 of the schema, and applying them again changes nothing") {
     CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 0
 
     as(CommitPath) { c =>
-      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("1"))
+      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("2"))
     }
     Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
       val owners = query(
@@ -185,7 +185,7 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     }
   }
 
-  test("maintenance deletes rows, registration last, and does nothing else") {
+  test("maintenance adopts a table, moves its version and deletes rows; nothing else") {
     val table = "file:/lake/reset"
     as(CommitPath) { c =>
       update(c, Register, table, Long.box(-1))
@@ -202,10 +202,26 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       update(c, "DELETE FROM delta_coordination.commit_entry WHERE table_uri = ?", table) shouldBe 1
       update(c, registration, table) shouldBe 1
 
+      // Since V2: adopting a table registers it, and adopting it again moves its version.
+      update(c, Register, table, Long.box(41)) shouldBe 1
+      update(
+        c,
+        "UPDATE delta_coordination.coordinated_table " +
+          "SET registered_version = 50, delta_table_id = 'id', registered_at = now() " +
+          "WHERE table_uri = ?",
+        table
+      ) shouldBe 1
+
       Seq(
-        "INSERT INTO delta_coordination.coordinated_table (table_uri, registered_version) " +
-          "VALUES ('file:/lake/x', -1)",
+        // A table is never renamed in the registry.
+        "UPDATE delta_coordination.coordinated_table SET table_uri = 'file:/lake/elsewhere'",
+        // Entries and taints are the commit path's to make: maintenance only removes them.
+        "INSERT INTO delta_coordination.commit_entry (table_uri, version, temp_path, writer_instance) " +
+          "VALUES ('file:/lake/reset', 51, '.tmp/x', 'operator')",
+        "INSERT INTO delta_coordination.table_taint (table_uri, reason) " +
+          "VALUES ('file:/lake/reset', 'by hand')",
         "UPDATE delta_coordination.commit_entry SET complete = true, completed_at = now()",
+        "UPDATE delta_coordination.schema_version SET version = 3",
         "TRUNCATE delta_coordination.commit_entry",
         "CREATE TABLE delta_coordination.scratch (id int)",
         "SELECT * FROM control.run"

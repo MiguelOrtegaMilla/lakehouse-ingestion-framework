@@ -100,7 +100,7 @@ The bootstrap script (`docker/postgres/init/`) runs only on an empty volume. Aft
 
 Least-privilege roles: [ADR-0013](docs/adr/0013-application-security-baseline.md) §3. `PostgresBootstrapSpec` tests the bootstrap against the same image and scripts.
 
-The tables of `delta_coordination`, and the privileges on them, come from the migration that `delta-pg-logstore` ships (`src/main/resources/db/migration/delta_coordination`). `CoordinationSchemaSpec` applies it with Flyway, as `ingest_migrator`, and tests what each role may and may not do.
+The tables of `delta_coordination`, and the privileges on them, come from the migrations that `delta-pg-logstore` ships (`src/main/resources/db/migration/delta_coordination`). `CoordinationSchemaSpec` applies them with Flyway, as `ingest_migrator`, and tests what each role may and may not do.
 
 ## License
 

@@ -207,7 +207,7 @@ object PostgresLogStore {
     }
 
   /** The store that every LogStore of this JVM with these settings shares (ADR-0004 §3.9). */
-  private def sharedCoordination(conf: Configuration): CoordinationStore =
+  private[logstore] def sharedCoordination(conf: Configuration): CoordinationStore =
     CoordinationSettings.from(conf) match {
       case Right(settings) => PostgresCoordinationStore.shared(settings)
       case Left(problems) =>

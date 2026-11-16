@@ -72,10 +72,12 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 | `ingest_migrator` | Owns schemas `control` and `delta_coordination`; DDL | Flyway only. Never at runtime. |
 | `ingest_control` | DML on `control`; read access to commit entries for the lineage views (`v_table_commits`) | Engine |
 | `ingest_coordination` | `SELECT` and `INSERT` on `coordinated_table`, `commit_entry` and `table_taint`. `UPDATE` only of `complete` and `completed_at` on `commit_entry`. `SELECT` on `schema_version`. **No `DELETE`, no other `UPDATE`, no DDL, no access to `control`.** ¹ | `PostgresLogStore` |
-| `ingest_maintenance` | `SELECT` and `DELETE` on `commit_entry`, `table_taint` and `coordinated_table`. `SELECT` on `schema_version`. Nothing else. ¹ | Entry pruning and registry reset (F9), in maintenance mode and runbooks |
+| `ingest_maintenance` | `SELECT` and `DELETE` on `commit_entry`, `table_taint` and `coordinated_table`. `INSERT` on `coordinated_table`, and `UPDATE` of its `registered_version`, `delta_table_id` and `registered_at`. `SELECT` on `schema_version`. Nothing else. ¹ ² | Adopting a table and adopting it again, registry reset (F9), entry pruning, in maintenance mode and runbooks |
 | `<source>_ro` | `SELECT` on the source tables | JDBC connector |
 
 ¹ *Updated in P2a.3 (2026-11-14) to the privileges the migration grants, which are narrower than first written. The rows said "`SELECT`, `INSERT`, `UPDATE` on `commit_entry` and `coordinated_table`" and "`DELETE` on the coordination tables". The commit path can now only add rows and mark an entry complete: it cannot rewrite an entry, change a registration or clear a taint. The decision is unchanged.*
+
+² *Updated in P2a.11 (2026-11-16) to the privileges of migration V2. The row said "`SELECT` and `DELETE` on `commit_entry`, `table_taint` and `coordinated_table`" and nothing more. Adopting a table registers it, and adopting it again moves its version, so the operator's role may now insert a registration and update those three columns of it. It still cannot make or change an entry, taint a table, or rename one in the registry. The decision is unchanged.*
 
 - **Why a separate maintenance role:** a bug on the commit path cannot erase a commit entry, because the role it runs as is not allowed to.
 - **Where it lives:**

@@ -3,13 +3,14 @@ package lakehouse.ingestion.logstore.coordination
 import java.io.IOException
 
 /**
- * A `CoordinationStore` in one JVM's memory, for tests of the protocol that need no database.
+ * A `CoordinationStore` in one JVM's memory, for tests of the protocol that need no database,
+ * and the `RegistryMaintenance` of the same registry, for tests of an operator's work.
  *
  * Every operation runs under one lock, which is the simplest way to be atomic and linearised.
- * It passes the same `CoordinationStoreContract` as the PostgreSQL implementation: that is what
- * makes a protocol test written against it worth trusting.
+ * It passes the same `CoordinationStoreContract` and `RegistryMaintenanceContract` as the
+ * PostgreSQL implementations: that is what makes a test written against it worth trusting.
  */
-final class InMemoryCoordinationStore extends CoordinationStore {
+final class InMemoryCoordinationStore extends CoordinationStore with RegistryMaintenance {
 
   private var registrations = Map.empty[TableUri, Registration]
   private var entries = Map.empty[(TableUri, Long), CommitEntry]
@@ -81,5 +82,50 @@ final class InMemoryCoordinationStore extends CoordinationStore {
         registrations += table -> registration.copy(taintReason = Some(reason))
       case None => throw new IOException(s"cannot taint $table: it is not registered")
     }
+  }
+
+  override def unfinished(table: TableUri): Seq[CommitEntry] = synchronized {
+    entries.values.filter(entry => entry.table == table && !entry.complete).toSeq.sortBy(_.version)
+  }
+
+  override def adopt(table: TableUri, version: Long, deltaTableId: Option[String]): Boolean = {
+    require(version >= 0, s"a table is adopted at a version it has, not at $version")
+    synchronized {
+      val isNew = !registrations.contains(table)
+      if (isNew)
+        registrations += table -> Registration(table, version, deltaTableId, taintReason = None)
+      isNew
+    }
+  }
+
+  override def readopt(
+      table: TableUri,
+      version: Long,
+      deltaTableId: Option[String]
+  ): Option[Readoption] = {
+    require(version >= 0, s"a table is adopted at a version it has, not at $version")
+    synchronized {
+      registrations.get(table).map { registered =>
+        val removed = entries.values
+          .filter(entry => entry.table == table && (entry.version > version || !entry.complete))
+          .toSeq
+          .sortBy(_.version)
+        entries --= removed.map(entry => (entry.table, entry.version))
+        registrations += table -> Registration(
+          table,
+          version,
+          deltaTableId.orElse(registered.deltaTableId),
+          taintReason = None
+        )
+        Readoption(registered.taintReason, removed)
+      }
+    }
+  }
+
+  override def forget(table: TableUri): Boolean = synchronized {
+    val wasRegistered = registrations.contains(table)
+    registrations -= table
+    entries = entries.filterNot { case ((owner, _), _) => owner == table }
+    wasRegistered
   }
 }
