@@ -99,8 +99,18 @@ object LogModel {
   /** Data files present on disk under the table root, outside `_delta_log`. */
   final case class DiskView(dataFiles: Set[String])
 
-  /** One row of the registry of commits: who has `version`, and under which run. */
-  final case class RegistryEntry(version: Long, complete: Boolean, runId: Option[String])
+  /**
+   * One row of the registry of commits: who has `version`, and under which run.
+   *
+   * @param tookMillis from the moment the version was taken to the moment its entry was marked
+   *   complete, on the database's clock; `None` while it is not complete
+   */
+  final case class RegistryEntry(
+      version: Long,
+      complete: Boolean,
+      runId: Option[String],
+      tookMillis: Option[Long] = None
+  )
 
   /**
    * What the coordination database holds about a table, read with plain SQL and not through

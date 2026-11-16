@@ -20,7 +20,8 @@ object RegistryReader {
       |WHERE c.table_uri = ?""".stripMargin
 
   private val Entries =
-    """SELECT version, complete, run_id::text
+    """SELECT version, complete, run_id::text,
+      |       (EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)::bigint
       |FROM delta_coordination.commit_entry
       |WHERE table_uri = ? ORDER BY version""".stripMargin
 
@@ -38,7 +39,15 @@ object RegistryReader {
         Iterator
           .continually(rows)
           .takeWhile(_.next())
-          .map(row => RegistryEntry(row.getLong(1), row.getBoolean(2), Option(row.getString(3))))
+          .map { row =>
+            val took = row.getLong(4)
+            RegistryEntry(
+              row.getLong(1),
+              row.getBoolean(2),
+              Option(row.getString(3)),
+              Option.unless(row.wasNull())(took)
+            )
+          }
           .toList
       }
     }

@@ -88,7 +88,7 @@ final class CoordinatedHarnessSpec
     probe.logStore shouldBe coordinated
     probe.logFileSystem shouldBe classOf[LocalFileSystem].getName
     probe.guarded shouldBe true
-    probe.contention shouldBe 0L
+    (probe.contention, probe.contentionAtInsert) shouldBe ((0L, 0L))
     probe.faultWaits shouldBe WriterProbe.NoWaits
 
     // The registry has the orchestrator's creation and the writer's three commits, each one
@@ -141,10 +141,11 @@ final class CoordinatedHarnessSpec
     val waited = probes.map(_.faultWaits.toMap.apply(FaultPoint.BeforeInsert.key))
     all(waited) should be >= commits.toLong
     // They did collide, and Delta settled each collision at the next version. A version lost
-    // at the INSERT was waited for; one found taken in the log beforehand was not.
-    val lost = probes.map(_.contention).sum
-    lost should be >= 1L
-    waited.sum should be <= 2L * commits + lost
+    // at the INSERT was waited for; one found taken in the log beforehand was not. So every
+    // wait is a commit that was made or a version that was lost at the INSERT, writer by writer.
+    probes.map(_.contention).sum should be >= 1L
+    all(probes.map(p => p.contention - p.contentionAtInsert)) should be >= 0L
+    waited shouldBe probes.map(_.contentionAtInsert + commits)
 
     val report = verify(run, settings, outcomes)
     withClue(report.anomalies.map(_.detail).mkString("\n")) { report.isClean shouldBe true }
