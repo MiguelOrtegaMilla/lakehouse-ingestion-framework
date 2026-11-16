@@ -150,6 +150,16 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
     lake.entry(1).value.runId shouldBe Some(winner)
   }
 
+  test("a creation lost to a writer that finished it in the meantime is counted the same") {
+    val lake = new Lake
+    lake.store.afterNext(ReadRegistration)(lake.commit(0)(Creation))
+    val run = newRun()
+
+    a[FileAlreadyExistsException] should be thrownBy run.attribute(lake.commit(0)(Creation))
+
+    run.contention shouldBe 1L
+  }
+
   test("F15: a claim that another writer's overtook while the reply was lost is counted once") {
     val lake = new Lake().withCommits(last = 0)
     val another = Claim(lake.table, 1L, ".tmp/another-writer", "host-b:2:app", runId = None)
