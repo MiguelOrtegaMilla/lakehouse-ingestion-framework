@@ -9,6 +9,7 @@ import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
 import io.delta.storage.HDFSLogStore
+import lakehouse.ingestion.logstore.coordination.FaultyCoordinationStore.ReadLatestEntry
 import lakehouse.ingestion.logstore.coordination.{Readoption, Registration}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -276,6 +277,41 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     fates(gone.getFileName.toString) shouldBe TempFate.KeptOnlyCopy
     Files.readAllLines(replaced).asScala shouldBe append(1)
     Files.readAllLines(gone).asScala shouldBe append(2)
+  }
+
+  test("a writer that stopped after taking its version finds its commit finished and collected") {
+    val lake = new Lake().withCommits(last = 0)
+    // While the writer is stopped, a reader publishes its commit, and the temporary files of
+    // published commits are collected: the writer's own among them.
+    var collected = Set.empty[TempFate]
+    val whileStopped = LogStores.at(FaultPoint.AfterInsert) {
+      lake.list(): Unit
+      collected = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs).values.toSet
+    }
+
+    // The commit is done, and its writer is told so: nothing was lost.
+    lake.commit(1, lake.logStore(whileStopped))(append(1))
+
+    collected shouldBe Set(TempFate.RemovedPublished)
+    lake.committed(1) shouldBe append(1)
+    lake.entry(1).value.complete shouldBe true
+    lake.temps shouldBe empty
+  }
+
+  test("a reader that stopped before publishing a commit finds it finished and collected") {
+    val lake = new Lake().withCommits(last = 0)
+    lake.crashAt(FaultPoint.AfterInsert, version = 1)
+    // This reader has read the unfinished entry. Before it publishes the commit, another
+    // reader does, and the temporary files are collected.
+    lake.store.afterNext(ReadLatestEntry) {
+      lake.list(): Unit
+      maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs): Unit
+    }
+
+    lake.list() shouldBe Seq(commit(0), commit(1))
+
+    lake.committed(1) shouldBe append(1)
+    lake.temps shouldBe empty
   }
 
   test("a table without temporary files has nothing to collect") {
