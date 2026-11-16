@@ -90,7 +90,7 @@ final private[logstore] class CommitProtocol(
     // when the version is plainly gone.
     if (log.exists(target)) throw taken(target, context)
 
-    val lines = admit(log, version, actions)
+    val lines = admit(log, version, actions, context)
 
     val claim =
       Claim(log.table, version, tempPathFor(target), writerInstance, context.map(_.runId))
@@ -215,7 +215,12 @@ final private[logstore] class CommitProtocol(
    *
    * @return the actions to write
    */
-  private def admit(log: TableLog, version: Long, actions: Iterator[String]): Iterator[String] = {
+  private def admit(
+      log: TableLog,
+      version: Long,
+      actions: Iterator[String],
+      context: Option[CommitContext]
+  ): Iterator[String] = {
     val table = log.table
     val (registration, lines) = store.registration(table) match {
       case Some(found) => (found, actions)
@@ -236,7 +241,7 @@ final private[logstore] class CommitProtocol(
     }
 
     registration.taintReason.foreach(reason => throw new TableTaintedException(table, reason))
-    if (version == 0) requireNewTable(log, registration)
+    if (version == 0) requireNewTable(log, registration, context)
     else requirePreviousCommit(log, registration, version)
     lines
   }
@@ -245,8 +250,17 @@ final private[logstore] class CommitProtocol(
    * Version 0 is being written and is not on the storage, so the table is new there. The
    * registry must know no commit of it either, or its entries belong to an earlier table at
    * the same path. (The base class's "old entries for table still exist".)
+   *
+   * Unless the table is on the storage by now. The registry is read after the log was looked
+   * at, and a writer that created the table between the two looks is in both: its commits are
+   * recorded and version 0 is in the log. That is a version this writer lost, not an earlier
+   * table, and Delta is told so.
    */
-  private def requireNewTable(log: TableLog, registration: Registration): Unit = {
+  private def requireNewTable(
+      log: TableLog,
+      registration: Registration,
+      context: Option[CommitContext]
+  ): Unit = {
     val known =
       if (registration.registeredVersion != Registration.NotYetCreated)
         Some(s"the table was adopted at version ${registration.registeredVersion}")
@@ -256,7 +270,11 @@ final private[logstore] class CommitProtocol(
           .latestEntry(log.table)
           .filter(latest => latest.version > 0 || latest.complete)
           .map(latest => s"its commits up to version ${latest.version} are recorded")
-    known.foreach(what => throw new StaleRegistrationException(log.table, what))
+    known.foreach { what =>
+      val creation = log.commitFile(0)
+      if (log.exists(creation)) throw taken(creation, context)
+      throw new StaleRegistrationException(log.table, what)
+    }
   }
 
   /** The commit before `version` must be in the log, and be one this protocol knows of. */

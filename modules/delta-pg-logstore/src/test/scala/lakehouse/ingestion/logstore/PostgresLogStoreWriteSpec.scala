@@ -177,6 +177,27 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
     a[FileAlreadyExistsException] should be thrownBy lake.commit(0)(Creation)
   }
 
+  test("a creation that another writer finishes while this one starts is a taken version too") {
+    // The other creator does all of it, and more, after this one has looked at the log and
+    // before it looks at the registry: once before the registration is read, once after.
+    Seq[Operation](ReadRegistration, Register).foreach { between =>
+      val lake = new Lake
+      lake.store.afterNext(between) {
+        lake.commit(0)(Creation)
+        lake.commit(1)(append(1))
+      }
+
+      val taken = the[FileAlreadyExistsException] thrownBy lake.commit(0)(append(99))
+
+      // Not a table that was dropped and created again: nothing for an operator to reset.
+      taken.getClass shouldBe classOf[FileAlreadyExistsException]
+      lake.committed(0) shouldBe Creation
+      (0L to 1L).map(lake.entry(_).value.complete) shouldBe Seq(true, true)
+      // The winner's two files, and nothing of the writer that lost.
+      lake.temps should have size 2
+    }
+  }
+
   test("a table registered by a creator that died before its first commit can be created") {
     val lake = new Lake
     a[SimulatedCrash] should be thrownBy
