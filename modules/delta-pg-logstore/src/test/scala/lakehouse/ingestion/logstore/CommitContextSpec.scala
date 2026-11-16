@@ -140,7 +140,7 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
   test("a version lost at the INSERT, before its file appears, is counted the same") {
     val lake = new Lake().withCommits(last = 0)
     val winner = UUID.randomUUID()
-    val another = Claim(lake.table, 1L, ".tmp/another-writer", "host-b:2:app", Some(winner))
+    val another = lake.claimBy("another-writer", version = 1).copy(runId = Some(winner))
     lake.memory.take(another) shouldBe TakeResult.Taken
     val run = newRun()
 
@@ -162,7 +162,7 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
 
   test("F15: a claim that another writer's overtook while the reply was lost is counted once") {
     val lake = new Lake().withCommits(last = 0)
-    val another = Claim(lake.table, 1L, ".tmp/another-writer", "host-b:2:app", runId = None)
+    val another = lake.claimBy("another-writer", version = 1)
     lake.store.failNext(Take, Preempted(by = another))
     val run = newRun()
 

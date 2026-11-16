@@ -55,7 +55,10 @@ commits.contention
 
 ## What an operator does
 
-`TableMaintenance`, with the operator's role. Each operation looks at the table's log first and refuses what the log does not bear out. They are for a table whose writers are stopped.
+`TableMaintenance`, with the operator's role. Each operation looks at the table's log first and refuses what the log does not bear out. They are for a table whose writers are stopped. A writer that was not is neither harmed nor does harm:
+
+- a registration has a generation, which the database changes when a table is adopted again and which goes with the registration when a table is reset. A writer's claim names the generation it read, and gets no version under another: `RegistrationChangedException`, and the transaction starts again;
+- `readopt` and `reset` change the registry only if its entries are still the ones they examined. If a writer took or finished a version in between, the table is examined again, and a table that is written every time is refused.
 
 | Operation | For |
 |---|---|
@@ -122,9 +125,7 @@ Around the scenarios:
 **Found by the review of P2a, and open**
 
 - **The schema version is checked once.** A store checks it before its first operation. A process that is running when a later migration is applied does not notice until it restarts.
-- **Nothing fences a writer against an operator.** `readopt`, `reset` and `adopt` are for a table whose writers are stopped, and nothing enforces it.
-  - A writer that takes a version while its table is adopted again can have its entry removed. Its commit is then found without one and the table is tainted again: closed, and to be adopted once more.
-  - A writer that is stalled, not stopped, goes on afterwards with what it had checked before. If its table was dropped, the registry reset and a new table created at the same path in the meantime, it can take a version in the new table's registry. In the two interleavings that `TableMaintenanceSpec` runs, the outcome is closed. Stalled in its checks, the writer is refused: the commit before its own is not in the new log. Stalled just before its `INSERT`, it takes a version it cannot publish, and the new table's readers stop at that entry until the table is adopted again. A new table that had already reached the writer's version would get its commit, as it would with Delta on any storage, where a commit is a file name. Closing this takes a generation on the registration that the `INSERT` checks in the same statement.
+- **A taint is not held to a generation.** A reader that stalls between finding a foreign commit and recording it, while the table is dropped, its registry reset and a table created in its place, taints the new table: closed, and a false alarm. (A writer's claim is held to the registration it read; see above.)
 - **Temporary files of commits that Delta expired are kept.** Delta's log cleanup removes commits below a checkpoint once they are older than the log retention (thirty days by default). A temporary file that was not collected before then looks like the only copy of a lost commit: `collectTemps` keeps it and reports it. Collect more often than the retention.
 - **The table id in the registry is informative.** A table created through the LogStore is registered with the `metaData.id` of the first writer that tried to create it. If that writer lost version 0 to another, the id in the registry is not the table's. Nothing reads it; the log is the source.
 - **`collectTemps` is not built for large logs.** It asks the registry once for each temporary file, and compares a file with its commit by reading both.

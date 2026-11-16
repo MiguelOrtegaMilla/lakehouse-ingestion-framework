@@ -4,6 +4,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CoordinationSchema, CoordinationStores}
 import lakehouse.ingestion.logstore.coordination.{
+  Claim,
   CoordinationSchemaException,
   CoordinationStoreContract,
   PostgresCoordinationStore
@@ -59,9 +60,9 @@ final class CoordinationSchemaCheckSpec extends AnyFunSuite with Matchers with B
     setVersion(newer)
     try
       Using.resource(new PostgresCoordinationStore(settings)) { store =>
-        val failure = the[CoordinationSchemaException] thrownBy store.take(
-          CoordinationStoreContract.claim(table, 0L)
-        )
+        // A claim as a writer makes one. Nothing of it is looked at: the schema comes first.
+        val claim = Claim(table, 0L, ".tmp/0.json.a", "host:1:app", runId = None, generation = 1L)
+        val failure = the[CoordinationSchemaException] thrownBy store.take(claim)
         failure.getMessage should include(s"version $newer")
         failure.getMessage should include(
           s"needs version ${PostgresCoordinationStore.SchemaVersion}"

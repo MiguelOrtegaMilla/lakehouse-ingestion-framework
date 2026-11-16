@@ -42,9 +42,8 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
 
     lake.commit(0)(Creation)
 
-    lake.memory.registration(lake.table) shouldBe Some(
-      Registration(lake.table, Registration.NotYetCreated, Some(TableId), taintReason = None)
-    )
+    saidBy(lake.memory.registration(lake.table)) shouldBe
+      Some((Registration.NotYetCreated, Some(TableId), None))
     lake.committed(0) shouldBe Creation
     val entry = lake.entry(0).value
     entry.complete shouldBe true
@@ -108,7 +107,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
 
   test("a version whose entry is another writer's is taken, before its file appears") {
     val lake = new Lake().withCommits(last = 0)
-    val another = Claim(lake.table, 1L, ".tmp/another-writer", "host-b:2:app", runId = None)
+    val another = lake.claimBy("another-writer", version = 1)
     lake.memory.take(another) shouldBe TakeResult.Taken
     val tempsBefore = lake.temps
 
@@ -172,7 +171,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
   test("a creation that another writer has in flight is a taken version, not an earlier table") {
     val lake = new Lake
     lake.memory.register(lake.table, Registration.NotYetCreated, None)
-    lake.memory.take(Claim(lake.table, 0L, ".tmp/creator", "host-b:2:app", None))
+    lake.memory.take(lake.claimBy("creator", version = 0))
 
     a[FileAlreadyExistsException] should be thrownBy lake.commit(0)(Creation)
   }
@@ -381,7 +380,7 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
 
   test("F15: a claim that never arrived, repeated after another writer's, is told so") {
     val lake = new Lake().withCommits(last = 0)
-    val another = Claim(lake.table, 1L, ".tmp/another-writer", "host-b:2:app", runId = None)
+    val another = lake.claimBy("another-writer", version = 1)
     lake.store.failNext(Take, Preempted(by = another))
     val tempsBefore = lake.temps
 

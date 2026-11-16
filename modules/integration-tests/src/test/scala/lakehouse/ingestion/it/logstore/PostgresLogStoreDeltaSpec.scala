@@ -40,8 +40,13 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Coo
 
     // The table registered itself with its first commit, under the id Delta gave it.
     val tableId = DeltaLog.forTable(spark, path).update().metadata.id
-    store.registration(keyOf(path)) shouldBe Some(
-      Registration(keyOf(path), Registration.NotYetCreated, Some(tableId), taintReason = None)
+    val registration = store.registration(keyOf(path)).getOrElse(fail("not registered"))
+    registration shouldBe Registration(
+      keyOf(path),
+      Registration.NotYetCreated,
+      Some(tableId),
+      taintReason = None,
+      registration.generation
     )
     (0L to 2L).foreach { version =>
       val committed = entry(path, version)

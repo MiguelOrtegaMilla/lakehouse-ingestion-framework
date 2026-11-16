@@ -98,7 +98,10 @@ final class PostgresMaintenanceAndGuardSpec
 
     maintenance.adopt(hadoop(lake.directory), fs, Some("its-id")) shouldBe Adoption(lake.table, 1L)
 
-    store.registration(lake.table) shouldBe Some(Registration(lake.table, 1L, Some("its-id"), None))
+    store
+      .registration(lake.table)
+      .map(r => (r.registeredVersion, r.deltaTableId, r.isTainted)) shouldBe
+      Some((1L, Some("its-id"), false))
     lake.commit(2)(append(2))
     store.entry(lake.table, 2L).map(_.complete) shouldBe Some(true)
     lake.list() shouldBe (0L to 2L).map(commit)
@@ -139,6 +142,48 @@ final class PostgresMaintenanceAndGuardSpec
     store.registration(lake.table).map(_.registeredVersion) shouldBe
       Some(Registration.NotYetCreated)
     lake.list() shouldBe Seq(commit(0))
+  }
+
+  test("a writer stalled before its INSERT while its table is adopted again gets no version") {
+    val lake = new Lake
+    lake.commit(0)(Creation)
+    lake.commit(1)(append(1))
+    // The operator's change commits between the writer's checks and its INSERT.
+    val whileAdopted = LogStores.at(FaultPoint.BeforeInsert) {
+      maintenance.readopt(hadoop(lake.directory), fs, None).version shouldBe 1L: Unit
+    }
+
+    a[RegistrationChangedException] should be thrownBy lake.commit(2, whileAdopted)(append(2))
+
+    store.entry(lake.table, 2L) shouldBe None
+    Files.exists(lake.commitFile(2)) shouldBe false
+    // The transaction, started again, reads the registration as it is and commits.
+    lake.commit(2)(append(2))
+    lake.list() shouldBe (0L to 2L).map(commit)
+  }
+
+  test("a writer of a dropped table gets no version of the table created in its place") {
+    val lake = new Lake
+    lake.commit(0)(Creation)
+    lake.commit(1)(append(1))
+    // While the writer of version 2 is stalled, the table is dropped, its registry reset, and
+    // a table created at its path that gets as far as the version before the writer's.
+    val whileReplaced = LogStores.at(FaultPoint.BeforeInsert) {
+      Using.resource(Files.walk(lake.log)) {
+        _.iterator.asScala.filter(Files.isRegularFile(_)).toList.foreach(Files.delete)
+      }
+      maintenance.reset(hadoop(lake.directory), fs)
+      lake.commit(0)(Creation)
+      lake.commit(1)(append(1))
+    }
+
+    a[RegistrationChangedException] should be thrownBy lake.commit(2, whileReplaced)(append(2))
+
+    // Version 2 of the new table is free, and its log holds only its own commits.
+    store.entry(lake.table, 2L) shouldBe None
+    Files.exists(lake.commitFile(2)) shouldBe false
+    lake.list() shouldBe Seq(commit(0), commit(1))
+    lake.temps should have size 2
   }
 
   test("F1: the orphan of a writer that died before its version is collected once it is old") {

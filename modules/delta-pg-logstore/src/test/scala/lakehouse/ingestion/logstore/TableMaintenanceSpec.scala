@@ -17,8 +17,10 @@ import lakehouse.ingestion.logstore.coordination.{
   CommitEntry,
   Readoption,
   Registration,
+  RegistryChange,
   RegistryMaintenance,
-  TableUri
+  TableUri,
+  TakeResult
 }
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -46,8 +48,14 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
   private def registrationOf(lake: Lake): Option[Registration] =
     lake.memory.registration(lake.table)
 
-  /** The registry of `lake`, where `first` happens just before its unfinished entries are read. */
-  private def registryWhere(lake: Lake)(first: => Unit): RegistryMaintenance =
+  /**
+   * The registry of `lake`, where other processes act at the two moments an operator's
+   * operation leaves them: just before it examines the entries, and just before it changes the
+   * registry on what it examined.
+   */
+  private def registryWhere(
+      lake: Lake
+  )(beforeExamining: () => Unit = () => (), beforeChanging: () => Unit = () => ()) =
     new RegistryMaintenance {
       private val registry = lake.memory
 
@@ -58,18 +66,43 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
         registry.entry(table, version)
 
       override def unfinished(table: TableUri): Seq[CommitEntry] = {
-        first
+        beforeExamining()
         registry.unfinished(table)
+      }
+
+      override def contradicted(table: TableUri, version: Long): Seq[CommitEntry] = {
+        beforeExamining()
+        registry.contradicted(table, version)
       }
 
       override def adopt(table: TableUri, version: Long, id: Option[String]): Boolean =
         registry.adopt(table, version, id)
 
-      override def readopt(table: TableUri, version: Long, id: Option[String]): Option[Readoption] =
-        registry.readopt(table, version, id)
+      override def readopt(
+          table: TableUri,
+          version: Long,
+          id: Option[String],
+          examined: Seq[CommitEntry]
+      ): RegistryChange[Readoption] = {
+        beforeChanging()
+        registry.readopt(table, version, id, examined)
+      }
 
-      override def forget(table: TableUri): Boolean = registry.forget(table)
+      override def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit] = {
+        beforeChanging()
+        registry.forget(table, examined)
+      }
     }
+
+  /** `effect`, the first time it is asked for and never again. */
+  private def once(effect: => Unit): () => Unit = {
+    var done = false
+    () =>
+      if (!done) {
+        done = true
+        effect
+      }
+  }
 
   private def age(file: LocalPath, by: FiniteDuration): Unit =
     Files.setLastModifiedTime(
@@ -90,7 +123,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val adopted = maintenanceOf(lake).adopt(hadoop(lake.directory), fs, Some(TableId))
 
     adopted shouldBe Adoption(lake.table, version = 2L)
-    registrationOf(lake) shouldBe Some(Registration(lake.table, 2L, Some(TableId), None))
+    saidBy(registrationOf(lake)) shouldBe Some((2L, Some(TableId), None))
     // From the next version on it is written through the LogStore, and read without alarm.
     lake.commit(3)(append(3))
     lake.list() shouldBe (0L to 3L).map(commit)
@@ -125,7 +158,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
 
     readopted shouldBe Readopted(lake.table, 2L, Readoption(Some(reason), Nil))
-    registrationOf(lake) shouldBe Some(Registration(lake.table, 2L, Some(TableId), None))
+    saidBy(registrationOf(lake)) shouldBe Some((2L, Some(TableId), None))
     // The commits made before keep their entries; writers and readers go on.
     (0L to 1L).map(lake.entry(_).value.complete) shouldBe Seq(true, true)
     lake.commit(3)(append(3))
@@ -204,8 +237,8 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val lake = new Lake().withCommits(last = 1)
     lake.crashAt(FaultPoint.AfterInsert, version = 2)
     // The operation has seen a log that ends at version 1. Before it asks the registry for
-    // unfinished entries, a reader publishes version 2 and acknowledges it.
-    val registry = registryWhere(lake)(lake.list(): Unit)
+    // the entries that log contradicts, a reader publishes version 2 and acknowledges it.
+    val registry = registryWhere(lake)(beforeExamining = once(lake.list(): Unit))
 
     val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
 
@@ -251,8 +284,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     (0L to 2L).foreach(lake.entry(_) shouldBe None)
     // The new table registers itself with its first commit, like any other.
     lake.commit(0)(Creation)
-    registrationOf(lake) shouldBe
-      Some(Registration(lake.table, Registration.NotYetCreated, Some(TableId), None))
+    saidBy(registrationOf(lake)) shouldBe Some((Registration.NotYetCreated, Some(TableId), None))
     lake.list() shouldBe Seq(commit(0))
   }
 
@@ -271,7 +303,8 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
   }
 
   // ---------------------------------------------------------------------------------------------
-  // A writer that was not stopped (a known limit: nothing fences it against the operator)
+  // A writer that was not stopped (ADR-0004 §3.5): the operator's change and the writer's claim
+  // are each made on what was examined, or not at all
   // ---------------------------------------------------------------------------------------------
 
   /** The table is dropped, its registry reset, and a table created again at its path. */
@@ -298,25 +331,145 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     lake.list() shouldBe (0L to 2L).map(commit)
   }
 
-  test("a writer stalled before its INSERT takes a version of the new table, and cannot publish") {
+  test("a writer stalled before its INSERT gets no version of the table created in its place") {
     val lake = new Lake().withCommits(last = 5)
     val stalled = LogStores.at(FaultPoint.BeforeInsert)(dropAndCreateAgain(lake, upTo = 2))
 
-    // Its temporary file went with the old table. The version it takes is the new table's.
-    an[UnpublishableCommitException] should be thrownBy
+    // The registration it read is gone, and the one in its place has another generation.
+    a[RegistrationChangedException] should be thrownBy
       lake.commit(6, lake.logStore(stalled))(append(6))
-    val taken = lake.entry(6).value
-    taken.complete shouldBe false
 
-    // Closed, not corrupted: the new table's readers stop at the entry, by name.
-    an[UnpublishableCommitException] should be thrownBy lake.list()
+    // The new table is as its own writers left it: read, and written on.
+    lake.entry(6) shouldBe None
     Files.exists(lake.commitFile(6)) shouldBe false
-
-    // The way out is the operator's: the log as it stands is the table.
-    maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None) shouldBe
-      Readopted(lake.table, 2L, Readoption(None, Seq(taken)))
     lake.list() shouldBe (0L to 2L).map(commit)
     lake.commit(3)(append(3))
+  }
+
+  test("a writer of a dropped table gets no version of a new one that reached its own") {
+    val lake = new Lake().withCommits(last = 5)
+    // The one case nothing else stops. The writer of version 6 stalls in its checks; the table
+    // created in its place gets as far as version 5, so the commit before the writer's is in
+    // the log, its temporary file is written into the new log, and version 6 is free.
+    lake.store.afterNext(ReadEntry)(dropAndCreateAgain(lake, upTo = 5))
+
+    a[RegistrationChangedException] should be thrownBy lake.commit(6)(append(6))
+
+    // A commit computed on the old table is not in the new one.
+    lake.entry(6) shouldBe None
+    Files.exists(lake.commitFile(6)) shouldBe false
+    lake.temps.map(_.getFileName.toString).toSet shouldBe
+      (0L to 5L).map(lake.entry(_).value.tempPath.stripPrefix(".tmp/")).toSet
+    lake.list() shouldBe (0L to 5L).map(commit)
+  }
+
+  test("a writer stalled before its INSERT while its table is adopted again gets no version") {
+    val lake = new Lake().withCommits(last = 1)
+    val whileAdopted = LogStores.at(FaultPoint.BeforeInsert) {
+      maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None): Unit
+    }
+    val tempsBefore = lake.temps
+
+    a[RegistrationChangedException] should be thrownBy
+      lake.commit(2, lake.logStore(whileAdopted))(append(2))
+
+    lake.entry(2) shouldBe None
+    lake.temps shouldBe tempsBefore
+    // It is not a refusal of the table: the transaction, started again, commits.
+    lake.commit(2)(append(2))
+    lake.list() shouldBe (0L to 2L).map(commit)
+  }
+
+  test("a commit made while its table is adopted again keeps its entry") {
+    val lake = new Lake().withCommits(last = 1)
+    // The operator has examined a table that ends at version 1. Before the registry is
+    // changed, a writer that was not stopped commits version 2.
+    val registry = registryWhere(lake)(beforeChanging = once(lake.commit(2)(append(2))))
+
+    val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
+
+    readopted shouldBe Readopted(lake.table, 2L, Readoption(None, Nil))
+    lake.entry(2).value.complete shouldBe true
+    lake.list() shouldBe (0L to 2L).map(commit)
+    registrationOf(lake).value.isTainted shouldBe false
+  }
+
+  test("a version taken while a table is adopted again is not the operator's to discard") {
+    val lake = new Lake().withCommits(last = 1)
+    // As above, and the writer has only taken its version when the registry is changed.
+    val registry =
+      registryWhere(lake)(beforeChanging = once(lake.crashAt(FaultPoint.AfterInsert, 2)))
+    val before = registrationOf(lake)
+
+    val refused = the[MaintenanceRefusedException] thrownBy
+      new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
+
+    refused.getMessage should include("version 2")
+    refused.getMessage should include("can still be published")
+    // Nothing was changed, not even the generation: the writer, were it alive, would go on.
+    registrationOf(lake) shouldBe before
+    lake.list() shouldBe (0L to 2L).map(commit)
+    lake.entry(2).value.complete shouldBe true
+  }
+
+  test("a table that is written every time it is examined is not adopted again") {
+    val lake = new Lake().withCommits(last = 0)
+    var next = 0L
+    val busy = registryWhere(lake)(beforeChanging = () => {
+      next += 1
+      lake.commit(next)(append(next))
+    })
+    val before = registrationOf(lake)
+
+    val refused = the[MaintenanceRefusedException] thrownBy
+      new TableMaintenance(busy).readopt(hadoop(lake.directory), fs, None)
+
+    refused.getMessage should include("is being written")
+    registrationOf(lake) shouldBe before
+    (0L to next).map(lake.entry(_).value.complete) shouldBe Seq.fill(next.toInt + 1)(true)
+  }
+
+  /** A process that outlived its table: it writes its temporary file and takes `version`. */
+  private def takenByAWriterStillRunning(lake: Lake, version: Long): CommitEntry = {
+    val claim = lake.claimBy(s"$version.json.still-running", version)
+    Files.createDirectories(lake.log.resolve(".tmp"))
+    Files.write(lake.log.resolve(claim.tempPath), append(version).asJava)
+    lake.memory.take(claim) shouldBe TakeResult.Taken
+    lake.entry(version).value
+  }
+
+  test("the registry of a dropped table is not reset while a writer of it can still publish") {
+    val lake = new Lake().withCommits(last = 1)
+    (0L to 1L).foreach(version => Files.delete(lake.commitFile(version)))
+    lake.temps.foreach(Files.delete)
+    val taken = takenByAWriterStillRunning(lake, version = 2)
+    val before = registrationOf(lake)
+
+    val refused = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(lake).reset(hadoop(lake.directory), fs)
+
+    refused.getMessage should include("version 2")
+    refused.getMessage should include("still running")
+    registrationOf(lake) shouldBe before
+    lake.entry(2) shouldBe Some(taken)
+  }
+
+  test("nor if such a writer takes its version while the registry is being reset") {
+    val lake = new Lake().withCommits(last = 1)
+    (0L to 1L).foreach(version => Files.delete(lake.commitFile(version)))
+    lake.temps.foreach(Files.delete)
+    // The operator found no unfinished entry. One is made before the registry is changed.
+    val registry = registryWhere(lake)(beforeChanging = once {
+      takenByAWriterStillRunning(lake, version = 2): Unit
+    })
+    val before = registrationOf(lake)
+
+    val refused = the[MaintenanceRefusedException] thrownBy
+      new TableMaintenance(registry).reset(hadoop(lake.directory), fs)
+
+    refused.getMessage should include("still running")
+    registrationOf(lake) shouldBe before
+    lake.entry(2).value.complete shouldBe false
   }
 
   // ---------------------------------------------------------------------------------------------

@@ -5,7 +5,12 @@ import java.util.UUID
 
 import lakehouse.ingestion.logstore.Concurrently
 import lakehouse.ingestion.logstore.coordination.RegisterResult.{AlreadyRegistered, Registered}
-import lakehouse.ingestion.logstore.coordination.TakeResult.{NotRegistered, Taken, TakenBy}
+import lakehouse.ingestion.logstore.coordination.TakeResult.{
+  NotRegistered,
+  RegistrationChanged,
+  Taken,
+  TakenBy
+}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -31,16 +36,24 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
 
     store.registration(table) shouldBe None
 
-    store.register(table, Registration.NotYetCreated, deltaTableId = None) shouldBe Registered
-    store.registration(table) shouldBe Some(
-      Registration(table, Registration.NotYetCreated, deltaTableId = None, taintReason = None)
-    )
+    val made = registrationBy(store.register(table, Registration.NotYetCreated, None))
+    made shouldBe Registration(table, Registration.NotYetCreated, None, None, made.generation)
+    store.registration(table) shouldBe Some(made)
+  }
+
+  test("every registration has a generation of its own") {
+    val generations = (1 to 3).map { _ =>
+      registrationBy(store.register(newTable(), Registration.NotYetCreated, None)).generation
+    }
+
+    generations.distinct shouldBe generations
   }
 
   test("registering a table again keeps the first registration") {
     val table = newTable()
-    store.register(table, 41L, Some("id-of-the-adopted-table")) shouldBe Registered
-    val first = Registration(table, 41L, Some("id-of-the-adopted-table"), taintReason = None)
+    val first = registrationBy(store.register(table, 41L, Some("id-of-the-adopted-table")))
+    (first.registeredVersion, first.deltaTableId) shouldBe
+      ((41L, Some("id-of-the-adopted-table")))
 
     store.register(table, 99L, Some("another-id")) shouldBe AlreadyRegistered(first)
     store.register(table, 41L, Some("id-of-the-adopted-table")) shouldBe AlreadyRegistered(first)
@@ -61,17 +74,32 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
     store.latestEntry(table) shouldBe None
   }
 
+  test("a claim under a generation that the registration does not have takes nothing") {
+    val table = registered()
+    val current = generationOf(table)
+    // What a writer holds that read the registry of an earlier registration of the table.
+    val stale = claim(table, 0L).copy(generation = current - 1)
+
+    store.take(stale) shouldBe RegistrationChanged
+
+    store.entry(table, 0L) shouldBe None
+    // The version is free for a writer that read the registration as it is.
+    store.take(stale.copy(generation = current)) shouldBe Taken
+  }
+
   test("the first claim takes the version, and a later one is told who owns it") {
     val table = registered()
     val run = UUID.randomUUID()
-    val first = Claim(table, 3L, ".tmp/3.json.first", "host-a:1:app", Some(run))
+    val generation = generationOf(table)
+    val first = Claim(table, 3L, ".tmp/3.json.first", "host-a:1:app", Some(run), generation)
     val owned =
       CommitEntry(table, 3L, ".tmp/3.json.first", complete = false, "host-a:1:app", Some(run))
 
     store.take(first) shouldBe Taken
     store.entry(table, 3L) shouldBe Some(owned)
 
-    store.take(Claim(table, 3L, ".tmp/3.json.second", "host-b:2:app", None)) shouldBe TakenBy(owned)
+    val second = Claim(table, 3L, ".tmp/3.json.second", "host-b:2:app", None, generation)
+    store.take(second) shouldBe TakenBy(owned)
     store.entry(table, 3L) shouldBe Some(owned)
   }
 
@@ -171,18 +199,31 @@ abstract class CoordinationStoreContract extends AnyFunSuite with Matchers {
 
     val results = Concurrently.atOnce(versions)(version => store.register(table, version, None))
 
-    val winners = versions.zip(results).collect { case (version, Registered) => version }
+    val winners = versions.zip(results).collect { case (version, _: Registered) => version }
     winners should have size 1
     val kept = store.registration(table).value
     kept.registeredVersion shouldBe winners.head
-    results.filterNot(_ == Registered).distinct shouldBe Seq(AlreadyRegistered(kept))
+    results.distinct should contain theSameElementsAs
+      Seq(Registered(kept), AlreadyRegistered(kept))
   }
 
   private def registered(): TableUri = {
     val table = newTable()
-    store.register(table, Registration.NotYetCreated, deltaTableId = None) shouldBe Registered
+    store.register(table, Registration.NotYetCreated, deltaTableId = None) shouldBe a[Registered]
     table
   }
+
+  /** The registration that a call made, or a failed test if it made none. */
+  private def registrationBy(result: RegisterResult): Registration = result match {
+    case Registered(registration) => registration
+    case other => fail(s"expected a new registration, got $other")
+  }
+
+  private def generationOf(table: TableUri): Long = store.registration(table).value.generation
+
+  /** A claim by a writer that read the registration of `table` just now. */
+  private def claim(table: TableUri, version: Long): Claim =
+    CoordinationStoreContract.claim(store, table, version)
 
   implicit private class Defined[A](option: Option[A]) {
 
@@ -201,13 +242,20 @@ object CoordinationStoreContract {
    */
   def newTable(): TableUri = new TableUri(s"file:/contract/${UUID.randomUUID()}")
 
-  /** A claim on `version` with a temporary path of its own, as each write attempt has. */
-  def claim(table: TableUri, version: Long): Claim =
+  /** A generation that no registration has: the one of a claim on a table that has none. */
+  private val NoGeneration = 0L
+
+  /**
+   * A claim on `version` with a temporary path of its own, as each write attempt has, by a
+   * writer that read the registration of `table` in `store` just now.
+   */
+  def claim(store: CoordinationStore, table: TableUri, version: Long): Claim =
     Claim(
       table,
       version,
       tempPath = f".tmp/$version%020d.json.${UUID.randomUUID()}",
       writerInstance = "host:1:app",
-      runId = None
+      runId = None,
+      generation = store.registration(table).map(_.generation).getOrElse(NoGeneration)
     )
 }
