@@ -6,7 +6,7 @@ import scala.concurrent.duration._
 import scala.util.Using
 
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CoordinationSchema, CoordinationStores}
-import lakehouse.ingestion.logstore.coordination.CoordinationStoreContract.{claim, newTable}
+import lakehouse.ingestion.logstore.coordination.CoordinationStoreContract.newTable
 import lakehouse.ingestion.logstore.coordination._
 import org.scalatest.BeforeAndAfterAll
 
@@ -52,8 +52,9 @@ final class PostgresRegistryMaintenanceSpec
 
     // The same code, connected as the role of the commit path: the database refuses it.
     Using.resource(new PostgresRegistryMaintenance(commitPath)) { asCommitPath =>
-      an[IOException] should be thrownBy asCommitPath.readopt(table, 0L, None)
-      an[IOException] should be thrownBy asCommitPath.forget(table)
+      val examined = asCommitPath.unfinished(table)
+      an[IOException] should be thrownBy asCommitPath.readopt(table, 0L, None, examined)
+      an[IOException] should be thrownBy asCommitPath.forget(table, examined)
     }
 
     // And nothing of what it tried was done, not even in part.
@@ -66,8 +67,9 @@ final class PostgresRegistryMaintenanceSpec
     store.take(claim(table, 0L)) shouldBe TakeResult.Taken
     store.taint(table, "version 0 has no entry")
 
-    // Forgetting deletes the taint, then the entries, then the registration. A session that
-    // holds the entry makes the second step wait until the statement is cancelled.
+    // Forgetting takes the registration, then deletes the taint, the entries and the
+    // registration. A session that holds the entry makes the entries' step wait until the
+    // statement is cancelled.
     Using.resource(pg.connect(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)) {
       holder =>
         holder.setAutoCommit(false)
@@ -82,7 +84,7 @@ final class PostgresRegistryMaintenanceSpec
         val impatient =
           operator.copy(statementTimeout = 1.second)
         Using.resource(new PostgresRegistryMaintenance(impatient)) { blocked =>
-          an[IOException] should be thrownBy blocked.forget(table)
+          an[IOException] should be thrownBy blocked.forget(table, blocked.unfinished(table))
         }
         holder.rollback()
     }

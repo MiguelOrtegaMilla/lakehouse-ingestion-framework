@@ -61,7 +61,7 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
 
   private def register(store: PostgresCoordinationStore): TableUri = {
     val table = newTable()
-    store.register(table, Registration.NotYetCreated, None) shouldBe RegisterResult.Registered
+    store.register(table, Registration.NotYetCreated, None) shouldBe a[RegisterResult.Registered]
     table
   }
 
@@ -104,7 +104,7 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
     // Timeouts well above the delay below: here the connection is cut, it does not time out.
     Using.resource(storeWith(statementTimeout = 20.seconds, connectTimeout = 20.seconds)) { store =>
       val table = register(store)
-      val mine = claim(table, 0L)
+      val mine = claim(store, table, 0L)
 
       // Replies are held back for three seconds: the INSERT reaches the server and commits long
       // before its answer could reach the store.
@@ -127,7 +127,7 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
 
       // Repeating the same claim settles it: the version is its own. Anybody else is told so.
       store.take(mine) shouldBe TakeResult.Taken
-      store.take(claim(table, 0L)) shouldBe a[TakeResult.TakenBy]
+      store.take(claim(store, table, 0L)) shouldBe a[TakeResult.TakenBy]
       store.entry(table, 0L).map(_.tempPath) shouldBe Some(mine.tempPath)
     }
   }
@@ -136,7 +136,7 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
     Using.resource(storeWith(statementTimeout = 20.seconds, connectTimeout = 5.seconds)) { store =>
       val table = register(store)
       Using.resource(inFlightClaim(table, 0L, ".tmp/in-flight")) { other =>
-        val call = Future(store.take(claim(table, 0L)))
+        val call = Future(store.take(claim(store, table, 0L)))
 
         // The store's INSERT can neither succeed nor give up: the version may yet be free.
         eventually(15.seconds.fromNow)(waitingForLock() == 1)
@@ -150,13 +150,65 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
     }
   }
 
+  test("a claim waits for a re-adoption of its table in flight, and is refused if it commits") {
+    Using.resource(storeWith(statementTimeout = 20.seconds, connectTimeout = 5.seconds)) { store =>
+      val table = register(store)
+      // The writer has read the registration, and the operator's change reaches the row first.
+      val stalled = claim(store, table, 0L)
+      Using.resource(inFlightChange(table, NewGeneration)) { operator =>
+        val call = Future(store.take(stalled))
+
+        // The registration the claim names may yet be the table's: the INSERT can neither
+        // succeed nor be refused.
+        eventually(15.seconds.fromNow)(waitingForLock() == 1)
+        call.isCompleted shouldBe false
+
+        operator.commit()
+        Await.result(call, 15.seconds) shouldBe TakeResult.RegistrationChanged
+      }
+      store.entry(table, 0L) shouldBe None
+      // A writer that reads the registration as it is now takes the version.
+      store.take(claim(store, table, 0L)) shouldBe TakeResult.Taken
+    }
+  }
+
+  test("a claim that waited for a re-adoption that is called off takes its version") {
+    Using.resource(storeWith(statementTimeout = 20.seconds, connectTimeout = 5.seconds)) { store =>
+      val table = register(store)
+      val mine = claim(store, table, 0L)
+      Using.resource(inFlightChange(table, NewGeneration)) { operator =>
+        val call = Future(store.take(mine))
+        eventually(15.seconds.fromNow)(waitingForLock() == 1)
+
+        operator.rollback()
+        Await.result(call, 15.seconds) shouldBe TakeResult.Taken
+      }
+      store.entry(table, 0L).map(_.tempPath) shouldBe Some(mine.tempPath)
+    }
+  }
+
+  test("a claim waits for its table to be forgotten, and then has no table to take from") {
+    Using.resource(storeWith(statementTimeout = 20.seconds, connectTimeout = 5.seconds)) { store =>
+      val table = register(store)
+      val stalled = claim(store, table, 0L)
+      Using.resource(inFlightChange(table, LockRegistration, DeleteRegistration)) { operator =>
+        val call = Future(store.take(stalled))
+        eventually(15.seconds.fromNow)(waitingForLock() == 1)
+
+        operator.commit()
+        Await.result(call, 15.seconds) shouldBe TakeResult.NotRegistered
+      }
+      store.registration(table) shouldBe None
+    }
+  }
+
   test(
     "a claim that waits longer than the statement timeout for a lock fails, and can be repeated"
   ) {
     val statementTimeout = 1.second
     Using.resource(storeWith(statementTimeout, connectTimeout = 5.seconds)) { store =>
       val table = register(store)
-      val mine = claim(table, 0L)
+      val mine = claim(store, table, 0L)
       Using.resource(inFlightClaim(table, 0L, ".tmp/never-committed")) { other =>
         val (attempt, elapsed) = timed(store.take(mine))
 
@@ -198,12 +250,12 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
   test("while PostgreSQL is stopped every call fails; when it is back the same store works") {
     Using.resource(storeWith(statementTimeout = 2.seconds, connectTimeout = 2.seconds)) { store =>
       val table = register(store)
-      store.take(claim(table, 0L)) shouldBe TakeResult.Taken
+      store.take(claim(store, table, 0L)) shouldBe TakeResult.Taken
 
       pg.stopPostgres()
       try {
         val (reading, readTime) = timed(store.latestEntry(table))
-        val (writing, writeTime) = timed(store.take(claim(table, 1L)))
+        val (writing, writeTime) = timed(store.take(claim(store, table, 1L)))
 
         // Never "no entry" for a read that could not be made, and nothing written unseen.
         reading.failed.get shouldBe an[IOException]
@@ -215,12 +267,20 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
       // The same store, with no restart of its own, and the entries are still there.
       store.latestEntry(table).map(_.version) shouldBe Some(0L)
       store.entry(table, 1L) shouldBe None
-      store.take(claim(table, 1L)) shouldBe TakeResult.Taken
+      store.take(claim(store, table, 1L)) shouldBe TakeResult.Taken
     }
   }
 
   /** Far longer than any timeout the stores of this suite are given. */
   private val HangsAfter = 45.seconds
+
+  // What an operator's tools run on a registration (`PostgresRegistryMaintenance`).
+  private val NewGeneration =
+    "UPDATE delta_coordination.coordinated_table SET generation = DEFAULT WHERE table_uri = ?"
+  private val LockRegistration =
+    "SELECT 1 FROM delta_coordination.coordinated_table WHERE table_uri = ? FOR UPDATE"
+  private val DeleteRegistration =
+    "DELETE FROM delta_coordination.coordinated_table WHERE table_uri = ?"
 
   /** PostgreSQL cancelled the statement, here on its `statement_timeout`. */
   private val QueryCanceled = "57014"
@@ -241,16 +301,34 @@ final class PostgresCoordinationFaultSpec extends AnyFunSuite with Matchers with
     other.setAutoCommit(false)
     Using.resource(
       other.prepareStatement(
-        """INSERT INTO delta_coordination.commit_entry (table_uri, version, temp_path, writer_instance)
-          |VALUES (?, ?, ?, 'another-writer')""".stripMargin
+        """INSERT INTO delta_coordination.commit_entry
+          |  (table_uri, version, temp_path, writer_instance, generation)
+          |SELECT table_uri, ?, ?, 'another-writer', generation
+          |FROM delta_coordination.coordinated_table WHERE table_uri = ?""".stripMargin
       )
     ) { statement =>
-      statement.setString(1, table.value)
-      statement.setLong(2, version)
-      statement.setString(3, tempPath)
+      statement.setLong(1, version)
+      statement.setString(2, tempPath)
+      statement.setString(3, table.value)
       statement.executeUpdate() shouldBe 1
     }
     other
+  }
+
+  /**
+   * An operator's change of the registration of `table`, in a transaction that is still open:
+   * the table is being adopted again, or forgotten. The caller commits or rolls back.
+   */
+  private def inFlightChange(table: TableUri, statements: String*): Connection = {
+    val operator = pg.observe(CoordinationSchema.MaintenanceRole, CoordinationSchema.Database)
+    operator.setAutoCommit(false)
+    statements.foreach { sql =>
+      Using.resource(operator.prepareStatement(sql)) { statement =>
+        statement.setString(1, table.value)
+        statement.execute()
+      }
+    }
+    operator
   }
 
   /** How many sessions of the store are waiting for a lock, seen by the superuser. */

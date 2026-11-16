@@ -47,9 +47,11 @@ trait CoordinationStore {
   def latestEntry(table: TableUri): Option[CommitEntry]
 
   /**
-   * Gives the claimed version to the claim if nobody has it: the linearisation point of a
-   * commit. A claim that already owns the version, from an earlier call whose reply was lost,
-   * is told so again.
+   * Gives the claimed version to the claim if nobody has it, and if the table's registration is
+   * still of the generation the claim names: the linearisation point of a commit. Both
+   * conditions are decided in the one step that takes the version, also against an operator's
+   * change of the registration that is in flight. A claim that already owns the version, from
+   * an earlier call whose reply was lost, is told so again.
    */
   @throws[IOException]
   def take(claim: Claim): TakeResult
@@ -73,7 +75,9 @@ trait CoordinationStore {
 sealed trait RegisterResult
 
 object RegisterResult {
-  case object Registered extends RegisterResult
+
+  /** @param registration the registration this call made, with the generation it was given */
+  final case class Registered(registration: Registration) extends RegisterResult
 
   /** @param existing the registration that stays, with its own version and id */
   final case class AlreadyRegistered(existing: Registration) extends RegisterResult
@@ -91,4 +95,11 @@ object TakeResult {
 
   /** The table is not registered, so no version of it can be taken (ADR-0004 §3.5, layer 2). */
   case object NotRegistered extends TakeResult
+
+  /**
+   * The table is registered, and not under the generation of the claim: since the writer read
+   * the registration, an operator adopted the table again, or reset its registry and the table
+   * was registered anew. What the writer checked no longer holds, so it gets no version.
+   */
+  case object RegistrationChanged extends TakeResult
 }

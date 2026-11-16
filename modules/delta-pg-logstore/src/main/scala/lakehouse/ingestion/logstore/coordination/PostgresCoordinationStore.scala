@@ -31,6 +31,11 @@ final class CoordinationSchemaException(message: String, cause: Throwable = null
  * registered table without entries is a harmless state, and the foreign key rules out the
  * opposite order.
  *
+ * '''A claim and an operator's change exclude each other in the database.''' An entry refers to
+ * its table's registration by generation. The foreign key check of the `INSERT` waits for a
+ * change of that registration that is in flight, and fails if the change commits: no statement
+ * here locks a registration, and the role of the commit path could not.
+ *
  * '''Fail closed.''' Every SQL error becomes an `IOException`. Waiting is bounded three times
  * over: for a connection, for a lock or a slow statement (by the server), and for a server or
  * a network that stops answering (by the socket).
@@ -68,20 +73,25 @@ final class PostgresCoordinationStore(
       s"not a registered version: $registeredVersion"
     )
     run(s"register $table") { connection =>
-      val inserted = update(connection, Register) { statement =>
+      val generation = query(connection, Register) { statement =>
         statement.setString(1, table.value)
         statement.setLong(2, registeredVersion)
         deltaTableId match {
           case Some(id) => statement.setString(3, id)
           case None => statement.setNull(3, Types.VARCHAR)
         }
+      }(_.getLong("generation"))
+      generation match {
+        case Some(given) =>
+          RegisterResult.Registered(
+            Registration(table, registeredVersion, deltaTableId, taintReason = None, given)
+          )
+        case None =>
+          RegisterResult.AlreadyRegistered(readRegistration(connection, table).getOrElse {
+            // Only maintenance deletes registrations, and not while writers are running.
+            throw new IOException(s"the registration of $table was deleted while it was being read")
+          })
       }
-      if (inserted == 1) RegisterResult.Registered
-      else
-        RegisterResult.AlreadyRegistered(readRegistration(connection, table).getOrElse {
-          // Only maintenance deletes registrations, and not while writers are running.
-          throw new IOException(s"the registration of $table was deleted while it was being read")
-        })
     }
   }
 
@@ -106,13 +116,18 @@ final class PostgresCoordinationStore(
               case Some(run) => statement.setObject(5, run)
               case None => statement.setNull(5, Types.OTHER)
             }
+            statement.setLong(6, claim.generation)
           })
         catch {
-          // The foreign key to the registry: the database itself refuses the claim.
+          // The foreign key to the registration: the database itself refuses the claim. It
+          // waited for an operator's change of the registration, if one was in flight.
           case e: SQLException if e.getSQLState == ForeignKeyViolation => None
         }
       inserted match {
-        case None => TakeResult.NotRegistered
+        // No registration of that generation. Which of the two it is only words the refusal.
+        case None =>
+          if (readRegistration(connection, claim.table).isEmpty) TakeResult.NotRegistered
+          else TakeResult.RegistrationChanged
         case Some(1) => TakeResult.Taken
         case Some(_) =>
           val owner = readEntry(connection, claim.table, claim.version).getOrElse {
@@ -169,12 +184,21 @@ final class PostgresCoordinationStore(
    * never does.
    */
   private[coordination] def transaction[T](action: String)(body: Connection => T): T =
+    transactionUnless(action)(connection => Right(body(connection)))
+
+  /**
+   * As `transaction`, for a change that `body` may call off once it has looked: `Right` keeps
+   * what it changed, `Left` takes all of it back.
+   */
+  private[coordination] def transactionUnless[T](
+      action: String
+  )(body: Connection => Either[T, T]): T =
     run(action) { connection =>
       connection.setAutoCommit(false)
       try {
-        val result = body(connection)
-        connection.commit()
-        result
+        val outcome = body(connection)
+        if (outcome.isRight) connection.commit() else connection.rollback()
+        outcome.merge
       } catch {
         case failure: Throwable =>
           try connection.rollback()
@@ -216,7 +240,8 @@ final class PostgresCoordinationStore(
         table,
         registeredVersion = row.getLong("registered_version"),
         deltaTableId = Option(row.getString("delta_table_id")),
-        taintReason = Option(row.getString("taint_reason"))
+        taintReason = Option(row.getString("taint_reason")),
+        generation = row.getLong("generation")
       )
     }
 
@@ -233,8 +258,8 @@ final class PostgresCoordinationStore(
 
 object PostgresCoordinationStore {
 
-  /** The version of schema `delta_coordination` this code works with: its migrations up to V2. */
-  val SchemaVersion = 2
+  /** The version of schema `delta_coordination` this code works with: its migrations up to V3. */
+  val SchemaVersion = 3
 
   /** What a session of this store calls itself in `pg_stat_activity`. */
   val ApplicationName = "delta-pg-logstore"
@@ -256,7 +281,7 @@ object PostgresCoordinationStore {
   private val SchemaVersionQuery = "SELECT version FROM delta_coordination.schema_version"
 
   private val ReadRegistration =
-    """SELECT c.registered_version, c.delta_table_id, t.reason AS taint_reason
+    """SELECT c.registered_version, c.delta_table_id, c.generation, t.reason AS taint_reason
       |FROM delta_coordination.coordinated_table c
       |LEFT JOIN delta_coordination.table_taint t ON t.table_uri = c.table_uri
       |WHERE c.table_uri = ?""".stripMargin
@@ -264,7 +289,8 @@ object PostgresCoordinationStore {
   private val Register =
     """INSERT INTO delta_coordination.coordinated_table (table_uri, registered_version, delta_table_id)
       |VALUES (?, ?, ?)
-      |ON CONFLICT DO NOTHING""".stripMargin
+      |ON CONFLICT DO NOTHING
+      |RETURNING generation""".stripMargin
 
   private val EntryColumns = "version, temp_path, complete, writer_instance, run_id"
 
@@ -279,8 +305,8 @@ object PostgresCoordinationStore {
 
   private val Take =
     """INSERT INTO delta_coordination.commit_entry
-      |  (table_uri, version, temp_path, writer_instance, run_id)
-      |VALUES (?, ?, ?, ?, ?)
+      |  (table_uri, version, temp_path, writer_instance, run_id, generation)
+      |VALUES (?, ?, ?, ?, ?, ?)
       |ON CONFLICT DO NOTHING""".stripMargin
 
   // The completion time is the database's, and the first one stays.

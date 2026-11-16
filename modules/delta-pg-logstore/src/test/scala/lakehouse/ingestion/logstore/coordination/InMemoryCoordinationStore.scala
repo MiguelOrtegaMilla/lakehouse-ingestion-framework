@@ -14,6 +14,13 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
 
   private var registrations = Map.empty[TableUri, Registration]
   private var entries = Map.empty[(TableUri, Long), CommitEntry]
+  private var lastGeneration = 0L
+
+  /** A generation that no registration of this registry has had. Called under the lock. */
+  private def nextGeneration(): Long = {
+    lastGeneration += 1
+    lastGeneration
+  }
 
   override def registration(table: TableUri): Option[Registration] =
     synchronized(registrations.get(table))
@@ -32,9 +39,9 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
         case Some(existing) => RegisterResult.AlreadyRegistered(existing)
         case None =>
           val registration =
-            Registration(table, registeredVersion, deltaTableId, taintReason = None)
+            Registration(table, registeredVersion, deltaTableId, None, nextGeneration())
           registrations += table -> registration
-          RegisterResult.Registered
+          RegisterResult.Registered(registration)
       }
     }
   }
@@ -47,22 +54,26 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
 
   override def take(claim: Claim): TakeResult = synchronized {
     val key = (claim.table, claim.version)
-    if (!registrations.contains(claim.table)) TakeResult.NotRegistered
-    else
-      entries.get(key) match {
-        case Some(owner) if owner.tempPath == claim.tempPath => TakeResult.Taken
-        case Some(owner) => TakeResult.TakenBy(owner)
-        case None =>
-          entries += key -> CommitEntry(
-            claim.table,
-            claim.version,
-            claim.tempPath,
-            complete = false,
-            claim.writerInstance,
-            claim.runId
-          )
-          TakeResult.Taken
-      }
+    registrations.get(claim.table) match {
+      case None => TakeResult.NotRegistered
+      case Some(registration) =>
+        entries.get(key) match {
+          case Some(owner) if owner.tempPath == claim.tempPath => TakeResult.Taken
+          case Some(owner) => TakeResult.TakenBy(owner)
+          case None if registration.generation != claim.generation =>
+            TakeResult.RegistrationChanged
+          case None =>
+            entries += key -> CommitEntry(
+              claim.table,
+              claim.version,
+              claim.tempPath,
+              complete = false,
+              claim.writerInstance,
+              claim.runId
+            )
+            TakeResult.Taken
+        }
+    }
   }
 
   override def complete(table: TableUri, version: Long, tempPath: String): Boolean =
@@ -88,12 +99,20 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
     entries.values.filter(entry => entry.table == table && !entry.complete).toSeq.sortBy(_.version)
   }
 
+  override def contradicted(table: TableUri, version: Long): Seq[CommitEntry] = synchronized {
+    entries.values
+      .filter(entry => entry.table == table && (entry.version > version || !entry.complete))
+      .toSeq
+      .sortBy(_.version)
+  }
+
   override def adopt(table: TableUri, version: Long, deltaTableId: Option[String]): Boolean = {
     require(version >= 0, s"a table is adopted at a version it has, not at $version")
     synchronized {
       val isNew = !registrations.contains(table)
       if (isNew)
-        registrations += table -> Registration(table, version, deltaTableId, taintReason = None)
+        registrations += table ->
+          Registration(table, version, deltaTableId, taintReason = None, nextGeneration())
       isNew
     }
   }
@@ -101,31 +120,42 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
   override def readopt(
       table: TableUri,
       version: Long,
-      deltaTableId: Option[String]
-  ): Option[Readoption] = {
+      deltaTableId: Option[String],
+      examined: Seq[CommitEntry]
+  ): RegistryChange[Readoption] = {
     require(version >= 0, s"a table is adopted at a version it has, not at $version")
     synchronized {
-      registrations.get(table).map { registered =>
-        val removed = entries.values
-          .filter(entry => entry.table == table && (entry.version > version || !entry.complete))
-          .toSeq
-          .sortBy(_.version)
-        entries --= removed.map(entry => (entry.table, entry.version))
-        registrations += table -> Registration(
-          table,
-          version,
-          deltaTableId.orElse(registered.deltaTableId),
-          taintReason = None
-        )
-        Readoption(registered.taintReason, removed)
+      registrations.get(table) match {
+        case None => RegistryChange.NotRegistered
+        case Some(registered) =>
+          val now = contradicted(table, version)
+          if (now.toSet != examined.toSet) RegistryChange.EntriesChanged(now)
+          else {
+            entries --= now.map(entry => (entry.table, entry.version))
+            registrations += table -> Registration(
+              table,
+              version,
+              deltaTableId.orElse(registered.deltaTableId),
+              taintReason = None,
+              nextGeneration()
+            )
+            RegistryChange.Applied(Readoption(registered.taintReason, now))
+          }
       }
     }
   }
 
-  override def forget(table: TableUri): Boolean = synchronized {
-    val wasRegistered = registrations.contains(table)
-    registrations -= table
-    entries = entries.filterNot { case ((owner, _), _) => owner == table }
-    wasRegistered
-  }
+  override def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit] =
+    synchronized {
+      if (!registrations.contains(table)) RegistryChange.NotRegistered
+      else {
+        val now = unfinished(table)
+        if (now.toSet != examined.toSet) RegistryChange.EntriesChanged(now)
+        else {
+          registrations -= table
+          entries = entries.filterNot { case ((owner, _), _) => owner == table }
+          RegistryChange.Applied(())
+        }
+      }
+    }
 }

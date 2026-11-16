@@ -32,12 +32,16 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
   private val ForeignKeyViolation = "23503"
   private val CheckViolation = "23514"
   private val InsufficientPrivilege = "42501"
+  private val GeneratedAlways = "428C9"
 
   private val Register =
     "INSERT INTO delta_coordination.coordinated_table (table_uri, registered_version) VALUES (?, ?)"
   private val TakeVersion =
-    """INSERT INTO delta_coordination.commit_entry (table_uri, version, temp_path, writer_instance)
-      |VALUES (?, ?, ?, ?)""".stripMargin
+    """INSERT INTO delta_coordination.commit_entry
+      |  (table_uri, version, temp_path, writer_instance, generation)
+      |VALUES (?, ?, ?, ?, ?)""".stripMargin
+  private val NewGeneration =
+    "UPDATE delta_coordination.coordinated_table SET generation = DEFAULT WHERE table_uri = ?"
   private val TakeVersionIfFree = s"$TakeVersion ON CONFLICT DO NOTHING"
   private val Complete =
     """UPDATE delta_coordination.commit_entry SET complete = true, completed_at = now()
@@ -46,11 +50,11 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     """INSERT INTO delta_coordination.table_taint (table_uri, reason) VALUES (?, ?)
       |ON CONFLICT DO NOTHING""".stripMargin
 
-  test("the migrations build version 2 of the schema, and applying them again changes nothing") {
+  test("the migrations build version 3 of the schema, and applying them again changes nothing") {
     CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 0
 
     as(CommitPath) { c =>
-      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("2"))
+      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("3"))
     }
     Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
       val owners = query(
@@ -72,7 +76,15 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     val table = "file:/lake/complete"
     as(CommitPath) { c =>
       update(c, Register, table, Long.box(-1)) shouldBe 1
-      update(c, TakeVersionIfFree, table, Long.box(0), ".tmp/0.json.a", "host:1:app") shouldBe 1
+      update(
+        c,
+        TakeVersionIfFree,
+        table,
+        Long.box(0),
+        ".tmp/0.json.a",
+        "host:1:app",
+        generationOf(c, table)
+      ) shouldBe 1
 
       val state = "SELECT complete, completed_at IS NULL, created_at IS NULL " +
         "FROM delta_coordination.commit_entry WHERE table_uri = ? AND version = 0"
@@ -88,7 +100,16 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     val table = "file:/lake/exclusive"
     as(CommitPath) { c =>
       update(c, Register, table, Long.box(-1))
-      update(c, TakeVersionIfFree, table, Long.box(7), ".tmp/7.json.first", "host:1:app") shouldBe 1
+      val generation = generationOf(c, table)
+      update(
+        c,
+        TakeVersionIfFree,
+        table,
+        Long.box(7),
+        ".tmp/7.json.first",
+        "host:1:app",
+        generation
+      ) shouldBe 1
 
       // The second writer is told so without an error, and nothing is overwritten.
       update(
@@ -97,7 +118,8 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
         table,
         Long.box(7),
         ".tmp/7.json.second",
-        "host:2:app"
+        "host:2:app",
+        generation
       ) shouldBe 0
       query(
         c,
@@ -107,7 +129,7 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
 
       // The primary key enforces it, whatever statement is used.
       sqlState(
-        update(c, TakeVersion, table, Long.box(7), ".tmp/7.json.third", "host:3:app")
+        update(c, TakeVersion, table, Long.box(7), ".tmp/7.json.third", "host:3:app", generation)
       ) shouldBe UniqueViolation
     }
   }
@@ -116,9 +138,76 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     as(CommitPath) { c =>
       val unregistered = "file:/lake/alias-of-a-registered-table"
       sqlState(
-        update(c, TakeVersionIfFree, unregistered, Long.box(0), ".tmp/0.json.a", "host:1:app")
+        update(
+          c,
+          TakeVersionIfFree,
+          unregistered,
+          Long.box(0),
+          ".tmp/0.json.a",
+          "host:1:app",
+          Long.box(1)
+        )
       ) shouldBe ForeignKeyViolation
       sqlState(update(c, Taint, unregistered, "gap at version 3")) shouldBe ForeignKeyViolation
+    }
+  }
+
+  test("an entry names the generation of its table's registration, and is held to it") {
+    val table = "file:/lake/generations"
+    def take(c: Connection, version: Long, generation: Long): Int =
+      update(
+        c,
+        TakeVersionIfFree,
+        table,
+        Long.box(version),
+        s".tmp/$version.json.a",
+        "host:1:app",
+        Long.box(generation)
+      )
+
+    val first = as(CommitPath) { c =>
+      update(c, Register, table, Long.box(-1))
+      val generation = generationOf(c, table).longValue
+      // Not a generation the registration has, whichever way it is wrong.
+      Seq(generation - 1, generation + 1000).foreach { wrong =>
+        sqlState(take(c, version = 0, wrong)) shouldBe ForeignKeyViolation
+      }
+      take(c, version = 0, generation) shouldBe 1
+      // Nobody chooses a generation: the database gives the next one.
+      sqlState(
+        update(
+          c,
+          "INSERT INTO delta_coordination.coordinated_table " +
+            "(table_uri, registered_version, generation) VALUES ('file:/lake/chosen', -1, 7)"
+        )
+      ) shouldBe GeneratedAlways
+      generation
+    }
+
+    // An operator adopts the table again: a new generation, and the entry that stays follows.
+    val second = as(Maintenance) { c =>
+      update(c, NewGeneration, table) shouldBe 1
+      val generation = generationOf(c, table).longValue
+      generation should be > first
+      query(
+        c,
+        "SELECT generation FROM delta_coordination.commit_entry WHERE table_uri = ?",
+        table
+      ) shouldBe Seq(Seq(generation.toString))
+      sqlState(
+        update(
+          c,
+          "UPDATE delta_coordination.coordinated_table SET generation = 7 WHERE table_uri = ?",
+          table
+        )
+      ) shouldBe GeneratedAlways
+      generation
+    }
+
+    // What a writer read before the operator's change no longer takes a version.
+    as(CommitPath) { c =>
+      sqlState(take(c, version = 1, first)) shouldBe ForeignKeyViolation
+      take(c, version = 1, second) shouldBe 1
     }
   }
 
@@ -126,13 +215,14 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     val table = "file:/lake/checks"
     as(CommitPath) { c =>
       update(c, Register, table, Long.box(-1))
+      val generation = generationOf(c, table)
       val completeWithoutTime =
         """INSERT INTO delta_coordination.commit_entry
-          |  (table_uri, version, temp_path, writer_instance, complete)
-          |VALUES (?, 0, '.tmp/0.json.a', 'host:1:app', true)""".stripMargin
-      sqlState(update(c, completeWithoutTime, table)) shouldBe CheckViolation
+          |  (table_uri, version, temp_path, writer_instance, complete, generation)
+          |VALUES (?, 0, '.tmp/0.json.a', 'host:1:app', true, ?)""".stripMargin
+      sqlState(update(c, completeWithoutTime, table, generation)) shouldBe CheckViolation
       sqlState(
-        update(c, TakeVersion, table, Long.box(-1), ".tmp/x", "host:1:app")
+        update(c, TakeVersion, table, Long.box(-1), ".tmp/x", "host:1:app", generation)
       ) shouldBe CheckViolation
       sqlState(update(c, Register, "file:/lake/checks-2", Long.box(-2))) shouldBe CheckViolation
     }
@@ -165,9 +255,13 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       "UPDATE delta_coordination.commit_entry SET writer_instance = 'other'",
       "UPDATE delta_coordination.coordinated_table SET registered_version = 9",
       "UPDATE delta_coordination.table_taint SET reason = 'nothing happened'",
+      // A registration's generation is an operator's to change, and its row an operator's to
+      // hold: the commit path waits on it through the foreign key of its entries, and no more.
+      "UPDATE delta_coordination.coordinated_table SET generation = DEFAULT",
+      "SELECT 1 FROM delta_coordination.coordinated_table FOR SHARE",
       // The schema version is the migrator's to set.
-      "INSERT INTO delta_coordination.schema_version (singleton, version) VALUES (false, 2)",
-      "UPDATE delta_coordination.schema_version SET version = 2",
+      "INSERT INTO delta_coordination.schema_version (singleton, version) VALUES (false, 3)",
+      "UPDATE delta_coordination.schema_version SET version = 3",
       // No DDL from the data path (ADR-0004, deviation 10).
       "CREATE TABLE delta_coordination.scratch (id int)",
       "ALTER TABLE delta_coordination.commit_entry ADD COLUMN extra text",
@@ -189,7 +283,15 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     val table = "file:/lake/reset"
     as(CommitPath) { c =>
       update(c, Register, table, Long.box(-1))
-      update(c, TakeVersionIfFree, table, Long.box(0), ".tmp/0.json.a", "host:1:app")
+      update(
+        c,
+        TakeVersionIfFree,
+        table,
+        Long.box(0),
+        ".tmp/0.json.a",
+        "host:1:app",
+        generationOf(c, table)
+      )
       update(c, Taint, table, "gap at version 3")
     }
 
@@ -203,12 +305,13 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       update(c, registration, table) shouldBe 1
 
       // Since V2: adopting a table registers it, and adopting it again moves its version.
+      // Since V3: and gives it a new generation.
       update(c, Register, table, Long.box(41)) shouldBe 1
       update(
         c,
         "UPDATE delta_coordination.coordinated_table " +
-          "SET registered_version = 50, delta_table_id = 'id', registered_at = now() " +
-          "WHERE table_uri = ?",
+          "SET registered_version = 50, delta_table_id = 'id', registered_at = now(), " +
+          "generation = DEFAULT WHERE table_uri = ?",
         table
       ) shouldBe 1
 
@@ -221,7 +324,7 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
         "INSERT INTO delta_coordination.table_taint (table_uri, reason) " +
           "VALUES ('file:/lake/reset', 'by hand')",
         "UPDATE delta_coordination.commit_entry SET complete = true, completed_at = now()",
-        "UPDATE delta_coordination.schema_version SET version = 3",
+        "UPDATE delta_coordination.schema_version SET version = 4",
         "TRUNCATE delta_coordination.commit_entry",
         "CREATE TABLE delta_coordination.scratch (id int)",
         "SELECT * FROM control.run"
@@ -235,6 +338,14 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     Using.resource(pg.connect(role, CoordinationSchema.Database))(body)
 
   private def sqlState(action: => Any): String = intercept[SQLException](action).getSQLState
+
+  /** The generation of the registration of `table`, as a writer reads it before a commit. */
+  private def generationOf(c: Connection, table: String): java.lang.Long =
+    query(
+      c,
+      "SELECT generation FROM delta_coordination.coordinated_table WHERE table_uri = ?",
+      table
+    ).head.head.toLong
 
   /** Runs one statement with bind parameters; returns the number of rows it changed. */
   private def update(c: Connection, sql: String, parameters: AnyRef*): Int =

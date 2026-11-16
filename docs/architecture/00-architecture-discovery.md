@@ -503,8 +503,8 @@ Derived views: `v_source_freshness`, `v_run_summary`, `v_table_commits` (joins c
 
 | Table | Key columns | Purpose |
 |---|---|---|
-| `commit_entry` | (`table_uri`, `version`) PK, `temp_path`, `complete`, `created_at`, `completed_at` (PostgreSQL clock), `writer_instance`, `run_id` (nullable, best effort) | The put-if-absent that gives mutual exclusion; recovery; commit audit trail; Delta version ↔ run lineage |
-| `coordinated_table` | `table_uri` PK, `delta_table_id`, `registered_version`, `registered_at` | Adoption registry: rejects unregistered or aliased paths (a foreign key from `commit_entry`); gap detection baseline |
+| `commit_entry` | (`table_uri`, `version`) PK, `temp_path`, `complete`, `created_at`, `completed_at` (PostgreSQL clock), `writer_instance`, `run_id` (nullable, best effort), `generation` (of the registration its writer read) | The put-if-absent that gives mutual exclusion; recovery; commit audit trail; Delta version ↔ run lineage |
+| `coordinated_table` | `table_uri` PK, `delta_table_id`, `registered_version`, `registered_at`, `generation` (given by the database) | Adoption registry: rejects unregistered or aliased paths, and claims made for an earlier registration (a foreign key from `commit_entry`); gap detection baseline |
 | `table_taint` | `table_uri` PK, `reason`, `tainted_at` | A table where a commit from outside the LogStore was detected. Writes are refused while its row exists. |
 | `schema_version` | One row: `version` | What the LogStore checks before touching a table (ADR-0004, deviation 10) |
 
@@ -513,6 +513,7 @@ As built by the migration `V1__coordination_schema.sql` (P2a.3). It differs in f
 - a taint is a row of its own, not a status column, so the commit path can be allowed to add it and not to clear it;
 - the commit path may only insert rows and mark an entry complete; maintenance may only delete.
 - since `V2__operator_privileges.sql` (P2a.11), maintenance may also register a table and move the version it is registered at, for adopting a table and adopting it again; the schema is at version 2.
+- since `V3__registration_generation.sql` (2026-11-16), a registration has a generation and an entry names the one its writer read, through its foreign key. A writer that looked at the registry before an operator adopted the table again, or reset it, gets no version afterwards (ADR-0004 §3.5); the schema is at version 3.
 
 A separate schema and a separate role mean the LogStore can be extracted as a library, and it only has the privileges it needs.
 
@@ -664,6 +665,7 @@ Decisions taken with the breakdown, recorded in ADR-0004 unless another ADR is n
 - **A known limit of detection**: a foreign writer that replaces a commit after it was published (§3.5).
 - **Found by the review of P2a (P2a.13) and fixed**: a creator that lost version 0 was told its table was stale (§3.2); a writer wrote after a commit that was gone from the log (§3.2); a commit that another process had finished was reported as lost once its temporary file was collected (§3.8); adopting a table again while a reader published a commit removed that commit's entry (§3.5).
 - **Found by the review and left open, as known limits** (the module's README lists them): nothing fences a stalled writer against an operator's reset or re-adoption; the temporary files of commits that Delta's log cleanup expired are kept; the table id in the registry is the first creator's, not necessarily the winner's; the schema version is checked once for each store.
+- **Closed after P2a, before P2b (2026-11-16)**: a writer is held to the registration it read by a generation that its `INSERT` names, and an operator's change to the entries it examined (migration V3, §3.5).
 - **`delta-storage` is `provided` to the LogStore module**, without Unity Catalog's client libraries ([ADR-0016](../adr/0016-delta-storage-provided-to-the-logstore-module.md)).
 - **GREEN widens the LogStore's own window**: the delay of the RED spike sits on a rename the LogStore no longer makes (§7.3).
 

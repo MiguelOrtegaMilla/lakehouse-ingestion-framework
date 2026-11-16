@@ -9,6 +9,14 @@ import java.io.IOException
  * Each operation happens whole or not at all, and fails closed like the store: what cannot be
  * done or looked up is an `IOException`. None of them looks at the table's log. Deciding that
  * an operation is right for a table is `TableMaintenance`'s part.
+ *
+ * '''A change is made on what was examined, or not at all.''' The operator decides by looking at
+ * a table's entries and at its log, and a writer that was not stopped may take or finish a
+ * version in between. Adopting a table again and forgetting one therefore name the entries the
+ * operator examined. The change holds the table's registration against writers while it looks
+ * at the entries again, and is called off if they are not those. Applied, it leaves the table
+ * with another generation of registration or with none, so a writer that had looked at the
+ * registry before gets no version afterwards (`CoordinationStore.take`).
  */
 trait RegistryMaintenance {
 
@@ -23,6 +31,13 @@ trait RegistryMaintenance {
   def unfinished(table: TableUri): Seq[CommitEntry]
 
   /**
+   * The entries of `table` that a log whose latest commit is `version` contradicts: the ones
+   * above `version` and the ones that are not complete, lowest version first.
+   */
+  @throws[IOException]
+  def contradicted(table: TableUri, version: Long): Seq[CommitEntry]
+
+  /**
    * Registers a table that exists and was never coordinated, at the version its log is at.
    *
    * @return whether it was registered; `false` if it already was, and nothing changed
@@ -32,23 +47,50 @@ trait RegistryMaintenance {
 
   /**
    * Makes the table's log, as it is at `version`, the table: the registration moves to
-   * `version`, the taint is cleared, and the entries that contradict the log are removed, which
-   * are the ones above `version` and the ones that are not complete.
+   * `version` and gets a new generation, the taint is cleared, and the entries that contradict
+   * the log are removed (`contradicted`).
    *
    * @param deltaTableId the table's id, if it is to be recorded anew
-   * @return what was cleared and removed, or `None` if the table is not registered
+   * @param examined the contradicted entries the caller looked at; the change is made only if
+   *   they are still the contradicted entries
+   * @return what was cleared and removed
    */
   @throws[IOException]
-  def readopt(table: TableUri, version: Long, deltaTableId: Option[String]): Option[Readoption]
+  def readopt(
+      table: TableUri,
+      version: Long,
+      deltaTableId: Option[String],
+      examined: Seq[CommitEntry]
+  ): RegistryChange[Readoption]
 
   /**
    * Removes everything the registry holds about `table`: its taint, its entries, its
    * registration.
    *
-   * @return whether the table was registered
+   * @param examined the unfinished entries the caller looked at; the change is made only if
+   *   they are still the unfinished entries
    */
   @throws[IOException]
-  def forget(table: TableUri): Boolean
+  def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit]
+}
+
+/** What became of a change that an operator asked for after examining a table's entries. */
+sealed trait RegistryChange[+A]
+
+object RegistryChange {
+
+  final case class Applied[A](result: A) extends RegistryChange[A]
+
+  /** The table is not registered. Nothing was changed. */
+  case object NotRegistered extends RegistryChange[Nothing]
+
+  /**
+   * The entries are not the ones the caller examined: a writer took a version, or a commit was
+   * finished, in the meantime. Nothing was changed.
+   *
+   * @param now the entries in their place
+   */
+  final case class EntriesChanged(now: Seq[CommitEntry]) extends RegistryChange[Nothing]
 }
 
 /**

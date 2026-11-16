@@ -10,13 +10,16 @@ import java.util.UUID
  *   writer, whichever call created it.
  * @param writerInstance `host:pid:spark.app.id`, for the audit trail
  * @param runId the engine run that commits, when the writer knows it (ADR-0004 §3.7)
+ * @param generation the generation of the table's registration that the writer read before it
+ *   prepared the commit. The version is given only while the registration is still that one.
  */
 final case class Claim(
     table: TableUri,
     version: Long,
     tempPath: String,
     writerInstance: String,
-    runId: Option[UUID]
+    runId: Option[UUID],
+    generation: Long
 ) {
   require(version >= 0, s"a commit version cannot be negative: $version")
   require(tempPath.nonEmpty, "a claim needs the path of its temporary file")

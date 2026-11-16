@@ -3,12 +3,14 @@ package lakehouse.ingestion.logstore
 import java.io.{FileNotFoundException, IOException}
 import java.util
 
+import scala.annotation.tailrec
 import scala.concurrent.duration._
 import scala.util.Using
 
 import lakehouse.ingestion.logstore.coordination.{
   CommitEntry,
   Readoption,
+  RegistryChange,
   RegistryMaintenance,
   TableUri
 }
@@ -67,6 +69,12 @@ object TempFate {
  * table's log first and refuses what the log does not bear out, so that a slip of the operator
  * does not discard a commit or un-register a live table. None runs on the commit path.
  *
+ * A writer that was not stopped is not harmed, and does no harm. Adopting a table again and
+ * resetting one change the registry only if its entries are still the ones this class examined;
+ * if a writer took or finished a version in between, the table is examined again. Once the
+ * change is made, a writer that had looked at the registry before it gets no version
+ * (`RegistrationChangedException`).
+ *
  * @param registry the registry, reached with an operator's privileges
  */
 final class TableMaintenance(
@@ -110,22 +118,35 @@ final class TableMaintenance(
     if (target.latestCommit.isEmpty) refuse(noTable)
     if (registry.registration(table).isEmpty)
       refuse(s"$table is not registered. A table that was never coordinated is adopted")
-    registry.unfinished(table).filter(target.canStillBePublished).foreach { entry =>
-      refuse(
-        s"version ${entry.version} of $table is committed and can still be published " +
-          s"(${entry.tempPath}). Read the table once, which publishes it, then adopt it again"
-      )
+
+    // The log, then the entries it contradicts, then the change, which is made only if those
+    // are still the entries. Readers are not stopped for this and a writer may not be: a commit
+    // that one of them publishes or takes while this looks makes it look again.
+    @tailrec
+    def examine(attemptsLeft: Int): Readopted = {
+      val latest = target.latestCommit.getOrElse(refuse(noTable))
+      val contradicted = registry.contradicted(table, latest)
+      contradicted.filter(entry => !entry.complete && target.canStillBePublished(entry)).foreach {
+        entry =>
+          refuse(
+            s"version ${entry.version} of $table is committed and can still be published " +
+              s"(${entry.tempPath}). Read the table once, which publishes it, then adopt it again"
+          )
+      }
+      // Recorded as published, above the listing, and in the log: published after the listing.
+      val logGrew = contradicted.exists(entry => entry.complete && target.isInLog(entry))
+      val change =
+        if (logGrew) RegistryChange.EntriesChanged(contradicted)
+        else registry.readopt(table, latest, deltaTableId, examined = contradicted)
+      change match {
+        case RegistryChange.Applied(removed) => Readopted(table, latest, removed)
+        case RegistryChange.NotRegistered =>
+          refuse(s"$table stopped being registered while it was being adopted again")
+        case RegistryChange.EntriesChanged(_) if attemptsLeft > 1 => examine(attemptsLeft - 1)
+        case RegistryChange.EntriesChanged(_) => refuse(beingWritten(table, "adopted again"))
+      }
     }
-    // The version to adopt at is read from the log now, after the unfinished entries. Readers
-    // are not stopped for this, and one may have published a commit in the meantime: read
-    // before, the version would leave that commit above the registration, and its entry among
-    // the ones removed. No entry was left that a reader can still publish, so the log does not
-    // grow after this listing.
-    val latest = target.latestCommit.getOrElse(refuse(noTable))
-    val removed = registry.readopt(table, latest, deltaTableId).getOrElse {
-      refuse(s"$table stopped being registered while it was being adopted again")
-    }
-    Readopted(table, latest, removed)
+    examine(Examinations)
   }
 
   /**
@@ -135,14 +156,34 @@ final class TableMaintenance(
   @throws[IOException]
   def reset(tablePath: Path, fs: FileSystem): Unit = {
     val target = new Target(tablePath, fs)
-    target.latestCommit.foreach { latest =>
-      refuse(
-        s"${target.table} still has a log, with commits up to version $latest. " +
-          "A table that exists is adopted again, not reset"
-      )
+    val table = target.table
+
+    // As in `readopt`: the registry is reset only if its unfinished entries are the ones looked
+    // at here. A writer that outlived the table may be about to publish a commit into its path.
+    @tailrec
+    def examine(attemptsLeft: Int): Unit = {
+      target.latestCommit.foreach { latest =>
+        refuse(
+          s"$table still has a log, with commits up to version $latest. " +
+            "A table that exists is adopted again, not reset"
+        )
+      }
+      val unfinished = registry.unfinished(table)
+      unfinished.filter(target.canStillBePublished).foreach { entry =>
+        refuse(
+          s"version ${entry.version} of $table is committed and can still be published " +
+            s"(${entry.tempPath}): the table is not gone, or one of its writers is still running"
+        )
+      }
+      registry.forget(table, examined = unfinished) match {
+        case RegistryChange.Applied(_) => ()
+        case RegistryChange.NotRegistered =>
+          refuse(s"$table is not registered: there is nothing to reset")
+        case RegistryChange.EntriesChanged(_) if attemptsLeft > 1 => examine(attemptsLeft - 1)
+        case RegistryChange.EntriesChanged(_) => refuse(beingWritten(table, "reset"))
+      }
     }
-    if (!registry.forget(target.table))
-      refuse(s"${target.table} is not registered: there is nothing to reset")
+    examine(Examinations)
   }
 
   /**
@@ -215,6 +256,9 @@ final class TableMaintenance(
       fs.exists(temp) && (!fs.exists(commit) || sameContent(temp, commit))
     }
 
+    /** Whether the commit file of `entry` is in the log. */
+    def isInLog(entry: CommitEntry): Boolean = fs.exists(commitFile(entry.version))
+
     def sameContent(one: Path, other: Path): Boolean =
       try
         fs.getFileStatus(one).getLen == fs.getFileStatus(other).getLen &&
@@ -236,6 +280,16 @@ object TableMaintenance {
 
   /** The temporary file of a commit: `<digits>.json.<unique>`. */
   private val TempOfCommit = """(\d+)\.json\..+""".r
+
+  /**
+   * How many times a table is examined before the operation gives up: its entries changed
+   * under every one of them, which is a table that is being written.
+   */
+  private val Examinations = 3
+
+  private def beingWritten(table: TableUri, operation: String): String =
+    s"$table is being written while it is $operation: its entries changed each of the " +
+      s"$Examinations times they were examined. Stop its writers first"
 
   private def refuse(why: String): Nothing = throw new MaintenanceRefusedException(why)
 }

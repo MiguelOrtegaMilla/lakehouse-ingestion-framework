@@ -38,6 +38,20 @@ final class StaleRegistrationException(val table: TableUri, known: String)
     )
 
 /**
+ * The table's registration changed between this writer's look at it and its claim of a version:
+ * an operator adopted the table again, or reset its registry and the table was registered anew
+ * (ADR-0004 §3.5). What the writer had checked about the table no longer holds, so nothing was
+ * written and no version was taken. It is not a refusal of the table: a transaction that starts
+ * again, from the table as it is now, may write.
+ */
+final class RegistrationChangedException(val table: TableUri)
+    extends IOException(
+      s"the registration of $table changed while a commit to it was being prepared: an operator " +
+        "adopted the table again, or reset its registry. Nothing was written; the transaction " +
+        "has to start again from the table as it is now"
+    )
+
+/**
  * The commit took its version and its file could not be given its name (ADR-0017). The commit
  * will appear: the next reader or writer of the table publishes it. The caller must therefore
  * not assume that it failed, and has to look at the table before writing the same data again.

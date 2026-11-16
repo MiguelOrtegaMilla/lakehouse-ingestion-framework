@@ -45,6 +45,9 @@ final private[logstore] class TableLog(
  *
  * Before any of that the registry must allow the write (§3.5, layer 2), and the commit before
  * this one must be published: a version is never written on top of one that is not visible.
+ * Those checks are made before the version is taken, and an operator may change the table's
+ * registration in between. The claim therefore names the generation of the registration that
+ * was checked, and takes the version only if the registration is still that one.
  *
  * A commit that some writer made without this protocol is detected in three places, and taints
  * the table each time (§3.5, layers 3 and 4): in the log without an entry, when a reader lists
@@ -73,6 +76,8 @@ final private[logstore] class CommitProtocol(
    *   It is the one exception Delta answers by checking for conflicts and trying the next
    *   version (ADR-0004 §8, item 2).
    * @throws WriteRefusedException the registry does not allow the write
+   * @throws RegistrationChangedException an operator changed the table's registration after
+   *   this writer had looked at it
    * @throws CommitMissingException the commit before this one is recorded as published, and
    *   its file is not in the log
    * @throws CommitPublicationPendingException the version is this writer's, and its file
@@ -92,10 +97,16 @@ final private[logstore] class CommitProtocol(
     // when the version is plainly gone.
     if (log.exists(target)) throw taken(target, context)
 
-    val lines = admit(log, version, actions, context)
+    val (registration, lines) = admit(log, version, actions, context)
 
-    val claim =
-      Claim(log.table, version, tempPathFor(target), writerInstance, context.map(_.runId))
+    val claim = Claim(
+      log.table,
+      version,
+      tempPathFor(target),
+      writerInstance,
+      context.map(_.runId),
+      registration.generation
+    )
     val temp = log.tempFile(claim.tempPath)
     log.storage.writeTemp(temp, lines)
     hooks.at(FaultPoint.BeforeInsert)
@@ -135,6 +146,11 @@ final private[logstore] class CommitProtocol(
       case TakeResult.NotRegistered =>
         discard(log, temp)
         throw new TableNotRegisteredException(log.table)
+
+      // Or replaces it. Everything checked above was checked against another registration.
+      case TakeResult.RegistrationChanged =>
+        discard(log, temp)
+        throw new RegistrationChangedException(log.table)
     }
   }
 
@@ -215,14 +231,14 @@ final private[logstore] class CommitProtocol(
   /**
    * Whether the registry lets this writer write `version`, and whether the log is ready for it.
    *
-   * @return the actions to write
+   * @return the registration that allowed it, and the actions to write
    */
   private def admit(
       log: TableLog,
       version: Long,
       actions: Iterator[String],
       context: Option[CommitContext]
-  ): Iterator[String] = {
+  ): (Registration, Iterator[String]) = {
     val table = log.table
     val (registration, lines) = store.registration(table) match {
       case Some(found) => (found, actions)
@@ -231,12 +247,11 @@ final private[logstore] class CommitProtocol(
       // commit is read once more than the others, for the table's id.
       case None if version == 0 =>
         val all = actions.toVector
-        val id = DeltaTableId.in(all)
-        val registered = store.register(table, Registration.NotYetCreated, id) match {
-          case RegisterResult.Registered =>
-            Registration(table, Registration.NotYetCreated, id, taintReason = None)
-          case RegisterResult.AlreadyRegistered(byAnother) => byAnother
-        }
+        val registered =
+          store.register(table, Registration.NotYetCreated, DeltaTableId.in(all)) match {
+            case RegisterResult.Registered(byThisWriter) => byThisWriter
+            case RegisterResult.AlreadyRegistered(byAnother) => byAnother
+          }
         (registered, all.iterator)
 
       case None => throw new TableNotRegisteredException(table)
@@ -245,7 +260,7 @@ final private[logstore] class CommitProtocol(
     registration.taintReason.foreach(reason => throw new TableTaintedException(table, reason))
     if (version == 0) requireNewTable(log, registration, context)
     else requirePreviousCommit(log, registration, version)
-    lines
+    (registration, lines)
   }
 
   /**

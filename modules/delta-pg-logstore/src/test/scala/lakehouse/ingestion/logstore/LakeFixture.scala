@@ -55,6 +55,14 @@ trait LakeFixture extends ScratchDirectories { this: AnyFunSuite with Matchers =
 
     def entry(version: Long): Option[CommitEntry] = memory.entry(table, version)
 
+    /** The generation of the table's registration, as a writer reads it before it commits. */
+    def generation: Long =
+      memory.registration(table).getOrElse(fail("the table is not registered")).generation
+
+    /** The claim of another process on `version`, which read the registration just now. */
+    def claimBy(another: String, version: Long): Claim =
+      Claim(table, version, s".tmp/$another", "host-b:2:app", runId = None, generation)
+
     def tempOf(entry: CommitEntry): LocalPath = log.resolve(entry.tempPath)
 
     /** The temporary files in the log, whether an entry points at them or not. */
@@ -105,4 +113,8 @@ object LakeFixture {
     Seq(s"""{"add":{"path":"part-$version.parquet","dataChange":true}}""")
 
   def hadoop(path: LocalPath): Path = new Path(LocalLogStorage.Scheme, null, path.toString)
+
+  /** What a registration says, without the generation the registry gave it. */
+  def saidBy(registration: Option[Registration]): Option[(Long, Option[String], Option[String])] =
+    registration.map(r => (r.registeredVersion, r.deltaTableId, r.taintReason))
 }
