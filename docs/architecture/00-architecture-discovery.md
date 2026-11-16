@@ -512,6 +512,7 @@ As built by the migration `V1__coordination_schema.sql` (P2a.3). It differs in f
 - the entry's key is the version, because only commit files get an entry and the file name follows from the version;
 - a taint is a row of its own, not a status column, so the commit path can be allowed to add it and not to clear it;
 - the commit path may only insert rows and mark an entry complete; maintenance may only delete.
+- since `V2__operator_privileges.sql` (P2a.11), maintenance may also register a table and move the version it is registered at, for adopting a table and adopting it again; the schema is at version 2.
 
 A separate schema and a separate role mean the LogStore can be extracted as a library, and it only has the privileges it needs.
 
@@ -648,7 +649,7 @@ The spike comes before the CI so that the CI starts out testing everything P1 bu
 | P2a.8 | Write path (`PostgresLogStore.write`, `CommitProtocol`): prepare, `INSERT`, publish, acknowledge; the commit before is finished first; registration at version 0; fault hooks, selectable from configuration. Each scenario is tested with a store that fails on request and again against PostgreSQL behind a proxy. | F1, F5, F6, F9, F12, F15, F16 | 4 | Done |
 | P2a.9 | Read path and recovery (`PostgresLogStore.listFrom`): before a log is listed, the latest commit is published and acknowledged if its writer stopped, and its file must be in the log. First Delta smoke test on the LogStore (`PostgresLogStoreDeltaSpec`): create, append, read, recover, retry a taken version, checkpoint. | F2, F3, F4, F7, F8, F14, F17 | 4 | Done |
 | P2a.10 | Uncoordinated-writer detection: gap and publish race → `TAINTED`. A commit without an entry is found by the reader that lists the log, which goes on, and by the writer that comes after it, which stops; a foreign file under the name of a commit being published stops whoever publishes. The foreign writer in the tests is Delta's default LogStore. | F10, F11 | 5 | Done |
-| P2a.11 | Operator operations (adopt, re-adopt, registry reset, temp GC) and the configuration guard (layer 1). The grant re-adoption needs, maintenance updating `registered_version`, arrives as migration V2. The guard also refuses a `file://` that Hadoop's own local file system does not serve (`LogStorage.of`, built in P2a.7), and probes the lake root for hard links. | The rest of F1 and F9 | 5 | |
+| P2a.11 | Operator operations (adopt, re-adopt, registry reset, temp GC) and the configuration guard (layer 1). The grant re-adoption needs, maintenance updating `registered_version`, arrives as migration V2. The guard also refuses a `file://` that Hadoop's own local file system does not serve (`LogStorage.of`, built in P2a.7), and probes the lake root for hard links. Built as `TableMaintenance` over `RegistryMaintenance`, run as `ingest_maintenance`, and `StartupGuard`. | The rest of F1 and F9 | 5 | Done |
 | P2a.12 | Attribution: `CommitContext`, `writer_instance`, contention counter | — | 5 | |
 | P2a.13 | Delta end to end on the LogStore (idempotent append, `MERGE`, `OPTIMIZE`, checkpoint, `VACUUM`); scenario ↔ test matrix; README; review | F1–F17 green in CI | 6 | |
 

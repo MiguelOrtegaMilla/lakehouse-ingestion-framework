@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -211,6 +211,24 @@ Closing it would take a check of every published commit against its entry, or th
 - **The taint** records the version, what was found and the process that found it. A tainted table is not examined again. If the taint cannot be recorded the outcome is the same, and the next reader or writer that meets the commit records it.
 - **Nothing foreign is touched**: neither the commit nor its sidecar (ADR-0015).
 
+*As built (P2a.11, 2026-11-16):* layer 1, and what an operator does about the others.
+- **The startup guard** is `StartupGuard`, a function of this module that an application calls with its Hadoop configuration and its lake root. It reports every problem at once:
+  - Delta is not told to use this LogStore for the lake's scheme;
+  - the lake has no storage (§2, and `file://` not served by Hadoop's own file system);
+  - a file cannot be written under the lake root and published under a second name;
+  - the coordination settings are unusable, the database does not answer, or its schema is at another version (F13);
+  - a fault hook setting cannot be read.
+
+  It does not ask Delta which LogStore it resolves for a path: this module does not see Delta, so a process that has Delta asks that too (the stress writers do, in P2b).
+- **An operator's operations** are `TableMaintenance`, over `RegistryMaintenance`, which connects as `ingest_maintenance` (ADR-0013 §3; migration V2 adds what it needs). Each looks at the table's log first and refuses what the log does not bear out.
+
+  | Operation | For | What it does | Refused when |
+  |---|---|---|---|
+  | Adopt | A table made without the LogStore | Registers it at the highest version in its log, with the `metaData.id` the caller read with Delta | The log has no commit; the table is registered |
+  | Adopt again | A tainted table (F10, F11), an entry that cannot be published (F17), a latest commit that is gone (F14), once an operator accepts the log as it stands | Moves the registration to the highest version in the log, clears the taint, removes the entries above that version and the ones that are not complete, and returns them | The table is not registered; the log has no commit; an entry can still be published, which a read of the table does |
+  | Reset | A table that was dropped (F9) | Removes its taint, its entries and its registration | The log still has a commit; the table is not registered |
+  | Collect temporary files | Any table (§3.8) | Removes the file of a commit that is published, and a file without an entry that is older than a day | Never; what it keeps, it reports |
+
 ### 3.6 Canonical table identity
 
 Mutual exclusion holds only if every writer maps the same table to the **same key**. Two spellings mean two keys, and therefore no exclusion. Rules:
@@ -247,6 +265,12 @@ The engine wraps each Delta write in `CommitContext.withRun(runId) { … }`, a t
 | Any, and `T(N)` is later lost *(P2a, F17)* | Entry incomplete, no `T(N)`, no `N.json` | Nobody can: the bytes are gone | Reads and writes fail closed, naming the entry, until an operator resolves it |
 
 Temp GC deletes `.tmp/` files whose entry is complete, or that have no entry and are older than a safety window. It runs only in maintenance mode, never on the commit path.
+
+*As built (P2a.11, 2026-11-16):* `TableMaintenance.collectTemps`. The safety window is a day by default. Two files are kept that the sentence above would delete or leaves open:
+- the file of a complete entry whose commit file is missing or holds other bytes. It is then the only copy of a commit that was lost (§3.5, the foreign commit that detection misses), and it is reported;
+- the file of an entry that is not complete, however old: it is the commit.
+
+A claim that loses its version has removed its file already (§3.2), so what the collection finds without an entry is what a writer left when it died before taking a version (F1).
 
 ### 3.9 Instances, configuration and connections *(added in P2a.1, 2026-11-14)*
 

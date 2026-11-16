@@ -43,4 +43,7 @@ object CoordinationSchema {
 
   /** The role the commit path connects as (ADR-0013 §3). */
   val CommitPathRole = "ingest_coordination"
+
+  /** The role an operator's tools connect as (ADR-0013 §3). */
+  val MaintenanceRole = "ingest_maintenance"
 }

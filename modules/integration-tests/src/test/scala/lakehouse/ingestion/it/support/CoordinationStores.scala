@@ -11,22 +11,23 @@ import lakehouse.ingestion.logstore.coordination.{CoordinationSettings, SecretRe
 object CoordinationStores {
 
   /**
-   * Settings for the commit path's role, with its password in a file, the way a deployment
-   * mounts a secret. The file is deleted when the JVM exits.
+   * Settings for a runtime role, the commit path's unless another is named, with its password
+   * in a file, the way a deployment mounts a secret. The file is deleted when the JVM exits.
    */
   def settings(
       jdbcUrl: String,
       pg: BootstrappedPostgres,
       poolMaxSize: Int = CoordinationSettings.DefaultPoolMaxSize,
       connectTimeout: FiniteDuration = CoordinationSettings.DefaultConnectTimeout,
-      statementTimeout: FiniteDuration = CoordinationSettings.DefaultStatementTimeout
+      statementTimeout: FiniteDuration = CoordinationSettings.DefaultStatementTimeout,
+      role: String = CoordinationSchema.CommitPathRole
   ): CoordinationSettings = {
     val secret = Files.createTempFile("coordination-secret-", ".txt")
     secret.toFile.deleteOnExit()
-    Files.write(secret, pg.password(CoordinationSchema.CommitPathRole).getBytes(UTF_8))
+    Files.write(secret, pg.password(role).getBytes(UTF_8))
     CoordinationSettings(
       jdbcUrl,
-      CoordinationSchema.CommitPathRole,
+      role,
       SecretRef.File(secret),
       poolMaxSize,
       connectTimeout,

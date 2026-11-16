@@ -163,6 +163,26 @@ final class PostgresCoordinationStore(
         throw new IOException(s"coordination store: cannot $action: ${e.getMessage}", e)
     }
 
+  /**
+   * Runs `body` in one transaction of its own: all of what it changes, or none. For the
+   * operations of this package that change more than one row at a time, which the commit path
+   * never does.
+   */
+  private[coordination] def transaction[T](action: String)(body: Connection => T): T =
+    run(action) { connection =>
+      connection.setAutoCommit(false)
+      try {
+        val result = body(connection)
+        connection.commit()
+        result
+      } catch {
+        case failure: Throwable =>
+          try connection.rollback()
+          catch { case rollback: SQLException => failure.addSuppressed(rollback) }
+          throw failure
+      } finally connection.setAutoCommit(true)
+    }
+
   private def connect(): Connection = {
     val opened = pool
     poolOpened = true
@@ -213,8 +233,8 @@ final class PostgresCoordinationStore(
 
 object PostgresCoordinationStore {
 
-  /** The version of schema `delta_coordination` this code works with: its migration V1. */
-  val SchemaVersion = 1
+  /** The version of schema `delta_coordination` this code works with: its migrations up to V2. */
+  val SchemaVersion = 2
 
   /** What a session of this store calls itself in `pg_stat_activity`. */
   val ApplicationName = "delta-pg-logstore"
@@ -323,14 +343,27 @@ object PostgresCoordinationStore {
   private def wholeSeconds(duration: FiniteDuration): Long =
     math.max(1L, math.ceil(duration.toMillis / 1000.0).toLong)
 
-  private def update(connection: Connection, sql: String)(bind: PreparedStatement => Unit): Int =
+  private[coordination] def update(connection: Connection, sql: String)(
+      bind: PreparedStatement => Unit
+  ): Int =
     Using.resource(connection.prepareStatement(sql)) { statement =>
       bind(statement)
       statement.executeUpdate()
     }
 
+  /** Every row of a query. */
+  private[coordination] def queryAll[T](connection: Connection, sql: String)(
+      bind: PreparedStatement => Unit
+  )(read: ResultSet => T): Seq[T] =
+    Using.resource(connection.prepareStatement(sql)) { statement =>
+      bind(statement)
+      Using.resource(statement.executeQuery()) { rows =>
+        Iterator.continually(rows).takeWhile(_.next()).map(read).toList
+      }
+    }
+
   /** The first row of a query, if it has one. */
-  private def query[T](connection: Connection, sql: String)(
+  private[coordination] def query[T](connection: Connection, sql: String)(
       bind: PreparedStatement => Unit
   )(read: ResultSet => T): Option[T] =
     Using.resource(connection.prepareStatement(sql)) { statement =>
@@ -338,7 +371,7 @@ object PostgresCoordinationStore {
       Using.resource(statement.executeQuery())(rows => Option.when(rows.next())(read(rows)))
     }
 
-  private def toEntry(table: TableUri, row: ResultSet): CommitEntry =
+  private[coordination] def toEntry(table: TableUri, row: ResultSet): CommitEntry =
     CommitEntry(
       table,
       version = row.getLong("version"),

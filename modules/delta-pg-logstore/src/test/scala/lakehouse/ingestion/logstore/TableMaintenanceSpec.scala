@@ -1,0 +1,297 @@
+package lakehouse.ingestion.logstore
+
+import java.nio.file.attribute.FileTime
+import java.nio.file.{Files, Path => LocalPath}
+import java.time.Instant
+import java.time.temporal.ChronoUnit
+
+import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
+
+import io.delta.storage.HDFSLogStore
+import lakehouse.ingestion.logstore.coordination.{Readoption, Registration}
+import org.scalatest.funsuite.AnyFunSuite
+import org.scalatest.matchers.should.Matchers
+
+/**
+ * An operator's work on a coordinated table (ADR-0004 §3.5, §3.8): what gets a table out of
+ * each state the fault scenarios leave it in, and what is refused because the table's log does
+ * not bear it out.
+ *
+ * The table, its log and its registry are `LakeFixture`'s; the registry is reached here the way
+ * an operator's tools reach it. The writer without the LogStore is Delta's default one.
+ */
+final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixture {
+
+  import LakeFixture._
+  import TableMaintenanceSpec._
+
+  private def maintenanceOf(lake: Lake) = new TableMaintenance(lake.memory)
+
+  /** Commits `version` as a process without this LogStore does. */
+  private def foreignCommit(lake: Lake, version: Long): Unit =
+    new HDFSLogStore(conf)
+      .write(hadoop(lake.commitFile(version)), ForeignActions.iterator.asJava, false, conf)
+
+  private def registrationOf(lake: Lake): Option[Registration] =
+    lake.memory.registration(lake.table)
+
+  private def age(file: LocalPath, by: FiniteDuration): Unit =
+    Files.setLastModifiedTime(
+      file,
+      FileTime.from(Instant.now().minus(by.toMillis, ChronoUnit.MILLIS))
+    ): Unit
+
+  // ---------------------------------------------------------------------------------------------
+  // Adopting a table
+  // ---------------------------------------------------------------------------------------------
+
+  test("a table made without the LogStore is adopted at the version its log is at") {
+    val lake = new Lake
+    (0L to 2L).foreach(foreignCommit(lake, _))
+    // Not coordinated: a write through the LogStore is refused.
+    a[TableNotRegisteredException] should be thrownBy lake.commit(3)(append(3))
+
+    val adopted = maintenanceOf(lake).adopt(hadoop(lake.directory), fs, Some(TableId))
+
+    adopted shouldBe Adoption(lake.table, version = 2L)
+    registrationOf(lake) shouldBe Some(Registration(lake.table, 2L, Some(TableId), None))
+    // From the next version on it is written through the LogStore, and read without alarm.
+    lake.commit(3)(append(3))
+    lake.list() shouldBe (0L to 3L).map(commit)
+    registrationOf(lake).value.isTainted shouldBe false
+  }
+
+  test("a table is not adopted if it has no commit, or if it is registered already") {
+    val empty = new Lake
+    val nothing = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(empty).adopt(hadoop(empty.directory), fs, None)
+    nothing.getMessage should include("no commit")
+    registrationOf(empty) shouldBe None
+
+    val coordinated = new Lake().withCommits(last = 1)
+    val before = registrationOf(coordinated)
+    val already = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(coordinated).adopt(hadoop(coordinated.directory), fs, Some("another-id"))
+    already.getMessage should include("registered already")
+    registrationOf(coordinated) shouldBe before
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Adopting a table again: out of every state that stops its writers or its readers
+  // ---------------------------------------------------------------------------------------------
+
+  test("after F10, adopting the table again accepts the foreign commit and clears the taint") {
+    val lake = new Lake().withCommits(last = 1)
+    foreignCommit(lake, 2)
+    lake.list() shouldBe (0L to 2L).map(commit)
+    val reason = registrationOf(lake).value.taintReason.value
+
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+
+    readopted shouldBe Readopted(lake.table, 2L, Readoption(Some(reason), Nil))
+    registrationOf(lake) shouldBe Some(Registration(lake.table, 2L, Some(TableId), None))
+    // The commits made before keep their entries; writers and readers go on.
+    (0L to 1L).map(lake.entry(_).value.complete) shouldBe Seq(true, true)
+    lake.commit(3)(append(3))
+    lake.list() shouldBe (0L to 3L).map(commit)
+    registrationOf(lake).value.isTainted shouldBe false
+  }
+
+  test("after F11, adopting the table again gives up our commit and hands back its entry") {
+    val lake = new Lake().withCommits(last = 0)
+    val foreignWriterWins = LogStores.at(FaultPoint.AfterInsert)(foreignCommit(lake, 1))
+    an[UncoordinatedWriteException] should be thrownBy
+      lake.commit(1, lake.logStore(foreignWriterWins))(append(1))
+    val ours = lake.entry(1).value
+    an[UncoordinatedWriteException] should be thrownBy lake.list()
+
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+
+    // The entry of the commit that lost its name is returned: its bytes are still in its file.
+    readopted.removed.removedEntries shouldBe Seq(ours)
+    readopted.removed.clearedTaint.value should include("version 1")
+    Files.readAllLines(lake.tempOf(ours)).asScala shouldBe append(1)
+    // The table is the log as it stands: version 1 is the foreign commit.
+    lake.list() shouldBe Seq(commit(0), commit(1))
+    lake.committed(1) shouldBe ForeignActions
+    lake.commit(2)(append(2))
+    lake.entry(2).value.complete shouldBe true
+  }
+
+  test("after F17, adopting the table again frees the version of the commit that was lost") {
+    val lake = new Lake().withCommits(last = 0)
+    val unfinished = lake.crashedAt(FaultPoint.AfterInsert, version = 1)
+    Files.delete(lake.tempOf(unfinished))
+    an[UnpublishableCommitException] should be thrownBy lake.list()
+
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+
+    readopted shouldBe Readopted(lake.table, 0L, Readoption(None, Seq(unfinished)))
+    lake.list() shouldBe Seq(commit(0))
+    lake.commit(1)(Seq("the commit that takes its place"))
+    lake.committed(1) shouldBe Seq("the commit that takes its place")
+  }
+
+  test("after F14, adopting the table again takes the log without the commit that is gone") {
+    val lake = new Lake().withCommits(last = 2)
+    val gone = lake.entry(2).value
+    Files.delete(lake.commitFile(2))
+    a[CommitMissingException] should be thrownBy lake.list()
+
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+
+    readopted shouldBe Readopted(lake.table, 1L, Readoption(None, Seq(gone)))
+    lake.list() shouldBe Seq(commit(0), commit(1))
+    lake.commit(2)(append(2))
+    lake.entry(2).value.complete shouldBe true
+  }
+
+  test("a commit that can still be published is not an operator's to discard") {
+    val lake = new Lake().withCommits(last = 0)
+    val unfinished = lake.crashedAt(FaultPoint.AfterInsert, version = 1)
+
+    val refused = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+
+    refused.getMessage should include("version 1")
+    refused.getMessage should include(unfinished.tempPath)
+    lake.entry(1) shouldBe Some(unfinished)
+
+    // A read publishes it, as the refusal says; then there is nothing left to discard.
+    lake.list() shouldBe Seq(commit(0), commit(1))
+    maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None) shouldBe
+      Readopted(lake.table, 1L, Readoption(None, Nil))
+    lake.entry(1).value.complete shouldBe true
+  }
+
+  test("a table is not adopted again if it is not registered, or if its log is gone") {
+    val foreign = new Lake
+    foreignCommit(foreign, 0)
+    val unknown = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(foreign).readopt(hadoop(foreign.directory), fs, None)
+    unknown.getMessage should include("not registered")
+
+    val dropped = new Lake().withCommits(last = 1)
+    val before = registrationOf(dropped)
+    (0L to 1L).foreach(version => Files.delete(dropped.commitFile(version)))
+    val noLog = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(dropped).readopt(hadoop(dropped.directory), fs, None)
+    noLog.getMessage should include("reset its registry")
+    registrationOf(dropped) shouldBe before
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Resetting the registry of a table that was dropped
+  // ---------------------------------------------------------------------------------------------
+
+  test(
+    "F9: once its registry is reset, a table can be created again at the path of a dropped one"
+  ) {
+    val lake = new Lake().withCommits(last = 2)
+    (0L to 2L).foreach(version => Files.delete(lake.commitFile(version)))
+    lake.temps.foreach(Files.delete)
+    a[StaleRegistrationException] should be thrownBy lake.commit(0)(Creation)
+
+    maintenanceOf(lake).reset(hadoop(lake.directory), fs)
+
+    registrationOf(lake) shouldBe None
+    (0L to 2L).foreach(lake.entry(_) shouldBe None)
+    // The new table registers itself with its first commit, like any other.
+    lake.commit(0)(Creation)
+    registrationOf(lake) shouldBe
+      Some(Registration(lake.table, Registration.NotYetCreated, Some(TableId), None))
+    lake.list() shouldBe Seq(commit(0))
+  }
+
+  test("the registry of a table that still has a log is not reset, nor one that has no registry") {
+    val live = new Lake().withCommits(last = 1)
+    val before = (registrationOf(live), lake0(live))
+    val exists = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(live).reset(hadoop(live.directory), fs)
+    exists.getMessage should include("up to version 1")
+    (registrationOf(live), lake0(live)) shouldBe before
+
+    val unknown = new Lake
+    val nothing = the[MaintenanceRefusedException] thrownBy
+      maintenanceOf(unknown).reset(hadoop(unknown.directory), fs)
+    nothing.getMessage should include("not registered")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Collecting temporary files
+  // ---------------------------------------------------------------------------------------------
+
+  test("F1: the orphan of a writer that died before its version is collected once it is old") {
+    val lake = new Lake().withCommits(last = 0)
+    val tempsBefore = lake.temps
+    lake.crashAt(FaultPoint.BeforeInsert, version = 1)
+    val orphan = lake.temps.diff(tempsBefore).head
+    val published = tempsBefore.head
+
+    // Young, it may belong to a writer that is about to take a version: it is left alone.
+    val first = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    first shouldBe Map(
+      orphan.getFileName.toString -> TempFate.KeptRecent,
+      published.getFileName.toString -> TempFate.RemovedPublished
+    )
+    Files.exists(orphan) shouldBe true
+
+    age(orphan, by = 2.days)
+    maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs) shouldBe
+      Map(orphan.getFileName.toString -> TempFate.RemovedOrphan)
+
+    lake.temps shouldBe empty
+    // The commit lost a name, not its content.
+    lake.committed(0) shouldBe Creation
+    lake.list() shouldBe Seq(commit(0))
+    lake.commit(1)(append(1))
+  }
+
+  test("the temporary file of a commit that is not published is kept, however old") {
+    val lake = new Lake().withCommits(last = 0)
+    val unfinished = lake.crashedAt(FaultPoint.AfterInsert, version = 1)
+    age(lake.tempOf(unfinished), by = 30.days)
+
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+
+    fates(lake.tempOf(unfinished).getFileName.toString) shouldBe TempFate.KeptUnfinished
+    // It is the commit: the next reader publishes it from there.
+    lake.list() shouldBe Seq(commit(0), commit(1))
+    lake.committed(1) shouldBe append(1)
+  }
+
+  test("the temporary file of a commit whose file is gone or replaced is the only copy, and kept") {
+    val lake = new Lake().withCommits(last = 2)
+    val replaced = lake.tempOf(lake.entry(1).value)
+    val gone = lake.tempOf(lake.entry(2).value)
+    // What the known limit of the detection looks like: a foreign file over a published commit.
+    Files.delete(lake.commitFile(1))
+    Files.write(lake.commitFile(1), ForeignActions.asJava)
+    Files.delete(lake.commitFile(2))
+
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, 0.seconds)
+
+    fates(replaced.getFileName.toString) shouldBe TempFate.KeptOnlyCopy
+    fates(gone.getFileName.toString) shouldBe TempFate.KeptOnlyCopy
+    Files.readAllLines(replaced).asScala shouldBe append(1)
+    Files.readAllLines(gone).asScala shouldBe append(2)
+  }
+
+  test("a table without temporary files has nothing to collect") {
+    val lake = new Lake
+    maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs) shouldBe empty
+  }
+
+  /** The entry of version 0, as a sign that nothing of the registry was touched. */
+  private def lake0(lake: Lake) = lake.entry(0)
+}
+
+object TableMaintenanceSpec {
+
+  private val ForeignActions = Seq(
+    """{"commitInfo":{"operation":"WRITE","engineInfo":"another writer"}}"""
+  )
+
+  private def commit(version: Long): String = f"$version%020d.json"
+}
