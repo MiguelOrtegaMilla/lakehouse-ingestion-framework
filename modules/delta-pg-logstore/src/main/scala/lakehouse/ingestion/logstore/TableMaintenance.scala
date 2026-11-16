@@ -105,12 +105,9 @@ final class TableMaintenance(
   def readopt(tablePath: Path, fs: FileSystem, deltaTableId: Option[String]): Readopted = {
     val target = new Target(tablePath, fs)
     val table = target.table
-    val latest = target.latestCommit.getOrElse {
-      refuse(
-        s"there is no table to adopt at $table: its log holds no commit. " +
-          "If the table was dropped, reset its registry"
-      )
-    }
+    val noTable = s"there is no table to adopt at $table: its log holds no commit. " +
+      "If the table was dropped, reset its registry"
+    if (target.latestCommit.isEmpty) refuse(noTable)
     if (registry.registration(table).isEmpty)
       refuse(s"$table is not registered. A table that was never coordinated is adopted")
     registry.unfinished(table).filter(target.canStillBePublished).foreach { entry =>
@@ -119,6 +116,12 @@ final class TableMaintenance(
           s"(${entry.tempPath}). Read the table once, which publishes it, then adopt it again"
       )
     }
+    // The version to adopt at is read from the log now, after the unfinished entries. Readers
+    // are not stopped for this, and one may have published a commit in the meantime: read
+    // before, the version would leave that commit above the registration, and its entry among
+    // the ones removed. No entry was left that a reader can still publish, so the log does not
+    // grow after this listing.
+    val latest = target.latestCommit.getOrElse(refuse(noTable))
     val removed = registry.readopt(table, latest, deltaTableId).getOrElse {
       refuse(s"$table stopped being registered while it was being adopted again")
     }
