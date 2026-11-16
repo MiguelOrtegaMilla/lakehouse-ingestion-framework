@@ -2,11 +2,13 @@ package lakehouse.ingestion.it.logstore
 
 import java.net.URI
 import java.nio.file.{Files, Path => LocalPath, Paths}
+import java.util.UUID
 
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
 import io.delta.storage.HDFSLogStore
+import io.delta.tables.DeltaTable
 import lakehouse.ingestion.it.support.{
   BootstrappedPostgres,
   CoordinationSchema,
@@ -34,9 +36,9 @@ import org.scalatest.matchers.should.Matchers
  * a real PostgreSQL.
  *
  * It is a smoke test: a table is created, appended to and read; a commit that a dead writer
- * left is found by Delta; a version conflict is retried by Delta. The suites that call the
- * LogStore's methods themselves test each scenario; this one shows that Delta and the LogStore
- * agree on what those methods mean.
+ * left is found by Delta; a version conflict is retried by Delta; the commits of a run are
+ * attributed to it. The suites that call the LogStore's methods themselves test each scenario;
+ * this one shows that Delta and the LogStore agree on what those methods mean.
  */
 final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with LocalSparkSuite {
 
@@ -160,6 +162,52 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Loc
     versionOf(path) shouldBe 2L
     countOf(path) shouldBe 20L
     (0L to 2L).map(entry(path, _).complete) shouldBe Seq(true, true, true)
+  }
+
+  test("every commit Delta makes inside a run's context has the run in its entry") {
+    val run = CommitContext.forRun(UUID.randomUUID())
+    val path = create("attributed") // version 0, outside the context
+
+    run.attribute {
+      // An idempotent append, as the engine writes a batch (ADR-0005).
+      rows(10L, 20L).write
+        .format("delta")
+        .mode("append")
+        .option("txnAppId", "attributed-source")
+        .option("txnVersion", 1L)
+        .save(path)
+      DeltaTable
+        .forPath(spark, path)
+        .as("target")
+        .merge(rows(15L, 25L).as("source"), "target.id = source.id")
+        .whenNotMatched()
+        .insertAll()
+        .execute()
+      DeltaTable.forPath(spark, path).delete("id < 5")
+      // Compaction runs its jobs on a thread pool, and commits on this thread.
+      DeltaTable.forPath(spark, path).optimize().executeCompaction(): Unit
+    }
+    append(path, 25L, 30L) // outside again
+
+    versionOf(path) shouldBe 5L
+    countOf(path) shouldBe 25L
+    (0L to 5L).map(entry(path, _).runId) shouldBe
+      None +: Seq.fill(4)(Some(run.runId)) :+ None
+    run.contention shouldBe 0L
+  }
+
+  test("a version that a run loses to another writer is counted for the run, once") {
+    val run = CommitContext.forRun(UUID.randomUUID())
+    val path = create("contended-by-a-run")
+    val transaction = DeltaLog.forTable(spark, path).startTransaction(None) // reads version 0
+    append(path, 10L, 20L) // another writer, in no run, takes version 1
+
+    // Delta tries version 1, is told it is taken, and commits at version 2: both attempts are
+    // on this thread, inside the context.
+    run.attribute(transaction.commit(Nil, DeltaOperations.ManualUpdate)) shouldBe 2L
+
+    run.contention shouldBe 1L
+    (0L to 2L).map(entry(path, _).runId) shouldBe Seq(None, None, Some(run.runId))
   }
 
   test("a checkpoint's pointer is written through the LogStore, and a new reader follows it") {

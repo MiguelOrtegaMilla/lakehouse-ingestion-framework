@@ -38,6 +38,10 @@ import org.slf4j.LoggerFactory
  * '''Fault hooks.''' The one thing the constructor does say, at WARN and every time, is which
  * fault hooks the configuration turns on. They are for tests, and slow every commit down.
  *
+ * '''Attribution.''' A commit written inside a `CommitContext` records the run it is for in
+ * its entry, next to the instance that wrote it, and tells the context of each version it
+ * loses to another writer (§3.7).
+ *
  * '''Reading.''' Delta finds a table's versions by listing its log, so `listFrom` is where a
  * reader meets the protocol: before the listing, a commit that was taken and not published is
  * published. `read` is Hadoop's, unchanged: Delta reads a file after it has listed it.
@@ -93,7 +97,15 @@ final class PostgresLogStore private[logstore] (
           s"refusing to overwrite the commit $file: a commit is never rewritten"
         )
       case Some(version) =>
-        protocol.commit(tableLog(file.getParent, fs, storage), version, file, actions.asScala)
+        // Delta calls this on the thread that called the operation: the thread whose context,
+        // if it is in one, says which run the commit is for.
+        protocol.commit(
+          tableLog(file.getParent, fs, storage),
+          version,
+          file,
+          actions.asScala,
+          CommitContext.current
+        )
       case None =>
         writeWhole(storage, file, actions.asScala, overwrite)
     }

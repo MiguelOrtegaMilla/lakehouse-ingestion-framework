@@ -67,6 +67,8 @@ final private[logstore] class CommitProtocol(
    * Writes commit `version` of the table. When it returns, the commit is visible under `target`.
    *
    * @param target the commit file, as Delta named it
+   * @param context the run the calling thread commits for, if it said so: its id goes into the
+   *   entry, and it is told of each version lost (ADR-0004 §3.7)
    * @throws java.nio.file.FileAlreadyExistsException the version belongs to another writer.
    *   It is the one exception Delta answers by checking for conflicts and trying the next
    *   version (ADR-0004 §8, item 2).
@@ -77,14 +79,21 @@ final private[logstore] class CommitProtocol(
    *   nothing is written without it (fail closed)
    */
   @throws[IOException]
-  def commit(log: TableLog, version: Long, target: Path, actions: Iterator[String]): Unit = {
+  def commit(
+      log: TableLog,
+      version: Long,
+      target: Path,
+      actions: Iterator[String],
+      context: Option[CommitContext]
+  ): Unit = {
     // Not the mutual exclusion, which is the entry. It spares a temporary file and an INSERT
     // when the version is plainly gone.
-    if (log.exists(target)) throw taken(target)
+    if (log.exists(target)) throw taken(target, context)
 
     val lines = admit(log, version, actions)
 
-    val claim = Claim(log.table, version, tempPathFor(target), writerInstance, runId = None)
+    val claim =
+      Claim(log.table, version, tempPathFor(target), writerInstance, context.map(_.runId))
     val temp = log.tempFile(claim.tempPath)
     log.storage.writeTemp(temp, lines)
     hooks.at(FaultPoint.BeforeInsert)
@@ -118,7 +127,7 @@ final private[logstore] class CommitProtocol(
 
       case TakeResult.TakenBy(_) =>
         discard(log, temp)
-        throw taken(target)
+        throw taken(target, context)
 
       // Registered a moment ago: only maintenance removes a registration.
       case TakeResult.NotRegistered =>
@@ -374,8 +383,15 @@ private[logstore] object CommitProtocol {
   /** A name for a temporary file of `file` that no other attempt has, relative to its directory. */
   def tempPathFor(file: Path): String = s"$TempDirectory/${file.getName}.${UUID.randomUUID()}"
 
-  private def taken(target: Path): FileAlreadyExistsException =
+  /**
+   * The version went to another writer, and the run is told. The writer learns it from the
+   * commit file or from the entry, depending on how far the winner had got: that says nothing
+   * about the contention, so both count.
+   */
+  private def taken(target: Path, context: Option[CommitContext]): FileAlreadyExistsException = {
+    context.foreach(_.versionLost())
     new FileAlreadyExistsException(target.toString)
+  }
 }
 
 /**
