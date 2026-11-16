@@ -123,7 +123,7 @@ final private[logstore] class CommitProtocol(
             case e: IOException =>
               throw new CommitPublicationPendingException(log.table, version, e)
           }
-        settle(published, entry, target)
+        settle(log, published, entry, target)
         hooks.at(FaultPoint.AfterPublish)
         acknowledge(entry)
 
@@ -205,7 +205,7 @@ final private[logstore] class CommitProtocol(
   @throws[IOException]
   def finish(log: TableLog, entry: CommitEntry): Unit = {
     val target = log.commitFile(entry.version)
-    settle(publish(log, entry, target), entry, target)
+    settle(log, publish(log, entry, target), entry, target)
     val found = retry(s"mark version ${entry.version} of ${entry.table} complete") {
       store.complete(entry.table, entry.version, entry.tempPath)
     }
@@ -319,7 +319,12 @@ final private[logstore] class CommitProtocol(
     }
 
   /** What the outcome of a publish means for the commit. */
-  private def settle(published: PublishResult, entry: CommitEntry, target: Path): Unit =
+  private def settle(
+      log: TableLog,
+      published: PublishResult,
+      entry: CommitEntry,
+      target: Path
+  ): Unit =
     published match {
       case PublishResult.Published | PublishResult.AlreadyPublished => ()
       case PublishResult.ForeignFile =>
@@ -330,8 +335,22 @@ final private[logstore] class CommitProtocol(
             s"${entry.tempPath}), so a writer without this LogStore made it"
         )
       case PublishResult.TempFileLost =>
-        throw new UnpublishableCommitException(entry.table, entry.version, entry.tempPath)
+        if (!finishedByAnother(log, entry, target))
+          throw new UnpublishableCommitException(entry.table, entry.version, entry.tempPath)
     }
+
+  /**
+   * Whether the commit of `entry` was published and acknowledged by another process since the
+   * entry was read. This one may have stopped for long between reading the entry, or making
+   * it, and publishing the commit. A temporary file is collected once its commit is published
+   * and acknowledged (ADR-0004 §3.8), so its absence then means that the work is done, not
+   * that the commit is lost.
+   */
+  private def finishedByAnother(log: TableLog, entry: CommitEntry, target: Path): Boolean =
+    log.exists(target) &&
+      store
+        .entry(entry.table, entry.version)
+        .exists(now => now.complete && now.tempPath == entry.tempPath)
 
   /**
    * Marks the entry complete. If that fails the commit is no less visible, so the failure is
