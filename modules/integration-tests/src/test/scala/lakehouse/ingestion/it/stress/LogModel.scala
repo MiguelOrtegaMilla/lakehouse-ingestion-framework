@@ -32,12 +32,23 @@ object LogModel {
    *   commit file and its sidecar in two steps, and the sidecar's rename does not overwrite.
    *   It is not certain: when both sidecar renames also race, the last writer's sidecar wins and
    *   matches the commit file it wrote.
+   * @param commitSidecars versions whose commit file has a `.crc` sidecar at all, whether it
+   *   matches or not. Delta's default LogStore leaves one next to every commit. A commit
+   *   published by `PostgresLogStore` has none (ADR-0015), so one there was written by somebody
+   *   else, or by a publish that went another way than it should.
+   * @param staleSidecars the other files of the log, by their path under `_delta_log`, that have
+   *   a sidecar which does not match them: Delta's version checksums, checkpoints, the pointer
+   *   to the last checkpoint. Delta writes some of these through Hadoop's checksummed file
+   *   system, so a sidecar there is ordinary; one that is stale makes the file unreadable to
+   *   every reader that checks it.
    */
   final case class LogView(
       versions: Seq[Long],
       commits: Seq[Commit],
       unreadable: Seq[UnreadableCommit],
-      checksumMismatches: Seq[Long] = Nil
+      checksumMismatches: Seq[Long] = Nil,
+      commitSidecars: Seq[Long] = Nil,
+      staleSidecars: Seq[String] = Nil
   ) {
 
     /** The data files of the latest version, replaying adds and removes in version order. */
@@ -87,4 +98,22 @@ object LogModel {
 
   /** Data files present on disk under the table root, outside `_delta_log`. */
   final case class DiskView(dataFiles: Set[String])
+
+  /** One row of the registry of commits: who has `version`, and under which run. */
+  final case class RegistryEntry(version: Long, complete: Boolean, runId: Option[String])
+
+  /**
+   * What the coordination database holds about a table, read with plain SQL and not through
+   * the LogStore's own store: the verifier does not ask the component under test what it did.
+   *
+   * @param registeredVersion the version the table is registered at (-1 if it was created
+   *   through the LogStore), or `None` if the table is not registered at all
+   * @param taint why the table refuses writes, if it does
+   * @param entries every entry of the table, lowest version first
+   */
+  final case class RegistryView(
+      registeredVersion: Option[Long],
+      taint: Option[String],
+      entries: Seq[RegistryEntry]
+  )
 }

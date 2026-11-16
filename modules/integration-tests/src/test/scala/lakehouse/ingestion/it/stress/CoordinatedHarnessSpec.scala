@@ -8,10 +8,23 @@ import java.util.UUID
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
+import io.delta.storage.HDFSLogStore
 import lakehouse.ingestion.it.stress.StressHarness.{Settings, WriterOutcome}
-import lakehouse.ingestion.it.stress.Verifier.Expected
-import lakehouse.ingestion.logstore.{FaultHooks, FaultPoint, PostgresLogStore}
-import org.apache.hadoop.fs.LocalFileSystem
+import lakehouse.ingestion.it.stress.Verifier.Anomaly.{
+  CommitWithoutEntry,
+  SidecarOnCommit,
+  TaintedTable,
+  UnfinishedEntry,
+  UnreadableTable
+}
+import lakehouse.ingestion.logstore.{
+  FaultHooks,
+  FaultPoint,
+  LogStores,
+  PostgresLogStore,
+  SimulatedCrash
+}
+import org.apache.hadoop.fs.{LocalFileSystem, Path => HadoopPath}
 import org.scalatest.LoneElement
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -50,6 +63,10 @@ final class CoordinatedHarnessSpec
   private def delay(point: FaultPoint, millis: Long): String =
     s"-Dspark.hadoop.${FaultHooks.delayKey(point)}=$millis"
 
+  /** A commit that changes nothing, as Delta writes one. */
+  private val EmptyCommit =
+    """{"commitInfo":{"timestamp":1763200000000,"operation":"Manual Update","operationParameters":{}}}"""
+
   test("a writer JVM set up for the LogStore passes its guard and commits through it") {
     val run = newRun("one-writer")
     val settings = Settings(
@@ -83,13 +100,19 @@ final class CoordinatedHarnessSpec
     entries.map(_.runId) shouldBe None +: Seq.fill(3)(Some(UUID.fromString(probe.runId)))
     registry.registration(keyOf(run)).map(_.isTainted) shouldBe Some(false)
 
-    // Nothing the verifier of the spikes objects to, through either reader; and the commits
-    // have no sidecar that could go stale.
-    val report = LogReader.verify(spark, run, Expected.of(settings), Seq(outcome))
+    // Nothing the verifier of the spikes objects to, through either reader, in the log or in
+    // the registry; and the commits have no sidecar that could go stale.
+    val report = verify(run, settings, Seq(outcome))
     withClue(report.anomalies.map(_.detail).mkString("\n")) { report.isClean shouldBe true }
     report.summary.readers.map(_._2) shouldBe Seq(None, None)
     report.summary.checksumMismatches shouldBe empty
-    logFiles(run).filter(_.endsWith(".json.crc")) shouldBe empty
+    report.summary.commitSidecars shouldBe empty
+    report.summary.registry.map(r => (r.registeredVersion, r.taint, r.entries.size)) shouldBe
+      Some((Some(-1L), None, 4))
+    // Delta writes its version checksums through Hadoop's checksummed file system: they have
+    // sidecars, which match.
+    logFiles(run).filter(_.endsWith(".crc.crc")) should not be empty
+    report.summary.staleSidecars shouldBe empty
   }
 
   test("two writer JVMs that reach for the same versions both finish, and count what they lost") {
@@ -123,12 +146,81 @@ final class CoordinatedHarnessSpec
     lost should be >= 1L
     waited.sum should be <= 2L * commits + lost
 
-    val report = LogReader.verify(spark, run, Expected.of(settings), outcomes)
+    val report = verify(run, settings, outcomes)
     withClue(report.anomalies.map(_.detail).mkString("\n")) { report.isClean shouldBe true }
+    // Two runs in the registry, one for each writer, and none of them shared.
+    report.summary.registry.map(_.entries.flatMap(_.runId).distinct.size) shouldBe Some(2)
     report.summary.latestVersion shouldBe Some(2L * commits)
     report.summary.readers.map(_._2) shouldBe Seq(None, None)
     registry.latestEntry(keyOf(run)).map(entry => (entry.version, entry.complete)) shouldBe
       Some((2L * commits, true))
+  }
+
+  /** A finished run of one writer and two commits, for a test to damage. */
+  private def finishedRun(label: String): (StressRun, Settings, Seq[WriterOutcome]) = {
+    val run = newRun(label)
+    val settings = Settings(
+      writers = 1,
+      commits = 2,
+      rowsPerCommit = 4,
+      extraJvmOptions = coordinatedJvmOptions,
+      guard = true
+    )
+    val outcomes = StressHarness.run(run, settings)
+    outcomes.map(_.exitCode) shouldBe Seq(StressWriter.ExitCode.Ok)
+    (run, settings, outcomes)
+  }
+
+  private def commitFile(run: StressRun, version: Long): Path =
+    logDir(run).resolve(f"$version%020d.json")
+
+  test("the verifier finds what a writer without the LogStore leaves on a real run") {
+    val (run, settings, outcomes) = finishedRun("foreign-writer")
+    // Another process commits version 3 with Delta's default LogStore.
+    val hadoopConf = spark.sessionState.newHadoopConf()
+    new HDFSLogStore(hadoopConf).write(
+      new HadoopPath(commitFile(run, 3).toUri),
+      Iterator(EmptyCommit).asJava,
+      false,
+      hadoopConf
+    )
+
+    val report = verify(run, settings, outcomes)
+
+    // The commit has no entry; the reader that met it tainted the table; and the default
+    // LogStore left a sidecar next to it, as it does for every commit.
+    report.anomalies.map(_.kind) should contain theSameElementsAs
+      Seq("CommitWithoutEntry", "TaintedTable", "SidecarOnCommit")
+    report.anomalies should contain allOf (CommitWithoutEntry(3), SidecarOnCommit(3))
+    report.anomalies.collect { case TaintedTable(reason) => reason }.loneElement should
+      include("version 3")
+    // The table itself is read, with the foreign commit in it: nothing is lost.
+    report.summary.readers.map(_._2) shouldBe Seq(None, None)
+    report.summary.lost shouldBe 0
+  }
+
+  test("the verifier finds a commit that was taken and can no longer be published") {
+    val (run, settings, outcomes) = finishedRun("unpublishable")
+    // A writer takes version 3 and dies, and the temporary file of its commit is lost (F17).
+    val dying = LogStores.over(registry, LogStores.crashAt(FaultPoint.AfterInsert))
+    a[SimulatedCrash] should be thrownBy dying.write(
+      new HadoopPath(commitFile(run, 3).toUri),
+      Iterator(EmptyCommit).asJava,
+      false,
+      spark.sessionState.newHadoopConf()
+    )
+    val taken = registry.entry(keyOf(run), 3L).getOrElse(fail("version 3 was not taken"))
+    Files.delete(logDir(run).resolve(taken.tempPath))
+
+    val report = verify(run, settings, outcomes)
+
+    // No reader gets the table, and the entry is still not complete after they tried.
+    report.anomalies.collect { case UnreadableTable(reader, error) =>
+      reader -> error.contains("UnpublishableCommitException")
+    } shouldBe LogModel.Reader.all.map(_ -> true)
+    report.anomalies.filterNot(_.kind == "UnreadableTable") shouldBe Seq(UnfinishedEntry(3))
+    // The writer's own commits are all in the log: nothing that was acknowledged is lost.
+    report.summary.lost shouldBe 0
   }
 
   test("a writer JVM that would commit with Delta's default LogStore refuses to run") {

@@ -65,9 +65,36 @@ object StressReport {
           "Commit files with a stale `.crc` sidecar",
           if (s.checksumMismatches.isEmpty) "0"
           else s"${s.checksumMismatches.size} (versions ${s.checksumMismatches.mkString(", ")})"
+        ),
+        Seq("Commit files with a `.crc` sidecar at all", s.commitSidecars.size.toString),
+        Seq(
+          "Other files of the log with a stale `.crc` sidecar",
+          if (s.staleSidecars.isEmpty) "0"
+          else s"${s.staleSidecars.size} (${s.staleSidecars.mkString(", ")})"
         )
       )
     )
+
+    val registrySection = s.registry.fold(
+      "Not a coordinated run: the table has no registry to be checked against."
+    ) { r =>
+      table(
+        Seq("Measure", "Value"),
+        Seq(
+          Seq(
+            "Registered at version",
+            r.registeredVersion.fold("(not registered)") {
+              case -1L => "-1 (created through the LogStore)"
+              case adopted => adopted.toString
+            }
+          ),
+          Seq("Taint", r.taint.getOrElse("none")),
+          Seq("Entries", r.entries.size.toString),
+          Seq("Entries not complete", r.entries.count(!_.complete).toString),
+          Seq("Runs that the entries name", r.entries.flatMap(_.runId).distinct.size.toString)
+        )
+      )
+    }
 
     val readerTable = table(
       Seq("Reader", "How it reads", "Result"),
@@ -159,6 +186,14 @@ object StressReport {
       "## Result",
       verdict,
       summaryTable,
+      "## Registry",
+      "For a run on `PostgresLogStore`: what the coordination database holds about the table, " +
+        "read with plain SQL after the readers below have read the table. Every commit must " +
+        "have a complete entry, every entry its commit, and each writer's commits its own " +
+        "run. On such a run no commit file may have a `.crc` sidecar, since a commit is " +
+        "published as a hard link and not through Hadoop's checksummed file system; the other " +
+        "files of the log may have one, and it must match.",
+      registrySection,
       "## Readers",
       "The verifier reads the commit files as bytes, without Delta or Hadoop. Delta readers " +
         "then load the table each in its own way, and their anomalies are tagged with the " +

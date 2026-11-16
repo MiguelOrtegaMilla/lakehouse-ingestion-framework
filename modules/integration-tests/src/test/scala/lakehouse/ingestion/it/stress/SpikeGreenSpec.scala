@@ -8,7 +8,7 @@ import java.time.{Instant, ZoneOffset}
 import scala.concurrent.duration._
 
 import lakehouse.ingestion.it.stress.StressHarness.Settings
-import lakehouse.ingestion.it.stress.Verifier.{Expected, Report}
+import lakehouse.ingestion.it.stress.Verifier.Report
 import lakehouse.ingestion.it.support.StressTest
 import lakehouse.ingestion.logstore.{FaultHooks, FaultPoint, PostgresLogStore}
 import org.apache.hadoop.fs.LocalFileSystem
@@ -23,7 +23,10 @@ import org.scalatest.matchers.should.Matchers
  *
  * '''The criterion''', for every variant: no commit lost and no other anomaly, no commit file
  * with a stale `.crc` sidecar, and both readers reading the table, the one that checks sidecars
- * and the one that does not.
+ * and the one that does not. "No other anomaly" includes what the verifier holds a coordinated
+ * run to: a complete entry for every commit and a commit for every entry, no taint, each
+ * writer's commits under its own run, no sidecar at all on a commit file, and no stale one on
+ * any other file of the log.
  *
  * '''The preconditions''', checked on each writer's own probe before any result counts: its
  * Delta resolved `PostgresLogStore` for the table, on Hadoop's own local file system, and the
@@ -72,7 +75,7 @@ final class SpikeGreenSpec extends AnyFunSuite with Matchers with CoordinatedStr
     val run = StressRun.create(stressRoot, s"$stamp-green-$variant")
     StressTable.create(spark, run.tableUri)
     val outcomes = StressHarness.run(run, settings)
-    val report = LogReader.verify(spark, run, Expected.of(settings), outcomes)
+    val report = verify(run, settings, outcomes)
     val markdown = StressReport.markdown(
       title,
       StressReport.environment ++ StressReport.harness(settings),
@@ -108,8 +111,11 @@ final class SpikeGreenSpec extends AnyFunSuite with Matchers with CoordinatedStr
       report.summary.lost shouldBe 0
       report.isClean shouldBe true
       report.summary.checksumMismatches shouldBe empty
+      report.summary.commitSidecars shouldBe empty
+      report.summary.staleSidecars shouldBe empty
       report.summary.readers.map { case (reader, error) => reader.label -> error } shouldBe
         LogModel.Reader.all.map(_.label -> None)
+      report.summary.registry.flatMap(_.registeredVersion) shouldBe Some(-1L)
     }
 
   private def faultWaits(report: Report): Seq[Seq[Long]] =

@@ -232,6 +232,168 @@ final class VerifierSpec extends AnyFunSuite with Matchers with LoneElement {
     report.summary.checksumMismatches shouldBe Seq(2L)
   }
 
+  test("a writer that refused to run attempted nothing") {
+    val writers = Seq(writer(0, ExitCode.Ok, 1L to 3L), writer(1, ExitCode.Refused, Nil))
+    val onlyWriter0 = (1L to 3L).map(0 -> _)
+
+    run(writers, logOf(onlyWriter0)).anomalies shouldBe empty
+    // Not even its first commit was in flight: one in the log is nobody's.
+    run(writers, logOf(onlyWriter0 :+ (1 -> 1L))).anomalies shouldBe Seq(
+      UnexpectedCommit(4, "writer-1 txnVersion=1 was never attempted")
+    )
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A run on PostgresLogStore: the registry, and the sidecars of the log
+  // ---------------------------------------------------------------------------------------------
+
+  private def runOf(w: Int) = s"00000000-0000-0000-0000-00000000000$w"
+
+  /** A writer that reported, as it exited, the run it attributed its commits to. */
+  private def reporting(outcome: WriterOutcome): WriterOutcome =
+    outcome.copy(probe =
+      Some(WriterProbe("LogStore", "FileSystem", "FileContext", 0, runId = runOf(outcome.writer)))
+    )
+
+  /**
+   * The registry a correct run leaves: the table created through the LogStore, and an entry
+   * for every commit, complete, a writer's under the writer's run.
+   */
+  private def registryOf(log: LogView): RegistryView =
+    RegistryView(
+      registeredVersion = Some(-1L),
+      taint = None,
+      entries = log.commits.sortBy(_.version).map { c =>
+        val writerRun = c.txns.headOption.map(txn => runOf(txn.appId.last.asDigit))
+        RegistryEntry(c.version, complete = true, writerRun)
+      }
+    )
+
+  private def coordinated(
+      log: LogView,
+      registry: RegistryView,
+      writers: Seq[WriterOutcome] = allOk.map(reporting)
+  ): Report =
+    Verifier.verify(
+      expected,
+      writers,
+      log,
+      Seq(Reader.Default -> Right(consistentTable(log))),
+      DiskView(log.everAdded),
+      Some(registry)
+    )
+
+  private def changed(registry: RegistryView)(change: RegistryEntry => RegistryEntry) =
+    registry.copy(entries = registry.entries.map(change))
+
+  test("a correct run on the LogStore is clean against its registry too") {
+    val log = logOf(interleaved)
+    val report = coordinated(log, registryOf(log))
+
+    report.anomalies shouldBe empty
+    report.summary.registry.map(_.entries.size) shouldBe Some(7)
+  }
+
+  test("a table that the registry does not know, or that is tainted, is each its own anomaly") {
+    val log = logOf(interleaved)
+    val registry = registryOf(log)
+
+    coordinated(log, RegistryView(None, None, Nil)).anomalies shouldBe Seq(TableNotRegistered)
+    coordinated(log, registry.copy(taint = Some("version 9 has no entry"))).anomalies shouldBe
+      Seq(TaintedTable("version 9 has no entry"))
+  }
+
+  test("an entry that is not complete is UnfinishedEntry, with or without its commit file") {
+    val log = logOf(interleaved)
+    val unfinished = changed(registryOf(log)) { e =>
+      if (e.version == 4) e.copy(complete = false) else e
+    }
+    // Version 7 was taken by a writer that died, and no reader could publish it.
+    val alsoTaken =
+      unfinished.copy(entries = unfinished.entries :+ RegistryEntry(7, complete = false, None))
+
+    coordinated(log, alsoTaken).anomalies shouldBe Seq(UnfinishedEntry(4), UnfinishedEntry(7))
+  }
+
+  test("a complete entry whose commit file is not in the log is EntryWithoutCommit") {
+    val log = logOf(interleaved)
+    val registry = registryOf(log)
+    val recorded =
+      registry.copy(entries = registry.entries :+ RegistryEntry(7, complete = true, None))
+
+    coordinated(log, recorded).anomalies shouldBe Seq(EntryWithoutCommit(7))
+  }
+
+  test("a commit that nobody took is CommitWithoutEntry, unless the table was adopted above it") {
+    val log = logOf(interleaved)
+    val registry = registryOf(log)
+    val without = registry.copy(entries = registry.entries.filterNot(e => Set(2L, 5L)(e.version)))
+
+    coordinated(log, without).anomalies shouldBe Seq(CommitWithoutEntry(2), CommitWithoutEntry(5))
+    // A table adopted at version 2: its commits up to there were made before it was coordinated.
+    val adopted = registry.copy(
+      registeredVersion = Some(2L),
+      entries = registry.entries.filter(_.version > 2)
+    )
+    coordinated(log, adopted).anomalies shouldBe empty
+  }
+
+  test("a writer's commit under no run, or under a run with another writer's, is misattributed") {
+    val log = logOf(interleaved)
+    val registry = registryOf(log)
+
+    val noRun = changed(registry)(e => if (e.version == 1) e.copy(runId = None) else e)
+    coordinated(log, noRun).anomalies shouldBe Seq(
+      MisattributedCommit(1, "writer-0", "its entry names no run")
+    )
+
+    // Version 2 is a commit of writer-1, recorded under the run of writer-0: neither writer's
+    // commits under that run can be told from the other's.
+    val shared = changed(registry)(e => if (e.version == 2) e.copy(runId = Some(runOf(0))) else e)
+    val confused = coordinated(log, shared).anomalies.collect { case m: MisattributedCommit =>
+      m.version -> m.writer
+    }
+    confused shouldBe Seq(1L -> "writer-0", 2L -> "writer-1", 3L -> "writer-0", 5L -> "writer-0")
+  }
+
+  test("a writer's commits under another run than the one it reported are misattributed") {
+    val log = logOf(interleaved)
+    val elsewhere = changed(registryOf(log)) { e =>
+      if (e.runId.contains(runOf(1))) e.copy(runId = Some("a-run-nobody-reported")) else e
+    }
+
+    coordinated(log, elsewhere).anomalies shouldBe Seq(2L, 4L, 6L).map { version =>
+      MisattributedCommit(
+        version,
+        "writer-1",
+        s"its entry names run a-run-nobody-reported, the writer ran as ${runOf(1)}"
+      )
+    }
+    // A writer that was killed reported nothing: its commits only need a run of their own.
+    coordinated(log, elsewhere, writers = allOk).anomalies shouldBe empty
+  }
+
+  test("on the LogStore no commit file has a sidecar, and no other file of the log a stale one") {
+    val log = logOf(interleaved).copy(
+      commitSidecars = Seq(3L),
+      staleSidecars = Seq("_last_checkpoint", "00000000000000000004.crc")
+    )
+
+    coordinated(log, registryOf(log)).anomalies shouldBe Seq(
+      SidecarOnCommit(3),
+      StaleSidecar("00000000000000000004.crc"),
+      StaleSidecar("_last_checkpoint")
+    )
+
+    // A run that is not coordinated is not held to it: Delta's default LogStore leaves a
+    // sidecar next to every commit. They are counted, and are no anomaly.
+    val uncoordinated = run(allOk, log)
+    uncoordinated.anomalies shouldBe empty
+    uncoordinated.summary.commitSidecars shouldBe Seq(3L)
+    uncoordinated.summary.staleSidecars shouldBe Seq("_last_checkpoint", "00000000000000000004.crc")
+    uncoordinated.summary.registry shouldBe None
+  }
+
   test("a journal that contradicts itself or its exit code is InconsistentJournal") {
     val writers = Seq(
       writer(0, ExitCode.Ok, Seq(1, 2)),
