@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. P2a.13 (2026-11-16): §3.2, §3.5, §3.8 and §7.1, from the review of P2a. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -144,6 +144,10 @@ sequenceDiagram
 - **Files that are not commits** are written to a temporary file and given their name in one step, without an entry. A commit is never overwritten, whatever `overwrite` says.
 - **Not ported yet:** the per-JVM `PathLock` of §4. It only spares duplicate recoveries, so it is decided with the read path (P2a.9). *(Decided there: not ported, §3.3.)*
 
+*As built (P2a.13, 2026-11-16), from the review of P2a.* Two checks of the write path were wrong at their edges:
+- **The commit before must be in the log, also when its entry is complete.** The diagram asks for `E(N-1)` and, as built in P2a.8, a complete entry was taken at its word. Delta does not list the log before it commits from a table it holds in memory, so a writer wrote N after a commit N-1 that was gone from the log (F14, or a table dropped under a running writer). N then became the latest entry, and readers were no longer stopped at the missing commit by name (§3.3, step 4): they were handed a log with a gap. The writer now requires the file, as it already did when N-1 had no entry, and fails with the reader's `CommitMissingException`. Delta's own log cleanup only removes commits below the last checkpoint, never the latest one, so it cannot trip the check; `PostgresLogStoreEndToEndSpec` runs that cleanup.
+- **A version 0 that the registry already knows is looked for in the log once more.** The registry is read after the log was looked at. A second creator that did the whole creation between the two looks left the first with exactly what F9 looks like, no version 0 in the log and recorded commits in the registry, and the first was refused with `StaleRegistrationException` where it had only lost the version. Before it calls the registration stale, the writer now looks at the log again: if version 0 is there, it answers `FileAlreadyExistsException`, and Delta decides on the two creations.
+
 ### 3.3 Read path — `listFrom(path)` on `_delta_log`
 
 1. Fetch the latest entry for the table, by numeric `version` among commit files.
@@ -229,6 +233,12 @@ Closing it would take a check of every published commit against its entry, or th
   | Reset | A table that was dropped (F9) | Removes its taint, its entries and its registration | The log still has a commit; the table is not registered |
   | Collect temporary files | Any table (§3.8) | Removes the file of a commit that is published, and a file without an entry that is older than a day | Never; what it keeps, it reports |
 
+  *As built (P2a.13, 2026-11-16), from the review of P2a.* Adopting a table again reads the version to adopt at **after** it has looked at the unfinished entries, not before. Readers are not stopped for the operation, and one that published an unfinished commit between the two steps left that commit above the version that had been read: its entry was removed with the ones the log contradicts, and the next reader tainted the table for a commit of our own.
+
+  Adopting again, resetting and adopting are for a table whose **writers are stopped**. Nothing enforces it, and two things can happen to a writer that is not (known limits):
+  - A writer that takes a version while its table is adopted again can have its entry removed. Its commit is then found without one, and the table is tainted again: closed, and to be adopted once more.
+  - A writer that is stalled, not stopped, goes on afterwards with what it checked before. If its table was dropped, the registry reset and a new table created at the same path in the meantime, it can take a version in the new table's registry. In the two interleavings that `TableMaintenanceSpec` runs, the outcome is closed: stalled in its checks, the writer is refused, because the commit before its own is not in the new log; stalled just before its `INSERT`, it takes a version it cannot publish, and the new table's readers stop at that entry until the table is adopted again. A new table that had already reached the writer's version would get its commit, as it would with Delta on any storage, where a commit is a file name. Closing this takes a generation on the registration that the `INSERT` checks in the same statement.
+
 ### 3.6 Canonical table identity
 
 Mutual exclusion holds only if every writer maps the same table to the **same key**. Two spellings mean two keys, and therefore no exclusion. Rules:
@@ -278,6 +288,10 @@ Temp GC deletes `.tmp/` files whose entry is complete, or that have no entry and
 - the file of an entry that is not complete, however old: it is the commit.
 
 A claim that loses its version has removed its file already (§3.2), so what the collection finds without an entry is what a writer left when it died before taking a version (F1).
+
+*As built (P2a.13, 2026-11-16), from the review of P2a.*
+- **A temporary file that is gone is not always F17.** A process that reads an unfinished entry, or makes one, may stop for long before it publishes. Meanwhile another process publishes and acknowledges the commit, and the collection removes the file, rightly. The first process then found no file and reported the commit as unpublishable: to a reader, a call for an operator on a healthy table; to the commit's own writer, the failure of a commit that was in the log. When the file is missing, the protocol now reads the entry again. Complete, with the same temporary path, and with the commit file in the log, means that the work is done. Anything else is F17.
+- **The collection and Delta's log cleanup are not reconciled** (known limit). Delta removes commits below a checkpoint once they are older than the log retention, thirty days by default. If the temporary file of such a commit was not collected before, it is from then on the file of a complete entry whose commit file is missing: kept, and reported as an only copy. Collecting more often than the retention avoids it. Telling the two cases apart takes the version of the last checkpoint.
 
 ### 3.9 Instances, configuration and connections *(added in P2a.1, 2026-11-14)*
 
@@ -406,6 +420,8 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 | F17 | Incomplete entry whose `T(N)` no longer exists | Recovery cannot publish. Reads and writes fail closed with an error that names the entry; nothing is published and the entry stays incomplete, for an operator to resolve. |
 
 *F15–F17 were added in P2a (2026-11-14), from the review of Delta 4.4.1's commit path (§8). The suite is F1–F17.*
+
+*As built (P2a.13, 2026-11-16):* each scenario is tested three ways where it applies: against a store that fails on request, in one JVM; against a real PostgreSQL whose connection is cut or whose container is stopped; and with Delta itself on the LogStore. The matrix of scenarios and tests is in the module's [README](../../modules/delta-pg-logstore/README.md#scenarios-and-their-tests).
 
 ### 7.2 Stress test + verifier (multi-process)
 

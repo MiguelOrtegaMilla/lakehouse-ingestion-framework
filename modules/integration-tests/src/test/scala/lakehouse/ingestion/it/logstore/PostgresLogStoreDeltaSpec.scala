@@ -1,7 +1,6 @@
 package lakehouse.ingestion.it.logstore
 
-import java.net.URI
-import java.nio.file.{Files, Path => LocalPath, Paths}
+import java.nio.file.Files
 import java.util.UUID
 
 import scala.jdk.CollectionConverters._
@@ -9,23 +8,9 @@ import scala.util.Using
 
 import io.delta.storage.HDFSLogStore
 import io.delta.tables.DeltaTable
-import lakehouse.ingestion.it.support.{
-  BootstrappedPostgres,
-  CoordinationSchema,
-  CoordinationStores,
-  LocalSparkSuite
-}
 import lakehouse.ingestion.logstore._
-import lakehouse.ingestion.logstore.coordination.{
-  CommitEntry,
-  CoordinationSettings,
-  PostgresCoordinationStore,
-  Registration,
-  TableUri
-}
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.spark.sql.DataFrame
+import lakehouse.ingestion.logstore.coordination.Registration
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -39,62 +24,11 @@ import org.scalatest.matchers.should.Matchers
  * left is found by Delta; a version conflict is retried by Delta; the commits of a run are
  * attributed to it. The suites that call the LogStore's methods themselves test each scenario;
  * this one shows that Delta and the LogStore agree on what those methods mean.
+ * `PostgresLogStoreEndToEndSpec` goes on from here, with the operations an ingestion makes.
  */
-final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with LocalSparkSuite {
+final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with CoordinatedDeltaSuite {
 
-  import PostgresLogStoreDeltaSpec._
-
-  private lazy val pg = BootstrappedPostgres.start()
-  private lazy val settings =
-    CoordinationStores.settings(pg.jdbcUrl(CoordinationSchema.Database), pg)
-
-  /** A store of the test's own, to look at the registry and to play a writer that dies. */
-  private lazy val store = new PostgresCoordinationStore(settings)
-
-  private val fs = FileSystem.getLocal(new Configuration())
-
-  override protected def sparkConf: Map[String, String] = Map(
-    "spark.delta.logStore.file.impl" -> classOf[PostgresLogStore].getName,
-    s"spark.hadoop.${CoordinationSettings.JdbcUrl}" -> settings.jdbcUrl,
-    s"spark.hadoop.${CoordinationSettings.User}" -> settings.user,
-    s"spark.hadoop.${CoordinationSettings.PasswordRef}" -> settings.password.toString
-  )
-
-  override def beforeAll(): Unit = {
-    CoordinationSchema.migrate(pg): Unit
-    super.beforeAll()
-  }
-
-  override def afterAll(): Unit =
-    try super.afterAll()
-    finally
-      try store.close()
-      finally pg.stop()
-
-  private def rows(from: Long, until: Long): DataFrame = spark.range(from, until).toDF("id")
-
-  private def create(name: String): String = {
-    val path = tablePath(name)
-    rows(0L, 10L).write.format("delta").save(path)
-    path
-  }
-
-  private def append(path: String, from: Long, until: Long): Unit =
-    rows(from, until).write.format("delta").mode("append").save(path)
-
-  private def countOf(path: String): Long = spark.read.format("delta").load(path).count()
-
-  private def versionOf(path: String): Long = DeltaLog.forTable(spark, path).update().version
-
-  private def keyOf(path: String): TableUri = TableIdentity.of(new Path(path), fs)
-
-  private def logOf(path: String): LocalPath = Paths.get(URI.create(path)).resolve("_delta_log")
-
-  private def commitFile(path: String, version: Long): LocalPath =
-    logOf(path).resolve(f"$version%020d.json")
-
-  private def entry(path: String, version: Long): CommitEntry =
-    store.entry(keyOf(path), version).getOrElse(fail(s"version $version has no entry"))
+  import CoordinatedDeltaSuite.EmptyCommit
 
   test("Delta creates, appends to and reads a table, and the registry has every commit") {
     val path = create("orders")
@@ -128,13 +62,7 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Loc
 
     // Another process takes version 2 and dies before publishing it. The commit is empty, as a
     // transaction that changed nothing: what matters is that it has a version.
-    val dying = LogStores.over(store, LogStores.crashAt(FaultPoint.AfterInsert))
-    a[SimulatedCrash] should be thrownBy dying.write(
-      new Path(commitFile(path, 2).toUri),
-      Iterator(EmptyCommit).asJava,
-      false,
-      spark.sessionState.newHadoopConf()
-    )
+    dieAfterTaking(path, version = 2, Seq(EmptyCommit))
     Files.exists(commitFile(path, 2)) shouldBe false
     entry(path, 2).complete shouldBe false
 
@@ -229,6 +157,7 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Loc
     versionOf(path) shouldBe 1L
     countOf(path) shouldBe 20L
   }
+
   test("a commit made without the LogStore is in what Delta reads, and stops what Delta writes") {
     val path = create("tainted")
     append(path, 10L, 20L)
@@ -249,15 +178,4 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Loc
     versionOf(path) shouldBe 2L
     Files.exists(commitFile(path, 3)) shouldBe false
   }
-
-  /** `error` and everything that caused it. */
-  private def causesOf(error: Throwable): List[Throwable] =
-    Iterator.iterate(error)(_.getCause).takeWhile(_ != null).toList
-}
-
-object PostgresLogStoreDeltaSpec {
-
-  /** A commit that changes nothing, as Delta writes one. */
-  private val EmptyCommit =
-    """{"commitInfo":{"timestamp":1763200000000,"operation":"Manual Update","operationParameters":{}}}"""
 }

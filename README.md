@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phase 1 (bootstrap) complete; Phase 2a (PostgreSQL-backed LogStore) is in progress.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phase 2a (the PostgreSQL-coordinated LogStore, tested in one JVM and with Delta) is complete; Phase 2b (its proof with several processes) is next.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -15,7 +15,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | Module | Responsibility |
 |---|---|
 | `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. |
-| `delta-pg-logstore` | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. |
+| [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
 | `engine` | Connectors, Delta writers, control-plane repositories, engine service |
 | `cli` | Entry point, wiring, exit codes |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
@@ -37,6 +37,8 @@ sbt integration-tests/test              # integration tests (needs Docker)
 sbt "integration-tests/testOnly lakehouse.ingestion.it.delta.*"   # Spark + Delta smoke test only (no Docker)
 sbt "integration-tests/testOnly *DeltaLogStoreContractSpec"   # what Delta asks of a LogStore (no Docker)
 sbt "integration-tests/testOnly *PostgresLogStoreDeltaSpec"   # Delta on the PostgreSQL-coordinated LogStore (needs Docker)
+sbt "integration-tests/testOnly *PostgresLogStoreEndToEndSpec"   # the operations of an ingestion on it: idempotent append, MERGE, OPTIMIZE, VACUUM, checkpoints (needs Docker)
+sbt "delta-pg-logstore/testOnly * -- -z F14"   # the tests of one fault scenario of ADR-0004, here F14
 ```
 
 Tests that run Spark fork their own JVM with the Java 17 module options Spark needs (`project/SparkTestJvm.scala`), 1 GB of heap and UTC. `SparkJvmOptionsSpec` fails if a Spark upgrade changes those options and the build has not followed. The LogStore module's tests also run in a JVM of their own, because they use Hadoop's local file system.

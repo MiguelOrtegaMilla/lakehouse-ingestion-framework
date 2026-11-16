@@ -280,6 +280,20 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
     a[CommitMissingException] should be thrownBy lake.list()
   }
 
+  test("a table dropped under a writer that holds it in memory is not written again") {
+    val lake = new Lake().withCommits(last = 2)
+    // The table is dropped by deleting its files; the writer goes on to its next version.
+    (0L to 2L).foreach(version => Files.delete(lake.commitFile(version)))
+    lake.temps.foreach(Files.delete)
+
+    a[CommitMissingException] should be thrownBy lake.commit(3)(append(3))
+
+    // Not a log with one commit in it, for the next reader to make something of.
+    Files.exists(lake.commitFile(3)) shouldBe false
+    lake.temps shouldBe empty
+    lake.entry(3) shouldBe None
+  }
+
   test("a taken commit whose temporary file is gone stops the next writer, by name") {
     val lake = new Lake().withCommits(last = 0)
     val unfinished = lake.crashedAt(FaultPoint.AfterInsert, version = 1)
