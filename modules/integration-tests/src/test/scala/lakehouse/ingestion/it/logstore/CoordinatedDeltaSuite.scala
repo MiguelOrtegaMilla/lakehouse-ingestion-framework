@@ -58,12 +58,7 @@ trait CoordinatedDeltaSuite extends LocalSparkSuite with Assertions { self: Suit
 
   protected val fs: FileSystem = FileSystem.getLocal(new Configuration())
 
-  override protected def sparkConf: Map[String, String] = Map(
-    "spark.delta.logStore.file.impl" -> classOf[PostgresLogStore].getName,
-    s"spark.hadoop.${CoordinationSettings.JdbcUrl}" -> settings.jdbcUrl,
-    s"spark.hadoop.${CoordinationSettings.User}" -> settings.user,
-    s"spark.hadoop.${CoordinationSettings.PasswordRef}" -> settings.password.toString
-  )
+  override protected def sparkConf: Map[String, String] = CoordinationStores.sparkSettings(settings)
 
   override def beforeAll(): Unit = {
     CoordinationSchema.migrate(pg): Unit

@@ -2,6 +2,7 @@
 # Runs the LogStore stress spikes (ADR-0004 §7.3, `sbt stress`) and lists the reports this
 # invocation wrote. Each run keeps its table, journals, logs and probes in target/stress/<run>/,
 # next to its report.md. Needs about 3 GB of free memory: the test JVM plus three writer JVMs.
+# The runs on PostgresLogStore (spike GREEN) start PostgreSQL with Testcontainers: they need Docker.
 # Extra arguments go to sbt before the alias, e.g. -J-Xmx2g.
 set -euo pipefail
 

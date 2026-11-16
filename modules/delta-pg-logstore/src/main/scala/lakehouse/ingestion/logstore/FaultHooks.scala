@@ -1,6 +1,7 @@
 package lakehouse.ingestion.logstore
 
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicLongArray
 
 import org.apache.hadoop.conf.Configuration
 
@@ -46,8 +47,23 @@ object FaultHooks {
   @throws[IOException]
   def from(conf: Configuration): FaultHooks = {
     val delays = delaysIn(conf).toMap
-    if (delays.isEmpty) Off else point => delays.get(point).foreach(Thread.sleep)
+    if (delays.isEmpty) Off
+    else
+      point =>
+        delays.get(point).foreach { millis =>
+          Thread.sleep(millis)
+          waits.incrementAndGet(FaultPoint.All.indexOf(point)): Unit
+        }
   }
+
+  private val waits = new AtomicLongArray(FaultPoint.All.size)
+
+  /**
+   * How many times writers of this JVM have waited at `point` because a configuration asked for
+   * it. A run that widens a window with these hooks reports the count, to show that the wait
+   * was in the path of the commits it measured: one that was not would prove nothing.
+   */
+  def waitsAt(point: FaultPoint): Long = waits.get(FaultPoint.All.indexOf(point))
 
   /**
    * The waits a configuration asks for, in milliseconds, in the order of the protocol. A

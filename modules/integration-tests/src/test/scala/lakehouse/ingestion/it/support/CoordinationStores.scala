@@ -5,10 +5,23 @@ import java.nio.file.Files
 
 import scala.concurrent.duration._
 
+import lakehouse.ingestion.logstore.PostgresLogStore
 import lakehouse.ingestion.logstore.coordination.{CoordinationSettings, SecretRef}
 
 /** Settings with which tests open a `PostgresCoordinationStore` on a `BootstrappedPostgres`. */
 object CoordinationStores {
+
+  /**
+   * What makes a Spark application commit through `PostgresLogStore` with `settings`, as a
+   * deployment sets it: the LogStore by name for `file:`, and its settings under
+   * `spark.hadoop.`. The password travels as its reference, never as its value.
+   */
+  def sparkSettings(settings: CoordinationSettings): Map[String, String] = Map(
+    "spark.delta.logStore.file.impl" -> classOf[PostgresLogStore].getName,
+    s"spark.hadoop.${CoordinationSettings.JdbcUrl}" -> settings.jdbcUrl,
+    s"spark.hadoop.${CoordinationSettings.User}" -> settings.user,
+    s"spark.hadoop.${CoordinationSettings.PasswordRef}" -> settings.password.toString
+  )
 
   /**
    * Settings for a runtime role, the commit path's unless another is named, with its password

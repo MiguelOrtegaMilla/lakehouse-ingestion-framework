@@ -33,7 +33,8 @@ object StressReport {
       "extra writer JVM options",
       if (settings.extraJvmOptions.isEmpty) "(none)"
       else settings.extraJvmOptions.mkString(" ")
-    )
+    ),
+    Setting("startup guard", if (settings.guard) "every writer must pass it" else "not asked")
   )
 
   /**
@@ -82,16 +83,22 @@ object StressReport {
         "Log FileSystem",
         "HDFSLogStore lock",
         "Commit FileContext",
-        "Delayed renames"
+        "Delayed renames",
+        "Startup guard",
+        "Fault hook waits",
+        "Versions lost to other writers"
       ),
       s.writers.map { w =>
-        StressTable.writerId(w.writer) +: w.probe.fold(Seq.fill(5)("(no probe)")) { p =>
+        StressTable.writerId(w.writer) +: w.probe.fold(Seq.fill(8)("(no probe)")) { p =>
           Seq(
             code(p.logStore),
             code(p.logFileSystem),
             if (p.hdfsLogStoreLockTaken) "taken (per instance)" else "not taken",
             code(p.commitFileContext),
-            p.delayedRenames.toString
+            p.delayedRenames.toString,
+            if (p.guarded) "passed" else "not asked",
+            p.faultWaits.map { case (point, waits) => s"$point: $waits" }.mkString(", "),
+            p.contention.toString
           )
         }
       }
@@ -144,7 +151,10 @@ object StressReport {
       "What each writer JVM resolved for the table, recorded by the writer itself: the code " +
         "path the result was measured on. `HDFSLogStore` takes its `synchronized (this)` lock " +
         "only on a `RawLocalFileSystem`, and even then the lock is per instance, never across " +
-        "JVMs.",
+        "JVMs. The last three columns are about `PostgresLogStore`: whether the writer had to " +
+        "pass its startup guard before touching the table; how many times it waited at each " +
+        "fault hook that its configuration turned on; and how many times one of its commits " +
+        "found its version taken by another writer, after which Delta tried the next version.",
       probeTable,
       "## Result",
       verdict,

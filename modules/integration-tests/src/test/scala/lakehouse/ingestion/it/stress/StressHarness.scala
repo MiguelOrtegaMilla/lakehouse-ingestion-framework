@@ -28,6 +28,8 @@ object StressHarness {
   /**
    * @param extraJvmOptions added to every writer's command line, typically `-Dspark.*` settings
    *   (the LogStore, a delaying file system)
+   * @param guard whether every writer must pass the startup guard of `PostgresLogStore` before
+   *   it touches the table (`WriterConfig.guard`)
    */
   final case class Settings(
       writers: Int,
@@ -35,6 +37,7 @@ object StressHarness {
       rowsPerCommit: Int,
       writerHeap: String = "512m",
       extraJvmOptions: Seq[String] = Nil,
+      guard: Boolean = false,
       readyTimeout: FiniteDuration = 2.minutes,
       runTimeout: FiniteDuration = 15.minutes
   ) {
@@ -93,7 +96,8 @@ object StressHarness {
       writer,
       settings.commits,
       settings.rowsPerCommit,
-      startTimeout
+      startTimeout,
+      settings.guard
     )
     val command =
       Seq(javaExecutable) ++

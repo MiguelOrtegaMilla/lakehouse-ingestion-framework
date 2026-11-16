@@ -1,6 +1,7 @@
 package lakehouse.ingestion.it.stress
 
 import java.nio.file.Files
+import java.util.UUID
 
 import scala.annotation.tailrec
 import scala.concurrent.duration._
@@ -9,6 +10,13 @@ import scala.util.{Failure, Success, Try, Using}
 
 import io.delta.tables.DeltaTable
 import lakehouse.ingestion.it.support.LocalSparkSuite
+import lakehouse.ingestion.logstore.{
+  CommitContext,
+  PostgresLogStore,
+  StartupGuard,
+  StartupRefusedException
+}
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 
 /**
@@ -19,6 +27,15 @@ import org.apache.spark.sql.SparkSession
  * and `txnVersion = 1..commits`, journaling each one after its write returns, and stops at the
  * first failure. Everything else, including which LogStore is used, comes from `-Dspark.*`.
  * As it exits it records what its Delta and Hadoop actually resolved (`WriterProbe`).
+ *
+ * A writer that is asked to (`WriterConfig.guard`) starts the way an application on
+ * `PostgresLogStore` must: before it touches the table it runs the startup guard on its own
+ * configuration, and after loading the table it asks Delta which LogStore it resolved, which
+ * is the one thing the guard cannot see. It refuses to run on any problem.
+ *
+ * Every writer attributes its commits to a run of its own (`CommitContext`). On
+ * `PostgresLogStore` that puts the run in each coordination entry, and counts the versions the
+ * writer lost to others; on any other LogStore it does nothing.
  *
  * The exit code tells the orchestrator how far the writer got (`ExitCode`).
  */
@@ -37,6 +54,12 @@ object StressWriter {
 
     /** The orchestrator JVM died; the writer halted so it does not outlive the run. */
     val Orphaned = 3
+
+    /**
+     * The startup guard refused the process: as configured it would not coordinate its commits.
+     * The table was not touched. (The exit code the discovery gives the engine for the same.)
+     */
+    val Refused = 4
   }
 
   private val BarrierPoll = 5.millis
@@ -74,16 +97,25 @@ object StressWriter {
       case Success(spark) =>
         try
           prepare(spark, config, run) match {
+            case Left(refusal: StartupRefusedException) =>
+              report(id, "refused to start: its commits would not be coordinated", refusal)
+              ExitCode.Refused
             case Left(error) =>
               report(id, "setup failed before the start barrier", error)
               ExitCode.SetupFailed
             case Right(probe) =>
               val started = System.nanoTime()
+              val commits = CommitContext.forRun(UUID.randomUUID())
               val code =
-                try commitAll(spark, config, run, journal)
+                try commitAll(spark, config, run, journal, commits)
                 finally
                   probe
-                    .copy(delayedRenames = DelayingLocalFs.delayedRenames)
+                    .copy(
+                      delayedRenames = DelayingLocalFs.delayedRenames,
+                      runId = commits.runId.toString,
+                      contention = commits.contention,
+                      faultWaits = WriterProbe.faultWaitsOfThisJvm
+                    )
                     .write(run.probe(config.writer))
               val elapsed = (System.nanoTime() - started).nanos.toMillis
               println(s"$id: exit code $code after $elapsed ms")
@@ -144,8 +176,17 @@ object StressWriter {
       run: StressRun
   ): Either[Throwable, WriterProbe] =
     Try {
+      // First of all, and before the table is looked at: what this process is set up to do.
+      if (config.guard)
+        StartupGuard.require(spark.sessionState.newHadoopConf(), new Path(run.root.toUri))
       DeltaTable.forPath(spark, run.tableUri).toDF.schema
-      val probe = WriterProbe.resolve(spark, run.tableUri)
+      val probe = WriterProbe.resolve(spark, run.tableUri).copy(guarded = config.guard)
+      // What the guard cannot see, since it does not see Delta: the LogStore Delta resolved.
+      val coordinated = classOf[PostgresLogStore].getName
+      if (config.guard && probe.logStore != coordinated)
+        throw new StartupRefusedException(
+          Seq(s"Delta resolves ${probe.logStore} for ${run.tableUri}, not $coordinated")
+        )
       Files.createFile(run.readyMarker(config.writer))
       awaitStart(run, config.startTimeout.fromNow)
       probe
@@ -164,13 +205,14 @@ object StressWriter {
       spark: SparkSession,
       config: WriterConfig,
       run: StressRun,
-      journal: AckJournal
+      journal: AckJournal,
+      commits: CommitContext
   ): Int = {
     @tailrec
     def loop(k: Long): Int =
       if (k > config.commits) ExitCode.Ok
       else
-        Try(append(spark, config, run, k)) match {
+        Try(commits.attribute(append(spark, config, run, k))) match {
           case Success(()) =>
             journal.ack(k)
             loop(k + 1)
