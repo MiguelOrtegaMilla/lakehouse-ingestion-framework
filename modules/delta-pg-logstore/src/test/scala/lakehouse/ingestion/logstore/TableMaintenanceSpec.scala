@@ -9,7 +9,10 @@ import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
 import io.delta.storage.HDFSLogStore
-import lakehouse.ingestion.logstore.coordination.FaultyCoordinationStore.ReadLatestEntry
+import lakehouse.ingestion.logstore.coordination.FaultyCoordinationStore.{
+  ReadEntry,
+  ReadLatestEntry
+}
 import lakehouse.ingestion.logstore.coordination.{
   CommitEntry,
   Readoption,
@@ -265,6 +268,55 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val nothing = the[MaintenanceRefusedException] thrownBy
       maintenanceOf(unknown).reset(hadoop(unknown.directory), fs)
     nothing.getMessage should include("not registered")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A writer that was not stopped (a known limit: nothing fences it against the operator)
+  // ---------------------------------------------------------------------------------------------
+
+  /** The table is dropped, its registry reset, and a table created again at its path. */
+  private def dropAndCreateAgain(lake: Lake, upTo: Long): Unit = {
+    val latest = lake.memory.latestEntry(lake.table).value.version
+    (0L to latest).foreach(version => Files.deleteIfExists(lake.commitFile(version)))
+    lake.temps.foreach(Files.delete)
+    maintenanceOf(lake).reset(hadoop(lake.directory), fs)
+    lake.commit(0)(Creation)
+    (1L to upTo).foreach(version => lake.commit(version)(append(version)))
+  }
+
+  test("a writer stalled in its checks while its table is dropped and created again is refused") {
+    val lake = new Lake().withCommits(last = 5)
+    // The writer of version 6 has asked for the entry of version 5, the last of its questions
+    // to the registry, when it stalls. It goes on in another table.
+    lake.store.afterNext(ReadEntry)(dropAndCreateAgain(lake, upTo = 2))
+
+    val missing = the[CommitMissingException] thrownBy lake.commit(6)(append(6))
+
+    // The commit before its own is not in the log of the new table: nothing is written.
+    missing.version shouldBe 5L
+    lake.entry(6) shouldBe None
+    lake.list() shouldBe (0L to 2L).map(commit)
+  }
+
+  test("a writer stalled before its INSERT takes a version of the new table, and cannot publish") {
+    val lake = new Lake().withCommits(last = 5)
+    val stalled = LogStores.at(FaultPoint.BeforeInsert)(dropAndCreateAgain(lake, upTo = 2))
+
+    // Its temporary file went with the old table. The version it takes is the new table's.
+    an[UnpublishableCommitException] should be thrownBy
+      lake.commit(6, lake.logStore(stalled))(append(6))
+    val taken = lake.entry(6).value
+    taken.complete shouldBe false
+
+    // Closed, not corrupted: the new table's readers stop at the entry, by name.
+    an[UnpublishableCommitException] should be thrownBy lake.list()
+    Files.exists(lake.commitFile(6)) shouldBe false
+
+    // The way out is the operator's: the log as it stands is the table.
+    maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None) shouldBe
+      Readopted(lake.table, 2L, Readoption(None, Seq(taken)))
+    lake.list() shouldBe (0L to 2L).map(commit)
+    lake.commit(3)(append(3))
   }
 
   // ---------------------------------------------------------------------------------------------
