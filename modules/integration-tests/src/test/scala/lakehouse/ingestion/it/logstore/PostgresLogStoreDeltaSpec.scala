@@ -140,6 +140,8 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Coo
     run.attribute(transaction.commit(Nil, DeltaOperations.ManualUpdate)) shouldBe 2L
 
     run.contention shouldBe 1L
+    // The other writer's commit was in the log by then: this one was behind, not beside it.
+    run.contentionAtInsert shouldBe 0L
     (0L to 2L).map(entry(path, _).runId) shouldBe Seq(None, None, Some(run.runId))
   }
 

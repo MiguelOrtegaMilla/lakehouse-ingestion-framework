@@ -95,7 +95,7 @@ final private[logstore] class CommitProtocol(
   ): Unit = {
     // Not the mutual exclusion, which is the entry. It spares a temporary file and an INSERT
     // when the version is plainly gone.
-    if (log.exists(target)) throw taken(target, context)
+    if (log.exists(target)) throw taken(target, context, atInsert = false)
 
     val (registration, lines) = admit(log, version, actions, context)
 
@@ -140,7 +140,7 @@ final private[logstore] class CommitProtocol(
 
       case TakeResult.TakenBy(_) =>
         discard(log, temp)
-        throw taken(target, context)
+        throw taken(target, context, atInsert = true)
 
       // Registered a moment ago: only maintenance removes a registration.
       case TakeResult.NotRegistered =>
@@ -289,7 +289,7 @@ final private[logstore] class CommitProtocol(
           .map(latest => s"its commits up to version ${latest.version} are recorded")
     known.foreach { what =>
       val creation = log.commitFile(0)
-      if (log.exists(creation)) throw taken(creation, context)
+      if (log.exists(creation)) throw taken(creation, context, atInsert = false)
       throw new StaleRegistrationException(log.table, what)
     }
   }
@@ -444,11 +444,18 @@ private[logstore] object CommitProtocol {
 
   /**
    * The version went to another writer, and the run is told. The writer learns it from the
-   * commit file or from the entry, depending on how far the winner had got: that says nothing
-   * about the contention, so both count.
+   * commit file or from the entry, depending on how far the winner had got. Both are
+   * contention, and both are counted; which of the two it was is counted too, since only the
+   * second means that the two writers were committing the version at the same time.
+   *
+   * @param atInsert whether the claim found the version taken, and not the look at the log
    */
-  private def taken(target: Path, context: Option[CommitContext]): FileAlreadyExistsException = {
-    context.foreach(_.versionLost())
+  private def taken(
+      target: Path,
+      context: Option[CommitContext],
+      atInsert: Boolean
+  ): FileAlreadyExistsException = {
+    context.foreach(_.versionLost(atInsert))
     new FileAlreadyExistsException(target.toString)
   }
 }

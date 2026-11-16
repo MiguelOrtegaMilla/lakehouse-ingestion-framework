@@ -126,6 +126,8 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
 
     a[FileAlreadyExistsException] should be thrownBy run.attribute(lake.commit(1)(append(99)))
     run.contention shouldBe 1L
+    // The commit was in the log already: the writer was behind, not inside the same commit.
+    run.contentionAtInsert shouldBe 0L
 
     // What Delta does next: the same commit, at the next version.
     run.attribute(lake.commit(2)(append(99)))
@@ -147,7 +149,29 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
     a[FileAlreadyExistsException] should be thrownBy run.attribute(lake.commit(1)(append(1)))
 
     run.contention shouldBe 1L
+    // Nothing was in the log when it looked: both writers were committing version 1 at once.
+    run.contentionAtInsert shouldBe 1L
     lake.entry(1).value.runId shouldBe Some(winner)
+  }
+
+  test("a run counts apart the versions it lost at the INSERT and the ones it found in the log") {
+    val lake = new Lake().withCommits(last = 1)
+    val run = newRun()
+
+    // Twice behind: version 1 is in the log.
+    (1 to 2).foreach { _ =>
+      a[FileAlreadyExistsException] should be thrownBy run.attribute(lake.commit(1)(append(99)))
+    }
+    // Three times inside a commit together with another writer: this one has looked at the
+    // log and written its temporary file when the other takes the version.
+    (2L to 4L).foreach { version =>
+      val meanwhile = LogStores.at(FaultPoint.BeforeInsert)(lake.commit(version)(append(version)))
+      a[FileAlreadyExistsException] should be thrownBy
+        run.attribute(lake.commit(version, lake.logStore(meanwhile))(append(99)))
+    }
+
+    run.contention shouldBe 5L
+    run.contentionAtInsert shouldBe 3L
   }
 
   test("a creation lost to a writer that finished it in the meantime is counted the same") {
@@ -158,6 +182,8 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
     a[FileAlreadyExistsException] should be thrownBy run.attribute(lake.commit(0)(Creation))
 
     run.contention shouldBe 1L
+    // The writer learnt it from the log, on its second look: the table was there by then.
+    run.contentionAtInsert shouldBe 0L
   }
 
   test("F15: a claim that another writer's overtook while the reply was lost is counted once") {
@@ -169,6 +195,7 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
     a[FileAlreadyExistsException] should be thrownBy run.attribute(lake.commit(1)(append(1)))
 
     run.contention shouldBe 1L
+    run.contentionAtInsert shouldBe 1L
   }
 
   test("F15: a version taken while the reply was lost is the run's own, and no contention") {

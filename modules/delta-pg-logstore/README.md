@@ -48,7 +48,8 @@ It refuses to go on, with every problem at once, if Delta is not told to use thi
 ```scala
 val commits = CommitContext.forRun(runId)
 commits.attribute { rows.write.format("delta").mode("append").save(path) }
-commits.contention
+commits.contention          // versions lost to other writers
+commits.contentionAtInsert  // of them, the ones lost while both were committing the version
 ```
 
 **Tables.** A table created through the LogStore is registered by its first commit. A table that exists already is adopted (below). Commits to any other table are refused.
