@@ -1,0 +1,88 @@
+# The LogStore stress runs (discovery §17, P2b.6; ADR-0004 §7.2–7.3): `sbt stress`, with the
+# natural race at the size of CI, eight writers that make 500 commits each.
+#
+# On demand and once a week. Not on pull requests: the runs take more than an hour, and they are
+# evidence under load, not a gate. The gate is ci.yml, whose tests inject every fault of the
+# protocol at a named point and run writers in several processes, with a writer killed and
+# PostgreSQL killed among them. Before merging a change to the LogStore, run this workflow by
+# hand on the branch of the change.
+#
+# Eight writer JVMs with 512 MB of heap, the test JVM and PostgreSQL need about 9 GB: the 16 GB
+# of the runners that public repositories get.
+#
+# Every third-party action is pinned by commit SHA, as in ci.yml (scripts/check-pins.sh).
+name: Stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      writers:
+        description: Writers of a natural run
+        default: "8"
+      commits:
+        description: Commits of each writer in a natural run
+        default: "500"
+      natural_runs:
+        description: Natural runs (0 leaves them out)
+        default: "1"
+  schedule:
+    # Mondays at 03:17 UTC. Off the hour, when scheduled workflows queue.
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stress:
+    name: LogStore stress runs
+    runs-on: ubuntu-24.04
+    # The natural run is given 15 s for each commit of a writer before the harness gives it up.
+    timeout-minutes: 240
+    env:
+      # A scheduled run has no inputs, and gets the sizes of CI.
+      STRESS_WRITERS: ${{ inputs.writers || '8' }}
+      STRESS_COMMITS: ${{ inputs.commits || '500' }}
+      STRESS_NATURAL_RUNS: ${{ inputs.natural_runs || '1' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The JDK comes from .sdkmanrc, the same pin as local development.
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version-file: .sdkmanrc
+          cache: sbt
+      - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+      # The four suites: Delta's default LogStore (RED), where a lost commit is the expected
+      # result, and PostgresLogStore (GREEN) with its kills and its outage of PostgreSQL.
+      - name: Stress runs
+        run: scripts/stress-logstore.sh
+      - name: Summary of the runs
+        if: always()
+        run: scripts/stress-summary.sh >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stress-reports
+          path: target/stress/*/report.md
+          retention-days: 30
+          if-no-files-found: ignore
+      # What a failure is looked into with: each writer's journal, log and probe. The tables stay.
+      - name: Upload the evidence of a failed run
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stress-evidence
+          path: |
+            target/stress/*/journals/
+            target/stress/*/logs/
+            target/stress/*/probes/
+            modules/*/target/test-reports/
+          retention-days: 7
+          if-no-files-found: ignore
