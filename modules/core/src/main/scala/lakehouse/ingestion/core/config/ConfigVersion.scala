@@ -30,8 +30,10 @@ import io.circe.{ACursor, Json}
  *
  * @param hash the SHA-256 of `text`, in hexadecimal
  * @param content `{ schema_version, profile, source }`
+ * @param origin the paths in `content` of the fields that say where the rows of the source
+ *   come from, as its connector names them. They are not content, and not in the hash
  */
-final case class ConfigVersion(hash: String, content: Json) {
+final case class ConfigVersion(hash: String, content: Json, origin: Vector[String]) {
 
   /** The content as it was hashed: keys in order, no space, no field that is null. */
   def text: String = ConfigVersion.print(content)
@@ -54,7 +56,9 @@ object ConfigVersion {
         "source" -> canonical(source)
       )
       .deepDropNullValues
-    ConfigVersion(sha256(print(content)), content)
+    val origin =
+      "source.connector.type" +: source.connector.origin.map(field => s"source.connector.$field")
+    ConfigVersion(sha256(print(content)), content, origin.toVector)
   }
 
   private def print(content: Json): String = content.noSpacesSortKeys
@@ -185,6 +189,10 @@ object ConfigVersion {
    * older version of the application wrote can still be compared: what it does not have is no
    * change.
    *
+   * Where the rows come from is one of them only for a source that was loaded by a watermark
+   * and still is: the kind of its connector, and the fields that its connector names as its
+   * origin, a database and a table for JDBC.
+   *
    * @param last the content of the snapshot of the last run
    */
   def breakingChanges(last: Json, now: ConfigVersion): Vector[BreakingChange] = {
@@ -199,6 +207,15 @@ object ConfigVersion {
         is <- at(now.content, path: _*)
         if was != is
       } yield BreakingChange(path.head, path.tail.mkString("."), shown(was), shown(is), consequence)
+
+    val incremental = Some(Json.fromString(Load.Mode.Incremental.name))
+    val byWatermark =
+      at(last, "source", "load", "mode") == incremental && at(
+        now.content,
+        "source",
+        "load",
+        "mode"
+      ) == incremental
 
     val silver = Seq("source", "targets", "silver", "table")
     val sameSilver =
@@ -250,6 +267,15 @@ object ConfigVersion {
         "watermark",
         "column"
       )
-    ).flatten
+    ).flatten ++
+      // A watermark says how far one table of one database was read. Of another, it says
+      // nothing, and a full load takes everything whatever it is.
+      now.origin.filter(_ => byWatermark).flatMap { field =>
+        changed(
+          "the watermark that is stored is of what was read before, and going on from it would " +
+            "skip rows of what is read now without a word",
+          field.split('.').toIndexedSeq: _*
+        )
+      }
   }
 }

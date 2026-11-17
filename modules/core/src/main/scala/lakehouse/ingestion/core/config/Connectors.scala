@@ -19,6 +19,15 @@ trait ConnectorConfig {
    * kind reads back from this must be this configuration again.
    */
   def canonical: Json
+
+  /**
+   * The fields of `canonical` that say where the rows come from, each by its path in the
+   * section, as `connection.url`. A source that is loaded by a watermark and changes one of
+   * them has a watermark of somewhere else: going on from it would skip rows without a word
+   * (`ConfigVersion.breakingChanges`). How the place is reached, a user or a timeout, is not
+   * one of them.
+   */
+  def origin: Seq[String]
 }
 
 /**
@@ -66,6 +75,9 @@ final case class JdbcConnectorConfig(connection: DatabaseConnection, table: Qual
 
   override def canonical: Json =
     Json.obj("connection" -> connection.canonical, "table" -> Json.fromString(table.toString))
+
+  /** The database and the table. The role, the password, TLS and the timeouts are how it is reached. */
+  override def origin: Seq[String] = Seq("connection.url", "table")
 }
 
 object JdbcConnector extends ConnectorKind {
@@ -100,6 +112,8 @@ final case class FileConnectorConfig(
     "format" -> Json.fromString(format.name),
     "pattern" -> pattern.fold(Json.Null)(p => Json.fromString(p.value))
   )
+
+  override def origin: Seq[String] = Seq("path", "pattern")
 }
 
 object FileConnectorConfig {

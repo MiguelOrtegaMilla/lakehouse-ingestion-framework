@@ -212,6 +212,7 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
           "endpoint" -> io.circe.Json.fromString(endpoint),
           "page_size" -> io.circe.Json.fromInt(pageSize)
         )
+      override def origin: Seq[String] = Seq("endpoint")
     }
     object Rest extends ConnectorKind {
       override val name: String = "rest"

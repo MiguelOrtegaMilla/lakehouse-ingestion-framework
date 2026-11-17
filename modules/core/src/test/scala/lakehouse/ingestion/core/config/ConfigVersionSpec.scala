@@ -238,8 +238,16 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
         SourceText + "owner: team-sales\nenabled: false\nquality: { max_rejected_ratio: 0.05 }\nfreshness_sla: 1h\n"
       ),
       version(changed(SourceText, "lookback: 10m", "lookback: 1h")),
-      version(changed(SourceText, "localhost:5432/sales", "db.internal:5432/sales")),
+      // How the database is reached, not which database it is.
       version(changed(SourceText, "env:SALES_RO_PASSWORD", "file:/run/secrets/sales_ro")),
+      version(changed(SourceText, "user: sales_ro", "user: sales_reader")),
+      version(
+        changed(
+          SourceText,
+          "tls: { mode: disable }",
+          "tls: { mode: disable }\n    timeouts: { connect: 2s, statement: 1m }"
+        )
+      ),
       version(
         SourceText + "schema: { on_new_column: rescue }\ncolumns:\n  email: { pii: email }\n"
       ),
@@ -282,6 +290,93 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     )
   }
 
+  private val Full = SourceText.replace(
+    "  mode: incremental\n  watermark: { column: updated_at, lookback: 10m }\n",
+    "  mode: full\n"
+  )
+
+  private val elsewhere = "the watermark that is stored is of what was read before, and going on " +
+    "from it would skip rows of what is read now without a word"
+
+  test("a source loaded by a watermark that reads another table or database is a breaking change") {
+    breaking(
+      version(changed(SourceText, "table: public.orders", "table: public.orders_v2"))
+    ) shouldBe
+      Seq(s"connector.table of the source was public.orders and is public.orders_v2: $elsewhere")
+    breaking(
+      version(changed(SourceText, "localhost:5432/sales", "localhost:5432/sales_replica"))
+    ) shouldBe Seq(
+      "connector.connection.url of the source was jdbc:postgresql://localhost:5432/sales and is " +
+        s"jdbc:postgresql://localhost:5432/sales_replica: $elsewhere"
+    )
+    // Another host or another port is another database, as far as anybody can tell from here.
+    breaking(
+      version(changed(SourceText, "localhost:5432/sales", "db.internal:5432/sales"))
+    ) should have size 1
+    breaking(
+      version(changed(SourceText, "localhost:5432/sales", "localhost:6432/sales"))
+    ) should have size 1
+    // Written another way, it is the same database: the port that is left out is 5432.
+    breaking(version(changed(SourceText, "localhost:5432/sales", "localhost/sales"))) shouldBe empty
+
+    val both = changed(
+      changed(SourceText, "table: public.orders", "table: archive.orders"),
+      "5432/sales",
+      "5432/archive"
+    )
+    ConfigVersion.breakingChanges(version().content, version(both)).map(_.field) shouldBe
+      Seq("connector.connection.url", "connector.table")
+  }
+
+  test("a source loaded in full reads another table or another database as it likes") {
+    val elsewhereInFull = changed(
+      changed(Full, "table: public.orders", "table: public.orders_v2"),
+      "5432/sales",
+      "5432/archive"
+    )
+
+    // There is no watermark to go on from: a full load takes everything, whatever it is.
+    breaking(version(elsewhereInFull), last = version(Full)) shouldBe empty
+    // From a watermark to full loads, and from full loads to a watermark that starts anew.
+    breaking(version(elsewhereInFull)) shouldBe empty
+    breaking(
+      version(changed(SourceText, "table: public.orders", "table: public.orders_v2")),
+      last = version(Full)
+    ) shouldBe empty
+  }
+
+  test("what the origin of a source is, is its connector's to say") {
+    version().origin shouldBe
+      Vector("source.connector.type", "source.connector.connection.url", "source.connector.table")
+    // The origin is not content: it is in no hash.
+    version().text should not include "origin"
+
+    // A kind of connector that loads by a watermark names its own, and is held to it.
+    final case class Feed(endpoint: String, token: SecretRef) extends ConnectorConfig {
+      override def kind: String = "feed"
+      override def canonical: Json = Json.obj(
+        "endpoint" -> Json.fromString(endpoint),
+        "token" -> Json.obj("secretRef" -> Json.fromString(token.toString))
+      )
+      override def origin: Seq[String] = Seq("endpoint")
+    }
+    def feed(endpoint: String, token: String): ConfigVersion = ConfigVersion.of(
+      profile(ProfileText),
+      source(SourceText).copy(connector = Feed(endpoint, SecretRef.Env(token)))
+    )
+    def fields(last: ConfigVersion, now: ConfigVersion): Seq[String] =
+      ConfigVersion.breakingChanges(last.content, now).map(_.field)
+
+    fields(feed("https://a.example/orders", "T1"), feed("https://b.example/orders", "T1")) shouldBe
+      Seq("connector.endpoint")
+    fields(
+      feed("https://a.example/orders", "T1"),
+      feed("https://a.example/orders", "T2")
+    ) shouldBe empty
+    // And another kind of connector altogether reads from somewhere else.
+    fields(version(), feed("https://a.example/orders", "T1")) shouldBe Seq("connector.type")
+  }
+
   test("every breaking change of a configuration is said, not the first alone") {
     val now = version(
       changed(
@@ -301,11 +396,7 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
       "  silver: { table: silver/sales/orders, partition_by: [order_day] }\n",
       ""
     )
-    val full = SourceText
-      .replace(
-        "  mode: incremental\n  watermark: { column: updated_at, lookback: 10m }\n",
-        "  mode: full\n"
-      )
+    val full = Full
 
     // Silver given up, and taken up again later with another key: nothing merged is in the way.
     breaking(version(bronzeOnly.replace("keys: [order_id]", "keys: [id]"))) shouldBe empty
