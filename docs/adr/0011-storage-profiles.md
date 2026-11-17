@@ -51,6 +51,10 @@ Source metadata refers to tables relatively (`bronze/sales/orders`). A `TableLoc
 - **Spark settings may not name a LogStore, a master or a credential.**
 - **Nothing is connected to and no name is looked up.** A profile whose databases cannot be reached validates in milliseconds.
 
+*As built (P3.6, 2026-11-17):* `PathTableLocator` in `core`.
+- **A table's URI is the root of the lake and the table's path after it.** Each is written one way where it is read (`RootUri`, `RelativePath`), so nothing is left to normalise, and a location outside the lake cannot be made.
+- **The split of the note above holds in a test** (`TableLocationAgreementSpec`). For a lake without links, the URI of `core` is the directory that `TableIdentity` keys the table by, before the table exists and after. Through a symbolic link in the lake's root, `core` gives two URIs and `TableIdentity` one key: it is the key that keeps commits apart, and the LogStore that makes it.
+
 ### 3. Everything a recovering node needs lives next to the table
 
 The LogStore temp files are in `<table>/_delta_log/.tmp/` on the shared storage, so any driver on any node or cluster can finish a half-published commit. Nothing correctness-related is kept on local disk or in JVM memory. Spark's shuffle and scratch directories stay node-local, as usual.
