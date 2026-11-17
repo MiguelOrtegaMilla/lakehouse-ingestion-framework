@@ -66,7 +66,8 @@ sbt scalafmtCheckAll scalafmtSbtCheck checkBoundaries Test/compile test   # need
 Several writer JVMs commit to one Delta table at the same time. A verifier then checks the result against what each writer saw succeed ([ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md) §7). These runs take minutes, so `sbt test` leaves them out:
 
 ```bash
-scripts/stress-logstore.sh   # runs `sbt stress` and lists the reports written (~3 GB of free memory; the runs on PostgresLogStore need Docker)
+scripts/stress-logstore.sh   # runs `sbt stress` and lists the reports written: about 65 minutes, ~4 GB of free memory, Docker for the runs on PostgresLogStore
+STRESS_NATURAL_RUNS=0 scripts/stress-logstore.sh   # without the ten natural runs of the GREEN spike: about 12 minutes
 sbt "integration-tests/Stress/testOnly *SpikeGreenSpec"   # only the runs on PostgresLogStore (needs Docker)
 ```
 
@@ -81,7 +82,7 @@ Three writer JVMs append to one table with Delta's default configuration ([full 
 | Natural race (3 × 200 commits, no fault injection) | **2 of 5** |
 | Widened window (a delay just before the rename that publishes the commit) | **5 of 5** |
 
-Delta notices nothing: the lost commit's file is replaced, not removed, so the log has no gap. On `file://`, Hadoop's `.crc` sidecar usually goes stale, and every reader that checks it then fails. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit. The fix is [ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md); its GREEN result comes in P2b.
+Delta notices nothing: the lost commit's file is replaced, not removed, so the log has no gap. On `file://`, Hadoop's `.crc` sidecar usually goes stale, and every reader that checks it then fails. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit. The fix is [ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md). The same suite on `PostgresLogStore` lost no commit: [Spike GREEN](docs/spikes/logstore-green.md), which is completed as P2b goes on.
 
 ## Local services
 
