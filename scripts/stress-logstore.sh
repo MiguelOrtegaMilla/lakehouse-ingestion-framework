@@ -3,8 +3,8 @@
 # invocation wrote. Each run keeps its table, journals, logs and probes in target/stress/<run>/,
 # next to its report.md. Needs about 3 GB of free memory: the test JVM plus three writer JVMs.
 # The runs on PostgresLogStore (spike GREEN) start PostgreSQL with Testcontainers: they need Docker.
-# The whole takes about 65 minutes, most of it in the ten natural runs of the GREEN spike;
-# STRESS_NATURAL_RUNS sets another number of them, and 0 leaves them out (about 12 minutes).
+# The whole takes about 75 minutes, most of it in the ten natural runs of the GREEN spike;
+# STRESS_NATURAL_RUNS sets another number of them, and 0 leaves them out (about 20 minutes).
 # Extra arguments go to sbt before the alias, e.g. -J-Xmx2g.
 set -euo pipefail
 

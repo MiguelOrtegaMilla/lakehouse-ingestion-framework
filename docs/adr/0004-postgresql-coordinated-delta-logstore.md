@@ -8,7 +8,7 @@
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0010](0010-concurrent-write-conflict-handling.md), [ADR-0011](0011-storage-profiles.md) |
 | **Sources studied** | `delta-io/delta` tag `v4.4.0`: `storage/.../LogStore.java`, `HadoopFileSystemLogStore.java`, `HDFSLogStore.java`, `storage-s3-dynamodb/.../BaseExternalLogStore.java`, `ExternalCommitEntry.java`, `S3DynamoDBLogStore.java`, `storage/.../commit/CommitCoordinatorClient.java`, `spark/.../coordinatedcommits/*`, `PROTOCOL.md` (catalog-managed tables); docs.delta.io *Storage configuration* and *Catalog-managed tables*. `BaseExternalLogStore` and `S3DynamoDBLogStore` are identical in `v4.4.0` and `master` at the time of writing. Re-read at tag `v4.4.1`, with Hadoop 3.4.2's `ChecksumFileSystem`, `ChecksumFs` and `RawLocalFileSystem`, in P2a.1. |
 | **Superseded in part** | [ADR-0015](0015-hard-link-publish-on-local-file-systems.md) (2026-11-14) replaces the `file://` publish of §3.4, with the rows of §3.8 and §4 that describe it. [ADR-0017](0017-a-failed-publish-is-reported-not-swallowed.md) (2026-11-14) replaces the handling of a failed publish in §3.2 and in deviation 4. Those passages keep their original text and point to the new ADR. |
-| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. P2a.13 (2026-11-16): §3.2, §3.5, §3.8 and §7.1, from the review of P2a. After P2a (2026-11-16): §3.1, §3.2 and §3.5, the generation of a registration; §3.8, the temporary files of expired commits. P2b.1 (2026-11-16): §3.5 and §7.3, as built. P2b.2 (2026-11-16): §7.2, as built. P2b.3 (2026-11-16): §3.7, the contention at the `INSERT`; §7.3, the GREEN result. Each change is dated in place and says what the text said before. |
+| **Amended** | P1.4d (2026-11-13): §1.2, §3.4, §3.6, from the RED spike. P2a (2026-11-14): open items answered (§8), and with them §2, §3.2, §3.5, §3.9 (new), §6, §7. P2a.6 (2026-11-15): §3.6, as built. P2a.7 (2026-11-15): §3.5, layer 1; §8, item 5 closed. P2a.8 (2026-11-15): §3.2 and §7.3, as built. P2a.9 (2026-11-15): §3.3 as built; §4, the `PathLock`. P2a.10 (2026-11-15): §3.5, as built. P2a.11 (2026-11-16): §3.5 and §3.8, as built. P2a.12 (2026-11-16): §3.7, as built. P2a.13 (2026-11-16): §3.2, §3.5, §3.8 and §7.1, from the review of P2a. After P2a (2026-11-16): §3.1, §3.2 and §3.5, the generation of a registration; §3.8, the temporary files of expired commits. P2b.1 (2026-11-16): §3.5 and §7.3, as built. P2b.2 (2026-11-16): §7.2, as built. P2b.3 (2026-11-16): §3.7, the contention at the `INSERT`; §7.3, the GREEN result. P2b.4 (2026-11-17): §7.2, the kills as built; §7.3, their result. Each change is dated in place and says what the text said before. |
 
 ---
 
@@ -474,6 +474,12 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 - **`DESCRIBE HISTORY` is not compared with the entries.** It is derived from the commit files, which the verifier reads itself and compares with the entries.
 - The rule for a writer that was killed (a prefix, and its commit in flight absent or present once) dates from P1.4b.
 
+*As built (P2b.4, 2026-11-17):* the kills (`WriterKiller`, `StressHarness.Chaos`).
+- **A writer is killed from outside, at a point of its commit.** One fault hook holds the victim for seconds at the point (§7.3), and the orchestrator kills its process when the registry and the log directory show it there. No LogStore made for the test stands in for the one that is deployed.
+- **A process is started in the place of the one that was killed**, and repeats the batch that was in flight under the same `txnVersion`. The rule above for a killed writer, a prefix, is for one that is not started again. Here every writer ends with all its batches, and each must be in the table exactly once.
+- **Each process commits under a run of its own**, which it writes down before its first commit, since a process that is killed reports nothing. The verifier holds a writer's commits to the runs of its processes.
+- **A kill is reported with what was seen when it was decided, and apart from it with what was read after it.** A writer that is alive may finish the commit of the dead one in between.
+
 ### 7.3 Spike (before / after, same harness)
 
 - **RED (P1):** default LogStore on `file://`. Expected result: lost commits, meaning versions that were overwritten, so some `(writer, k)` are missing although their writer saw success. Two variants:
@@ -501,7 +507,8 @@ The protocol is tested against a `CoordinationStore` trait with a fault-injectin
 - **The natural race is weak evidence, and is reported as such.** RED lost commits in 2 runs of 6; its run of the same day as GREEN lost nothing, so that race does not tell the two apart on one day. GREEN lost nothing in 10 runs of 10, in which two writers were committing one version at once 376 times.
 - **The configuration of RED, `DelayingLocalFs` included**, was run too: no rename was delayed and no version was lost at the `INSERT`. The window RED widened no longer exists; that run shows nothing more.
 - The contention of RED was not measured: the counter is this LogStore's. Its zeros in a report mean that.
-- Still to come: writers killed inside the window (P2b.4), PostgreSQL restarted in a run (P2b.5).
+- **Writers killed inside a commit (P2b.4, 2026-11-17)** lost no batch and wrote none twice. Killed before the `INSERT`: no version taken, and the batch written once, by the process started in its place. Killed after the `INSERT` and after the publish: the batch in the table at the version the dead process had taken, finished by another process. Six kills at random moments all fell before the `INSERT`: they add deaths outside a commit, and none inside one.
+- Still to come: PostgreSQL restarted in a run (P2b.5).
 
 ---
 
