@@ -2,12 +2,12 @@
 
 | | |
 |---|---|
-| **Phase** | P2b.3 (suite and runs), 2026-11-16. The writers killed inside a commit (P2b.4) and the restart of PostgreSQL (P2b.5) are added to this document as they are run. |
+| **Phase** | P2b.3 (suite and runs), 2026-11-16; P2b.4 (writers killed inside a commit), 2026-11-17. The restart of PostgreSQL (P2b.5) is added to this document when it is run. |
 | **Plan** | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md) §7.3 |
 | **Before** | [Spike RED](logstore-red.md): the same harness on Delta's default LogStore |
-| **Code** | `SpikeGreenSpec`, `CoordinatedStressSuite`, the stress harness and verifier (`modules/integration-tests/.../it/stress/`). The RED suite, `SpikeRedSpec`, is unchanged. |
-| **Reproduce** | `scripts/stress-logstore.sh`: both suites, about 65 minutes, Docker, about 4 GB of free memory. With `STRESS_NATURAL_RUNS=0` the natural runs are left out, and it takes about 12 minutes. |
-| **Harness** | Commit `68ec1b5`. GREEN and RED were run one after the other on 2026-11-16, by one invocation of the script. |
+| **Code** | `SpikeGreenSpec`; `SpikeGreenKillSpec` and `WriterKiller` for the kills; `GreenSpikeSuite`, `CoordinatedStressSuite`, the stress harness and verifier (`modules/integration-tests/.../it/stress/`). The RED suite, `SpikeRedSpec`, is unchanged. |
+| **Reproduce** | `scripts/stress-logstore.sh`: the three suites, about 75 minutes, Docker, about 4 GB of free memory. With `STRESS_NATURAL_RUNS=0` the natural runs are left out, and it takes about 20 minutes. The kills alone, about 9 minutes: `sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"`. |
+| **Harness** | The runs of 2026-11-16: the commit *test: run the suite of the RED spike on PostgresLogStore (P2b.3)*, GREEN and RED one after the other, by one invocation of the script. The kills of 2026-11-17: the commit *test: kill a writer inside a commit and start a process in its place (P2b.4)*. |
 
 ## Question
 
@@ -22,6 +22,7 @@ How much each part of that says is not the same, and the rest of this document k
 - **The decisive evidence is the widened window.** Three writers are held, with their commits ready, between the check that a version is free and the step that takes it. On Delta's default LogStore that run lost an acknowledged commit **every time it was made: 6 runs of 6**, five on 2026-11-13 and one on 2026-11-16. On `PostgresLogStore` it lost **none**, and its writers lost **52 versions at the `INSERT`**: 52 times a writer had found the version free, had waited with its commit ready, and found the version taken when it claimed it. Each was settled by Delta at the next version.
 - **The natural race is the weak evidence.** Without any delay, the default LogStore lost commits in **2 runs of 6** between 2026-11-13 and 2026-11-16. `PostgresLogStore` lost none in **10 runs of 10**, during which two writers were committing one version at the same moment **376 times**, without help, and nothing was lost.
 - **The natural race of one day does not tell the two apart.** The one natural run of RED on 2026-11-16 lost nothing either. A clean natural run can be luck, with any LogStore: four of the six RED runs were.
+- **A writer that dies inside a commit loses nothing and repeats nothing.** A writer was killed with `kill -9` at each of the three points where a death leaves something different behind, and a process started in its place repeated the batch that was in flight. Killed before the `INSERT`, it had made no commit, and the batch was written once, by the process started afterwards. Killed after the `INSERT` or after the publish, its commit was in the table at the version it had taken, finished by another process, and the repeated batch wrote nothing.
 
 ## How to read the evidence
 
@@ -29,7 +30,8 @@ A stress run can show that a failure happens. It cannot show that one never does
 
 - In **the widened window** the situation is made, not waited for. Every writer is inside the window on every commit, and the run shows how often: each writer reports the times it waited there and the versions it lost there. The default LogStore fails in that situation every time. The claim "no commit is lost" rests on this run.
 - In **the natural race** the situation happens by chance, and for most commits it does not happen at all. A run without a lost commit says little by itself. What it adds is a count of the times the situation did happen unprovoked, 376 here, and that is all it is used for.
-- Still to come are the writers **killed** inside the window (P2b.4): the same situation, with a process that dies in it.
+- In **the kills at a chosen point** the situation is made too: the victim is held at one point of its commit and killed there, from outside. Each run says what was seen when the kill was decided, how long the process took to die, and what it left, so that no kill is reported at a point where there was none.
+- **The kills at random moments** are weak evidence, as the natural race is. A commit is a few milliseconds of a batch that takes more than a second, and none of the six kills landed inside one.
 
 ## Setup
 
@@ -80,9 +82,32 @@ The suite of RED, and what RED's own widening can no longer do.
 
 **Why the window is widened another way.** RED widened its window with `DelayingLocalFs`, a sleep before the rename that publishes a commit file. `PostgresLogStore` publishes a commit as a hard link and never renames one ([ADR-0015](../adr/0015-hard-link-publish-on-local-file-systems.md)), so that sleep is not in the path of a commit any more. The windows this LogStore has are on either side of the `INSERT` that takes a version, and its own fault hooks hold a writer there (`lakehouse.logstore.fault.<point>.delayMs`). The hooks count their waits, as `DelayingLocalFs` counted its delayed renames: a widened window proves something only if the wait was where the commits went.
 
+### Variants with a writer killed
+
+A writer dies with `kill -9` inside a commit, and a process is started in its place that repeats the batch that was in flight, under the same transaction identifier. Delta skips a batch that is in the table.
+
+| Variant | Writers × batches | What it shows | Pass condition, besides the criterion |
+|---|---|---|---|
+| **Killed before the `INSERT`** | 3 × 8, the victim held 3 s at `beforeInsert` | A commit that is ready and never happens | No version taken for the batch in flight, and the commit it had ready left where it was; the batch is a commit of the process started afterwards |
+| **Killed after the `INSERT`** | 3 × 8, the victim held 3 s at `afterInsert` | A commit that exists, whose writer dies before it is in the log | One version taken more than batches acknowledged; the batch is in the table at the version the victim was seen to take, as a commit of the dead process |
+| **Killed after the publish** | 3 × 8, the victim held 3 s at `afterPublish` | A commit in the log whose entry its writer never completes | The same |
+| Killed at random moments | 3 × 50, six kills, no hook | Deaths anywhere in a batch | Every process killed had taken versions of its own, and had a batch in flight |
+
+In every variant each writer must end with all its batches acknowledged, and every batch must be in the table exactly once. A batch written twice is an anomaly of the verifier, as a lost one is.
+
+**How a writer is killed.** From outside, and running the LogStore that is deployed: nothing in the writer knows that it will die. One fault hook, set in the victim alone, holds it for three seconds at the point in each of its commits. The orchestrator looks at the registry and at the log directory many times a second, and kills the process when it sees what a process at that point leaves:
+
+- before the `INSERT`, a temporary file that no entry points at, kept for longer than a writer that is not held keeps one (400 ms);
+- after the `INSERT`, an entry of the victim's process that is not complete, whose commit file is not in the log;
+- after the publish, an entry of the victim's process that is not complete, whose commit file is in the log.
+
+The victim is killed in its third commit, so that it has commits before the one it dies in. After the `INSERT` and after the publish, its process must be gone in less than half the time it is held for, counted from the start of the look that saw it there: the victim did not finish the commit itself.
+
+**What is read after a kill is reported apart from what was seen before it.** The writers that are alive finish the commit of a dead one when they next look at the table, and that can be within the milliseconds a kill takes. What a process left is put down to it only through the registry, whose entries name their process. A temporary file names nobody, so one counts only if the victim was seen holding it.
+
 ## Results
 
-Runs of 2026-11-16, GREEN from 21:55 UTC and RED from 22:51 UTC. Both suites passed: `SpikeGreenSpec` 16 tests in 55 minutes, `SpikeRedSpec` 4 tests in 6.6 minutes, no failure, error or skipped test.
+Runs of 2026-11-16, GREEN from 21:55 UTC and RED from 22:51 UTC. Both suites passed: `SpikeGreenSpec` 16 tests in 55 minutes, `SpikeRedSpec` 4 tests in 6.6 minutes, no failure, error or skipped test. The kills are of 2026-11-17, from 18:13 UTC: `SpikeGreenKillSpec`, 4 tests in 8.6 minutes, all passed.
 
 ### The widened window
 
@@ -146,6 +171,23 @@ In every GREEN run: no anomaly, no sidecar on a commit file, both readers read t
 
 It is the same experiment as RED, and it no longer tests the same thing. The delay sits on a rename that this LogStore never makes, so nothing was widened: no rename was delayed, and no version was lost at the `INSERT`. The result says that the window RED widened is gone. It does not say that the window was survived; the two runs above say that, for the windows this LogStore has.
 
+### Writers killed inside a commit
+
+Runs of 2026-11-17. In all four no acknowledged batch was lost and none was in the table twice, every entry of the registry was complete at the end, and both readers read the table.
+
+| Killed | Seen when the kill was decided | Process gone after | Read right after | The batch in flight, after the run | Acknowledged | **Lost** | **Twice** |
+|---|---|---|---|---|---|---|---|
+| Before the `INSERT` | 1 temporary file that no entry pointed at, kept for 400 ms or more | 63 ms | 2 versions taken for 2 batches acknowledged; the file still there | Batch 3: a commit of the process started in its place | 24 | **0** | **0** |
+| After the `INSERT` | Version 18 taken by the victim, its commit not in the log | 92 ms | 3 versions for 2 batches; version 18 still not in the log | Batch 3 is version 18: a commit of the dead process | 24 | **0** | **0** |
+| After the publish | Version 12 of the victim in the log, its entry not complete | 64 ms | 3 versions for 2 batches; the entry of version 12 still not complete | Batch 3 is version 12: a commit of the dead process | 24 | **0** | **0** |
+| At random moments, six times | | | No entry of the dead process unfinished, six times of six | Each one a commit of a process started later | 150 | **0** | **0** |
+
+- **Before the `INSERT`** the commit never happened. The dead process had taken two versions, for the two batches it had acknowledged, and none for the third. It left two things that belong to no commit. One is the temporary file of the commit it had ready, which the collection of temporary files removes after a day ([ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md) §3.8). The other is the data file of the batch, the one orphan data file of the run, which is for `VACUUM`. The process started in its place wrote the batch again, and that is the commit in the table.
+- **After the `INSERT`** the commit had happened, and only the registry knew. Version 18 was the victim's, and was not in the log when its process was gone. At the end of the run batch 3 is version 18, under the run of the dead process: a writer that was alive published it, and the process started in the victim's place found the batch in the table and wrote nothing. It is the recovery that the widened window showed with the owner alive, here with the owner dead.
+- **After the publish** the commit was in the log and its entry was not complete. It was complete at the end of the run, as every entry was, and the dead process cannot have completed it.
+- **The registry keeps the two processes of the victim apart.** In each of these three runs the entries name four runs: one for each of the other two writers, one for the process that was killed, and one for the process started in its place.
+- **At random moments**, six processes were killed while they were committing. Each had taken versions of its own (2, 3, 24, 2, 6 and 3 of them) and had a batch in flight. All six died before their `INSERT`: in each case the batch in flight is a commit of the process started afterwards. One had written the data file of its batch, which no commit added. None died inside the milliseconds of a commit. The run shows that a death in the rest of a batch costs nothing: 150 batches in the table, once each, under nine runs. It says nothing about a death inside a commit, which is what the three runs above are for.
+
 ### Controls
 
 | | Commits | Lost | Anomalies | Waits at the hooks |
@@ -174,11 +216,16 @@ A writer made its 200 commits in 261 to 277 s on `PostgresLogStore`, and in 273 
 - **The natural race is not a rate.** How often two writers meet at the `INSERT` depends on hardware, load and commit latency. The 376 are a count on this machine, on this day.
 - **The collisions of RED were not counted.** The count at the `INSERT` exists only on `PostgresLogStore`, so the two cannot be compared by it. What can be compared is the outcome: lost commits.
 - **The window before the `INSERT` is widened by a hook of the LogStore itself.** The hook only sleeps, between two steps the LogStore takes anyway, and the control shows that it loses nothing by itself.
-- **No process dies in these runs, and PostgreSQL stays up.** Those are P2b.4 and P2b.5.
+- **PostgreSQL stays up in every run.** Its restart in the middle of one is P2b.5.
+- **One kill at each point, in one run.** The three variants were run three times on 2026-11-17, twice while the suite was being written: nine kills, and no batch lost or written twice. The table has the last execution. It is a demonstration at each point, not a rate.
+- **What the read after a kill finds is not always the same.** In the two earlier executions of that day, the entry of the commit killed after the publish was complete by the time it was read: a writer that was alive had finished the commit in the milliseconds between. Since then a run reports what was seen when the kill was decided apart from what was read after it.
+- **The kills at random moments did not land inside a commit.** Their first version did not even land on a writer that was committing: it drew its moments from the start of the run, and all six kills fell on processes that were still starting (run `20261117T180355Z`: clean, and saying nothing). The variant now waits until its victim has acknowledged two or three batches more.
+- **A process that is killed is not a machine that stops.** What the process had written reaches the disk, because the operating system goes on. A loss of power, with data written and not yet synced, is not in these runs.
 - **Other runs of the day are not in the tables.** The deterministic variants were run twice more while the suite was being written, and two natural runs belong to an execution that was stopped for lack of memory. All were clean. They were made before the count at the `INSERT` existed, so their reports do not have it.
 
 ## Consequences for the project
 
 - **The fix of ADR-0004 holds where the default LogStore fails every time**, and where it fails by chance. The engine can be built on tables that several instances write.
-- **P2b.4** kills writers inside the two windows: the remaining way to lose a commit is a writer that dies with one half made.
+- **A writer that dies with a commit half made costs a repeated batch, and nothing else.** The batch is repeated under the same transaction identifier: it is written if the commit had not happened, and skipped if it had. That is how the engine is to treat a batch whose outcome it does not know.
+- **P2b.5** stops PostgreSQL in the middle of a run, with writers that repeat the batch that failed.
 - **The count at the `INSERT` is there for the engine to report next to the total** (`commit_contention`, ADR-0010), if it proves useful there: the total says how busy a table is, the count at the `INSERT` how often its writers were truly in each other's way. That is decided with the engine's metrics (P11).

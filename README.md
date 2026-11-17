@@ -66,9 +66,10 @@ sbt scalafmtCheckAll scalafmtSbtCheck checkBoundaries Test/compile test   # need
 Several writer JVMs commit to one Delta table at the same time. A verifier then checks the result against what each writer saw succeed ([ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md) §7). These runs take minutes, so `sbt test` leaves them out:
 
 ```bash
-scripts/stress-logstore.sh   # runs `sbt stress` and lists the reports written: about 65 minutes, ~4 GB of free memory, Docker for the runs on PostgresLogStore
-STRESS_NATURAL_RUNS=0 scripts/stress-logstore.sh   # without the ten natural runs of the GREEN spike: about 12 minutes
+scripts/stress-logstore.sh   # runs `sbt stress` and lists the reports written: about 75 minutes, ~4 GB of free memory, Docker for the runs on PostgresLogStore
+STRESS_NATURAL_RUNS=0 scripts/stress-logstore.sh   # without the ten natural runs of the GREEN spike: about 20 minutes
 sbt "integration-tests/Stress/testOnly *SpikeGreenSpec"   # only the runs on PostgresLogStore (needs Docker)
+sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"   # only the writers killed inside a commit: about 9 minutes (needs Docker)
 ```
 
 Each run keeps its table, writer journals, logs and probes in `target/stress/<run>/`, next to its `report.md`.
