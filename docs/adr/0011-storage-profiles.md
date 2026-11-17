@@ -42,6 +42,15 @@ Source metadata refers to tables relatively (`bronze/sales/orders`). A `TableLoc
 | *(Note, 2026-11-17, at the start of P3.)* The canonicalisation above is split in two. `core` validates and normalises a table's URI by its text alone (scheme, user info, slashes, relative segments), at startup validation. Resolving symbolic links needs the file system, and stays in the LogStore's `TableIdentity` (ADR-0004 §3.6), where the engine applies it when it starts (P5) | `core` has no Hadoop and may not depend on the LogStore (ADR-0012). `TableIdentity` gives the key that commits are coordinated under, so there is one implementation of what touches the file system, and a test holds `core`'s answer to it for a path without links |
 | `s3a` credentials only through environment variables / Hadoop credential providers, never YAML | Security (ADR-0007) |
 
+*As built (P3.3, 2026-11-17):* `Profile` in `core`, validated from the text of the file alone.
+- **A root is `file:///absolute/path` or `s3a://bucket/prefix`**, with segments of the grammar of relative paths (ADR-0013 §2) and no user, password or query. `s3://` is refused with the reason of the first row above.
+- **`landing.root` and `lake.uri` must be apart**: neither is the other, nor inside it. Files that land are never read as tables.
+- **A database is `jdbc:postgresql://host:port/database` and nothing after it.** TLS and timeouts are fields of their own, and a parameter in the URL would win over them without a word; some parameters of the driver also name a class for it to load (CVE-2022-21724).
+- **TLS is `disable` or `verify-full`**, with no mode in between (ADR-0013 §5). `disable` to a host that is not this machine is a warning.
+- **The profile has the timeouts of each database and the retry budget of the engine**, and one rule about them: the budget is longer than the LogStore itself waits for the coordination database, its connect timeout times its three attempts. A batch without that database takes 5 s to fail (P2b.5), and a shorter budget would give up on outages that would have passed.
+- **Spark settings may not name a LogStore, a master or a credential.**
+- **Nothing is connected to and no name is looked up.** A profile whose databases cannot be reached validates in milliseconds.
+
 ### 3. Everything a recovering node needs lives next to the table
 
 The LogStore temp files are in `<table>/_delta_log/.tmp/` on the shared storage, so any driver on any node or cluster can finish a half-published commit. Nothing correctness-related is kept on local disk or in JVM memory. Spark's shuffle and scratch directories stay node-local, as usual.

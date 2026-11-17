@@ -1,0 +1,45 @@
+# The profile of local development: every process on this machine, a lake on its disk, and the
+# PostgreSQL of docker/docker-compose.yml (README, "Local services").
+#
+# A profile says where the application runs and on what. What it ingests is in conf/sources/,
+# and is the same in every profile.
+lake:
+  # A directory of the Linux file system, never one under /mnt/c. /tmp is emptied when the
+  # machine restarts: for a lake that is to last, name a directory of your own.
+  uri: "file:///tmp/lakehouse-ingestion/lake"
+  deployment: single-machine
+
+landing:
+  # Where files to ingest are left. The paths of file sources are relative to it.
+  root: "file:///tmp/lakehouse-ingestion/landing"
+
+databases:
+  # One PostgreSQL holds both schemas here, and each has a role of its own (ADR-0003, ADR-0013).
+  # A password is never written in this file, only where it is:
+  #   export INGEST_CONTROL_PASSWORD="$(cat docker/secrets/ingest_control_password)"
+  #   export INGEST_COORDINATION_PASSWORD="$(cat docker/secrets/ingest_coordination_password)"
+  control:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_control
+    password: { secretRef: "env:INGEST_CONTROL_PASSWORD" }
+    tls: { mode: disable }   # the database is on this machine
+  coordination:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_coordination
+    password: { secretRef: "env:INGEST_COORDINATION_PASSWORD" }
+    tls: { mode: disable }
+    # How long a commit waits for this database before it fails. The LogStore tries three times.
+    timeouts: { connect: 5s, statement: 10s }
+
+# For how long the engine goes on with a step that fails with an error that passes. It must be
+# longer than the LogStore itself waits for the coordination database: 3 x 5s here.
+retries:
+  budget: 2m
+  first_backoff: 1s
+  max_backoff: 30s
+
+spark:
+  master: "local[2]"
+  settings:
+    spark.sql.shuffle.partitions: 4
+    spark.ui.enabled: false
