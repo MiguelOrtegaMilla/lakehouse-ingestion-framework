@@ -8,8 +8,12 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /**
- * What the loader of configuration accepts and what it refuses (ADR-0013 §5). Each refusal is
+ * What the reader of configuration accepts and what it refuses (ADR-0013 §5). Each refusal is
  * tried with the document that the control exists for.
+ *
+ * The values expected of the documents that are accepted are those circe-yaml 0.16.1 gave for
+ * them, which the reader was compared with before it took its place: the same JSON for every
+ * document that both accept.
  */
 final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
 
@@ -50,9 +54,9 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
   }
 
   test("YAML 1.2: yes, no, on and off are strings, and only true and false are booleans") {
-    // The JSON schema of YAML 1.2, which is the loader's: nothing is a boolean or a null but
-    // the words JSON has for them. `True` and `~` are strings, and a decoder that expects a
-    // boolean or nothing then says so.
+    // The JSON schema of YAML 1.2: nothing is a boolean or a null but the words JSON has for
+    // them. `True` and `~` are strings, and a decoder that expects a boolean or nothing then
+    // says so.
     val text =
       """a: yes
         |b: no
@@ -116,7 +120,7 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
 
     SafeYaml.parse("retries: !!str 3\n").left.value shouldBe
       TagNotAllowed("tag:yaml.org,2002:str", Some(Position(1, 10)))
-    // circe-yaml would have made this the object {"secret": "value"}.
+    // circe-yaml makes this the object {"secret": "value"}.
     SafeYaml.parse("password: !secret value\n").left.value shouldBe
       TagNotAllowed("!secret", Some(Position(1, 11)))
     SafeYaml.parse("keys: !!set { a, b }\n").left.value shouldBe a[TagNotAllowed]
@@ -152,6 +156,84 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
       obj("defaults" -> defaults, "orders" -> defaults, "customers" -> defaults)
   }
 
+  test("plain scalars are numbers only as JSON writes them, and strings otherwise") {
+    def value(text: String): Json =
+      SafeYaml.parse(s"v: $text").value.hcursor.downField("v").focus.get
+
+    Seq("1", "-1", "0", "-0", "1.5", "-0.5", "1e3", "1E3", "1.5e-3", "1.0", "12345678901234567890")
+      .foreach { number =>
+        withClue(number)(value(number).asNumber.map(_.toString) shouldBe Some(number))
+      }
+    // An identifier with zeros in front stays what was written, and so does everything else
+    // that only looks like a number, a date or a variable.
+    Seq("007", "0x1F", "0o17", "1_000", "+1", "2026-11-17", "12:30:00", "${HOME}", ".5", "a b c")
+      .foreach { text =>
+        withClue(text)(value(text) shouldBe str(text))
+      }
+    value("\"1\"") shouldBe str("1")
+    value("'true'") shouldBe str("true")
+    value("\"\"") shouldBe str("")
+  }
+
+  test("a number that JSON does not have is refused, not guessed at") {
+    Seq("1.", ".inf", "-.inf", ".nan").foreach { text =>
+      withClue(text) {
+        SafeYaml.parse(s"v: $text").left.value shouldBe NotANumber(text, Some(Position(1, 4)))
+      }
+    }
+    NotANumber("1.", None).message shouldBe
+      "'1.' is read as a number that JSON does not have: write it as JSON does, or quote it"
+  }
+
+  test("block scalars and quoted scalars are strings, with what YAML does to their lines") {
+    val text =
+      """literal: |
+        |  line one
+        |  line two
+        |folded: >
+        |  folded
+        |  text
+        |single: 'it''s'
+        |double: "tab\tnew\nline"
+        |""".stripMargin
+
+    SafeYaml.parse(text).value shouldBe obj(
+      "literal" -> str("line one\nline two\n"),
+      "folded" -> str("folded text\n"),
+      "single" -> str("it's"),
+      "double" -> str("tab\tnew\nline")
+    )
+  }
+
+  test("collections keep their order and their emptiness") {
+    SafeYaml.parse("[1, [2, 3], {a: b}, [], {}]").value shouldBe Json.arr(
+      Json.fromInt(1),
+      Json.arr(Json.fromInt(2), Json.fromInt(3)),
+      obj("a" -> str("b")),
+      Json.arr(),
+      obj()
+    )
+    SafeYaml.parse("z: 1\na: 2\nm: 3\n").value.asObject.map(_.keys.toList) shouldBe
+      Some(List("z", "a", "m"))
+    // A key is the text that was written, whatever it would be as a value.
+    SafeYaml.parse("1: x\ntrue: y\n~: z\n").value shouldBe
+      obj("1" -> str("x"), "true" -> str("y"), "~" -> str("z"))
+  }
+
+  test("an alias must have its anchor before it, and nothing may contain itself") {
+    SafeYaml.parse("a: *nope\n").left.value shouldBe UnknownAlias("nope", Some(Position(1, 4)))
+    // circe-yaml ends in a StackOverflowError on this one: the tree contains itself.
+    SafeYaml.parse("a: &a [*a]\n").left.value shouldBe UnknownAlias("a", Some(Position(1, 8)))
+    SafeYaml.parse("&m {self: *m}\n").left.value shouldBe a[UnknownAlias]
+    // An anchor on a scalar, and one that is given a second value: an alias is the last.
+    SafeYaml.parse("a: &x 1\nb: *x\nc: &x 2\nd: *x\n").value shouldBe obj(
+      "a" -> Json.fromInt(1),
+      "b" -> Json.fromInt(1),
+      "c" -> Json.fromInt(2),
+      "d" -> Json.fromInt(2)
+    )
+  }
+
   test("a merge key is a key like any other: YAML 1.2 has no merge") {
     val text =
       """base: &base { on_new_column: add }
@@ -173,7 +255,8 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
     SafeYaml.parse(nested(limit)).isRight shouldBe true
     SafeYaml.parse(nested(limit + 1)).left.value shouldBe
       TooDeep(limit, Some(Position(1, limit + 1)))
-    // The loader alone ends here in a StackOverflowError, which is no error of the document.
+    // A loader that builds its tree by recursion ends here in a StackOverflowError, which is
+    // no error of the document: circe-yaml does.
     SafeYaml.parse(nested(100000)).left.value shouldBe a[TooDeep]
     SafeYaml.parse("- " * 50000 + "x").left.value shouldBe a[TooDeep]
     SafeYaml.parse("{a: " * 50000).left.value shouldBe a[TooDeep]
@@ -190,9 +273,10 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
   }
 
   test("a file must hold one document: not none, and not two") {
-    SafeYaml.parse("").left.value shouldBe NotOneDocument(0)
-    SafeYaml.parse("# only a comment\n").left.value shouldBe NotOneDocument(0)
-    SafeYaml.parse("id: a\n---\nid: b\n").left.value shouldBe NotOneDocument(2)
+    SafeYaml.parse("").left.value shouldBe NoDocument
+    SafeYaml.parse("# only a comment\n").left.value shouldBe NoDocument
+    SafeYaml.parse("id: a\n---\nid: b\n---\nid: c\n").left.value shouldBe
+      SeveralDocuments(Some(Position(2, 1)))
   }
 
   test("a key must be a plain value: not a collection, and not an alias") {
@@ -212,7 +296,8 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
   test("a refusal says what is wrong and where") {
     DuplicateKey("id", Some(Position(3, 1))).message shouldBe
       "the key 'id' appears twice in one mapping (line 3, column 1)"
-    NotOneDocument(2).message shouldBe "the file has 2 documents, and must have one"
+    SeveralDocuments(Some(Position(2, 1))).message shouldBe
+      "the file has more than one document, and must have one (line 2, column 1)"
     TooLarge(65, 64).message shouldBe "the document has 65 characters, and the limit is 64"
   }
 }

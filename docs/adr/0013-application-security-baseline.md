@@ -123,11 +123,14 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 | **Safe YAML loading** | circe-yaml builds a node tree and converts it to JSON: no tag-driven object construction, which is the class of the SnakeYAML CVE-2022-1471. On top of that: limits on alias expansion (billion laughs), nesting depth and document size; duplicate keys rejected; YAML 1.2 semantics preferred, so `yes`/`no`/`on`/`off` are not booleans. | P3 |
 | **Threat model** | `docs/security/threat-model.md`: assets, trust boundaries, a STRIDE-lite table mapped to these controls, and what is out of scope. Written from what is actually built. | P12 |
 
-*Safe YAML loading, as built (P3.1, 2026-11-17):* `SafeYaml` in `core`, on `circe-yaml-v12` and snakeyaml-engine.
-- The limits on size and on aliases are the loader's own settings, set low: 256 KiB and 8 aliases of any kind.
-- **The loader has no limit on nesting**, and builds its tree by recursion: a hundred thousand `[` end in a `StackOverflowError`. Before a document is loaded, `SafeYaml` goes through its events, which the parser yields without recursion, and refuses nesting beyond 32 there.
-- The same look refuses **every tag**, a duplicate key, a key that is not a scalar, and a file that does not hold exactly one document. No tag constructs a class in circe-yaml, but one it does not know becomes an object named after it, which changes the shape of a configuration silently.
-- YAML 1.2 is read with its JSON schema: `yes`, `no`, `True` and `~` are strings, and `<<` is no merge.
+*Safe YAML loading, as built (P3.1, 2026-11-17):* `SafeYaml` in `core`, on snakeyaml-engine alone. circe-yaml, which the row above names, is not used.
+- **What was measured of circe-yaml** (`circe-yaml-v12` 0.16.1, YAML 1.2). It builds a tree of nodes and walks it by recursion:
+  - it has no limit on nesting, and a hundred thousand `[` end in a `StackOverflowError`, as does a collection that contains itself through an alias (`a: &a [*a]`);
+  - it turns a tag that it does not know into an object named after the tag, and it gives the plain scalar `${HOME}` such a tag: `password: ${DB_PASSWORD}` becomes `{"ENV_VARIABLE": "${DB_PASSWORD}"}`, without a word;
+  - it throws on a duplicate key, out of a method that returns its other failures.
+- **The JSON is built from the events of the parser**, which yields them one at a time, with no recursion, and constructs nothing. There is no tree and no loader, so there is nothing for a tag to construct and no stack for a document to exhaust. Plain scalars are read with the engine's own resolver for the JSON schema of YAML 1.2: `yes`, `no`, `True`, `~`, `007` and `${HOME}` are strings, and `<<` is no merge.
+- **What is refused**, each with its line and column: a document over 256 KiB; nesting beyond 32; more than 8 aliases, of any kind; an alias with no anchor before it, or inside the collection that its anchor names; every tag; a key twice in one mapping; a key that is not a scalar; a number that JSON does not have (`.inf`); a file that does not hold exactly one document.
+- **Nothing was lost by it.** Over a corpus of 69 documents the two gave the same JSON for every document that both accept. They differed in the two failures above, in `${HOME}`, in tags, which circe-yaml accepts, and in the wording of refusals.
 
 ### 6. Enterprise / future
 
