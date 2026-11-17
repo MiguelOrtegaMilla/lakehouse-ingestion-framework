@@ -4,53 +4,50 @@ import scala.annotation.tailrec
 import scala.collection.mutable
 import scala.jdk.OptionConverters._
 
-import io.circe.Json
-import io.circe.yaml.v12.{Parser => YamlParser}
+import io.circe.{Json, JsonNumber}
 import org.snakeyaml.engine.v2.api.LoadSettings
 import org.snakeyaml.engine.v2.api.lowlevel.Parse
+import org.snakeyaml.engine.v2.common.Anchor
 import org.snakeyaml.engine.v2.events._
 import org.snakeyaml.engine.v2.exceptions.{Mark, MarkedYamlEngineException, YamlEngineException}
+import org.snakeyaml.engine.v2.nodes.Tag
+import org.snakeyaml.engine.v2.resolver.JsonScalarResolver
 
 /**
  * Reads one YAML document into JSON, for configuration that people write and the application
  * does not trust (ADR-0007, ADR-0013 §5).
  *
- * The document is YAML 1.2: `yes`, `no`, `on` and `off` are strings, and only `true` and `false`
- * are booleans. It is loaded by circe-yaml, which builds a tree of nodes and turns it into JSON.
- * No tag ever chooses a class to construct, which is what CVE-2022-1471 was in SnakeYAML.
+ * The JSON is built from the events of the document, which snakeyaml-engine's parser yields one
+ * at a time. That parser is a state machine: it does not recurse, and it constructs nothing.
+ * There is no tree of nodes and no loader behind this, so there is nothing that a tag could
+ * make construct a class, which is what CVE-2022-1471 was in SnakeYAML, and no recursion for
+ * a deep document to exhaust.
  *
- * Before it is loaded, the document is looked at as the stream of its events, which the parser
- * yields one at a time without building anything. That look refuses what the loader would
- * accept, what it cannot be asked to refuse, and what it refuses badly (as measured on
- * circe-yaml-v12 0.16.1 with snakeyaml-engine 3.0.1):
+ * What is refused, each with its line and column:
  *
- *  - '''too much nesting'''. The loader has no limit on depth, and it builds and walks the tree
- *    by recursion: a hundred thousand `[` end in a `StackOverflowError`, which is no error of
- *    the document;
- *  - '''too many aliases''', which is how a short document becomes a huge tree (the "billion
- *    laughs"). The loader's own limit counts only aliases of collections, and by default
- *    allows fifty;
- *  - '''any tag''', `!!str` included. The loader turns a tag it does not know into an object
- *    with the tag's name as its key: `password: !secret x` becomes `{"secret": "x"}`, and
- *    the shape of the configuration changes without a word;
- *  - '''a key twice in one mapping'''. The loader refuses it too, by throwing an exception
- *    out of a method that returns its failures;
+ *  - '''a document that is too large''', before it is read at all;
+ *  - '''too much nesting''';
+ *  - '''too many aliases'''. An alias costs nothing here, since the value it stands for is
+ *    shared, but whoever walks the JSON afterwards walks it once for every alias: it is how a
+ *    short document becomes a huge one (the "billion laughs");
+ *  - '''an alias without its anchor''', or inside the collection that its anchor names;
+ *  - '''any tag''', `!!str` included: nothing in a configuration needs one;
+ *  - '''a key twice in one mapping''';
  *  - '''a key that is not a scalar''', which JSON cannot hold;
- *  - '''no document, or more than one''', which the loader refuses as well.
+ *  - '''no document, or more than one'''.
  *
- * A document that is too large is refused before it is read at all.
- *
- * What a writer of configuration should know of YAML 1.2 as it is loaded here, the JSON schema:
- * `null` or nothing is a null, and `~` is a string; `True` is a string; and `<<` is a key like
- * any other, not a merge.
+ * A scalar that is not quoted is read by the JSON schema of YAML 1.2, with the engine's own
+ * resolver. `null`, or nothing, is a null; `true` and `false` are booleans; a number is one
+ * that JSON has too. Everything else is a string: `yes`, `no`, `on`, `off`, `True`, `~`, `007`,
+ * `0x1F`, a date, `${HOME}`. And `<<` is a key like any other, not a merge.
  */
 object SafeYaml {
 
   /**
    * @param maxCodePoints the length of a document. Configuration files are a few kilobytes.
    * @param maxDepth how deep collections may nest. The configuration model nests five or six.
-   * @param maxAliases how many aliases a document may have, of any kind. An alias inside an
-   *   aliased collection multiplies, so the tree can grow by a factor of two for every two.
+   * @param maxAliases how many aliases a document may have. An alias inside an aliased
+   *   collection multiplies: what is walked can double with every two.
    */
   final case class Limits(maxCodePoints: Int, maxDepth: Int, maxAliases: Int) {
     require(maxCodePoints > 0 && maxDepth > 0 && maxAliases >= 0, s"invalid limits: $this")
@@ -93,6 +90,11 @@ object SafeYaml {
       override def problem: String = s"the document has more than $limit aliases"
     }
 
+    final case class UnknownAlias(name: String, at: Option[Position]) extends Refusal {
+      override def problem: String =
+        s"the alias '*$name' has no anchor before it, or is inside the collection it names"
+    }
+
     final case class DuplicateKey(key: String, at: Option[Position]) extends Refusal {
       override def problem: String = s"the key '$key' appears twice in one mapping"
     }
@@ -105,14 +107,23 @@ object SafeYaml {
       override def problem: String = "a key is a collection or an alias, and must be a plain value"
     }
 
-    final case class NotOneDocument(documents: Int) extends Refusal {
-      override def at: Option[Position] = None
+    /** A value that YAML reads as a number and JSON cannot hold: `1.`, `.inf`, `.nan`. */
+    final case class NotANumber(text: String, at: Option[Position]) extends Refusal {
       override def problem: String =
-        if (documents == 0) "the file has no document"
-        else s"the file has $documents documents, and must have one"
+        s"'$text' is read as a number that JSON does not have: write it as JSON does, or quote it"
     }
 
-    /** The text is not YAML, or the loader could not turn it into JSON. */
+    case object NoDocument extends Refusal {
+      override def at: Option[Position] = None
+      override def problem: String = "the file has no document"
+    }
+
+    /** @param at where the second document starts */
+    final case class SeveralDocuments(at: Option[Position]) extends Refusal {
+      override def problem: String = "the file has more than one document, and must have one"
+    }
+
+    /** The text is not YAML. */
     final case class Malformed(problem: String, at: Option[Position]) extends Refusal
   }
 
@@ -120,134 +131,177 @@ object SafeYaml {
   def parse(text: String, limits: Limits = Limits.Default): Either[Refusal, Json] = {
     val codePoints = text.codePointCount(0, text.length)
     if (codePoints > limits.maxCodePoints) Left(Refusal.TooLarge(codePoints, limits.maxCodePoints))
-    else examine(text, limits).toLeft(()).flatMap(_ => load(text, limits))
+    else new Reading(limits).of(text)
   }
 
-  /** The loader, with its own limits set as well: a second line, behind the look at the events. */
-  private def load(text: String, limits: Limits): Either[Refusal, Json] =
-    // The loader returns most of its failures, and throws some: a duplicate key is one.
-    try
-      YamlParser
-        .make(
-          YamlParser.Config(
-            allowDuplicateKeys = false,
-            allowRecursiveKeys = false,
-            codePointLimit = limits.maxCodePoints,
-            maxAliasesForCollections = limits.maxAliases
-          )
-        )
-        .parse(text)
-        .left
-        .map(failure => Refusal.Malformed(firstLine(failure.message), None))
-    catch {
-      case thrown: YamlEngineException =>
-        Left(
-          Refusal.Malformed(firstLine(Option(thrown.getMessage).getOrElse(thrown.toString)), None)
-        )
-    }
+  /** A collection whose end has not come yet. */
+  sealed private trait Open {
+    def anchor: Option[String]
+  }
 
-  /** A mapping that is open, with the keys seen in it and whether a key comes next. */
-  final private class OpenMapping {
+  final private class OpenMapping(val anchor: Option[String]) extends Open {
+    val fields: mutable.Builder[(String, Json), Vector[(String, Json)]] = Vector.newBuilder
     val keys: mutable.Set[String] = mutable.Set.empty
-    var keyNext: Boolean = true
+
+    /** The key whose value comes next; `None` when a key does. */
+    var key: Option[String] = None
   }
 
-  /**
-   * Goes through the events of the document and stops at the first thing that is refused. The
-   * parser behind the events is a state machine, with no recursion: the depth of a document
-   * costs it nothing, and nothing is built.
-   */
-  private def examine(text: String, limits: Limits): Option[Refusal] = {
-    val settings = LoadSettings.builder().setCodePointLimit(limits.maxCodePoints).build()
-    // `None` for a sequence, which has no keys.
-    val open = mutable.Stack.empty[Option[OpenMapping]]
-    var documents = 0
-    var aliases = 0
+  final private class OpenSequence(val anchor: Option[String]) extends Open {
+    val items: mutable.Builder[Json, Vector[Json]] = Vector.newBuilder
+  }
 
-    /** A value is complete: in a mapping, a key comes next. */
-    def valueDone(): Unit = open.headOption.flatten.foreach(_.keyNext = true)
+  /** One reading of one document: the state between its events. */
+  final private class Reading(limits: Limits) {
 
-    /** The node that `event` starts is a key if a mapping is open and a key comes next. */
-    def asKey(event: Event): Option[Option[Refusal]] =
-      open.headOption.flatten.filter(_.keyNext).map { mapping =>
-        mapping.keyNext = false
-        event match {
-          case scalar: ScalarEvent =>
-            Option.when(!mapping.keys.add(scalar.getValue))(
-              Refusal.DuplicateKey(scalar.getValue, position(event))
+    private val resolver = new JsonScalarResolver()
+    private val open = mutable.Stack.empty[Open]
+    private val anchored = mutable.Map.empty[String, Json]
+    private var documents = 0
+    private var aliases = 0
+    private var root = Option.empty[Json]
+
+    def of(text: String): Either[Refusal, Json] = {
+      val settings = LoadSettings.builder().setCodePointLimit(limits.maxCodePoints).build()
+      try {
+        val events = new Parse(settings).parseString(text).iterator()
+
+        @tailrec
+        def first(): Option[Refusal] =
+          if (!events.hasNext) None
+          else
+            refused(events.next()) match {
+              case None => first()
+              case found => found
+            }
+
+        first().toLeft(()).flatMap(_ => root.toRight(Refusal.NoDocument))
+      } catch {
+        case marked: MarkedYamlEngineException =>
+          Left(
+            Refusal.Malformed(
+              Seq(Option(marked.getContext), Option(marked.getProblem)).flatten.mkString(": "),
+              marked.getProblemMark.toScala.map(position)
             )
-          case _ => Some(Refusal.KeyNotScalar(position(event)))
-        }
+          )
+        case other: YamlEngineException =>
+          Left(
+            Refusal.Malformed(firstLine(Option(other.getMessage).getOrElse(other.toString)), None)
+          )
       }
-
-    def opened(mapping: Option[OpenMapping], event: Event): Option[Refusal] = {
-      open.push(mapping)
-      Option.when(open.size > limits.maxDepth)(Refusal.TooDeep(limits.maxDepth, position(event)))
     }
 
-    def tagged(tag: java.util.Optional[String], event: Event): Option[Refusal] =
-      tag.toScala.map(Refusal.TagNotAllowed(_, position(event)))
-
-    def refused(event: Event): Option[Refusal] = event match {
+    /** Takes one event in, and says whether the document is refused at it. */
+    private def refused(event: Event): Option[Refusal] = event match {
       case _: DocumentStartEvent =>
         documents += 1
-        None
+        Option.when(documents > 1)(Refusal.SeveralDocuments(position(event)))
+
       case scalar: ScalarEvent =>
         tagged(scalar.getTag, event).orElse {
-          asKey(event).getOrElse {
-            valueDone()
-            None
+          keyExpected match {
+            case Some(mapping) =>
+              val key = scalar.getValue
+              if (!mapping.keys.add(key)) Some(Refusal.DuplicateKey(key, position(event)))
+              else {
+                mapping.key = Some(key)
+                remember(scalar.getAnchor, Json.fromString(key))
+                None
+              }
+            case None =>
+              valueOf(scalar) match {
+                case Left(refusal) => Some(refusal)
+                case Right(value) =>
+                  remember(scalar.getAnchor, value)
+                  place(value)
+                  None
+              }
           }
         }
-      case _: AliasEvent =>
+
+      case alias: AliasEvent =>
         aliases += 1
+        val name = alias.getAlias.getValue
         if (aliases > limits.maxAliases)
           Some(Refusal.TooManyAliases(limits.maxAliases, position(event)))
+        else if (keyExpected.nonEmpty) Some(Refusal.KeyNotScalar(position(event)))
         else
-          asKey(event).getOrElse {
-            valueDone()
-            None
+          anchored.get(name) match {
+            case Some(value) =>
+              place(value)
+              None
+            case None => Some(Refusal.UnknownAlias(name, position(event)))
           }
-      case mapping: MappingStartEvent =>
-        tagged(mapping.getTag, event)
-          .orElse(asKey(event).flatten)
-          .orElse(opened(Some(new OpenMapping), event))
-      case sequence: SequenceStartEvent =>
-        tagged(sequence.getTag, event)
-          .orElse(asKey(event).flatten)
-          .orElse(opened(None, event))
+
+      case start: MappingStartEvent =>
+        tagged(start.getTag, event).orElse(opened(new OpenMapping(name(start.getAnchor)), event))
+
+      case start: SequenceStartEvent =>
+        tagged(start.getTag, event).orElse(opened(new OpenSequence(name(start.getAnchor)), event))
+
       case _: MappingEndEvent | _: SequenceEndEvent =>
-        open.pop(): Unit
-        valueDone()
+        val closed = open.pop()
+        val value = closed match {
+          case mapping: OpenMapping => Json.fromFields(mapping.fields.result())
+          case sequence: OpenSequence => Json.fromValues(sequence.items.result())
+        }
+        // Only now: an alias inside the collection finds no anchor, so nothing contains itself.
+        closed.anchor.foreach(anchored.update(_, value))
+        place(value)
         None
+
       case _ => None
     }
 
-    try {
-      val events = new Parse(settings).parseString(text).iterator()
+    /** The mapping that is open and waits for a key, if the next node is to be one. */
+    private def keyExpected: Option[OpenMapping] =
+      open.headOption.collect { case mapping: OpenMapping if mapping.key.isEmpty => mapping }
 
-      @tailrec
-      def first(): Option[Refusal] =
-        if (!events.hasNext) None
-        else
-          refused(events.next()) match {
-            case None => first()
-            case found => found
-          }
+    private def opened(collection: Open, event: Event): Option[Refusal] =
+      if (keyExpected.nonEmpty) Some(Refusal.KeyNotScalar(position(event)))
+      else {
+        open.push(collection)
+        Option.when(open.size > limits.maxDepth)(Refusal.TooDeep(limits.maxDepth, position(event)))
+      }
 
-      first().orElse(Option.when(documents != 1)(Refusal.NotOneDocument(documents)))
-    } catch {
-      case marked: MarkedYamlEngineException =>
-        Some(
-          Refusal.Malformed(
-            Seq(Option(marked.getContext), Option(marked.getProblem)).flatten.mkString(": "),
-            marked.getProblemMark.toScala.map(position)
-          )
-        )
-      case other: YamlEngineException =>
-        Some(Refusal.Malformed(firstLine(Option(other.getMessage).getOrElse(other.toString)), None))
+    /** Puts a value that is complete where it belongs: in the open collection, or at the top. */
+    private def place(value: Json): Unit = open.headOption match {
+      case Some(mapping: OpenMapping) =>
+        mapping.key.foreach(key => mapping.fields += (key -> value))
+        mapping.key = None
+      case Some(sequence: OpenSequence) => sequence.items += value
+      case None => root = Some(value)
+    }
+
+    private def remember(anchor: java.util.Optional[Anchor], value: Json): Unit =
+      name(anchor).foreach(anchored.update(_, value))
+
+    private def tagged(tag: java.util.Optional[String], event: Event): Option[Refusal] =
+      tag.toScala.map(Refusal.TagNotAllowed(_, position(event)))
+
+    /**
+     * A scalar as JSON. One that is quoted, or written as a block, is a string. A plain one is
+     * what the JSON schema of YAML 1.2 says, by the engine's own resolver.
+     */
+    private def valueOf(scalar: ScalarEvent): Either[Refusal, Json] = {
+      val text = scalar.getValue
+      if (!scalar.isPlain) Right(Json.fromString(text))
+      else {
+        val tag = resolver.resolve(text, java.lang.Boolean.TRUE)
+        if (tag == Tag.NULL) Right(Json.Null)
+        else if (tag == Tag.BOOL) Right(Json.fromBoolean(text == "true"))
+        else if (tag == Tag.INT || tag == Tag.FLOAT)
+          JsonNumber
+            .fromString(text)
+            .map(Json.fromJsonNumber)
+            .toRight(Refusal.NotANumber(text, position(scalar)))
+        else Right(Json.fromString(text))
+      }
     }
   }
+
+  private def name(anchor: java.util.Optional[Anchor]): Option[String] =
+    anchor.toScala.map(_.getValue)
 
   private def position(event: Event): Option[Position] = event.getStartMark.toScala.map(position)
 

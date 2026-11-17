@@ -24,11 +24,8 @@ object Dependencies {
     // newer than the build's Scala, and that one is Spark's.
     val circe = "0.14.15"
     val cats = "2.13.0"
-    // The newest release. Maven Central's `latest`, 1.15.0, is an older one (2023) that was
-    // published under a wrong number.
-    val circeYaml = "0.16.1"
     // The version that Spark 4.1.4's dependencies bring to the engine's classpath, where `core`
-    // meets it. circe-yaml itself is built with 2.7.
+    // meets it.
     val snakeyamlEngine = "3.0.1"
 
     val postgresJdbc = "42.7.14"
@@ -75,9 +72,8 @@ object Dependencies {
 
   val catsCore = "org.typelevel" %% "cats-core" % Versions.cats
   val circeCore = "io.circe" %% "circe-core" % Versions.circe
-  // YAML 1.2, through snakeyaml-engine: `yes` and `no` are strings (ADR-0013 §5).
-  val circeYamlV12 = "io.circe" %% "circe-yaml-v12" % Versions.circeYaml
-  // Used directly as well, for the look at a document's events before it is loaded.
+  // YAML 1.2. `core` builds JSON from the events of its parser, with no loader between them
+  // (ADR-0013 §5, SafeYaml).
   val snakeyamlEngine = "org.snakeyaml" % "snakeyaml-engine" % Versions.snakeyamlEngine
 
   val postgresJdbc = "org.postgresql" % "postgresql" % Versions.postgresJdbc

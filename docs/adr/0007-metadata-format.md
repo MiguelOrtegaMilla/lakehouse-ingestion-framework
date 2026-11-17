@@ -17,6 +17,7 @@ Adding a source must mean writing configuration, not code. The configuration mus
 
 - **One YAML file per source** under `conf/sources/`, plus application **profiles** (`conf/app/<profile>.yaml`: lake URI, databases, Spark settings).
 - **Decoding** with circe + circe-yaml into typed case classes.
+  - *(Note, 2026-11-17, P3.1.)* circe-yaml is not used. The JSON that circe decodes is built from the events of snakeyaml-engine's parser, in `SafeYaml` ([ADR-0013](0013-application-security-baseline.md) §5 has what was measured). Everything after the JSON is as decided here: circe decoders into typed case classes.
 - **Two-stage validation at startup**, accumulating *all* errors (`ValidatedNel`):
   1. Structure: decoding errors with the file path and field.
   2. Semantics:
