@@ -53,6 +53,13 @@ final class BootstrappedPostgres private (
 
   def unpause(): Unit = docker.unpauseContainerCmd(container.getContainerId).exec(): Unit
 
+  /**
+   * Kills the server, as `docker kill` does: no shutdown and no checkpoint, every connection
+   * cut. The container and its data stay, and the server recovers from its write-ahead log
+   * when it is started again (`restart`).
+   */
+  def kill(): Unit = docker.killContainerCmd(container.getContainerId).exec(): Unit
+
   /** Shuts the server down, as `docker stop` does. The container and its data stay. */
   def halt(): Unit = docker.stopContainerCmd(container.getContainerId).exec(): Unit
 

@@ -337,8 +337,9 @@ object Verifier {
   }
 
   /**
-   * Classifies each `txnVersion` of one writer. Writers commit sequentially and stop at their
-   * first failure, so at most one attempt is in flight when a writer stops: the failed one, or,
+   * Classifies each `txnVersion` of one writer. Writers commit sequentially and stop at the
+   * first failure they do not repeat, so at most one batch is in flight when a writer stops: the
+   * failed one, or,
    * if the writer stopped without journaling a failure (killed, orphaned), the one after its
    * last acknowledgement. A writer that failed its setup never reached the barrier.
    */
@@ -368,6 +369,8 @@ object Verifier {
     val acked = w.journal.acked
     val contiguous = acked == (1L to acked.size.toLong).toVector
     val failureFollows = w.journal.failure.forall(_.txnVersion == acked.size + 1L)
+    // A batch is repeated before it is acknowledged, or it is the one after the last.
+    val beyond = w.journal.repeated.map(_.txnVersion).filter(_ > acked.size + 1L).distinct
     val matchesExit = w.exitCode match {
       case StressWriter.ExitCode.Ok =>
         acked.size == expected.commits && w.journal.failure.isEmpty
@@ -379,6 +382,8 @@ object Verifier {
     Seq(
       contiguous -> s"acknowledgements are not 1..n: ${acked.mkString(",")}",
       failureFollows -> s"failure ${w.journal.failure} does not follow the last acknowledgement",
+      beyond.isEmpty -> (s"repeated attempts at ${beyond.mkString(",")}, beyond the batch after " +
+        "the last acknowledgement"),
       matchesExit -> (s"exit code ${w.exitCode} contradicts the journal (${acked.size} acks, " +
         s"failure ${w.journal.failure})")
     ).collect { case (false, reason) => InconsistentJournal(id, reason) }

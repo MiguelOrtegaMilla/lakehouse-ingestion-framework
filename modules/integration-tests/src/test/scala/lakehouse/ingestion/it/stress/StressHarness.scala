@@ -37,6 +37,8 @@ object StressHarness {
    * @param alsoFor more options for the first process of one writer and of no other, such as
    *   the fault hook that holds the writer that a run is going to kill. A process started in
    *   its place does not get them.
+   * @param repeatFor for how long a writer repeats a batch that fails (`WriterConfig.repeatFor`);
+   *   zero, and it stops at its first failure
    */
   final case class Settings(
       writers: Int,
@@ -46,6 +48,7 @@ object StressHarness {
       extraJvmOptions: Seq[String] = Nil,
       guard: Boolean = false,
       alsoFor: Map[Int, Seq[String]] = Map.empty,
+      repeatFor: FiniteDuration = Duration.Zero,
       readyTimeout: FiniteDuration = 2.minutes,
       runTimeout: FiniteDuration = 15.minutes
   ) {
@@ -90,6 +93,23 @@ object StressHarness {
     def acknowledged(writer: Int): Vector[Long] = AckJournal.read(stressRun.journal(writer)).acked
 
     /**
+     * Waits until the writer has acknowledged that many batches.
+     *
+     * @throws HarnessFailure the writer exited first, or took longer than `within`
+     */
+    def awaitAcknowledged(writer: Int, batches: Int, within: FiniteDuration = 2.minutes): Unit = {
+      val deadline = within.fromNow
+      while (acknowledged(writer).size < batches) {
+        val id = StressTable.writerId(writer)
+        if (!isAlive(writer))
+          throw new HarnessFailure(s"$id exited before it acknowledged $batches batches")
+        if (deadline.isOverdue())
+          throw new HarnessFailure(s"$id did not acknowledge $batches batches within $within")
+        Thread.sleep(AckPoll.toMillis)
+      }
+    }
+
+    /**
      * Kills the writer as `kill -9` does: the process gets no chance to finish, flush or clean
      * up anything. Returns when it is gone.
      */
@@ -122,6 +142,7 @@ object StressHarness {
   final class HarnessFailure(message: String) extends RuntimeException(message)
 
   private val ReadyPoll = 50.millis
+  private val AckPoll = 20.millis
   private val LogTailLines = 40
 
   def run(stressRun: StressRun, settings: Settings): Seq[WriterOutcome] =
@@ -181,7 +202,8 @@ object StressHarness {
       startTimeout,
       settings.guard,
       firstCommit,
-      restarted
+      restarted,
+      settings.repeatFor
     )
     val command =
       Seq(javaExecutable) ++

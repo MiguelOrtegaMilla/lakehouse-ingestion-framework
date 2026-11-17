@@ -1,6 +1,14 @@
 package lakehouse.ingestion.it.stress
 
+import java.nio.file.Files
+
+import scala.annotation.tailrec
+import scala.concurrent.duration._
+
+import lakehouse.ingestion.it.stress.StressHarness.{Chaos, HarnessFailure}
+import lakehouse.ingestion.it.stress.WriterKiller.InFlight
 import lakehouse.ingestion.it.support.{
+  BootstrappedPostgres,
   CoordinationSchema,
   CoordinationStores,
   LocalSparkSuite,
@@ -28,7 +36,7 @@ import scala.util.Using
  */
 trait CoordinatedStressSuite extends LocalSparkSuite { self: Suite =>
 
-  import CoordinatedStressSuite.BatchCommit
+  import CoordinatedStressSuite.{BatchCommit, Look, Outage}
 
   protected lazy val pg: ProxiedPostgres = ProxiedPostgres.start()
 
@@ -60,6 +68,83 @@ trait CoordinatedStressSuite extends LocalSparkSuite { self: Suite =>
   protected def registryView(run: StressRun): LogModel.RegistryView =
     Using.resource(pg.observe(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)) {
       RegistryReader.view(_, keyOf(run).value)
+    }
+
+  /**
+   * The entries of the table of `run` now, and for the ones that are not complete, whether
+   * their commit file is in the log.
+   */
+  protected def look(run: StressRun): Look = {
+    val logDir = run.tableDir.resolve("_delta_log")
+    val entries = registryView(run).entries
+    Look(
+      entries.map(_.version).toSet,
+      entries.filterNot(_.complete).map { entry =>
+        InFlight(entry.version, Files.exists(logDir.resolve(f"${entry.version}%020d.json")))
+      }
+    )
+  }
+
+  /**
+   * Waits for a version of the table of `run` that is taken and whose commit is not in the
+   * log: a commit that exists in the coordination database alone.
+   *
+   * @throws HarnessFailure there was none within `within`
+   */
+  protected def awaitTakenAndNotPublished(run: StressRun, within: FiniteDuration): Look = {
+    val deadline = within.fromNow
+    @tailrec
+    def await(): Look = {
+      val found = look(run)
+      if (found.unfinished.exists(!_.published)) found
+      else if (deadline.isOverdue())
+        throw new HarnessFailure(s"no version was seen taken and not published within $within")
+      else {
+        Thread.sleep(10)
+        await()
+      }
+    }
+    await()
+  }
+
+  /**
+   * Kills PostgreSQL in the middle of a run, as `docker kill` does, leaves it down for
+   * `downFor`, and starts it again: a crash of the coordination database, which it recovers
+   * from out of its write-ahead log. Whatever happens, PostgreSQL is started again.
+   *
+   * @param before the registry at the last look before the kill
+   */
+  protected def killPostgres(
+      run: StressRun,
+      chaos: Chaos,
+      writers: Int,
+      downFor: FiniteDuration,
+      before: Look
+  ): Outage = {
+    val durability = Seq("fsync", "synchronous_commit", "full_page_writes").map { setting =>
+      setting -> serverSetting(setting)
+    }
+    val atKill = (0 until writers).map(chaos.acknowledged(_).size)
+    val killed = System.nanoTime()
+    pg.killPostgres()
+    val whileDown =
+      try {
+        Thread.sleep(downFor.toMillis)
+        (0 until writers).map(writer => chaos.acknowledged(writer).size - atKill(writer))
+      } finally pg.startPostgres()
+    val down = (System.nanoTime() - killed).nanos
+    Outage(durability, before, look(run), down, atKill, whileDown)
+  }
+
+  private def serverSetting(name: String): String =
+    Using.resource(pg.observe(BootstrappedPostgres.Superuser, "postgres")) { connection =>
+      Using.resource(connection.createStatement()) { statement =>
+        // A fixed name of this file, never input.
+        Using.resource(statement.executeQuery(s"SHOW $name")) { rows =>
+          rows.next()
+          rows.getString(1)
+        }
+      }
     }
 
   /** What kills the writers of `run`, looking at them from outside. The caller closes it. */
@@ -116,4 +201,45 @@ object CoordinatedStressSuite {
 
   /** Where a writer's batch is in the log, and the run that the entry of that version names. */
   final case class BatchCommit(version: Long, run: Option[String])
+
+  /**
+   * The registry of a table at one moment.
+   *
+   * @param versions the versions that have an entry
+   * @param unfinished of them, the ones whose entry is not complete, and whether their commit
+   *   file was in the log at that moment
+   */
+  final case class Look(versions: Set[Long], unfinished: Seq[InFlight]) {
+
+    def describe: String =
+      if (unfinished.isEmpty) s"${versions.size} entries, all complete"
+      else
+        s"${versions.size} entries, with " + unfinished
+          .map(e => s"version ${e.version} ${if (e.published) "in the log" else "not in the log"}")
+          .mkString(", ") + " not complete"
+  }
+
+  /**
+   * An outage of PostgreSQL in the middle of a run: killed, down for a time, started again.
+   *
+   * @param durability the settings of the server that say whether a commit it confirmed
+   *   outlives its crash, as it ran with them
+   * @param before the registry at the last look before the kill
+   * @param after the registry at the first look after the restart
+   * @param down from the kill to the first connection that the server accepted again
+   * @param acknowledgedAtKill how many batches each writer had acknowledged at the kill
+   * @param acknowledgedWhileDown how many more each acknowledged before the server was started
+   */
+  final case class Outage(
+      durability: Seq[(String, String)],
+      before: Look,
+      after: Look,
+      down: FiniteDuration,
+      acknowledgedAtKill: Seq[Int],
+      acknowledgedWhileDown: Seq[Int]
+  ) {
+
+    /** The versions that had an entry before the kill and have none after the restart. */
+    def gone: Seq[Long] = (before.versions -- after.versions).toSeq.sorted
+  }
 }

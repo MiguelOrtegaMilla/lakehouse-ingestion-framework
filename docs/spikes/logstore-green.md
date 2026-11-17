@@ -2,12 +2,12 @@
 
 | | |
 |---|---|
-| **Phase** | P2b.3 (suite and runs), 2026-11-16; P2b.4 (writers killed inside a commit), 2026-11-17. The restart of PostgreSQL (P2b.5) is added to this document when it is run. |
+| **Phase** | P2b.3 (suite and runs), 2026-11-16; P2b.4 (writers killed inside a commit) and P2b.5 (PostgreSQL killed in the middle of a run), 2026-11-17. |
 | **Plan** | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md) §7.3 |
 | **Before** | [Spike RED](logstore-red.md): the same harness on Delta's default LogStore |
-| **Code** | `SpikeGreenSpec`; `SpikeGreenKillSpec` and `WriterKiller` for the kills; `GreenSpikeSuite`, `CoordinatedStressSuite`, the stress harness and verifier (`modules/integration-tests/.../it/stress/`). The RED suite, `SpikeRedSpec`, is unchanged. |
-| **Reproduce** | `scripts/stress-logstore.sh`: the three suites, about 75 minutes, Docker, about 4 GB of free memory. With `STRESS_NATURAL_RUNS=0` the natural runs are left out, and it takes about 20 minutes. The kills alone, about 9 minutes: `sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"`. |
-| **Harness** | The runs of 2026-11-16: the commit *test: run the suite of the RED spike on PostgresLogStore (P2b.3)*, GREEN and RED one after the other, by one invocation of the script. The kills of 2026-11-17: the commit *test: kill a writer inside a commit and start a process in its place (P2b.4)*. |
+| **Code** | `SpikeGreenSpec`; `SpikeGreenKillSpec` and `WriterKiller` for the kills; `SpikeGreenOutageSpec` for PostgreSQL killed; `GreenSpikeSuite`, `CoordinatedStressSuite`, the stress harness and verifier (`modules/integration-tests/.../it/stress/`). The RED suite, `SpikeRedSpec`, is unchanged. |
+| **Reproduce** | `scripts/stress-logstore.sh`: the four suites, about 80 minutes, Docker, about 4 GB of free memory. With `STRESS_NATURAL_RUNS=0` the natural runs are left out, and it takes about 25 minutes. One suite alone: `sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"`, about 9 minutes, or `*SpikeGreenOutageSpec`, about 6. |
+| **Harness** | The runs of 2026-11-16: the commit *test: run the suite of the RED spike on PostgresLogStore (P2b.3)*, GREEN and RED one after the other, by one invocation of the script. The kills of 2026-11-17: the commit *test: kill a writer inside a commit and start a process in its place (P2b.4)*. PostgreSQL killed, the same day: the commit *test: kill PostgreSQL in the middle of a run, with writers that repeat a batch (P2b.5)*. |
 
 ## Question
 
@@ -23,6 +23,7 @@ How much each part of that says is not the same, and the rest of this document k
 - **The natural race is the weak evidence.** Without any delay, the default LogStore lost commits in **2 runs of 6** between 2026-11-13 and 2026-11-16. `PostgresLogStore` lost none in **10 runs of 10**, during which two writers were committing one version at the same moment **376 times**, without help, and nothing was lost.
 - **The natural race of one day does not tell the two apart.** The one natural run of RED on 2026-11-16 lost nothing either. A clean natural run can be luck, with any LogStore: four of the six RED runs were.
 - **A writer that dies inside a commit loses nothing and repeats nothing.** A writer was killed with `kill -9` at each of the three points where a death leaves something different behind, and a process started in its place repeated the batch that was in flight. Killed before the `INSERT`, it had made no commit, and the batch was written once, by the process started afterwards. Killed after the `INSERT` or after the publish, its commit was in the table at the version it had taken, finished by another process, and the repeated batch wrote nothing.
+- **A coordination database that dies loses nothing either.** PostgreSQL was killed in the middle of a run, with no shutdown, and started again half a minute later. While it was down no version could be taken: every attempt failed, 15 in each run, and the writers repeated their batches until they were in the table. After its recovery no version that PostgreSQL had confirmed was gone, and every batch was in the table once. A commit whose version was taken before the kill, and that was not in the log yet, was published by its writer while the database was down.
 
 ## How to read the evidence
 
@@ -32,6 +33,7 @@ A stress run can show that a failure happens. It cannot show that one never does
 - In **the natural race** the situation happens by chance, and for most commits it does not happen at all. A run without a lost commit says little by itself. What it adds is a count of the times the situation did happen unprovoked, 376 here, and that is all it is used for.
 - In **the kills at a chosen point** the situation is made too: the victim is held at one point of its commit and killed there, from outside. Each run says what was seen when the kill was decided, how long the process took to die, and what it left, so that no kill is reported at a point where there was none.
 - **The kills at random moments** are weak evidence, as the natural race is. A commit is a few milliseconds of a batch that takes more than a second, and none of the six kills landed inside one.
+- In **the outage of PostgreSQL** the situation is made as well, and in one run at a chosen moment: when the registry shows a version that is taken and not published. What such a run must show first is that the outage reached every writer as a batch that failed. An outage that the LogStore waits out says nothing of what a writer does afterwards.
 
 ## Setup
 
@@ -105,9 +107,26 @@ The victim is killed in its third commit, so that it has commits before the one 
 
 **What is read after a kill is reported apart from what was seen before it.** The writers that are alive finish the commit of a dead one when they next look at the table, and that can be within the milliseconds a kill takes. What a process left is put down to it only through the registry, whose entries name their process. A temporary file names nobody, so one counts only if the victim was seen holding it.
 
+### Variants with PostgreSQL killed
+
+PostgreSQL dies in the middle of a run as `docker kill` does: no shutdown, no checkpoint, every connection cut. It is started again 30 s later and recovers from its write-ahead log. A writer repeats a batch that fails, under the same transaction identifier, until the batch is in the table.
+
+| Variant | Writers × batches | What it shows | Pass condition, besides the criterion |
+|---|---|---|---|
+| **PostgreSQL killed in a natural run** | 3 × 30, killed once every writer has acknowledged 5 batches | The writers wherever the kill finds them | Every writer repeated a batch, and none from before the kill; no version of the registry gone after the restart |
+| **PostgreSQL killed with a version taken and not published** | 3 × 20, every writer held 1.5 s at `afterInsert`; killed when the registry shows such a version | A commit that exists in the coordination database alone, when that database dies | The same; and that version is in the registry after the restart |
+
+As with the kills, each writer must end with all its batches acknowledged, and every batch must be in the table exactly once.
+
+**Killed, not stopped.** A stop was tried in P2a against the store alone: every call fails while the server is down, and the same store works when it is back. A kill adds the recovery. What PostgreSQL confirmed before it died must be there afterwards: if it forgot a version that a writer had been told was its own, another writer would take that version again. Each report says, from the server itself, that it ran with `fsync`, `synchronous_commit` and `full_page_writes` on.
+
+**Why 30 seconds.** A writer waits up to 5 s for a connection (`lakehouse.logstore.timeout.connectMs`), and the LogStore tries the `INSERT` that takes a version three times. An outage shorter than that is waited out inside a commit, and no batch fails. Thirty seconds are longer than that wait on every path.
+
+**Two retries, with two owners.** The LogStore repeats a step of its own, for a reply that is lost. The writer repeats the batch, for an outage; in the engine that will be the engine's part. Each attempt that fails is in the writer's journal as `RETRY`, which says nothing of whether the commit was made: the acknowledgement of the batch settles that.
+
 ## Results
 
-Runs of 2026-11-16, GREEN from 21:55 UTC and RED from 22:51 UTC. Both suites passed: `SpikeGreenSpec` 16 tests in 55 minutes, `SpikeRedSpec` 4 tests in 6.6 minutes, no failure, error or skipped test. The kills are of 2026-11-17, from 18:13 UTC: `SpikeGreenKillSpec`, 4 tests in 8.6 minutes, all passed.
+Runs of 2026-11-16, GREEN from 21:55 UTC and RED from 22:51 UTC. Both suites passed: `SpikeGreenSpec` 16 tests in 55 minutes, `SpikeRedSpec` 4 tests in 6.6 minutes, no failure, error or skipped test. The kills are of 2026-11-17, from 18:13 UTC: `SpikeGreenKillSpec`, 4 tests in 8.6 minutes, all passed. PostgreSQL was killed the same day, from 19:04 UTC: `SpikeGreenOutageSpec`, 2 tests in 6.0 minutes, both passed.
 
 ### The widened window
 
@@ -188,6 +207,31 @@ Runs of 2026-11-17. In all four no acknowledged batch was lost and none was in t
 - **The registry keeps the two processes of the victim apart.** In each of these three runs the entries name four runs: one for each of the other two writers, one for the process that was killed, and one for the process started in its place.
 - **At random moments**, six processes were killed while they were committing. Each had taken versions of its own (2, 3, 24, 2, 6 and 3 of them) and had a batch in flight. All six died before their `INSERT`: in each case the batch in flight is a commit of the process started afterwards. One had written the data file of its batch, which no commit added. None died inside the milliseconds of a commit. The run shows that a death in the rest of a batch costs nothing: 150 batches in the table, once each, under nine runs. It says nothing about a death inside a commit, which is what the three runs above are for.
 
+### PostgreSQL killed in the middle of a run
+
+Runs of 2026-11-17. In both no acknowledged batch was lost and none was in the table twice, every entry of the registry was complete at the end, and both readers read the table.
+
+| | Natural run | With a version taken and not published |
+|---|---|---|
+| Writers × batches | 3 × 30 | 3 × 20 |
+| Batches acknowledged at the kill | 6, 5, 5 | 3, 3, 3 |
+| Registry at the last look before the kill | 17 entries, all complete | 11 entries; version 10 not complete, its commit not in the log |
+| From the kill to the first connection accepted | 34.5 s | 33.2 s |
+| Registry at the first look after the restart | 17 entries, all complete | 11 entries; version 10 not complete, its commit in the log |
+| Versions gone from the registry | **none** | **none** |
+| Batches acknowledged while PostgreSQL was down | 0, 0, 0 | 0, 1, 0 |
+| Attempts that failed and were repeated | 5, 5, 5 | 6, 3, 6 |
+| Their errors | `java.io.IOException`, 15 of 15 | `java.io.IOException`, 15 of 15 |
+| Acknowledged at the end | 90 | 60 |
+| **Lost** | **0** | **0** |
+| **Twice** | **0** | **0** |
+
+- **Every attempt made while PostgreSQL was down failed**, each after the 5 s that a writer waits for a connection, with the `IOException` of a coordination store that does not answer. No commit was made without the database: at the end every commit file has its entry, and no entry was made in those 30 seconds.
+- **PostgreSQL forgot nothing that it had confirmed.** The 17 and the 11 entries of before the kill were there after the recovery.
+- **The commit that only the database knew of was published without the database.** Version 10 was batch 4 of `writer-1`, which had taken it and was holding it when PostgreSQL died. The writer published the commit, waited 5 s for a connection to mark its entry complete, gave that up and left it "to the next reader or writer of the table", as the LogStore logs it, and acknowledged the batch while PostgreSQL was still down. After the restart the entry was there, not complete, with its commit in the log. It was complete at the end, and the writer saw no attempt at that batch fail. A commit is made at the `INSERT`: nothing after it needs the database.
+- **The repeated batches were written once.** Each writer's next batch failed for as long as the outage lasted, three to six times, and was in the table once at the end. The orphan data files of the two runs, 3 and 2, are files that failed attempts had written.
+- **A checkpoint fell due during the outage.** Version 10 is one that Delta checkpoints. `writer-1` wrote the checkpoint while PostgreSQL was down. The cleanup of the log that follows a checkpoint lists the log, which reads the registry, and failed; Delta logged it ("Error when writing checkpoint-related files") and went on.
+
 ### Controls
 
 | | Commits | Lost | Anomalies | Waits at the hooks |
@@ -216,7 +260,11 @@ A writer made its 200 commits in 261 to 277 s on `PostgresLogStore`, and in 273 
 - **The natural race is not a rate.** How often two writers meet at the `INSERT` depends on hardware, load and commit latency. The 376 are a count on this machine, on this day.
 - **The collisions of RED were not counted.** The count at the `INSERT` exists only on `PostgresLogStore`, so the two cannot be compared by it. What can be compared is the outcome: lost commits.
 - **The window before the `INSERT` is widened by a hook of the LogStore itself.** The hook only sleeps, between two steps the LogStore takes anyway, and the control shows that it loses nothing by itself.
-- **PostgreSQL stays up in every run.** Its restart in the middle of one is P2b.5.
+- **One outage in each run, of one length**, and two runs. The suite was run twice on 2026-11-17, and the table has the second execution.
+- **An outage of ten seconds did not reach every writer.** In the first execution PostgreSQL was down for 10 s, 12.2 s to the first connection. In the run with the version taken, the writer that held it published its commit, waited 5 s on its acknowledgement and once more for a connection, and PostgreSQL was back: it saw no batch fail, and the run did not meet its pass condition. Nothing was lost or written twice. The outage was made longer than the LogStore waits, since the run is there to show what a writer does after a failure.
+- **The rule by which a writer repeats a batch is the harness's**: every failure is repeated, a second later, for up to two minutes. Telling the failures that are worth repeating from the others, and backing off, is the engine's.
+- **A PostgreSQL that is killed is not a disk that is lost.** Its files stay and the operating system goes on. What was tried is the recovery from the write-ahead log of a server that got no shutdown, not a loss of power.
+- **The first look after the restart races with the writers**, which finish an entry that is not complete as soon as they reach the database again.
 - **One kill at each point, in one run.** The three variants were run three times on 2026-11-17, twice while the suite was being written: nine kills, and no batch lost or written twice. The table has the last execution. It is a demonstration at each point, not a rate.
 - **What the read after a kill finds is not always the same.** In the two earlier executions of that day, the entry of the commit killed after the publish was complete by the time it was read: a writer that was alive had finished the commit in the milliseconds between. Since then a run reports what was seen when the kill was decided apart from what was read after it.
 - **The kills at random moments did not land inside a commit.** Their first version did not even land on a writer that was committing: it drew its moments from the start of the run, and all six kills fell on processes that were still starting (run `20261117T180355Z`: clean, and saying nothing). The variant now waits until its victim has acknowledged two or three batches more.
@@ -227,5 +275,6 @@ A writer made its 200 commits in 261 to 277 s on `PostgresLogStore`, and in 273 
 
 - **The fix of ADR-0004 holds where the default LogStore fails every time**, and where it fails by chance. The engine can be built on tables that several instances write.
 - **A writer that dies with a commit half made costs a repeated batch, and nothing else.** The batch is repeated under the same transaction identifier: it is written if the commit had not happened, and skipped if it had. That is how the engine is to treat a batch whose outcome it does not know.
-- **P2b.5** stops PostgreSQL in the middle of a run, with writers that repeat the batch that failed.
+- **The engine's retries have to outlast the LogStore's wait.** A batch that fails for want of the database fails after 5 s, not at once, and three times that at the `INSERT`. The engine's rule for errors that pass (how long, how far apart) is to be set with those numbers in hand, and a batch that failed is always safe to repeat under its transaction identifier.
+- **An entry can stay unfinished through an outage with its writer alive.** The writer does not wait for the database to mark its entry complete: the next reader or writer does it. The verifier's rule, that every entry is complete once the readers have read the table, held.
 - **The count at the `INSERT` is there for the engine to report next to the total** (`commit_contention`, ADR-0010), if it proves useful there: the total says how busy a table is, the count at the `INSERT` how often its writers were truly in each other's way. That is decided with the engine's metrics (P11).

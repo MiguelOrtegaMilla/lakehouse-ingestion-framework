@@ -7,7 +7,7 @@ import scala.util.{Random, Using}
 import lakehouse.ingestion.it.stress.CoordinatedStressSuite.BatchCommit
 import lakehouse.ingestion.it.stress.GreenSpikeSuite.Spiked
 import lakehouse.ingestion.it.stress.SpikeGreenKillSpec.Side
-import lakehouse.ingestion.it.stress.StressHarness.{Chaos, WriterOutcome}
+import lakehouse.ingestion.it.stress.StressHarness.WriterOutcome
 import lakehouse.ingestion.it.stress.WriterKiller.{InFlight, Killed}
 import lakehouse.ingestion.it.support.StressTest
 import lakehouse.ingestion.logstore.FaultPoint
@@ -207,18 +207,6 @@ final class SpikeGreenKillSpec extends AnyFunSuite with Matchers with GreenSpike
       Some(BatchCommit(taken, Some(killed)))
   }
 
-  /** Waits until the writer has acknowledged that many batches. */
-  private def awaitAcknowledged(chaos: Chaos, writer: Int, batches: Int): Unit = {
-    val deadline = 2.minutes.fromNow
-    while (chaos.acknowledged(writer).size < batches) {
-      if (!chaos.isAlive(writer))
-        fail(s"${StressTable.writerId(writer)} exited before it acknowledged $batches batches")
-      if (deadline.isOverdue())
-        fail(s"${StressTable.writerId(writer)} did not acknowledge $batches batches in time")
-      Thread.sleep(20)
-    }
-  }
-
   /**
    * On which side of its `INSERT` a process died, as the registry tells after the run: the
    * commit of the batch that was in flight is put down to the run of the dead process, which
@@ -262,8 +250,7 @@ final class SpikeGreenKillSpec extends AnyFunSuite with Matchers with GreenSpike
               val writer = candidates(random.nextInt(candidates.size))
               // The process is committing, not starting: it acknowledges two or three batches
               // more, of which only the first can be one that it found in the table.
-              awaitAcknowledged(
-                chaos,
+              chaos.awaitAcknowledged(
                 writer,
                 chaos.acknowledged(writer).size + 2 + random.nextInt(2)
               )

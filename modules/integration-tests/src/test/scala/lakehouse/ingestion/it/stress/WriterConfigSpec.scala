@@ -17,6 +17,8 @@ final class WriterConfigSpec extends AnyFunSuite with Matchers {
     WriterConfig.fromArgs(unguarded.toArgs) shouldBe Right(unguarded)
     val inPlaceOfAKilledOne = config.copy(firstCommit = 7, restarted = true)
     WriterConfig.fromArgs(inPlaceOfAKilledOne.toArgs) shouldBe Right(inPlaceOfAKilledOne)
+    val repeating = config.copy(repeatFor = 90.seconds)
+    WriterConfig.fromArgs(repeating.toArgs) shouldBe Right(repeating)
   }
 
   test("rejects malformed, unknown, missing and out-of-range arguments") {
@@ -32,7 +34,8 @@ final class WriterConfigSpec extends AnyFunSuite with Matchers {
       replaced("rows-per-commit", "ten") -> "rows-per-commit must be a positive integer",
       replaced("guard", "maybe") -> "guard must be true or false",
       replaced("first-commit", "0") -> "first-commit must be a positive integer",
-      replaced("restarted", "again") -> "restarted must be true or false"
+      replaced("restarted", "again") -> "restarted must be true or false",
+      replaced("repeat-seconds", "-1") -> "repeat-seconds must be a non-negative integer"
     )
     cases.foreach { case (args, expected) =>
       WriterConfig.fromArgs(args).left.map(_.startsWith(expected)) shouldBe Left(true)

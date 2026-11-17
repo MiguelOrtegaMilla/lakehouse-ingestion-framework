@@ -411,6 +411,30 @@ final class VerifierSpec extends AnyFunSuite with Matchers with LoneElement {
     uncoordinated.summary.registry shouldBe None
   }
 
+  test("attempts that failed and were repeated change nothing of what a writer acknowledged") {
+    val noAnswer = Failure(2, "java.io.IOException: no answer")
+    val repeating = allOk.map { outcome =>
+      outcome.copy(journal = outcome.journal.copy(repeated = Vector(noAnswer, noAnswer)))
+    }
+
+    run(repeating, logOf(interleaved)).anomalies shouldBe empty
+  }
+
+  test("a repeated attempt at a batch the writer had not reached is InconsistentJournal") {
+    val ahead = Failure(5, "java.io.IOException: no answer")
+    val writers = allOk.map { outcome =>
+      if (outcome.writer == 0)
+        outcome.copy(journal = outcome.journal.copy(repeated = Vector(ahead)))
+      else outcome
+    }
+
+    run(writers, logOf(interleaved)).anomalies.collect { case j: InconsistentJournal =>
+      j.detail
+    } shouldBe Seq(
+      "writer-0: repeated attempts at 5, beyond the batch after the last acknowledgement"
+    )
+  }
+
   test("a journal that contradicts itself or its exit code is InconsistentJournal") {
     val writers = Seq(
       writer(0, ExitCode.Ok, Seq(1, 2)),
