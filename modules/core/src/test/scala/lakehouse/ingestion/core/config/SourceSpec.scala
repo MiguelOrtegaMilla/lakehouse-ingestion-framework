@@ -207,6 +207,11 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
   test("a new kind of connector reads its own section, and the model of a source does not change") {
     final case class RestConfig(endpoint: String, pageSize: Int) extends ConnectorConfig {
       override def kind: String = "rest"
+      override def canonical: io.circe.Json = io.circe.Json
+        .obj(
+          "endpoint" -> io.circe.Json.fromString(endpoint),
+          "page_size" -> io.circe.Json.fromInt(pageSize)
+        )
     }
     object Rest extends ConnectorKind {
       override val name: String = "rest"

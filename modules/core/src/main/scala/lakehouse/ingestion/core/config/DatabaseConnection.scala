@@ -3,6 +3,7 @@ package lakehouse.ingestion.core.config
 import scala.concurrent.duration._
 
 import cats.syntax.all._
+import io.circe.Json
 import lakehouse.ingestion.core.config.Read.{Obj, Problem, Result}
 
 /**
@@ -18,7 +19,30 @@ final case class DatabaseConnection(
     password: SecretRef,
     tls: Tls,
     timeouts: Timeouts
-)
+) {
+
+  /**
+   * The connection as it is stored and hashed: the fields of a file, with every default. The
+   * password is where it is, as in the file: a connection never held the password itself.
+   */
+  def canonical: Json = Json.obj(
+    "url" -> Json.fromString(url.value),
+    "user" -> Json.fromString(user.value),
+    "password" -> Json.obj("secretRef" -> Json.fromString(password.toString)),
+    "tls" -> (tls match {
+      case Tls.Disabled => Json.obj("mode" -> Json.fromString("disable"))
+      case Tls.VerifyFull(certificate) =>
+        Json.obj(
+          "mode" -> Json.fromString("verify-full"),
+          "root_certificate" -> Json.fromString(certificate)
+        )
+    }),
+    "timeouts" -> Json.obj(
+      "connect" -> Json.fromString(Durations.render(timeouts.connect)),
+      "statement" -> Json.fromString(Durations.render(timeouts.statement))
+    )
+  )
+}
 
 object DatabaseConnection {
 

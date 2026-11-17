@@ -1,6 +1,7 @@
 package lakehouse.ingestion.core.config
 
 import cats.syntax.all._
+import io.circe.Json
 import lakehouse.ingestion.core.config.Read.{Obj, Problem, Result}
 
 /** What a connector is told about the source it reads: the `connector` section of a source. */
@@ -11,6 +12,13 @@ trait ConnectorConfig {
 
   /** What is worth a second look in it, by the path of the field. */
   def warnings: Seq[Problem] = Nil
+
+  /**
+   * The section as it is stored and hashed (`ConfigVersion`): every field with the name it has
+   * in a file, defaults included, and `type` left out, which is added from `kind`. What the
+   * kind reads back from this must be this configuration again.
+   */
+  def canonical: Json
 }
 
 /**
@@ -55,6 +63,9 @@ final case class JdbcConnectorConfig(connection: DatabaseConnection, table: Qual
 
   override def warnings: Seq[Problem] =
     DatabaseConnection.warnings("connector.connection", connection).toSeq
+
+  override def canonical: Json =
+    Json.obj("connection" -> connection.canonical, "table" -> Json.fromString(table.toString))
 }
 
 object JdbcConnector extends ConnectorKind {
@@ -81,7 +92,14 @@ final case class FileConnectorConfig(
     format: FileConnectorConfig.Format,
     pattern: Option[FileConnectorConfig.Pattern]
 ) extends ConnectorConfig {
+
   override def kind: String = FileConnector.name
+
+  override def canonical: Json = Json.obj(
+    "path" -> Json.fromString(path.value),
+    "format" -> Json.fromString(format.name),
+    "pattern" -> pattern.fold(Json.Null)(p => Json.fromString(p.value))
+  )
 }
 
 object FileConnectorConfig {

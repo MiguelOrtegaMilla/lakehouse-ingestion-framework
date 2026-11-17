@@ -35,6 +35,12 @@ Adding a source must mean writing configuration, not code. The configuration mus
 - **Validation opens no connection and looks no name up.** Whether a database or a source answers is another step, with timeouts of its own.
 - **Warnings are apart from errors**: what is allowed and unusual, as a database on another machine without TLS, is said once and stops nothing.
 
+*As built (P3.7, 2026-11-18):* `ConfigVersion` in `core`.
+- **What is hashed is the resolved configuration**, the profile and the source with every default, written one way: keys in order, no space, nothing that is null, and a `schema_version`. The order of the keys of a file, its comments, `120s` for `2m`, a default written out: none of them changes the hash. A new field with a default changes every hash when the application is upgraded, and a run records the version of the application next to its hash.
+- **The content is a configuration.** It has the names of the fields of the files, so a snapshot can be read back, and gives the same profile and the same source. A test does that for every configuration of the repository and of the corpus.
+- **It is not redacted, because it holds no secret**: a configuration has references to secrets, and its types have no place for a value.
+- **The comparison with the last snapshot looks at a few paths of the content**, so a snapshot that an older version of the application wrote can still be compared. Breaking: another key while Silver is merged into, another watermark column, another Bronze or Silver table, another partitioning of the same Silver table, another lake. It is a pure function; where the last snapshot comes from, and what lets a breaking change through, are P4 and P7.
+
 ## Alternatives
 
 | Option | Verdict |
