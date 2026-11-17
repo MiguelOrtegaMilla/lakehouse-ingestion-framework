@@ -55,6 +55,21 @@ object AckJournal {
     )
 
   /**
+   * Opens the journal of a writer that was killed, for the process started in its place: what
+   * it acknowledges is added after the entries that are there. A fragment at the end, of an
+   * entry whose write the kill cut short, is removed first: left there, the next entry would
+   * be read as a part of it.
+   */
+  def reopen(path: Path): AckJournal = {
+    val channel = FileChannel.open(path, StandardOpenOption.READ, StandardOpenOption.WRITE)
+    val bytes = Files.readAllBytes(path)
+    val whole = bytes.lastIndexOf('\n'.toByte) + 1
+    channel.truncate(whole.toLong)
+    channel.position(whole.toLong)
+    new AckJournal(channel)
+  }
+
+  /**
    * Reads a journal. Only newline-terminated lines are entries: a trailing fragment is a line
    * whose write was cut short (a writer killed mid-append) and is ignored. Ignoring it is the
    * conservative reading, because it can only turn an acknowledgement into "unknown"; reading

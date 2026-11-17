@@ -21,6 +21,13 @@ final class StressRun private (val root: Path) {
 
   def log(writer: Int): Path = root.resolve("logs").resolve(s"${name(writer)}.log")
 
+  /**
+   * The runs a writer attributed its commits to, one line for each of its processes, written
+   * by the process before it commits anything. A writer that is killed leaves no probe, and
+   * the one started in its place commits under a run of its own.
+   */
+  def runs(writer: Int): Path = root.resolve("journals").resolve(s"${name(writer)}.runs")
+
   /** Created by a writer once its session is up and the table is loaded. */
   def readyMarker(writer: Int): Path = root.resolve("barrier").resolve(s"${name(writer)}.ready")
 

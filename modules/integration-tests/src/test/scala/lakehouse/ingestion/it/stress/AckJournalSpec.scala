@@ -44,6 +44,23 @@ final class AckJournalSpec extends AnyFunSuite with Matchers with BeforeAndAfter
     AckJournal.read(journalPath).acked shouldBe Vector(11L)
   }
 
+  test("a journal reopened after a kill goes on after its entries, and drops one cut short") {
+    Using.resource(AckJournal.open(journalPath)) { journal =>
+      journal.ack(1)
+      journal.ack(2)
+    }
+    // The writer was killed while it wrote its third entry.
+    Files.write(journalPath, "ACK".getBytes(UTF_8), java.nio.file.StandardOpenOption.APPEND)
+
+    Using.resource(AckJournal.reopen(journalPath)) { journal =>
+      journal.ack(3)
+      journal.ack(4)
+    }
+
+    AckJournal.read(journalPath) shouldBe AckJournal.Contents(Vector(1L, 2L, 3L, 4L), None)
+    new String(Files.readAllBytes(journalPath), UTF_8) shouldBe "ACK 1\nACK 2\nACK 3\nACK 4\n"
+  }
+
   test("refuses to open a journal that already exists") {
     withRaw("")
     an[FileAlreadyExistsException] should be thrownBy AckJournal.open(journalPath)

@@ -224,6 +224,67 @@ final class CoordinatedHarnessSpec
     report.summary.lost shouldBe 0
   }
 
+  test("a writer killed after it took a version leaves a commit that is in the table once") {
+    val run = newRun("killed-after-insert")
+    val commits = 4
+    val settings = Settings(
+      writers = 2,
+      commits = commits,
+      rowsPerCommit = 4,
+      extraJvmOptions = coordinatedJvmOptions,
+      guard = true,
+      // The first writer is held for three seconds after each INSERT, where it is to die.
+      alsoFor = Map(0 -> Seq(delay(FaultPoint.AfterInsert, millis = 3000)))
+    )
+    var killed = Option.empty[WriterKiller.Killed]
+
+    val outcomes = Using.resource(killerOf(run)) { killer =>
+      StressHarness.run(
+        run,
+        settings,
+        chaos => {
+          // kill -9, the moment the registry shows a version of its own that is not published.
+          killed =
+            Some(killer.killAt(chaos, writer = 0, FaultPoint.AfterInsert, afterAcknowledging = 1))
+          chaos.restart(0)
+        }
+      )
+    }
+
+    val kill = killed.getOrElse(fail("no writer was killed"))
+    // It was seen with a version taken and its commit not in the log, and it died there: well
+    // inside the three seconds it was held for.
+    val taken = kill.seen match {
+      case Some(WriterKiller.InFlight(version, false)) => version
+      case other => fail(s"the writer was killed on seeing $other")
+    }
+    kill.goneAfter.toMillis should be < 1500L
+    // One version taken more than batches acknowledged: its second batch was a commit by
+    // then, and nobody had been told.
+    (kill.acknowledged, kill.entriesOfProcess, kill.batchInFlight) shouldBe ((1, 2, 2L))
+
+    // The process started in its place repeated that batch, and both writers finished.
+    outcomes.foreach { outcome =>
+      withClue(logOf(outcome)) {
+        outcome.exitCode shouldBe StressWriter.ExitCode.Ok
+        outcome.journal.acked shouldBe (1L to commits.toLong).toVector
+      }
+    }
+    outcomes.map(_.kills) shouldBe Seq(1, 0)
+    outcomes.head.runs should have size 2
+
+    // Every batch is in the table exactly once, the one in flight too, and nothing else is
+    // wrong: with the registry, through both readers.
+    val report = verify(run, settings, outcomes)
+    withClue(report.anomalies.map(_.detail).mkString("\n")) { report.isClean shouldBe true }
+    report.summary.readers.map(_._2) shouldBe Seq(None, None)
+    // The commit of the batch in flight is the one the killed process made, at the version it
+    // had taken: another process published it, and the writer that repeated the batch found
+    // it there and wrote nothing.
+    commitOfBatch(run, writer = 0, batch = 2) shouldBe
+      Some(CoordinatedStressSuite.BatchCommit(taken, outcomes.head.runs.headOption))
+  }
+
   test("a writer JVM that would commit with Delta's default LogStore refuses to run") {
     val run = newRun("misconfigured")
     val filesBefore = logFiles(run)

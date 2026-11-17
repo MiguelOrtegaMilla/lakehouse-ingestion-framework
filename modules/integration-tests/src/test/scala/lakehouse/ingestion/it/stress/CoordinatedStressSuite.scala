@@ -28,6 +28,8 @@ import scala.util.Using
  */
 trait CoordinatedStressSuite extends LocalSparkSuite { self: Suite =>
 
+  import CoordinatedStressSuite.BatchCommit
+
   protected lazy val pg: ProxiedPostgres = ProxiedPostgres.start()
 
   /** How every process of a run reaches the coordination database. */
@@ -60,6 +62,27 @@ trait CoordinatedStressSuite extends LocalSparkSuite { self: Suite =>
       RegistryReader.view(_, keyOf(run).value)
     }
 
+  /** What kills the writers of `run`, looking at them from outside. The caller closes it. */
+  protected def killerOf(run: StressRun): WriterKiller =
+    new WriterKiller(
+      pg.observe(CoordinationSchema.CommitPathRole, CoordinationSchema.Database),
+      keyOf(run).value,
+      run.tableDir.resolve("_delta_log")
+    )
+
+  /**
+   * The commit of a writer's batch, read after the run is over: its version in the log, and
+   * the run that its entry in the registry names. `None` if the batch is not in the log.
+   */
+  protected def commitOfBatch(run: StressRun, writer: Int, batch: Long): Option[BatchCommit] = {
+    val entries = registryView(run).entries.map(e => e.version -> e.runId).toMap
+    LogReader
+      .logView(spark, run.tableDir)
+      .commits
+      .find(_.txns.contains(LogModel.Txn(StressTable.writerId(writer), batch)))
+      .map(commit => BatchCommit(commit.version, entries.get(commit.version).flatten))
+  }
+
   /**
    * Verifies a finished run as a coordinated one: what every run is held to, and what
    * `PostgresLogStore` adds, with the registry read after the readers have read the table.
@@ -87,4 +110,10 @@ trait CoordinatedStressSuite extends LocalSparkSuite { self: Suite =>
     finally
       try registry.close()
       finally pg.stop()
+}
+
+object CoordinatedStressSuite {
+
+  /** Where a writer's batch is in the log, and the run that the entry of that version names. */
+  final case class BatchCommit(version: Long, run: Option[String])
 }
