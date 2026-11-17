@@ -41,7 +41,10 @@ lazy val root = (project in file("."))
 
 /** Pure domain: configuration model, validation, planning. No Spark, no JDBC. */
 lazy val core = module("core", artifact = "core")
-  .settings(rules(forbidden = Seq(Forbid.spark, Forbid.anyDelta, Forbid.hadoop) ++ Forbid.jdbc))
+  .settings(
+    rules(forbidden = Seq(Forbid.spark, Forbid.anyDelta, Forbid.hadoop) ++ Forbid.jdbc),
+    libraryDependencies ++= Seq(catsCore, circeCore, circeYamlV12, snakeyamlEngine, scalatest)
+  )
 
 /**
  * PostgreSQL-coordinated Delta LogStore (ADR-0004). Depends on no other project module, so it

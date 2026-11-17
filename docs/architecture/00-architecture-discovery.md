@@ -689,6 +689,32 @@ Decisions taken with the breakdown:
 - **The natural race is the weak evidence, and the report says so.** A run without a lost commit can be luck, as three of the five RED runs were. It is run ten times, with the contention of each run reported and some required in total. The strong evidence is the widened window and the kills, where the race is made to happen every time.
 - **The refusal of a misconfigured process comes with P2b.1**, not as a part of its own: the guard enters the writer there, and its refusal is tested where it is added.
 
+**P3 breakdown** (decided at the start of P3, 2026-11-17). One commit per part, with its tests; two or three parts in each pull request. All of it is in `core`, which has no Spark, no JDBC and no Hadoop, except the command of P3.8.
+
+| Part | Content | PR | Status |
+|---|---|---|---|
+| P3.1 | The verification item of §20 on circe-yaml, closed. cats, circe and circe-yaml (YAML 1.2) in `core`. The loader of configuration, `SafeYaml`: one document into JSON, with limits on size, nesting and aliases, and no tag, no duplicate key, no key that is not a scalar. Each refusal is tested with the document it exists for: the billion laughs, a hundred thousand levels of nesting, the tags of CVE-2022-1471. | 1 | Done |
+| P3.2 | Value types with an allow-list grammar: `SqlIdentifier`, `RelativePath`, `SecretRef` (`env:`, `file:`), durations with a unit. The malicious corpus of ADR-0013 §1 and §2. | 1 | |
+| P3.3 | The profile (`conf/app/<profile>.yaml`): lake, `landing.root`, the databases with their TLS options and timeouts, the retry budget, Spark settings. The static rules of ADR-0011 §2. `conf/app/local.yaml`, validated by a test. | 2 | |
+| P3.4 | The source (`conf/sources/*.yaml`, §13.1): connector, load, schema policy, targets, keys, PII. Decoding that knows its fields and accumulates every error with its file and field. | 2 | |
+| P3.5 | Validation across sources: duplicate ids, partition keys within the keys of fan-in tables (ADR-0010), literal passwords refused. A corpus of invalid configurations with the errors each must give. | 2 | |
+| P3.6 | `TableLocator` and `PathTableLocator`: the lake URI and a relative path into one URI, normalised by its text alone. Targets that escape the lake. The test of agreement with the LogStore's `TableIdentity` (`integration-tests`). | 3 | |
+| P3.7 | The version of a configuration: canonical and redacted JSON of the resolved configuration, its SHA-256, and the comparison that finds a breaking change (primary key, watermark column, target). Storing the snapshot is P4. | 3 | |
+| P3.8 | `ConfigLoader` and the command `validate` in `cli`: a profile and its sources, every error at once, an exit code. No connection is opened. | 4 | |
+| P3.9 | Documentation (how to add a source, the reference of the fields), the README, and a review. | 4 | |
+
+**Exit criterion of P3:** the example configurations validate; the corpus of invalid ones gives all its errors at once, each with its file and field; the malicious corpus is refused whole; the hash of a configuration does not change with the order of its keys or its comments; a profile whose databases cannot be reached validates in milliseconds; `core` has no Spark, JDBC or Hadoop.
+
+Decisions taken with the breakdown:
+- **P3 starts while the first run of the stress job in CI is still going** (§20, open items). The plan had P3 wait for P2b to pass. P3 is all in `core`, which shares no code with the LogStore, so a failed run is fixed on a branch of its own. The engine (P4, P5) does wait.
+- **Validation is static, and opens no connection.** A dependency that is down costs seconds for each attempt: a batch without the coordination database takes 5 s to fail (P2b.5). Whether a database or a source answers is another step, with timeouts of its own (P5, P8).
+- **Timeouts and the retry budget are in the model of the profile from P3**, with one rule: the engine's budget for errors that pass must be longer than the LogStore itself waits for the database, the connect timeout times its three attempts. A shorter one would give up on outages that would have passed. The policy itself is P8.
+- **`core` normalises a table's URI by its text alone.** What needs the file system, symbolic links, stays in the LogStore's `TableIdentity`, which is the key that commits are coordinated under; a test holds the two to the same answer. `core` may not depend on the LogStore or on Hadoop, and two implementations of the whole rule could give one table two keys. ADR-0011 §2 has the note.
+- **The hash is of the resolved configuration, defaults included**: what ran. A new field with a default then changes every hash when the application is upgraded, and a run records the version of the application next to its hash to tell that apart (`ingestion_run.app_version`).
+- **A field that the model does not know is an error.** A misspelt `watermark` must not become a full load that nobody asked for.
+- **The command `validate` is part of P3**, though the row of P3 does not name it: it makes the phase something to run, and the build validates the examples with it.
+- **circe stays at 0.14.15.** Its later releases are built with Scala 2.13.18, and the build's Scala is Spark's, 2.13.17.
+
 **Changes from v1:**
 - The LogStore enters as **P2**, before the engine, so every later phase is built and tested on verified multi-writer ground (risk-first).
 - Type 2 tests are woven into P5 (fan-in), P7 (backfill ∥ incremental), P10 (concurrent `MERGE`) and P11 (engine demo with concurrent `OPTIMIZE`).
@@ -767,7 +793,7 @@ That is what Data Platform interviews probe, and what you need in order to opera
 | `hadoop-aws` version matching Spark's Hadoop (3.4.2, ADR-0014) | `s3a://` profile | E1 |
 | `dependency-review-action` evaluates the dependency snapshots submitted for sbt (it needs one for the base and one for the head commit) | The CI vulnerability gate (ADR-0013) | P1.5 |
 | The official `postgres` image runs as a non-root `user:` with a named volume | Non-root containers (ADR-0013) | P1 — **closed**: yes. The image creates the data directory with mode 1777, so `user: postgres` works on a fresh named volume; `cap_drop: ALL` and `no-new-privileges` also work. Tested by `PostgresBootstrapSpec`. |
-| circe-yaml: which loader limits it exposes (aliases, depth, size), duplicate-key behaviour, and whether its YAML 1.2 module fits | Safe YAML loading (ADR-0013) | P3 |
+| circe-yaml: which loader limits it exposes (aliases, depth, size), duplicate-key behaviour, and whether its YAML 1.2 module fits | Safe YAML loading (ADR-0013) | P3 — **closed** (P3.1): `circe-yaml-v12` 0.16.1 fits. It reads YAML 1.2 with the JSON schema (`yes`, `True` and `~` are strings) and exposes limits on size and on aliases of collections. It has **no limit on nesting**, and a hundred thousand levels end in a `StackOverflowError`; it throws on a duplicate key where it returns its other failures; and it turns an unknown tag into an object. `SafeYaml` looks at the events of a document first and refuses all three there. With the snakeyaml-engine that Spark brings, 3.0.1, the loader's tests pass; it is built with 2.7. |
 
 ### Open items and accepted exceptions
 
@@ -790,6 +816,7 @@ Follow-ups found while building a phase that belong to a later one. Each row say
 | No kill at a random moment has landed inside a commit (0 of 12 in two executions): a commit is milliseconds of a batch that takes more than a second | **Accepted** (P2b.4). The deaths inside a commit are the ones at the three chosen points, and the fault tests of P2a | What a random kill adds is deaths in the rest of a batch | — |
 | PostgreSQL is killed as a process, once in a run and for 30 s. A loss of power, with data written and not yet synced, is not tried, for PostgreSQL or for a writer | **Accepted** (P2b.5). It needs a machine that can be cut off, not a container | The protocol relies on PostgreSQL keeping what it confirmed, and on a published commit file staying | E1 at the earliest |
 | A batch that fails for want of the coordination database fails after the connect timeout, 5 s by default, and after three times that at the `INSERT`; an outage shorter than that is waited out inside the commit | Open (from P2b.5). The engine's rule for errors that pass has to be set with these numbers: how long it goes on, and how far apart | A retry budget shorter than the LogStore's own wait gives up on outages that would have passed | P8 |
+| The engine's compile classpath, where Spark and Delta are `provided`, resolves `scala-library` 2.13.18, and the build's Scala is 2.13.17 (ADR-0014: the patch Spark is built with). The jar has been in the cache since P1. `core` and `delta-pg-logstore` resolve 2.13.17 | Open (seen in P3.1, while circe was pinned). Find which dependency asks for it, and whether the Scala of the build should follow | The engine has no code yet. A library compiled against a newer `scala-library` than the one a process runs with can fail to link | P5, before the engine's first code |
 
 ## 21. Project identity (D6)
 
