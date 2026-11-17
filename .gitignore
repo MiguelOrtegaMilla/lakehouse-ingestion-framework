@@ -17,3 +17,6 @@ docker/secrets/
 
 # Python bytecode (scripts/)
 __pycache__/
+
+# The profile of this machine, with its own directories: copied from conf/app/local.example.yaml.
+conf/app/local.yaml

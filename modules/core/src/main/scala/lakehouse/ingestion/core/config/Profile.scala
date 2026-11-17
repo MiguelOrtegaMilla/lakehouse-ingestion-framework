@@ -345,6 +345,15 @@ object Profile {
 
     val warnings = Chain.fromSeq(
       Seq(
+        // The registry outlives such a lake: its tables would be gone, and their commits not.
+        Option.when(local && lake.uri.segments.headOption.contains("tmp"))(
+          Problem(
+            "lake.uri",
+            "is under /tmp, which is emptied when the machine restarts. The coordination " +
+              "database would still have the commits of the lake's tables, and the LogStore " +
+              "would find them missing and refuse to write"
+          )
+        ),
         Option.when(lake.sharedFilesystem && local && cluster)(
           Problem(
             "lake.shared_filesystem",

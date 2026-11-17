@@ -1,17 +1,19 @@
 # The profile of local development: every process on this machine, a lake on its disk, and the
 # PostgreSQL of docker/docker-compose.yml (README, "Local services").
 #
-# A profile says where the application runs and on what. What it ingests is in conf/sources/,
-# and is the same in every profile.
+# Copy this file to conf/app/local.yaml, which git ignores, and put the directories of your own
+# machine in it. A profile says where the application runs and on what. What it ingests is in
+# conf/sources/, and is the same in every profile.
 lake:
-  # A directory of the Linux file system, never one under /mnt/c. /tmp is emptied when the
-  # machine restarts: for a lake that is to last, name a directory of your own.
-  uri: "file:///tmp/lakehouse-ingestion/lake"
+  # A directory that lasts, in the Linux file system: never one under /mnt/c, and never /tmp.
+  # The coordination database keeps the commits of every table of the lake. If the lake were
+  # emptied under it, the LogStore would find those commits missing and refuse to write.
+  uri: "file:///home/CHANGE_ME/lakehouse/lake"
   deployment: single-machine
 
 landing:
   # Where files to ingest are left. The paths of file sources are relative to it.
-  root: "file:///tmp/lakehouse-ingestion/landing"
+  root: "file:///home/CHANGE_ME/lakehouse/landing"
 
 databases:
   # One PostgreSQL holds both schemas here, and each has a role of its own (ADR-0003, ADR-0013).
