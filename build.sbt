@@ -29,8 +29,9 @@ ThisBuild / scalacOptions ++= Seq(
   "-Wconf:any:e,cat=deprecation:w"
 )
 
-// One log4j version in every classpath: Spark's (see Dependencies.log4jAlignment).
-ThisBuild / dependencyOverrides ++= log4jAlignment
+// One log4j version in every classpath, Spark's, and one Scala library, the build's and Spark's
+// (see Dependencies.log4jAlignment and Dependencies.scalaAlignment).
+ThisBuild / dependencyOverrides ++= log4jAlignment ++ scalaAlignment
 
 lazy val root = (project in file("."))
   .aggregate(core, deltaPgLogstore, engine, cli, integrationTests)
