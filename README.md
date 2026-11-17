@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phase 2, the PostgreSQL-coordinated LogStore, is built: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Its stress job ran in CI with eight writers and 500 commits each, and lost none of 4,000.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phase 2, the PostgreSQL-coordinated LogStore, is built: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Over 33 runs on two machines it acknowledged 10,954 commits and lost none; the stress job in CI ran eight writers of 500 commits each.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -85,9 +85,10 @@ Three writer JVMs append to one table on `file://`, each in batches that carry a
 
 | | RED: Delta's default LogStore | GREEN: `PostgresLogStore` |
 |---|---|---|
-| **Widened window**: every writer is held at the point where a version is claimed | Lost a commit that its writer saw succeed in **6 runs of 6** | **0 lost** of 60 commits in 2 runs, one on each side of the `INSERT`. Held before it, the writers found their version taken at the `INSERT` 52 times, and went on at the next one |
-| **Natural race**: 3 writers × 200 commits, no fault injection | Lost commits in **2 runs of 6** | **0 lost** of 6,000 commits in 10 runs. Two writers were committing one version at the same time 376 times |
-| **Natural race in CI**: 8 writers × 500 commits, on a runner of GitHub Actions | Not run at that size. Its widened window lost its commit on that runner too | **0 lost** of 4,000 commits in 1 run |
+| **Widened window**: every writer is held at the point where a version is claimed | Lost a commit that its writer saw succeed in **7 runs of 7**, one of them in CI | **0 lost** of 60 commits in 2 runs, one on each side of the `INSERT`. Held before it, the writers found their version taken at the `INSERT` 52 times, and went on at the next one |
+| **Natural race**: 3 writers × 200 commits, no fault injection | Lost commits in **2 runs of 7**, neither of them the one in CI | **0 lost** of 6,000 commits in 10 runs. Two writers were committing one version at the same time 376 times |
+| **Natural race in CI**: 8 writers × 500 commits, on a runner of GitHub Actions | Not run at that size | **0 lost** of 4,000 commits in 1 run |
+| **Every run on `PostgresLogStore`**, of the four suites, here and in CI | | **0 lost** of 10,954 commits in 33 runs: 6,477 in 21 runs on the development machine, 4,477 in the 12 runs of the stress job in CI |
 | **A writer killed** with `kill -9` inside a commit, and started again | Not run | **0 lost, 0 written twice**, of 222 batches in 4 runs: a kill before the `INSERT`, one after it, one after the publish, and six at random moments |
 | **PostgreSQL killed** in the middle of a run, and started again 30 s later | Does not apply | **0 lost, 0 written twice**, of 150 batches in 2 runs. Every attempt made meanwhile failed, 15 in each run, and was repeated |
 | **Readers** | The one that checks `.crc` sidecars fails on the replaced commit. The one that does not reads the table, without the commit | Both read every table |
