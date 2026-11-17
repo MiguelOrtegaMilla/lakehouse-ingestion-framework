@@ -39,6 +39,7 @@ Source metadata refers to tables relatively (`bronze/sales/orders`). A `TableLoc
 | `file://` is allowed only with `deployment: single-machine`, or with an explicit `shared_filesystem: true` (e.g. NFS) that is logged as a warning | Executors on other nodes cannot see a local disk. NFS rename and listing semantics need their own verification. |
 | A `local[*]` master with `deployment: cluster` is allowed (tests); a cluster master with `single-machine` + `file://` is rejected | Prevents silently writing data files to each worker's own disk |
 | Canonicalisation: qualified URI, user info stripped, symlinks resolved for `file://`, trailing slashes normalised | One table ↔ one key |
+| *(Note, 2026-11-17, at the start of P3.)* The canonicalisation above is split in two. `core` validates and normalises a table's URI by its text alone (scheme, user info, slashes, relative segments), at startup validation. Resolving symbolic links needs the file system, and stays in the LogStore's `TableIdentity` (ADR-0004 §3.6), where the engine applies it when it starts (P5) | `core` has no Hadoop and may not depend on the LogStore (ADR-0012). `TableIdentity` gives the key that commits are coordinated under, so there is one implementation of what touches the file system, and a test holds `core`'s answer to it for a path without links |
 | `s3a` credentials only through environment variables / Hadoop credential providers, never YAML | Security (ADR-0007) |
 
 ### 3. Everything a recovering node needs lives next to the table

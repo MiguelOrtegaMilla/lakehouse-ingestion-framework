@@ -123,6 +123,12 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 | **Safe YAML loading** | circe-yaml builds a node tree and converts it to JSON: no tag-driven object construction, which is the class of the SnakeYAML CVE-2022-1471. On top of that: limits on alias expansion (billion laughs), nesting depth and document size; duplicate keys rejected; YAML 1.2 semantics preferred, so `yes`/`no`/`on`/`off` are not booleans. | P3 |
 | **Threat model** | `docs/security/threat-model.md`: assets, trust boundaries, a STRIDE-lite table mapped to these controls, and what is out of scope. Written from what is actually built. | P12 |
 
+*Safe YAML loading, as built (P3.1, 2026-11-17):* `SafeYaml` in `core`, on `circe-yaml-v12` and snakeyaml-engine.
+- The limits on size and on aliases are the loader's own settings, set low: 256 KiB and 8 aliases of any kind.
+- **The loader has no limit on nesting**, and builds its tree by recursion: a hundred thousand `[` end in a `StackOverflowError`. Before a document is loaded, `SafeYaml` goes through its events, which the parser yields without recursion, and refuses nesting beyond 32 there.
+- The same look refuses **every tag**, a duplicate key, a key that is not a scalar, and a file that does not hold exactly one document. No tag constructs a class in circe-yaml, but one it does not know becomes an object named after it, which changes the shape of a configuration silently.
+- YAML 1.2 is read with its JSON schema: `yes`, `no`, `True` and `~` are strings, and `<<` is no merge.
+
 ### 6. Enterprise / future
 
 - Storage ACLs so that only the service identity can write `_delta_log/` (already in ADR-0004).
