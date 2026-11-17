@@ -1,19 +1,12 @@
 package lakehouse.ingestion.it.stress
 
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path, Paths}
-import java.time.format.DateTimeFormatter
-import java.time.{Instant, ZoneOffset}
-
 import scala.collection.mutable
 import scala.concurrent.duration._
 
 import lakehouse.ingestion.it.stress.StressHarness.Settings
 import lakehouse.ingestion.it.stress.Verifier.Report
 import lakehouse.ingestion.it.support.StressTest
-import lakehouse.ingestion.logstore.{FaultHooks, FaultPoint, PostgresLogStore}
-import org.apache.hadoop.fs.LocalFileSystem
-import org.scalatest.Assertion
+import lakehouse.ingestion.logstore.FaultPoint
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -49,105 +42,26 @@ import org.scalatest.matchers.should.Matchers
  *     versions the writers lost to each other, and how many of those at the `INSERT`, which are
  *     the times two writers were committing one version at once.
  *
- * The strong evidence is the widened windows, and the writers killed inside them (P2b.4).
+ * The strong evidence is the widened windows, and the writers killed inside them
+ * (`SpikeGreenKillSpec`).
  *
  * Each run, with its table, journals, logs and probes, stays in `target/stress/<run>/`, next to
  * its `report.md`.
  */
-final class SpikeGreenSpec extends AnyFunSuite with Matchers with CoordinatedStressSuite {
+final class SpikeGreenSpec extends AnyFunSuite with Matchers with GreenSpikeSuite {
 
   import SpikeGreenSpec._
-
-  private val RowsPerCommit = 10
 
   /** The delay of the RED spike's widened window: longer than a writer's whole commit cycle. */
   private val WidenedDelay = 1500.millis
 
-  private val stamp = DateTimeFormatter
-    .ofPattern("yyyyMMdd'T'HHmmss'Z'")
-    .withZone(ZoneOffset.UTC)
-    .format(Instant.now())
-
-  private def stressRoot: Path =
-    Paths.get(sys.props.getOrElse("repo.root", ".")).resolve("target").resolve("stress")
-
   /** The setting that makes every commit of a writer wait at `point`. */
-  private def delayAt(point: FaultPoint): String =
-    s"-Dspark.hadoop.${FaultHooks.delayKey(point)}=${WidenedDelay.toMillis}"
+  private def delayAt(point: FaultPoint): String = delayAt(point, WidenedDelay)
 
-  /** Writers set up for `PostgresLogStore`, each of which must pass its startup guard. */
-  private def coordinated(writers: Int, commits: Int, alsoWith: Seq[String] = Nil): Settings =
-    Settings(
-      writers = writers,
-      commits = commits,
-      rowsPerCommit = RowsPerCommit,
-      extraJvmOptions = coordinatedJvmOptions ++ alsoWith,
-      guard = true
-    )
-
-  /**
-   * Runs one variant, writes its report and checks its preconditions.
-   *
-   * @param notes what the run shows, for its report; they may quote what the run found
-   */
+  /** Runs one variant, writes its report, checks its preconditions, and gives the report. */
   private def spike(variant: String, title: String, settings: Settings)(
       notes: Report => Seq[String]
-  ): Report = {
-    val run = StressRun.create(stressRoot, s"$stamp-green-$variant")
-    StressTable.create(spark, run.tableUri)
-    val started = System.nanoTime()
-    val outcomes = StressHarness.run(run, settings)
-    val elapsed = (System.nanoTime() - started).nanos
-    val report = verify(run, settings, outcomes)
-    val markdown = StressReport.markdown(
-      title,
-      StressReport.environment ++ StressReport.harness(settings) :+
-        StressReport.Setting(
-          "time from the first writer's launch to the last one's exit",
-          f"${elapsed.toMillis / 1000.0}%.1f s"
-        ),
-      StressWriter.SparkSettings,
-      report,
-      notes(report)
-    )
-    Files.write(run.report, markdown.getBytes(UTF_8))
-    info(s"report: ${run.report}")
-    info(
-      s"lost ${report.summary.lost} of ${report.summary.acknowledged} acknowledged commits; " +
-        s"stale sidecars at ${report.summary.checksumMismatches.mkString("[", ", ", "]")}; " +
-        s"versions lost to other writers: ${contention(report)}, " +
-        s"${contentionAtInsert(report)} of them at the INSERT; " +
-        s"anomalies: ${report.anomalies.groupMapReduce(_.kind)(_ => 1)(_ + _)}; " +
-        f"${elapsed.toMillis / 1000.0}%.1f s"
-    )
-
-    withClue(s"see ${run.report}: ") {
-      outcomes.foreach { o =>
-        val probe = o.probe.getOrElse(fail(s"${StressTable.writerId(o.writer)} left no probe"))
-        probe.logStore shouldBe classOf[PostgresLogStore].getName
-        probe.logFileSystem shouldBe classOf[LocalFileSystem].getName
-        probe.guarded shouldBe true
-      }
-      // A contradiction in a journal is a harness bug in any variant, never a measurement.
-      report.count("InconsistentJournal") shouldBe 0
-    }
-    report
-  }
-
-  /** The criterion of the spike. */
-  private def isGreen(report: Report): Assertion =
-    withClue(report.anomalies.map(_.detail).mkString("\n")) {
-      report.summary.lost shouldBe 0
-      report.isClean shouldBe true
-      report.summary.checksumMismatches shouldBe empty
-      report.summary.commitSidecars shouldBe empty
-      report.summary.staleSidecars shouldBe empty
-      report.summary.readers.map { case (reader, error) => reader.label -> error } shouldBe
-        LogModel.Reader.all.map(_.label -> None)
-      report.summary.registry.flatMap(_.registeredVersion) shouldBe Some(-1L)
-    }
-
-  private def probes(report: Report): Seq[WriterProbe] = report.summary.writers.flatMap(_.probe)
+  ): Report = spikeRun(variant, title, settings)((_, report) => notes(report)).report
 
   /** The waits of each writer at the three fault hooks, in the order of the protocol. */
   private def faultWaits(report: Report): Seq[Seq[Long]] =
@@ -155,16 +69,6 @@ final class SpikeGreenSpec extends AnyFunSuite with Matchers with CoordinatedStr
 
   private def waitsAt(report: Report, point: FaultPoint): Seq[Long] =
     probes(report).map(_.faultWaits.toMap.apply(point.key))
-
-  /** The versions that the writers of the run lost to each other, all together. */
-  private def contention(report: Report): Long = probes(report).map(_.contention).sum
-
-  /**
-   * Of those, the ones lost at the `INSERT`: the times two writers were committing one version
-   * at once, which is when Delta's default LogStore loses a commit.
-   */
-  private def contentionAtInsert(report: Report): Long =
-    probes(report).map(_.contentionAtInsert).sum
 
   /**
    * The commits of writers that were complete in less time than their own writer had to wait

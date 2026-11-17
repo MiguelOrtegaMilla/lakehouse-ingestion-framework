@@ -369,8 +369,25 @@ final class VerifierSpec extends AnyFunSuite with Matchers with LoneElement {
         s"its entry names run a-run-nobody-reported, the writer ran as ${runOf(1)}"
       )
     }
-    // A writer that was killed reported nothing: its commits only need a run of their own.
+    // A writer that reported nothing: its commits only need a run of their own.
     coordinated(log, elsewhere, writers = allOk).anomalies shouldBe empty
+  }
+
+  test("a writer that was killed and started again has its commits under any of its runs") {
+    val log = logOf(interleaved)
+    // The first process of writer-1 made version 2 and was killed; the second made the rest.
+    val twoProcesses = changed(registryOf(log)) { e =>
+      if (e.version == 2) e.copy(runId = Some("the-run-of-the-killed-process")) else e
+    }
+    val restarted = allOk.map(reporting).map { outcome =>
+      if (outcome.writer == 1)
+        outcome.copy(runs = Seq("the-run-of-the-killed-process", runOf(1)), kills = 1)
+      else outcome
+    }
+
+    coordinated(log, twoProcesses, writers = restarted).anomalies shouldBe empty
+    // Without the run that the killed process wrote down, its commit would be nobody's.
+    coordinated(log, twoProcesses).anomalies.map(_.kind) shouldBe Seq("MisattributedCommit")
   }
 
   test("on the LogStore no commit file has a sidecar, and no other file of the log a stale one") {

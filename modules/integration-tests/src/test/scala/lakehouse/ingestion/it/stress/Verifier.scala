@@ -283,8 +283,12 @@ object Verifier {
 
   /**
    * Every commit of a writer is attributed to a run, no run has commits of two writers, and a
-   * writer that reported its run has all of its commits under that one. Two processes that
+   * writer that reported its runs has all of its commits under one of them. Two processes that
    * commit to one table at the same time must never be confused in the registry.
+   *
+   * A writer has one run for each of its processes: one, unless it was killed and started
+   * again. Each process writes its run down before it commits (`WriterOutcome.runs`), and the
+   * one that exits reports its own once more with its probe.
    */
   private def attributionAnomalies(
       entries: Map[Long, RegistryEntry],
@@ -304,7 +308,8 @@ object Verifier {
       .mapValues(_.toSet)
       .toMap
     val reported = writers.flatMap { w =>
-      w.probe.map(_.runId).filter(_.nonEmpty).map(StressTable.writerId(w.writer) -> _)
+      val runs = (w.runs ++ w.probe.map(_.runId)).filter(_.nonEmpty).toSet
+      Option.when(runs.nonEmpty)(StressTable.writerId(w.writer) -> runs)
     }.toMap
 
     attributed.flatMap {
@@ -321,11 +326,11 @@ object Verifier {
             )
           )
         else
-          reported.get(writer).filter(_ != run).map { own =>
+          reported.get(writer).filterNot(_.contains(run)).map { own =>
             MisattributedCommit(
               version,
               writer,
-              s"its entry names run $run, the writer ran as $own"
+              s"its entry names run $run, the writer ran as ${own.toSeq.sorted.mkString(", ")}"
             )
           }
     }

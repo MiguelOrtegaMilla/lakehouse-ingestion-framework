@@ -1,6 +1,9 @@
 package lakehouse.ingestion.it.stress
 
-import java.nio.file.Files
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files, StandardOpenOption}
 import java.util.UUID
 
 import scala.annotation.tailrec
@@ -35,7 +38,11 @@ import org.apache.spark.sql.SparkSession
  *
  * Every writer attributes its commits to a run of its own (`CommitContext`). On
  * `PostgresLogStore` that puts the run in each coordination entry, and counts the versions the
- * writer lost to others; on any other LogStore it does nothing.
+ * writer lost to others; on any other LogStore it does nothing. The process writes its run
+ * down before it commits anything, since one that is killed reports nothing as it goes.
+ *
+ * A process started in the place of one that was killed (`WriterConfig.restarted`) goes on in
+ * the writer's journal from the batch that was in flight, under a run of its own.
  *
  * The exit code tells the orchestrator how far the writer got (`ExitCode`).
  */
@@ -77,7 +84,8 @@ object StressWriter {
         val id = StressTable.writerId(config.writer)
         val opened = Try {
           val run = StressRun.at(config.runDir)
-          run -> AckJournal.open(run.journal(config.writer))
+          val journal = run.journal(config.writer)
+          run -> (if (config.restarted) AckJournal.reopen(journal) else AckJournal.open(journal))
         }
         opened match {
           case Failure(error) =>
@@ -106,6 +114,7 @@ object StressWriter {
             case Right(probe) =>
               val started = System.nanoTime()
               val commits = CommitContext.forRun(UUID.randomUUID())
+              recordRun(run, config, commits.runId)
               val code =
                 try commitAll(spark, config, run, journal, commits)
                 finally
@@ -188,10 +197,27 @@ object StressWriter {
         throw new StartupRefusedException(
           Seq(s"Delta resolves ${probe.logStore} for ${run.tableUri}, not $coordinated")
         )
-      Files.createFile(run.readyMarker(config.writer))
-      awaitStart(run, config.startTimeout.fromNow)
+      // The barrier is for the writers that start a run together.
+      if (!config.restarted) {
+        Files.createFile(run.readyMarker(config.writer))
+        awaitStart(run, config.startTimeout.fromNow)
+      }
       probe
     }.toEither
+
+  /** Adds the run of this process to the writer's runs, on disk before its first commit. */
+  private def recordRun(run: StressRun, config: WriterConfig, runId: UUID): Unit =
+    Using.resource(
+      FileChannel.open(
+        run.runs(config.writer),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.WRITE,
+        StandardOpenOption.APPEND
+      )
+    ) { channel =>
+      channel.write(ByteBuffer.wrap(s"$runId\n".getBytes(UTF_8))): Unit
+      channel.force(true)
+    }
 
   @tailrec
   private def awaitStart(run: StressRun, deadline: Deadline): Unit =
@@ -222,7 +248,7 @@ object StressWriter {
             report(StressTable.writerId(config.writer), s"commit txnVersion=$k failed", error)
             ExitCode.CommitFailed
         }
-    loop(1)
+    loop(config.firstCommit.toLong)
   }
 
   private def append(spark: SparkSession, config: WriterConfig, run: StressRun, k: Long): Unit =

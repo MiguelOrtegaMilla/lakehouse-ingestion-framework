@@ -15,6 +15,12 @@ import scala.concurrent.duration._
  * @param guard whether the writer, before it touches the table, must find itself set up to
  *   coordinate its commits (`StartupGuard`), and refuse to run otherwise. A writer that is to
  *   run on Delta's default LogStore, as in the RED spike, is not asked.
+ * @param firstCommit the `txnVersion` the process starts at: 1, or, for a process started in
+ *   the place of one that was killed, the one after the last that the writer acknowledged. It
+ *   repeats the batch that was in flight, as the engine repeats a batch whose outcome it does
+ *   not know, and Delta skips it if it is in the table.
+ * @param restarted whether the process takes the place of one that was killed. It then goes on
+ *   in the writer's journal, and does not wait at the start barrier, which is long open.
  */
 final case class WriterConfig(
     runDir: Path,
@@ -22,7 +28,9 @@ final case class WriterConfig(
     commits: Int,
     rowsPerCommit: Int,
     startTimeout: FiniteDuration,
-    guard: Boolean
+    guard: Boolean,
+    firstCommit: Int = 1,
+    restarted: Boolean = false
 ) {
 
   def toArgs: Seq[String] = Seq(
@@ -31,7 +39,9 @@ final case class WriterConfig(
     s"${WriterConfig.Commits}=$commits",
     s"${WriterConfig.RowsPerCommit}=$rowsPerCommit",
     s"${WriterConfig.StartTimeoutSeconds}=${startTimeout.toSeconds}",
-    s"${WriterConfig.Guard}=$guard"
+    s"${WriterConfig.Guard}=$guard",
+    s"${WriterConfig.FirstCommit}=$firstCommit",
+    s"${WriterConfig.Restarted}=$restarted"
   )
 }
 
@@ -43,8 +53,11 @@ object WriterConfig {
   private val RowsPerCommit = "rows-per-commit"
   private val StartTimeoutSeconds = "start-timeout-seconds"
   private val Guard = "guard"
+  private val FirstCommit = "first-commit"
+  private val Restarted = "restarted"
 
-  private val Keys = Set(RunDir, Writer, Commits, RowsPerCommit, StartTimeoutSeconds, Guard)
+  private val Keys =
+    Set(RunDir, Writer, Commits, RowsPerCommit, StartTimeoutSeconds, Guard, FirstCommit, Restarted)
 
   def fromArgs(args: Seq[String]): Either[String, WriterConfig] = {
     val pairs = args.map(_.split("=", 2).toList)
@@ -68,13 +81,17 @@ object WriterConfig {
         rows <- positive(RowsPerCommit)
         timeout <- positive(StartTimeoutSeconds)
         guard <- values(Guard).toBooleanOption.toRight(s"$Guard must be true or false")
+        first <- positive(FirstCommit)
+        restarted <- values(Restarted).toBooleanOption.toRight(s"$Restarted must be true or false")
       } yield WriterConfig(
         Paths.get(values(RunDir)),
         writer,
         commits,
         rows,
         timeout.seconds,
-        guard
+        guard,
+        first,
+        restarted
       )
   }
 }
