@@ -59,14 +59,15 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
   private def warningsOf(text: String): Seq[String] =
     Profile.load(File, text).value.warnings.map(_.message)
 
-  test("the profile of local development is valid, with nothing to warn of") {
-    val file = repository.resolve("conf/app/local.yaml")
-    val loaded = Profile.load("conf/app/local.yaml", new String(Files.readAllBytes(file), UTF_8))
+  test("the example of a local profile is valid, with nothing to warn of") {
+    val file = repository.resolve("conf/app/local.example.yaml")
+    val loaded =
+      Profile.load("conf/app/local.example.yaml", new String(Files.readAllBytes(file), UTF_8))
 
     loaded.left.map(_.toChain.toVector.map(_.message)) shouldBe a[Right[_, _]]
     val profile = loaded.value.value
     loaded.value.warnings shouldBe empty
-    profile.lake.uri.value shouldBe "file:///tmp/lakehouse-ingestion/lake"
+    profile.lake.uri.value shouldBe "file:///home/CHANGE_ME/lakehouse/lake"
     profile.lake.deployment shouldBe Deployment.SingleMachine
     profile.databases.control.user.value shouldBe "ingest_control"
     profile.databases.coordination.password shouldBe SecretRef.Env("INGEST_COORDINATION_PASSWORD")
@@ -176,6 +177,17 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
     errorsOf(pointless) shouldBe Seq(
       s"$File: lake.shared_filesystem is true, and it only says something of a file:// lake in a cluster deployment"
     )
+  }
+
+  test("a lake under /tmp is warned of: the registry would outlive it") {
+    warningsOf(Valid.replace("file:///data/lake", "file:///tmp/lakehouse/lake")) shouldBe Seq(
+      s"$File: lake.uri is under /tmp, which is emptied when the machine restarts. The " +
+        "coordination database would still have the commits of the lake's tables, and the " +
+        "LogStore would find them missing and refuse to write"
+    )
+    // Only the lake: a landing zone that is emptied loses files that were yet to be read.
+    warningsOf(Valid.replace("file:///data/landing", "file:///tmp/landing")) shouldBe empty
+    warningsOf(Valid.replace("file:///data/lake", "file:///data/tmp/lake")) shouldBe empty
   }
 
   test("a cluster of Spark with a single-machine lake on a local disk is refused") {
