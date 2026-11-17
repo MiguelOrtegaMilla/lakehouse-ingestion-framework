@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phase 2, the PostgreSQL-coordinated LogStore, is built: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). The stress job has yet to make its first run in CI, at the size of CI.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phase 2, the PostgreSQL-coordinated LogStore, is built: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Its stress job ran in CI with eight writers and 500 commits each, and lost none of 4,000.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -81,12 +81,13 @@ Each run keeps its table, writer journals, logs and probes in `target/stress/<ru
 
 ### Results: Delta's default LogStore and `PostgresLogStore`
 
-Three writer JVMs append to one table on `file://`, each in batches that carry a transaction identifier. RED is Delta's default configuration ([write-up](docs/spikes/logstore-red.md)). GREEN is the same harness and the same verifier on `PostgresLogStore` ([write-up](docs/spikes/logstore-green.md)). The runs are of 2026-11-13, 2026-11-16 and 2026-11-17, on one development machine.
+Three writer JVMs append to one table on `file://`, each in batches that carry a transaction identifier. RED is Delta's default configuration ([write-up](docs/spikes/logstore-red.md)). GREEN is the same harness and the same verifier on `PostgresLogStore` ([write-up](docs/spikes/logstore-green.md)). The runs are of 2026-11-13, 2026-11-16 and 2026-11-17, on one development machine, but for the one that says it was in CI.
 
 | | RED: Delta's default LogStore | GREEN: `PostgresLogStore` |
 |---|---|---|
 | **Widened window**: every writer is held at the point where a version is claimed | Lost a commit that its writer saw succeed in **6 runs of 6** | **0 lost** of 60 commits in 2 runs, one on each side of the `INSERT`. Held before it, the writers found their version taken at the `INSERT` 52 times, and went on at the next one |
 | **Natural race**: 3 writers × 200 commits, no fault injection | Lost commits in **2 runs of 6** | **0 lost** of 6,000 commits in 10 runs. Two writers were committing one version at the same time 376 times |
+| **Natural race in CI**: 8 writers × 500 commits, on a runner of GitHub Actions | Not run at that size. Its widened window lost its commit on that runner too | **0 lost** of 4,000 commits in 1 run |
 | **A writer killed** with `kill -9` inside a commit, and started again | Not run | **0 lost, 0 written twice**, of 222 batches in 4 runs: a kill before the `INSERT`, one after it, one after the publish, and six at random moments |
 | **PostgreSQL killed** in the middle of a run, and started again 30 s later | Does not apply | **0 lost, 0 written twice**, of 150 batches in 2 runs. Every attempt made meanwhile failed, 15 in each run, and was repeated |
 | **Readers** | The one that checks `.crc` sidecars fails on the replaced commit. The one that does not reads the table, without the commit | Both read every table |
@@ -96,7 +97,7 @@ The rows do not say equally much, and the write-ups keep them apart:
 - **The widened window is the decisive evidence.** The race is made to happen on every commit, and the default LogStore fails in it every time.
 - **The natural race is weak evidence.** The one RED run of the same day as GREEN lost nothing either: a clean natural run can be luck.
 - **The kills at chosen points are the ones that count.** The six at random moments all fell outside a commit.
-- **One machine, one file system, three writers.** The natural race with eight writers and 500 commits each is the stress job in CI.
+- **Two machines, local file systems, appends.** Three writers on a development machine, and eight in the stress job in CI, once. Object storage is not in these runs.
 
 On the default LogStore Delta notices nothing: the lost commit's file is replaced, not removed, so the log has no gap. On `file://`, Hadoop's `.crc` sidecar usually goes stale, and every reader that checks it then fails. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit. The fix is [ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md): a version is claimed with an `INSERT` in PostgreSQL, and its commit is published as a hard link, which never replaces a file.
 

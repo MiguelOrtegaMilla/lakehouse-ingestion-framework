@@ -21,6 +21,7 @@ How much each part of that says is not the same, and the rest of this document k
 
 - **The decisive evidence is the widened window.** Three writers are held, with their commits ready, between the check that a version is free and the step that takes it. On Delta's default LogStore that run lost an acknowledged commit **every time it was made: 6 runs of 6**, five on 2026-11-13 and one on 2026-11-16. On `PostgresLogStore` it lost **none**, and its writers lost **52 versions at the `INSERT`**: 52 times a writer had found the version free, had waited with its commit ready, and found the version taken when it claimed it. Each was settled by Delta at the next version.
 - **The natural race is the weak evidence.** Without any delay, the default LogStore lost commits in **2 runs of 6** between 2026-11-13 and 2026-11-16. `PostgresLogStore` lost none in **10 runs of 10**, during which two writers were committing one version at the same moment **376 times**, without help, and nothing was lost.
+- **With eight writers it lost none either.** The stress job in CI ran the natural race with eight writers and 500 commits each: 4,000 commits acknowledged, none lost, on a runner where the default LogStore lost its commit in the widened window as it does here.
 - **The natural race of one day does not tell the two apart.** The one natural run of RED on 2026-11-16 lost nothing either. A clean natural run can be luck, with any LogStore: four of the six RED runs were.
 - **A writer that dies inside a commit loses nothing and repeats nothing.** A writer was killed with `kill -9` at each of the three points where a death leaves something different behind, and a process started in its place repeated the batch that was in flight. Killed before the `INSERT`, it had made no commit, and the batch was written once, by the process started afterwards. Killed after the `INSERT` or after the publish, its commit was in the table at the version it had taken, finished by another process, and the repeated batch wrote nothing.
 - **A coordination database that dies loses nothing either.** PostgreSQL was killed in the middle of a run, with no shutdown, and started again half a minute later. While it was down no version could be taken: every attempt failed, 15 in each run, and the writers repeated their batches until they were in the table. After its recovery no version that PostgreSQL had confirmed was gone, and every batch was in the table once. A commit whose version was taken before the kill, and that was not in the log yet, was published by its writer while the database was down.
@@ -232,6 +233,20 @@ Runs of 2026-11-17. In both no acknowledged batch was lost and none was in the t
 - **The repeated batches were written once.** Each writer's next batch failed for as long as the outage lasted, three to six times, and was in the table once at the end. The orphan data files of the two runs, 3 and 2, are files that failed attempts had written.
 - **A checkpoint fell due during the outage.** Version 10 is one that Delta checkpoints. `writer-1` wrote the checkpoint while PostgreSQL was down. The cleanup of the log that follows a checkpoint lists the log, which reads the registry, and failed; Delta logged it ("Error when writing checkpoint-related files") and went on.
 
+### The natural race with eight writers, in CI
+
+The first run of the stress workflow (`.github/workflows/stress.yml`), on a runner of GitHub Actions, 2026-11-17. It runs the four suites, with the natural race at the size ADR-0004 gives CI: eight writers that make 500 commits each, once.
+
+| | Writers × commits | Acknowledged | **Lost** | Verifier |
+|---|---|---|---|---|
+| GREEN, natural race | 8 × 500 | 4,000 | **0** | no anomalies |
+| GREEN, every other run of the job: controls, widened window, the configuration of RED, the kills, PostgreSQL killed | as above | | **0** | no anomalies |
+| RED, widened window | 3 × 10 | | **its commit** | lost, as on the development machine |
+
+- **Eight writers on one table lost nothing**: 4,000 commits acknowledged and 4,000 in the log. It is the natural race, so it is the weak evidence, with more writers than cores and so more of them at one version at a time than three writers ever were.
+- **The default LogStore lost its commit on that machine too.** The widened window of RED is what says that the harness finds a lost commit there: a GREEN that loses none on a machine where RED would not either would say nothing.
+- **The deterministic runs gave there what they gave here.** The kills at chosen points and the outage of PostgreSQL depend on timing: a process seen at a point and killed there, a database down for longer than the LogStore waits. They passed on a machine with other cores and another disk.
+
 ### Controls
 
 | | Commits | Lost | Anomalies | Waits at the hooks |
@@ -256,7 +271,8 @@ A writer made its 200 commits in 261 to 277 s on `PostgresLogStore`, and in 273 
 
 ## Limits of this result
 
-- **One machine, one file system** (WSL2, ext4), three writers, small commits, appends only. The stress job in CI runs the natural race with eight writers and 500 commits each; it had not made its first run when this was written, and no result of it is here. `s3a://` is E1.
+- **Two machines, one kind of file system**: a development machine (WSL2, ext4) for every run of this document but one, and a runner of GitHub Actions for the natural race with eight writers. Small commits, appends only. `s3a://` is E1.
+- **The run in CI is one run, known by its outcome.** What its eight writers lost to each other, and how long it took, are in the reports that the job keeps as its artifact, and not in this document.
 - **The natural race is not a rate.** How often two writers meet at the `INSERT` depends on hardware, load and commit latency. The 376 are a count on this machine, on this day.
 - **The collisions of RED were not counted.** The count at the `INSERT` exists only on `PostgresLogStore`, so the two cannot be compared by it. What can be compared is the outcome: lost commits.
 - **The window before the `INSERT` is widened by a hook of the LogStore itself.** The hook only sleeps, between two steps the LogStore takes anyway, and the control shows that it loses nothing by itself.
