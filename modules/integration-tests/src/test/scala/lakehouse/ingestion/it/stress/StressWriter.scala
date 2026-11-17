@@ -44,6 +44,11 @@ import org.apache.spark.sql.SparkSession
  * A process started in the place of one that was killed (`WriterConfig.restarted`) goes on in
  * the writer's journal from the batch that was in flight, under a run of its own.
  *
+ * A writer that is asked to (`WriterConfig.repeatFor`) repeats a batch that failed, with its
+ * `txnVersion`, until it is in the table or the time is up. A failed attempt says nothing of
+ * whether the commit was made, and Delta skips a batch that is in the table: that is how the
+ * engine is to treat a batch whose outcome it does not know.
+ *
  * The exit code tells the orchestrator how far the writer got (`ExitCode`).
  */
 object StressWriter {
@@ -53,7 +58,10 @@ object StressWriter {
     /** Every commit returned without error and is journaled. */
     val Ok = 0
 
-    /** A commit threw after the barrier; its `FAIL` entry is the journal's last line. */
+    /**
+     * A commit threw after the barrier, and was not repeated or not for any longer; its `FAIL`
+     * entry is the journal's last line.
+     */
     val CommitFailed = 1
 
     /** Invalid arguments, or no session, table or start signal: nothing was committed. */
@@ -70,6 +78,9 @@ object StressWriter {
   }
 
   private val BarrierPoll = 5.millis
+
+  /** Between two attempts at a batch that fails. */
+  private val RepeatPause = 1.second
   private val ParentPoll = 1.second
 
   def main(args: Array[String]): Unit = sys.exit(run(args.toSeq))
@@ -235,20 +246,31 @@ object StressWriter {
       journal: AckJournal,
       commits: CommitContext
   ): Int = {
+    val id = StressTable.writerId(config.writer)
+
+    /** @param repeatUntil set while batch `k` is failing: when the writer gives it up */
     @tailrec
-    def loop(k: Long): Int =
+    def loop(k: Long, repeatUntil: Option[Deadline]): Int =
       if (k > config.commits) ExitCode.Ok
       else
         Try(commits.attribute(append(spark, config, run, k))) match {
           case Success(()) =>
             journal.ack(k)
-            loop(k + 1)
+            loop(k + 1, None)
           case Failure(error) =>
-            journal.fail(k, error)
-            report(StressTable.writerId(config.writer), s"commit txnVersion=$k failed", error)
-            ExitCode.CommitFailed
+            val until = repeatUntil.getOrElse(config.repeatFor.fromNow)
+            if (until.hasTimeLeft()) {
+              journal.retry(k, error)
+              report(id, s"commit txnVersion=$k failed, and is repeated", error)
+              Thread.sleep(RepeatPause.toMillis)
+              loop(k, Some(until))
+            } else {
+              journal.fail(k, error)
+              report(id, s"commit txnVersion=$k failed", error)
+              ExitCode.CommitFailed
+            }
         }
-    loop(config.firstCommit.toLong)
+    loop(config.firstCommit.toLong, None)
   }
 
   private def append(spark: SparkSession, config: WriterConfig, run: StressRun, k: Long): Unit =

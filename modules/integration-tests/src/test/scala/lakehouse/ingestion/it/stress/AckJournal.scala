@@ -16,13 +16,20 @@ import java.nio.file.{Files, Path, StandardOpenOption}
  * Format, one entry per line:
  * {{{
  * ACK <txnVersion>
+ * RETRY <txnVersion> <exception class>: <message>
  * FAIL <txnVersion> <exception class>: <message>
  * }}}
- * A writer stops at its first failure, so `FAIL`, if present, is the last entry.
+ * `RETRY` is an attempt that failed and that the writer is going to repeat. It says nothing of
+ * whether the commit was made: the `ACK` of the batch settles that. `FAIL` is the failure the
+ * writer stopped at, so it is the last entry, if it is there.
  */
 final class AckJournal private (channel: FileChannel) extends AutoCloseable {
 
   def ack(txnVersion: Long): Unit = append(s"${AckJournal.Ack} $txnVersion")
+
+  /** The attempt at `txnVersion` failed, and the writer repeats the batch. */
+  def retry(txnVersion: Long, error: Throwable): Unit =
+    append(s"${AckJournal.Retry} $txnVersion ${AckJournal.describe(error)}")
 
   def fail(txnVersion: Long, error: Throwable): Unit =
     append(s"${AckJournal.Fail} $txnVersion ${AckJournal.describe(error)}")
@@ -40,13 +47,21 @@ final class AckJournal private (channel: FileChannel) extends AutoCloseable {
 object AckJournal {
 
   private val Ack = "ACK"
+  private val Retry = "RETRY"
   private val Fail = "FAIL"
   private val MaxMessageLength = 500
 
   final case class Failure(txnVersion: Long, error: String)
 
-  /** What a journal says: the acknowledged `txnVersion`s in order, and the failure, if any. */
-  final case class Contents(acked: Vector[Long], failure: Option[Failure])
+  /**
+   * What a journal says: the acknowledged `txnVersion`s in order, the failure the writer
+   * stopped at, if any, and the attempts that failed and were repeated, in order.
+   */
+  final case class Contents(
+      acked: Vector[Long],
+      failure: Option[Failure],
+      repeated: Vector[Failure] = Vector.empty
+  )
 
   /** Opens a new journal; fails if one already exists, so a run can never mix two writers. */
   def open(path: Path): AckJournal =
@@ -79,11 +94,13 @@ object AckJournal {
     val text = new String(Files.readAllBytes(path), UTF_8)
     val lines = text.split("\n", -1).toVector.dropRight(1)
     lines.zipWithIndex.foldLeft(Contents(Vector.empty, None)) {
-      case (contents @ Contents(_, Some(_)), (_, n)) =>
+      case (contents @ Contents(_, Some(_), _), (_, n)) =>
         throw malformed(path, n, s"entry after a FAIL entry ($contents)")
       case (contents, (line, n)) =>
         line.split(" ", 3).toList match {
           case Ack :: Version(k) :: Nil => contents.copy(acked = contents.acked :+ k)
+          case Retry :: Version(k) :: error :: Nil =>
+            contents.copy(repeated = contents.repeated :+ Failure(k, error))
           case Fail :: Version(k) :: error :: Nil =>
             contents.copy(failure = Some(Failure(k, error)))
           case _ => throw malformed(path, n, s"unrecognised entry '$line'")

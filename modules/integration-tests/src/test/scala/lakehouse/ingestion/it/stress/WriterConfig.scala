@@ -21,6 +21,10 @@ import scala.concurrent.duration._
  *   not know, and Delta skips it if it is in the table.
  * @param restarted whether the process takes the place of one that was killed. It then goes on
  *   in the writer's journal, and does not wait at the start barrier, which is long open.
+ * @param repeatFor for how long the writer repeats a batch that fails, counted from the first
+ *   failure of the batch; zero for a writer that stops at its first failure. The batch is
+ *   repeated with its `txnVersion`, as the engine repeats a batch whose outcome it does not
+ *   know.
  */
 final case class WriterConfig(
     runDir: Path,
@@ -30,7 +34,8 @@ final case class WriterConfig(
     startTimeout: FiniteDuration,
     guard: Boolean,
     firstCommit: Int = 1,
-    restarted: Boolean = false
+    restarted: Boolean = false,
+    repeatFor: FiniteDuration = Duration.Zero
 ) {
 
   def toArgs: Seq[String] = Seq(
@@ -41,7 +46,8 @@ final case class WriterConfig(
     s"${WriterConfig.StartTimeoutSeconds}=${startTimeout.toSeconds}",
     s"${WriterConfig.Guard}=$guard",
     s"${WriterConfig.FirstCommit}=$firstCommit",
-    s"${WriterConfig.Restarted}=$restarted"
+    s"${WriterConfig.Restarted}=$restarted",
+    s"${WriterConfig.RepeatSeconds}=${repeatFor.toSeconds}"
   )
 }
 
@@ -55,9 +61,19 @@ object WriterConfig {
   private val Guard = "guard"
   private val FirstCommit = "first-commit"
   private val Restarted = "restarted"
+  private val RepeatSeconds = "repeat-seconds"
 
-  private val Keys =
-    Set(RunDir, Writer, Commits, RowsPerCommit, StartTimeoutSeconds, Guard, FirstCommit, Restarted)
+  private val Keys = Set(
+    RunDir,
+    Writer,
+    Commits,
+    RowsPerCommit,
+    StartTimeoutSeconds,
+    Guard,
+    FirstCommit,
+    Restarted,
+    RepeatSeconds
+  )
 
   def fromArgs(args: Seq[String]): Either[String, WriterConfig] = {
     val pairs = args.map(_.split("=", 2).toList)
@@ -83,6 +99,7 @@ object WriterConfig {
         guard <- values(Guard).toBooleanOption.toRight(s"$Guard must be true or false")
         first <- positive(FirstCommit)
         restarted <- values(Restarted).toBooleanOption.toRight(s"$Restarted must be true or false")
+        repeat <- nonNegative(RepeatSeconds)
       } yield WriterConfig(
         Paths.get(values(RunDir)),
         writer,
@@ -91,7 +108,8 @@ object WriterConfig {
         timeout.seconds,
         guard,
         first,
-        restarted
+        restarted,
+        repeat.seconds
       )
   }
 }

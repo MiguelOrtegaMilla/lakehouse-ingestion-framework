@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 
+import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
@@ -17,6 +18,7 @@ import lakehouse.ingestion.it.stress.Verifier.Anomaly.{
   UnfinishedEntry,
   UnreadableTable
 }
+import lakehouse.ingestion.logstore.coordination.CoordinationSettings
 import lakehouse.ingestion.logstore.{
   FaultHooks,
   FaultPoint,
@@ -283,6 +285,53 @@ final class CoordinatedHarnessSpec
     // it there and wrote nothing.
     commitOfBatch(run, writer = 0, batch = 2) shouldBe
       Some(CoordinatedStressSuite.BatchCommit(taken, outcomes.head.runs.headOption))
+  }
+
+  test("PostgreSQL killed in the middle of a run: the writers repeat their batch, once each") {
+    val run = newRun("postgres-killed")
+    val commits = 6
+    val settings = Settings(
+      writers = 2,
+      commits = commits,
+      rowsPerCommit = 4,
+      // A writer gives a connection up after a second, not after the five of the default, so
+      // that an outage of six is longer than the LogStore itself waits for the database.
+      extraJvmOptions = coordinatedJvmOptions :+
+        s"-Dspark.hadoop.${CoordinationSettings.ConnectTimeoutMs}=1000",
+      guard = true,
+      // A batch that fails is repeated with its txnVersion, for far longer than the outage.
+      repeatFor = 1.minute
+    )
+    var outage = Option.empty[CoordinatedStressSuite.Outage]
+
+    val outcomes = StressHarness.run(
+      run,
+      settings,
+      chaos => {
+        (0 until settings.writers).foreach(chaos.awaitAcknowledged(_, batches = 1))
+        // As docker kill does: no shutdown, no checkpoint. Six seconds down, then recovery.
+        outage = Some(
+          killPostgres(run, chaos, settings.writers, downFor = 6.seconds, before = look(run))
+        )
+      }
+    )
+
+    // Both writers ended with every batch acknowledged, and each had to repeat one.
+    outcomes.foreach { outcome =>
+      withClue(logOf(outcome)) {
+        outcome.exitCode shouldBe StressWriter.ExitCode.Ok
+        outcome.journal.acked shouldBe (1L to commits.toLong).toVector
+        outcome.journal.repeated should not be empty
+      }
+    }
+    // PostgreSQL forgot no version that it had confirmed before it was killed.
+    outage.getOrElse(fail("PostgreSQL was not killed")).gone shouldBe empty
+
+    // Every batch is in the table exactly once, and nothing else is wrong: with the registry,
+    // through both readers.
+    val report = verify(run, settings, outcomes)
+    withClue(report.anomalies.map(_.detail).mkString("\n")) { report.isClean shouldBe true }
+    report.summary.readers.map(_._2) shouldBe Seq(None, None)
   }
 
   test("a writer JVM that would commit with Delta's default LogStore refuses to run") {

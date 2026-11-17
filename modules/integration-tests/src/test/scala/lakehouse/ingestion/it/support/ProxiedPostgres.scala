@@ -14,7 +14,7 @@ import org.testcontainers.utility.{DockerImageName, TestcontainersConfiguration}
 
 /**
  * The bootstrapped PostgreSQL behind a Toxiproxy, both on a private Docker network, so that a
- * test can break the connection for real: cut it, delay it, or stop or freeze the server.
+ * test can break the connection for real: cut it, delay it, or stop, kill or freeze the server.
  *
  * Two proxies lead to the same server:
  *
@@ -43,6 +43,9 @@ final class ProxiedPostgres private (
 
   /** Shuts PostgreSQL down, as `docker stop` does; its data stays. */
   def stopPostgres(): Unit = postgres.halt()
+
+  /** Kills PostgreSQL, as `docker kill` does: a crash, which it recovers from when started. */
+  def killPostgres(): Unit = postgres.kill()
 
   /** Starts PostgreSQL again and waits until it accepts connections. */
   def startPostgres(): Unit = {

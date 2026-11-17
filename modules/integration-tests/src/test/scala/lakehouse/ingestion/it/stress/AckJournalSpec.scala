@@ -34,6 +34,26 @@ final class AckJournalSpec extends AnyFunSuite with Matchers with BeforeAndAfter
     )
   }
 
+  test("reads back the attempts that failed and were repeated, apart from the rest") {
+    Using.resource(AckJournal.open(journalPath)) { journal =>
+      journal.ack(1)
+      journal.retry(2, new java.io.IOException("no answer"))
+      journal.retry(2, new java.io.IOException("no answer"))
+      journal.ack(2)
+      journal.retry(3, new IllegalStateException("gone"))
+      journal.fail(3, new java.io.IOException("still no answer"))
+    }
+    AckJournal.read(journalPath) shouldBe AckJournal.Contents(
+      Vector(1L, 2L),
+      Some(AckJournal.Failure(3, "java.io.IOException: still no answer")),
+      Vector(
+        AckJournal.Failure(2, "java.io.IOException: no answer"),
+        AckJournal.Failure(2, "java.io.IOException: no answer"),
+        AckJournal.Failure(3, "java.lang.IllegalStateException: gone")
+      )
+    )
+  }
+
   test("an empty journal acknowledges nothing") {
     Using.resource(AckJournal.open(journalPath))(_ => ())
     AckJournal.read(journalPath) shouldBe AckJournal.Contents(Vector.empty, None)

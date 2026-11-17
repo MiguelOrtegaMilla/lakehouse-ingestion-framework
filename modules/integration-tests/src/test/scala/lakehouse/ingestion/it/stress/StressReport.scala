@@ -34,7 +34,13 @@ object StressReport {
       if (settings.extraJvmOptions.isEmpty) "(none)"
       else settings.extraJvmOptions.mkString(" ")
     ),
-    Setting("startup guard", if (settings.guard) "every writer must pass it" else "not asked")
+    Setting("startup guard", if (settings.guard) "every writer must pass it" else "not asked"),
+    Setting(
+      "a batch that fails",
+      if (settings.repeatFor.toMillis > 0)
+        s"is repeated for up to ${settings.repeatFor.toSeconds} s, then stops the writer"
+      else "stops the writer"
+    )
   )
 
   /**
@@ -157,12 +163,13 @@ object StressReport {
             .mkString("\n\n")
 
     val writerTable = table(
-      Seq("Writer", "Exit code", "Acknowledged", "Failure"),
+      Seq("Writer", "Exit code", "Acknowledged", "Attempts repeated", "Failure"),
       s.writers.map { w =>
         Seq(
           StressTable.writerId(w.writer),
           w.exitCode.toString,
           w.journal.acked.size.toString,
+          w.journal.repeated.size.toString,
           w.journal.failure.fold("")(f => s"txnVersion=${f.txnVersion}: ${f.error}")
         )
       }
