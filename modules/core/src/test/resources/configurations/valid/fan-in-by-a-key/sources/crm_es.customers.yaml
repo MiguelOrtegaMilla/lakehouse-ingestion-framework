@@ -1,0 +1,15 @@
+# The partition is a column of the sources' own, and it is part of the key of each.
+id: crm_es.customers
+connector:
+  type: jdbc
+  connection:
+    url: "jdbc:postgresql://localhost:5432/crm"
+    user: reader
+    password: { secretRef: "env:READER_PASSWORD" }
+    tls: { mode: disable }
+  table: customers
+load: { mode: full }
+keys: [region, customer_id]
+targets:
+  bronze: { table: bronze/crm_es/customers }
+  silver: { table: silver/crm/customers, partition_by: [region] }

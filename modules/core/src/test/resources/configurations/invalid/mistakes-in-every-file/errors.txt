@@ -1,0 +1,6 @@
+profile.yaml: lake.deployment must be one of single-machine, cluster
+sources/crm.customers.yaml: connector.table has 3 parts: a table is a name, or schema.name
+sources/crm.customers.yaml: load.watermark is missing: an incremental load goes by a column that only grows
+sources/sales.orders.yaml: id is sales.orders, which is the id of sources/sales.orders_copy.yaml as well
+sources/sales.orders_copy.yaml: id is sales.orders, and a source is in the file of its name, sales.orders.yaml
+sources/sales.orders_copy.yaml: id is sales.orders, which is the id of sources/sales.orders.yaml as well

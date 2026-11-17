@@ -1,0 +1,5 @@
+id: shop_b.returns
+connector: { type: file, path: shop_b/returns, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/returns }

@@ -1,0 +1,1 @@
+sources/crm.contacts.yaml: connector.type must be one of jdbc, file

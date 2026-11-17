@@ -1,0 +1,11 @@
+id: b
+connector: { type: file, path: b, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/b }
+---
+id: b
+connector: { type: file, path: b, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/b }

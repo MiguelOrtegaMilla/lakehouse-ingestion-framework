@@ -1,0 +1,5 @@
+id: crm.contacts
+connector: { type: rest, endpoint: "https://crm.example/contacts" }
+load: { mode: full }
+targets:
+  bronze: { table: bronze/crm/contacts }

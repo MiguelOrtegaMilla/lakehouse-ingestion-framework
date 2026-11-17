@@ -1,0 +1,1 @@
+sources/crm_es.customers.yaml: targets.silver.partition_by[0] is region, which is not one of keys, and silver/crm/customers is written by sources/crm_pt.customers.yaml as well: there a row is found by its key within its partition, so the partition is part of the key (ADR-0010)

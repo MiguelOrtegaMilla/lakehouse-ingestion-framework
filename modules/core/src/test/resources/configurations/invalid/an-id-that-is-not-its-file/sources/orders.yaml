@@ -1,0 +1,12 @@
+id: sales.orders
+connector:
+  type: jdbc
+  connection:
+    url: "jdbc:postgresql://localhost:5432/sales"
+    user: reader
+    password: { secretRef: "env:READER_PASSWORD" }
+    tls: { mode: disable }
+  table: orders
+load: { mode: full }
+targets:
+  bronze: { table: bronze/sales/orders }

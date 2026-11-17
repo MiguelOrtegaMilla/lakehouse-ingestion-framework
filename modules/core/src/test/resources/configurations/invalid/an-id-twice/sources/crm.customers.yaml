@@ -1,0 +1,12 @@
+id: crm.customers
+connector:
+  type: jdbc
+  connection:
+    url: "jdbc:postgresql://localhost:5432/crm"
+    user: reader
+    password: { secretRef: "env:READER_PASSWORD" }
+    tls: { mode: disable }
+  table: customers
+load: { mode: full }
+targets:
+  bronze: { table: bronze/crm/customers }

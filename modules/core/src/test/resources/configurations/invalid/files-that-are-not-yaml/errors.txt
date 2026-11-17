@@ -1,0 +1,4 @@
+sources/a.yaml: while parsing a flow mapping: expected ',' or '}', but got <stream end> (line 3, column 1)
+sources/b.yaml: the file has more than one document, and must have one (line 6, column 1)
+sources/c.yaml: the document has more than 8 aliases (line 10, column 5)
+sources/d.yaml: must be a mapping of fields, and is a list

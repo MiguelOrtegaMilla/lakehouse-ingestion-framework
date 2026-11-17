@@ -1,0 +1,17 @@
+lake: { uri: "file:///data/lake", deployment: single-machine }
+landing: { root: "file:///data/landing" }
+databases:
+  control:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_control
+    password: Tr0ub4dor-and-3
+    tls: { mode: disable }
+  coordination:
+    url: "jdbc:postgresql://ingest_coordination:Tr0ub4dor-and-3@localhost:5432/ingestion_control"
+    user: ingest_coordination
+    password: { secretRef: "env:INGEST_COORDINATION_PASSWORD" }
+    tls: { mode: disable }
+spark:
+  master: "local[2]"
+  settings:
+    spark.hadoop.fs.s3a.secret.key: Tr0ub4dor-and-3

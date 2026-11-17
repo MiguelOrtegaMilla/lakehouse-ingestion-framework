@@ -1,0 +1,10 @@
+defaults: &d { mode: new_files }
+l0: *d
+l1: *d
+l2: *d
+l3: *d
+l4: *d
+l5: *d
+l6: *d
+l7: *d
+l8: *d

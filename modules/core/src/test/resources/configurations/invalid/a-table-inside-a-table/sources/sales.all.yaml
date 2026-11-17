@@ -1,0 +1,5 @@
+id: sales.all
+connector: { type: file, path: sales, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/sales }

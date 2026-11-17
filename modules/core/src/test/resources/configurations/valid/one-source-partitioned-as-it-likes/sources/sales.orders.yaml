@@ -1,0 +1,15 @@
+# The rule about partitions is for tables that several sources write.
+id: sales.orders
+connector:
+  type: jdbc
+  connection:
+    url: "jdbc:postgresql://localhost:5432/sales"
+    user: reader
+    password: { secretRef: "env:READER_PASSWORD" }
+    tls: { mode: disable }
+  table: orders
+load: { mode: full }
+keys: [order_id]
+targets:
+  bronze: { table: bronze/sales/orders }
+  silver: { table: silver/sales/orders, partition_by: [order_day] }

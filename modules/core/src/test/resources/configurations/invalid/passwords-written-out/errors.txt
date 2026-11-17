@@ -1,0 +1,5 @@
+profile.yaml: databases.control.password must be a reference to a secret, as { secretRef: "env:NAME" } or { secretRef: "file:/run/secrets/name" }, and never the secret itself
+profile.yaml: databases.coordination.url has a user or a password in it: the user is a field of its own, and a password is a reference
+profile.yaml: spark.settings.spark.hadoop.fs.s3a.secret.key is a credential, and no credential is written in a profile: object storage takes its own from the environment or from a Hadoop credential provider (ADR-0011)
+sources/sales.orders.yaml: connector.connection.url has parameters: a URL is jdbc:postgresql://host:port/database and nothing more. TLS and timeouts are fields of their own, and a password is a reference
+sources/sales.orders.yaml: connector.connection.password.secretRef is not a reference: write env:NAME or file:/absolute/path, never the secret

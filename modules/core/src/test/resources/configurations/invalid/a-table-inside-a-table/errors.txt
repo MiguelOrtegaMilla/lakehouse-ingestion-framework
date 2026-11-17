@@ -1,0 +1,1 @@
+sources/sales.orders.yaml: targets.bronze.table is bronze/sales/orders, inside bronze/sales, which is a table of sources/sales.all.yaml: no table is inside another

@@ -1,0 +1,15 @@
+# The profile of every case that has none of its own.
+lake: { uri: "file:///data/lake", deployment: single-machine }
+landing: { root: "file:///data/landing" }
+databases:
+  control:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_control
+    password: { secretRef: "env:INGEST_CONTROL_PASSWORD" }
+    tls: { mode: disable }
+  coordination:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_coordination
+    password: { secretRef: "env:INGEST_COORDINATION_PASSWORD" }
+    tls: { mode: disable }
+spark: { master: "local[2]" }
