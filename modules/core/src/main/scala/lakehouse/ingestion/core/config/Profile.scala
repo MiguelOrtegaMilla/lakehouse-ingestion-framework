@@ -52,41 +52,7 @@ object Profile {
    * @param control the control plane: runs, batches, leases, state (ADR-0003)
    * @param coordination what the LogStore claims the versions of a table in (ADR-0004)
    */
-  final case class Databases(control: Database, coordination: Database)
-
-  /** @param user the role to connect as; a name like any other that configuration gives */
-  final case class Database(
-      url: PostgresUrl,
-      user: SqlIdentifier,
-      password: SecretRef,
-      tls: Tls,
-      timeouts: Timeouts
-  )
-
-  /** TLS to a database (ADR-0013 §5). Two modes, and none in between that encrypts and trusts anyone. */
-  sealed trait Tls
-
-  object Tls {
-
-    /** No TLS: for a database on this machine. */
-    case object Disabled extends Tls
-
-    /** `sslmode=verify-full`: the server proves it is the host that was named, to this root. */
-    final case class VerifyFull(rootCertificate: String) extends Tls
-  }
-
-  /**
-   * @param connect how long a connection is waited for. It is how long a call takes to fail
-   *   when the database is down
-   * @param statement how long one statement may run
-   */
-  final case class Timeouts(connect: FiniteDuration, statement: FiniteDuration)
-
-  object Timeouts {
-
-    /** The LogStore's own defaults (`CoordinationSettings`); a test holds the two to each other. */
-    val Default: Timeouts = Timeouts(connect = 5.seconds, statement = 10.seconds)
-  }
+  final case class Databases(control: DatabaseConnection, coordination: DatabaseConnection)
 
   /**
    * For how long the engine goes on with a step that fails with an error that passes, and how
@@ -173,8 +139,8 @@ object Profile {
       ),
       top.required("databases")(_.obj { databases =>
         (
-          databases.required("control")(_.obj(database)),
-          databases.required("coordination")(_.obj(database))
+          databases.required("control")(_.obj(DatabaseConnection.read)),
+          databases.required("coordination")(_.obj(DatabaseConnection.read))
         ).mapN(Databases)
       }),
       top.orElse("retries", Retries.Default)(_.obj(retries)),
@@ -193,41 +159,6 @@ object Profile {
       ),
       fields.orElse("shared_filesystem", false)(_.boolean)
     ).mapN(Lake)
-
-  private def database(fields: Obj): Result[Database] =
-    (
-      fields.required("url")(_.text(PostgresUrl.parse)),
-      fields.required("user")(_.text(SqlIdentifier.parse)),
-      fields.required("password")(_.secret),
-      fields.required("tls")(_.obj(tls)),
-      fields.orElse("timeouts", Timeouts.Default)(_.obj(timeouts))
-    ).mapN(Database)
-
-  private def tls(fields: Obj): Result[Tls] = {
-    val certificate = fields.optional("root_certificate")(_.text(absolutePath))
-    val mode = fields.required("mode")(_.oneOf("disable" -> false, "verify-full" -> true))
-    (mode, certificate).tupled.andThen {
-      case (true, Some(path)) => Read.valid(Tls.VerifyFull(path))
-      case (true, None) =>
-        Read.invalid(
-          fields.path("root_certificate"),
-          "is missing: verify-full needs the certificate of the authority that signed the server's"
-        )
-      case (false, Some(_)) =>
-        Read.invalid(
-          fields.path("root_certificate"),
-          "is set, and mode is disable: nothing would be verified with it"
-        )
-      case (false, None) => Read.valid(Tls.Disabled)
-    }
-  }
-
-  private def timeouts(fields: Obj): Result[Timeouts] =
-    (
-      // The connection pool takes no shorter wait; a longer one is a hang, not a timeout.
-      fields.orElse("connect", Timeouts.Default.connect)(_.duration(250.millis, 5.minutes)),
-      fields.orElse("statement", Timeouts.Default.statement)(_.duration(1.second, 1.hour))
-    ).mapN(Timeouts.apply)
 
   private def retries(fields: Obj): Result[Retries] =
     (
@@ -260,10 +191,6 @@ object Profile {
   }
 
   private val CredentialWords = Seq("password", "secret", "token", "access.key")
-
-  private def absolutePath(text: String): Either[String, String] =
-    if (!text.startsWith("/")) Left("must be an absolute path")
-    else RelativePath.parse(text.drop(1)).map(_ => text)
 
   // -------------------------------------------------------------------------------------------
   // What is about more than one field
@@ -361,15 +288,9 @@ object Profile {
               "such storage are not those of a local disk, and need a verification of their own"
           )
         )
-      ).flatten ++ Seq("control" -> databases.control, "coordination" -> databases.coordination)
-        .collect {
-          case (name, database) if database.tls == Tls.Disabled && !database.url.isLoopback =>
-            Problem(
-              s"databases.$name.tls.mode",
-              "is disable, and the database is on another machine: its traffic, the password " +
-                "included, is not encrypted"
-            )
-        }
+      ).flatten ++
+        DatabaseConnection.warnings("databases.control", databases.control) ++
+        DatabaseConnection.warnings("databases.coordination", databases.coordination)
     )
 
     (errors, warnings)

@@ -1,0 +1,15 @@
+# The returns that the warehouse exports: CSV files left in a directory of the landing zone.
+# An example of a file source, with only what a source must have.
+id: sales.returns
+owner: team-sales
+
+connector:
+  type: file
+  path: sales/returns          # relative to the landing root of the profile
+  format: csv
+  pattern: "returns-*.csv"
+
+load: { mode: new_files }
+
+targets:
+  bronze: { table: bronze/sales/returns }

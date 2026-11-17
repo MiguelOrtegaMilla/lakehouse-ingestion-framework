@@ -1,0 +1,42 @@
+# The orders of the sales database: what changed since the last load, by `updated_at`.
+# An example of a table read over JDBC, with every section a source can have.
+id: sales.orders
+owner: team-sales
+
+connector:
+  type: jdbc
+  connection:
+    url: "jdbc:postgresql://localhost:5432/sales"
+    user: sales_ro
+    # export SALES_RO_PASSWORD="$(cat docker/secrets/sales_ro_password)"
+    password: { secretRef: "env:SALES_RO_PASSWORD" }
+    tls: { mode: disable }   # the database is on this machine
+  table: public.orders
+
+load:
+  mode: incremental
+  # A load starts 10m before the last watermark, for rows that arrived late, and stops 1m
+  # behind the present, for transactions that are still open.
+  watermark: { column: updated_at, lookback: 10m, safety_margin: 1m }
+  max_batch_range: 7d
+
+# What tells one order from another: Silver merges by it.
+keys: [order_id]
+
+# An incremental load does not see a row that was deleted. A run of its own compares the keys.
+deletes: { strategy: key_reconciliation }
+
+# "null" in quotes: without them it is no value at all, and the default is taken.
+schema: { on_new_column: add, on_missing_column: "null", on_type_change: fail }
+
+columns:
+  customer_email: { pii: email, silver: { mask: hmac } }
+
+quality: { max_rejected_ratio: 0.01 }
+
+# Relative to the lake of the profile.
+targets:
+  bronze: { table: bronze/sales/orders }
+  silver: { table: silver/sales/orders, partition_by: [_source_id] }
+
+freshness_sla: 2h

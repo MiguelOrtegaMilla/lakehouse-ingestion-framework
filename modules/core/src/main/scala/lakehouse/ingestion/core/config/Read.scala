@@ -18,8 +18,11 @@ import io.circe.{Json, JsonObject}
  *    nobody asked for;
  *  - '''an error has the path of its field''' and words that say what is expected, since the
  *    one who reads it wrote YAML, not Scala.
+ *
+ * It is public for the kinds of connector: each reads the fields of its own configuration with
+ * it (`ConnectorKind`), so that a new kind of source changes nothing here.
  */
-private[config] object Read {
+object Read {
 
   /** A mistake at one field of the file. */
   final case class Problem(field: String, problem: String)
@@ -92,6 +95,13 @@ private[config] object Read {
             "{ secretRef: \"file:/run/secrets/name\" }, and never the secret itself"
         )
 
+    /** A share of a whole: a number from 0 to 1. */
+    def ratio: Result[Double] = json.asNumber.map(_.toDouble) match {
+      case Some(share) if share >= 0 && share <= 1 => valid(share)
+      case Some(_) => fail("must be between 0 and 1")
+      case None => fail(s"must be a number between 0 and 1, and is ${kind(json)}")
+    }
+
     /** One of a few words. */
     def oneOf[A](choices: (String, A)*): Result[A] = {
       val words = choices.map(_._1)
@@ -130,6 +140,14 @@ private[config] object Read {
   final class Obj private[Read] (val field: String, fields: JsonObject) {
 
     private val asked = mutable.LinkedHashSet.empty[String]
+    private var judged = true
+
+    /**
+     * Says that the fields nobody asked for are not to be called mistakes: what would have
+     * asked for them could not be told, as the kind of a connector whose `type` is wrong. That
+     * one error is then the only one, and not one more for every field of the section.
+     */
+    def restUnjudged(): Unit = judged = false
 
     /** The path of a field of this mapping, for a rule that is about more than one field. */
     def path(name: String): String = child(field, name)
@@ -152,17 +170,21 @@ private[config] object Read {
     /** Runs `body`, and then refuses every field that `body` did not ask for. */
     private[Read] def read[A](body: Obj => Result[A]): Result[A] = {
       val result = body(this)
-      val unknown = Chain.fromSeq(fields.keys.toSeq.filterNot(asked)).map { name =>
-        Problem(path(name), s"is not a field that is known here${suggestion(name, asked.toSeq)}")
-      }
+      val unknown =
+        Chain.fromSeq(fields.keys.toSeq.filter(_ => judged).filterNot(asked)).map { name =>
+          Problem(path(name), s"is not a field that is known here${suggestion(name, asked.toSeq)}")
+        }
       NonEmptyChain
         .fromChain(unknown)
         .fold(result)(more => result <* Validated.invalid[NonEmptyChain[Problem], Unit](more))
     }
   }
 
-  private def child(field: String, name: String): String =
-    if (field.isEmpty) name else s"$field.$name"
+  /** The path of a field. A name is the writer's: what ASCII does not print is shown by its code. */
+  private def child(field: String, name: String): String = {
+    val shown = name.flatMap(c => if (c > 0x20 && c < 0x7f) c.toString else f"\\u${c.toInt}%04X")
+    if (field.isEmpty) shown else s"$field.$shown"
+  }
 
   private def kind(json: Json): String =
     json.fold(

@@ -1,6 +1,6 @@
 package lakehouse.ingestion.it.config
 
-import lakehouse.ingestion.core.config.Profile
+import lakehouse.ingestion.core.config.{Profile, Timeouts}
 import lakehouse.ingestion.logstore.RetryPolicy
 import lakehouse.ingestion.logstore.coordination.CoordinationSettings
 import org.scalatest.funsuite.AnyFunSuite
@@ -20,8 +20,8 @@ final class LogStoreNumbersAgreementSpec extends AnyFunSuite with Matchers {
   }
 
   test("the timeouts a profile leaves out are the LogStore's defaults") {
-    Profile.Timeouts.Default.connect shouldBe CoordinationSettings.DefaultConnectTimeout
-    Profile.Timeouts.Default.statement shouldBe CoordinationSettings.DefaultStatementTimeout
+    Timeouts.Default.connect shouldBe CoordinationSettings.DefaultConnectTimeout
+    Timeouts.Default.statement shouldBe CoordinationSettings.DefaultStatementTimeout
   }
 
   test("the shortest connect timeout of a profile is the shortest the LogStore takes") {

@@ -29,6 +29,12 @@ Adding a source must mean writing configuration, not code. The configuration mus
 - **Secrets by reference only**: `secretRef: env:NAME` or `file:/run/secrets/name`, resolved by a `SecretResolver`. Literal passwords are rejected by validation.
 - **Versioning**: SHA-256 of the canonicalised, redacted config, recorded on every run. The redacted content is stored once in `control.config_snapshot`.
 
+*As built (P3.3 and P3.4, 2026-11-17):* `Profile` and `Source` in `core`.
+- **A mapping knows its fields.** A field that the model does not have is an error, with the field that was probably meant: a misspelt `watermark` must not become a full load that nobody asked for.
+- **The connector-specific `validate` is a `ConnectorKind`**: it reads the fields of its own section, with the same reader and the same errors as the rest of the file, and says which ways of loading it has. The kinds are given to `Source.load`; the model of a source names none.
+- **Validation opens no connection and looks no name up.** Whether a database or a source answers is another step, with timeouts of its own.
+- **Warnings are apart from errors**: what is allowed and unusual, as a database on another machine without TLS, is said once and stops nothing.
+
 ## Alternatives
 
 | Option | Verdict |
