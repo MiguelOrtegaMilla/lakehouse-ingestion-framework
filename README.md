@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phase 2a (the PostgreSQL-coordinated LogStore, tested in one JVM and with Delta) is complete; Phase 2b (its proof with several processes) is next.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phase 2, the PostgreSQL-coordinated LogStore, is built: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). The stress job has yet to make its first run in CI, at the size of CI.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -54,6 +54,8 @@ GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs on every push to `mai
 | Dependency submission | Sends the resolved sbt dependency graph to GitHub, which raises Dependabot alerts on known vulnerabilities |
 | Dependency review | Pull requests only: fails if the change introduces a dependency with a known vulnerability of high severity or above |
 
+The stress runs have a workflow of their own ([`stress.yml`](.github/workflows/stress.yml)), on demand and every Monday, and not on pull requests: they take more than an hour and are evidence under load, not a gate. It runs `scripts/stress-logstore.sh` with the natural race at eight writers and 500 commits each, shows what each run's verifier found in the job summary, and keeps every report as an artifact. A change to the LogStore is run through it by hand, on its branch, before it is merged.
+
 The workflow token is read-only; only the submission job may write, to the dependency graph. Dependabot proposes updates for the pinned actions. The security baseline behind these checks is [ADR-0013](docs/adr/0013-application-security-baseline.md) §4–5.
 
 ```bash
@@ -71,20 +73,32 @@ STRESS_NATURAL_RUNS=0 scripts/stress-logstore.sh   # without the ten natural run
 sbt "integration-tests/Stress/testOnly *SpikeGreenSpec"   # only the runs on PostgresLogStore (needs Docker)
 sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"   # only the writers killed inside a commit: about 9 minutes (needs Docker)
 sbt "integration-tests/Stress/testOnly *SpikeGreenOutageSpec"   # only PostgreSQL killed in the middle of a run: about 6 minutes (needs Docker)
+STRESS_WRITERS=8 STRESS_COMMITS=500 STRESS_NATURAL_RUNS=1 scripts/stress-logstore.sh   # the natural race at the size of the stress job in CI: about 9 GB of memory
+scripts/stress-summary.sh   # one row for each report in target/stress: acknowledged, lost, and what the verifier found
 ```
 
 Each run keeps its table, writer journals, logs and probes in `target/stress/<run>/`, next to its `report.md`.
 
-### Spike RED: Delta's default LogStore on `file://`
+### Results: Delta's default LogStore and `PostgresLogStore`
 
-Three writer JVMs append to one table with Delta's default configuration ([full write-up](docs/spikes/logstore-red.md)):
+Three writer JVMs append to one table on `file://`, each in batches that carry a transaction identifier. RED is Delta's default configuration ([write-up](docs/spikes/logstore-red.md)). GREEN is the same harness and the same verifier on `PostgresLogStore` ([write-up](docs/spikes/logstore-green.md)). The runs are of 2026-11-13, 2026-11-16 and 2026-11-17, on one development machine.
 
-| Variant | Runs that lost a commit its writer saw succeed |
-|---|---|
-| Natural race (3 × 200 commits, no fault injection) | **2 of 5** |
-| Widened window (a delay just before the rename that publishes the commit) | **5 of 5** |
+| | RED: Delta's default LogStore | GREEN: `PostgresLogStore` |
+|---|---|---|
+| **Widened window**: every writer is held at the point where a version is claimed | Lost a commit that its writer saw succeed in **6 runs of 6** | **0 lost** of 60 commits in 2 runs, one on each side of the `INSERT`. Held before it, the writers found their version taken at the `INSERT` 52 times, and went on at the next one |
+| **Natural race**: 3 writers × 200 commits, no fault injection | Lost commits in **2 runs of 6** | **0 lost** of 6,000 commits in 10 runs. Two writers were committing one version at the same time 376 times |
+| **A writer killed** with `kill -9` inside a commit, and started again | Not run | **0 lost, 0 written twice**, of 222 batches in 4 runs: a kill before the `INSERT`, one after it, one after the publish, and six at random moments |
+| **PostgreSQL killed** in the middle of a run, and started again 30 s later | Does not apply | **0 lost, 0 written twice**, of 150 batches in 2 runs. Every attempt made meanwhile failed, 15 in each run, and was repeated |
+| **Readers** | The one that checks `.crc` sidecars fails on the replaced commit. The one that does not reads the table, without the commit | Both read every table |
 
-Delta notices nothing: the lost commit's file is replaced, not removed, so the log has no gap. On `file://`, Hadoop's `.crc` sidecar usually goes stale, and every reader that checks it then fails. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit. The fix is [ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md). The same suite on `PostgresLogStore` lost no commit: [Spike GREEN](docs/spikes/logstore-green.md), which is completed as P2b goes on.
+The rows do not say equally much, and the write-ups keep them apart:
+
+- **The widened window is the decisive evidence.** The race is made to happen on every commit, and the default LogStore fails in it every time.
+- **The natural race is weak evidence.** The one RED run of the same day as GREEN lost nothing either: a clean natural run can be luck.
+- **The kills at chosen points are the ones that count.** The six at random moments all fell outside a commit.
+- **One machine, one file system, three writers.** The natural race with eight writers and 500 commits each is the stress job in CI.
+
+On the default LogStore Delta notices nothing: the lost commit's file is replaced, not removed, so the log has no gap. On `file://`, Hadoop's `.crc` sidecar usually goes stale, and every reader that checks it then fails. A reader that checks no sidecars, as on object storage, reads the table without error and without the commit. The fix is [ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md): a version is claimed with an `INSERT` in PostgreSQL, and its commit is published as a hard link, which never replaces a file.
 
 ## Local services
 

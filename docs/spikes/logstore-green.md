@@ -6,7 +6,7 @@
 | **Plan** | [ADR-0004](../adr/0004-postgresql-coordinated-delta-logstore.md) §7.3 |
 | **Before** | [Spike RED](logstore-red.md): the same harness on Delta's default LogStore |
 | **Code** | `SpikeGreenSpec`; `SpikeGreenKillSpec` and `WriterKiller` for the kills; `SpikeGreenOutageSpec` for PostgreSQL killed; `GreenSpikeSuite`, `CoordinatedStressSuite`, the stress harness and verifier (`modules/integration-tests/.../it/stress/`). The RED suite, `SpikeRedSpec`, is unchanged. |
-| **Reproduce** | `scripts/stress-logstore.sh`: the four suites, about 80 minutes, Docker, about 4 GB of free memory. With `STRESS_NATURAL_RUNS=0` the natural runs are left out, and it takes about 25 minutes. One suite alone: `sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"`, about 9 minutes, or `*SpikeGreenOutageSpec`, about 6. |
+| **Reproduce** | `scripts/stress-logstore.sh`: the four suites, about 80 minutes, Docker, about 4 GB of free memory. With `STRESS_NATURAL_RUNS=0` the natural runs are left out, and it takes about 25 minutes. One suite alone: `sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"`, about 9 minutes, or `*SpikeGreenOutageSpec`, about 6. In CI: the workflow `stress.yml`, on demand and weekly, with the natural race at eight writers and 500 commits each. |
 | **Harness** | The runs of 2026-11-16: the commit *test: run the suite of the RED spike on PostgresLogStore (P2b.3)*, GREEN and RED one after the other, by one invocation of the script. The kills of 2026-11-17: the commit *test: kill a writer inside a commit and start a process in its place (P2b.4)*. PostgreSQL killed, the same day: the commit *test: kill PostgreSQL in the middle of a run, with writers that repeat a batch (P2b.5)*. |
 
 ## Question
@@ -256,7 +256,7 @@ A writer made its 200 commits in 261 to 277 s on `PostgresLogStore`, and in 273 
 
 ## Limits of this result
 
-- **One machine, one file system** (WSL2, ext4), three writers, small commits, appends only. The stress job in CI runs eight writers (P2b.6); `s3a://` is E1.
+- **One machine, one file system** (WSL2, ext4), three writers, small commits, appends only. The stress job in CI runs the natural race with eight writers and 500 commits each; it had not made its first run when this was written, and no result of it is here. `s3a://` is E1.
 - **The natural race is not a rate.** How often two writers meet at the `INSERT` depends on hardware, load and commit latency. The 376 are a count on this machine, on this day.
 - **The collisions of RED were not counted.** The count at the `INSERT` exists only on `PostgresLogStore`, so the two cannot be compared by it. What can be compared is the outcome: lost commits.
 - **The window before the `INSERT` is widened by a hook of the LogStore itself.** The hook only sleeps, between two steps the LogStore takes anyway, and the control shows that it loses nothing by itself.

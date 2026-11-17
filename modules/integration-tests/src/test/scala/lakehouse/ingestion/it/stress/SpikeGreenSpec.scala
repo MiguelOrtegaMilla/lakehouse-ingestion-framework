@@ -244,10 +244,13 @@ final class SpikeGreenSpec extends AnyFunSuite with Matchers with GreenSpikeSuit
       val report = spike(
         f"natural-$number%02d",
         s"Spike GREEN — PostgresLogStore, natural race (run $number of $NaturalRuns)",
-        coordinated(writers = 3, commits = 200)
+        // A run of the size of CI takes far longer than the harness waits by default.
+        coordinated(NaturalWriters, NaturalCommits)
+          .copy(runTimeout = 15.minutes.max(NaturalCommits * TimeForACommit))
       ) { report =>
         Seq(
-          "No fault injection: three writers, 200 commits each, as in the RED spike.",
+          s"No fault injection: $NaturalWriters writers, $NaturalCommits commits each" +
+            (if (NaturalWriters == 3 && NaturalCommits == 200) ", as in the RED spike." else "."),
           "This is the weak evidence. A run in which no commit is lost can be luck: three of the " +
             "five RED runs lost none either, with a LogStore that loses commits. It is run " +
             s"$NaturalRuns times. The strong evidence is in the runs that widen the window, and " +
@@ -290,4 +293,24 @@ object SpikeGreenSpec {
    */
   val NaturalRuns: Int =
     sys.env.get(NaturalRunsVariable).flatMap(_.toIntOption).filter(_ >= 0).getOrElse(10)
+
+  /**
+   * The environment variables with the size of a natural run. The defaults are the spike's and
+   * RED's, three writers and 200 commits each, which fit a development machine. The stress job
+   * in CI runs eight writers and 500 commits each (ADR-0004 §7.2).
+   */
+  val WritersVariable = "STRESS_WRITERS"
+  val CommitsVariable = "STRESS_COMMITS"
+
+  val NaturalWriters: Int = positive(WritersVariable, 3)
+  val NaturalCommits: Int = positive(CommitsVariable, 200)
+
+  /**
+   * What a natural run is given for each commit of a writer before the harness gives it up: many
+   * times what one takes, with writers that outnumber the cores of the machine or not.
+   */
+  private val TimeForACommit = 15.seconds
+
+  private def positive(variable: String, default: Int): Int =
+    sys.env.get(variable).flatMap(_.toIntOption).filter(_ > 0).getOrElse(default)
 }
