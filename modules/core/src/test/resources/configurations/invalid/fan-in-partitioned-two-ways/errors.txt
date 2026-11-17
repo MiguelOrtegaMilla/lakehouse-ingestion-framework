@@ -1,0 +1,2 @@
+sources/crm_es.customers.yaml: targets.silver.partition_by is [_source_id], and silver/crm/customers is written by sources/crm_pt.customers.yaml as well, partitioned another way: a table is partitioned one way
+sources/crm_pt.customers.yaml: targets.silver.partition_by is [region], and silver/crm/customers is written by sources/crm_es.customers.yaml as well, partitioned another way: a table is partitioned one way

@@ -1,0 +1,2 @@
+sources/sales.orders.yaml: targets.silver.table is silver/shared/orders, which sources/shop.orders.yaml writes as its Bronze table: a table has one layer
+sources/shop.orders.yaml: targets.bronze.table is silver/shared/orders, which sources/sales.orders.yaml writes as its Silver table: a table has one layer

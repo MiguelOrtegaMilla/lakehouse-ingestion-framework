@@ -1,0 +1,17 @@
+# The retry budget is too short as well. That is a rule about several fields, and it is
+# said once every field is right by itself: errors.txt does not have it.
+lake: { uri: "file:///data/lake", deployment: laptop }
+landing: { root: "file:///data/landing" }
+databases:
+  control:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_control
+    password: { secretRef: "env:INGEST_CONTROL_PASSWORD" }
+    tls: { mode: disable }
+  coordination:
+    url: "jdbc:postgresql://localhost:5432/ingestion_control"
+    user: ingest_coordination
+    password: { secretRef: "env:INGEST_COORDINATION_PASSWORD" }
+    tls: { mode: disable }
+spark: { master: "local[2]" }
+retries: { budget: 10s, max_backoff: 5s }

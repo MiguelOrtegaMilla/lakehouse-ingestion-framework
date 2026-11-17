@@ -48,6 +48,7 @@ Blind appends (Bronze) have no read set, so under Delta's default `WriteSerializ
 - A fan-in Silver table is **partitioned by the column that separates its writers** (typically `_source_id`, or a business partition the sources already own, such as region).
 - The engine puts that partition **literally in the `MERGE` condition** (`t._source_id = 'crm_es' AND t.<key> = s.<key>`). Delta's conflict detection then sees disjoint read sets, so writers on different partitions do not conflict. Without the literal predicate, a `MERGE` is treated as reading the whole table, and any concurrent append conflicts.
 - **Config validation rule (generic, not business logic):** for a table written by more than one source, the key must include the partition column. Overlapping key spaces across sources would be a business-level merge rule, which is out of scope for the framework.
+  - *As built (P3.5, 2026-11-17):* `Configuration` in `core`. Such a table must be partitioned, and the same way by every source that writes it. `_source_id` is the engine's own column and counts as part of every key without being listed in one; any other partition column must be among the keys of each source. A table that one source writes is partitioned as that source likes.
 - **Maintenance:** `OPTIMIZE` is scoped by partition (`WHERE`) and scheduled away from active partitions where possible. Its conflicts with `MERGE` are classified as *retry*.
 
 ### 4. Silver cursor = Bronze Delta version

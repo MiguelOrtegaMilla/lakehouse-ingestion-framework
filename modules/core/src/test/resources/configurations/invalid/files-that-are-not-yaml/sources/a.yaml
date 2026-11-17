@@ -1,0 +1,2 @@
+id: a
+connector: { type: file, path: a, format: csv

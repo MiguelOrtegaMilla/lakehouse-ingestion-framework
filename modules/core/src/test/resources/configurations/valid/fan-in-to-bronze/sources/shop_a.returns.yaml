@@ -1,0 +1,6 @@
+# Appends never read: several sources may write one Bronze table as it is (ADR-0010).
+id: shop_a.returns
+connector: { type: file, path: shop_a/returns, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/returns }
