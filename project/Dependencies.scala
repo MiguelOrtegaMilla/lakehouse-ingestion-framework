@@ -58,6 +58,21 @@ object Dependencies {
     ("org.apache.hadoop" % "hadoop-client-runtime" % Versions.hadoop % Test)
       .exclude("ch.qos.reload4j", "reload4j")
 
+  /**
+   * Pins the modules of Scala itself to the build's Scala, which is Spark's (ADR-0014). Spark
+   * 4.1.4 depends on jackson-module-scala 2.21.2, which is built with Scala 2.13.18 and asks for
+   * that `scala-library`. Spark's own build manages `scala-library`, `scala-reflect` and
+   * `scala-compiler` to its `scala.version`, so its distribution runs on 2.13.17. sbt does not
+   * read the dependency management of a library's parent: without this override it gave the
+   * engine and the integration tests 2.13.18, and they were compiled for one Scala library and
+   * run on another, which is not the one of `spark-submit` either.
+   * `checkBoundaries` fails on any other version (ModuleBoundaries).
+   */
+  val scalaAlignment: Seq[ModuleID] =
+    Seq("scala-library", "scala-reflect", "scala-compiler").map(
+      "org.scala-lang" % _ % Versions.scala
+    )
+
   val catsCore = "org.typelevel" %% "cats-core" % Versions.cats
   val circeCore = "io.circe" %% "circe-core" % Versions.circe
   // YAML 1.2, through snakeyaml-engine: `yes` and `no` are strings (ADR-0013 §5).

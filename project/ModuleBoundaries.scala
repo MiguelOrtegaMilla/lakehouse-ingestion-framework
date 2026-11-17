@@ -22,6 +22,9 @@ object ModuleBoundaries {
     override def toString: String = s"$organization:${namePrefix}*"
   }
 
+  /** The modules of Scala itself, which must all have the version of the build's Scala. */
+  private val ScalaModules = Set("scala-library", "scala-reflect", "scala-compiler")
+
   /** The forbidden groups the rules of ADR-0012 are written in. */
   object Forbid {
     val spark: Forbidden = Forbidden("org.apache.spark")
@@ -60,7 +63,20 @@ object ModuleBoundaries {
         else
           thisProject.value.dependencies.map(d => s"project dependency on '${d.project.project}'")
 
-      val violations = forbiddenModules ++ forbiddenProjects
+      // The Scala library that the code is compiled against and that the tests run on is the
+      // build's, which is Spark's (ADR-0014). A dependency built with a newer Scala asks for a
+      // newer library, and sbt would give it one (Dependencies.scalaAlignment).
+      val scala = scalaVersion.value
+      val resolved =
+        (Compile / externalDependencyClasspath).value ++ (Test / externalDependencyClasspath).value
+      val otherScala = resolved
+        .flatMap(_.get(moduleID.key))
+        .filter(m => m.organization == "org.scala-lang" && ScalaModules(m.name))
+        .filter(_.revision != scala)
+        .map(m => s"${m.organization}:${m.name}:${m.revision} (the build's Scala is $scala)")
+        .distinct
+
+      val violations = forbiddenModules ++ forbiddenProjects ++ otherScala
       if (violations.nonEmpty)
         sys.error(
           violations.mkString(s"[$id] violates ADR-0012 module boundaries:\n  - ", "\n  - ", "")
