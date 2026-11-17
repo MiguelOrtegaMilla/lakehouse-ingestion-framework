@@ -63,6 +63,12 @@ Each lake profile declares a `landing.root` next to `lake.uri` (ADR-0011). Sourc
   - a symlinked file and a symlinked directory inside the landing directory that point outside the root;
   - a target escaping the lake root.
 
+*As built (P3.2, 2026-11-17):* `SqlIdentifier`, `QualifiedName` and `RelativePath` in `core`.
+- **The static validation of paths is an allow-list too**, where the text above lists what to reject. A path is segments separated by `/`; a segment starts with a letter or a digit of ASCII and goes on with letters, digits, `_`, `-`, `.` and `=`. Everything in the list above falls outside it, and so does what the list did not think of: a glob, a `~`, a look-alike of `..` in Unicode.
+- **Names that Spark and Delta treat as hidden are refused**, those that start with `_` or `.`. A target that ended in `_delta_log` would be the log of another table.
+- **A path is written one way**: no `/` at the end, no empty segment, no `.`. Two texts never name one place.
+- **A refusal names the character by its code point and does not repeat the text**, for names and for paths: what was written may be something a terminal obeys, or a letter that is not the one it looks like.
+
 ### 3. Least privilege in PostgreSQL (Required)
 
 Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required**, with one addition: the data path cannot delete coordination rows.
