@@ -91,7 +91,7 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
     val ran = run("validate", "--profile", profile.toString, "--sources", sources.toString)
 
-    ran.exit shouldBe Main.Exit.Permanent
+    ran.exit shouldBe 4
     ran.out shouldBe empty
     ran.errors shouldBe Seq(
       s"$profile: lake.deployment must be one of single-machine, cluster",
@@ -134,7 +134,33 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
       "1 error in 1 file. The configuration is not valid."
   }
 
-  test("a command line that is not one ends in 2, with what is wrong and how it is written") {
+  test("the exit codes are those of the contract with the orchestrator, one meaning each") {
+    // Discovery §14.1. The numbers are what an orchestrator is configured with: they are
+    // pinned here by their value, and not by the name that the code calls them.
+    Main.Exit.All shouldBe Seq(
+      0 -> "ok",
+      2 -> "skipped: locked",
+      3 -> "transient failure",
+      4 -> "permanent failure",
+      5 -> "data threshold exceeded",
+      64 -> "usage error"
+    )
+    Main.Exit.All.map(_._1).distinct should have size Main.Exit.All.size.toLong
+    // A command line that is wrong must not look like a lease that is taken, which an
+    // orchestrator answers by trying again at its next trigger.
+    Main.Exit.Usage should not be Main.Exit.SkippedLocked
+    (Main.Exit.Ok, Main.Exit.SkippedLocked, Main.Exit.Transient) shouldBe ((0, 2, 3))
+    (Main.Exit.Permanent, Main.Exit.DataThreshold, Main.Exit.Usage) shouldBe ((4, 5, 64))
+  }
+
+  test("the usage says which code is which") {
+    Main.Usage should include(
+      "exit codes: 0 the configuration is valid; 4 the configuration is not valid;"
+    )
+    Main.Usage should include("64 the command line is not one")
+  }
+
+  test("a command line that is not one ends in 64, with what is wrong and how it is written") {
     val wrong = Seq(
       Seq.empty[String] -> "error: no command",
       Seq("run") -> "error: 'run' is not a command",
@@ -167,7 +193,7 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     wrong.foreach { case (args, problem) =>
       withClue(args.mkString(" ")) {
         val ran = run(args: _*)
-        ran.exit shouldBe Main.Exit.Usage
+        ran.exit shouldBe 64
         ran.out shouldBe empty
         ran.errors.head shouldBe problem
         ran.err should include(

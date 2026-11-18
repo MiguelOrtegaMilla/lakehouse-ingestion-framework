@@ -15,15 +15,55 @@ import lakehouse.ingestion.core.config.{ConfigLoader, Configuration, ConfigVersi
  */
 object Main {
 
-  /** How a command ended, for whoever started the process (discovery §14). */
+  /**
+   * How a command ended, for whoever started the process: the contract with the orchestrator
+   * (discovery §14). The framework does not schedule itself, so the exit code is all that an
+   * orchestrator has to tell "run it again" from "do not", and a code has one meaning.
+   *
+   * All of them are here, those that no command gives yet as well, so that none is given a
+   * second meaning by the next command that needs a number.
+   */
   object Exit {
+
+    /** The command did what it was asked. */
     val Ok = 0
 
-    /** The command line is not one: nothing was looked at. */
-    val Usage = 2
+    /**
+     * `SKIPPED_LOCKED`: another run holds the lease of the source (ADR-0006). Nothing was read
+     * or written. It is not a failure, and an orchestrator answers it by doing nothing until
+     * its next trigger.
+     */
+    val SkippedLocked = 2
 
-    /** Something that trying again does not mend: here, a configuration that is not valid. */
+    /** A failure that passes and that outlasted the retries. Running again later may do. */
+    val Transient = 3
+
+    /**
+     * Something that running again does not mend, until somebody changes something: here, a
+     * configuration that is not valid.
+     */
     val Permanent = 4
+
+    /** More rows were rejected than the source allows, and the batch was not committed. */
+    val DataThreshold = 5
+
+    /**
+     * The command line is not one: nothing was looked at. `EX_USAGE` of `sysexits.h`, far from
+     * the codes of a run on purpose. It was 2 for a day, which is `SkippedLocked`: an
+     * orchestrator would have answered a mistyped command by trying it again at every trigger,
+     * for ever.
+     */
+    val Usage = 64
+
+    /** Every code, with what it is called in a report. */
+    val All: Seq[(Int, String)] = Seq(
+      Ok -> "ok",
+      SkippedLocked -> "skipped: locked",
+      Transient -> "transient failure",
+      Permanent -> "permanent failure",
+      DataThreshold -> "data threshold exceeded",
+      Usage -> "usage error"
+    )
   }
 
   val Usage: String =
@@ -35,8 +75,8 @@ object Main {
       |  --profile  the file of the profile, as conf/app/local.yaml
       |  --sources  the directory of the sources, one .yaml file for each, as conf/sources
       |
-      |exit codes: 0 the configuration is valid; 2 the command line is not one;
-      |            4 the configuration is not valid""".stripMargin
+      |exit codes: 0 the configuration is valid; 4 the configuration is not valid;
+      |            64 the command line is not one""".stripMargin
 
   def main(args: Array[String]): Unit = sys.exit(run(args.toSeq, System.out, System.err))
 
