@@ -53,6 +53,9 @@ jobs:
           persist-credentials: false
       # The JDK, sbt, and the cache that the tests of ci.yml save.
       - uses: ./.github/actions/setup-build
+      # Before an hour of runs, and not in the middle of them.
+      - name: Resolve the build
+        run: scripts/retry-on-429.sh sbt -batch update
       # The four suites: Delta's default LogStore (RED), where a lost commit is the expected
       # result, and PostgresLogStore (GREEN) with its kills and its outage of PostgreSQL.
       - name: Stress runs
