@@ -1,0 +1,15 @@
+# Where sbt downloads from in CI: sbt itself, the plugins of the build, and its libraries
+# (.github/actions/setup-build).
+#
+# Maven Central, and after it Google's mirror of Maven Central, which sbt asks when Central
+# answers with an error for the description of a library, as 429 (Too Many Requests) is. The
+# runners of CI share their addresses, and Central limits how much one address may ask for.
+#
+# That covers a library whose description Central refused. One whose description came and
+# whose jar was then refused is asked of nobody else: sbt downloads a jar from where its
+# description came. For that there is repositories-mirror-first, which a command that failed
+# on a 429 is run again with (scripts/retry-on-429.sh).
+[repositories]
+  local
+  maven-central
+  google-mirror: https://maven-central.storage-download.googleapis.com/maven2/

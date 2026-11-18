@@ -69,3 +69,16 @@ runs:
 
     # The sbt launcher; the build's sbt version comes from project/build.properties.
     - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+
+    # Where sbt downloads from, for every step of the job that runs it: Maven Central and then
+    # its mirror, and the other way round for a command that is run again after a 429
+    # (.github/sbt/repositories). `override` makes the list the one of the launcher, of the
+    # plugins and of the build alike.
+    - name: Repositories of sbt
+      shell: bash
+      run: |
+        repositories="$GITHUB_WORKSPACE/.github/sbt"
+        {
+          echo "SBT_OPTS=-Dsbt.override.build.repos=true -Dsbt.repository.config=$repositories/repositories"
+          echo "RETRY_SBT_OPTS=-Dsbt.override.build.repos=true -Dsbt.repository.config=$repositories/repositories-mirror-first"
+        } >> "$GITHUB_ENV"
