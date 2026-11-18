@@ -4,7 +4,11 @@
 version: 2
 updates:
   - package-ecosystem: github-actions
-    directory: /
+    # The workflows (which / stands for), and the local action that they share: Dependabot
+    # does not look for actions under .github/actions unless it is told where.
+    directories:
+      - /
+      - /.github/actions/setup-build
     schedule:
       interval: monthly
     # Leave a new release two weeks to settle before proposing it.

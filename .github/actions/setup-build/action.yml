@@ -1,0 +1,69 @@
+# What every job that runs sbt starts with: the JDK, the sbt launcher, and the cache of what sbt
+# downloads. One definition, so that the jobs cannot come to differ in it.
+#
+# The cache is restored by its key, the hash of the build definition, or failing that by the
+# newest cache there is. A change to the build then downloads what it changed, and not sbt
+# itself and every library again. That matters beyond the minutes: Maven Central answers 429 to
+# an address that asks for too much, and a job that starts with nothing asks for everything.
+#
+# One job saves the cache, the one that runs the whole build, and the others read it. Jobs that
+# share a key and all save would leave in it what the first to finish happened to need.
+#
+# Every third-party action is pinned by commit SHA, as in the workflows (scripts/check-pins.sh).
+name: Set up the build
+description: The JDK of .sdkmanrc, the sbt launcher, and the cache of what sbt downloads.
+
+inputs:
+  save-cache:
+    description: >-
+      "true" in the one job that saves the cache when it ends well. The others restore it and
+      leave it as it is.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # The JDK comes from .sdkmanrc, the same pin as local development.
+    - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      with:
+        distribution: temurin
+        java-version-file: .sdkmanrc
+
+    - name: Key of the sbt cache
+      id: sbt-cache
+      shell: bash
+      env:
+        BUILD_HASH: ${{ hashFiles('**/*.sbt', 'project/build.properties', 'project/**/*.scala') }}
+      run: |
+        echo "prefix=sbt-${RUNNER_OS}-${RUNNER_ARCH}-" >> "$GITHUB_OUTPUT"
+        echo "key=sbt-${RUNNER_OS}-${RUNNER_ARCH}-${BUILD_HASH}" >> "$GITHUB_OUTPUT"
+
+    # sbt itself and its compiler bridge (~/.sbt), and the libraries of the build and of its
+    # plugins (coursier, and ivy for what still resolves through it).
+    - name: Restore and save the sbt cache
+      if: inputs.save-cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/coursier
+          ~/.ivy2/cache
+          ~/.sbt
+          !~/.sbt/*.lock
+        key: ${{ steps.sbt-cache.outputs.key }}
+        restore-keys: ${{ steps.sbt-cache.outputs.prefix }}
+
+    - name: Restore the sbt cache
+      if: inputs.save-cache != 'true'
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cache/coursier
+          ~/.ivy2/cache
+          ~/.sbt
+          !~/.sbt/*.lock
+        key: ${{ steps.sbt-cache.outputs.key }}
+        restore-keys: ${{ steps.sbt-cache.outputs.prefix }}
+
+    # The sbt launcher; the build's sbt version comes from project/build.properties.
+    - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
