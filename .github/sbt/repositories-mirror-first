@@ -1,0 +1,10 @@
+# The repositories of CI with the mirror before Maven Central: what a command that failed on a
+# 429 from Central is run again with (scripts/retry-on-429.sh, .github/sbt/repositories).
+#
+# Everything the mirror has then comes from it, descriptions and jars, whatever of it was
+# already downloaded from Central. Central is asked only for what the mirror does not have,
+# as a release of the last hours.
+[repositories]
+  local
+  google-mirror: https://maven-central.storage-download.googleapis.com/maven2/
+  maven-central
