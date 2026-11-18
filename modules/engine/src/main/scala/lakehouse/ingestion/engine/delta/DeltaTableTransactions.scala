@@ -4,6 +4,7 @@ import scala.annotation.tailrec
 
 import lakehouse.ingestion.core.config.TableLocation
 import lakehouse.ingestion.core.control.{BatchId, TableTransactions, TxnAppId}
+import lakehouse.ingestion.engine.RunFailedException
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
@@ -26,23 +27,25 @@ import org.apache.spark.sql.delta.actions.{Action, SetTransaction}
  * (`CommitMetadata`), which any writer of a table may set as it likes.
  *
  * '''What is used of Delta that is not its API''' (discovery §5, R3). Delta shows neither
- * answer through a public method, so three of its own classes are asked, in this file and in
- * no other:
+ * answer through a public method, so its own classes are asked, in this file and in no other:
  *  - `Snapshot.transactions`, the last transaction of each application, which Delta keeps in
  *    the state of a table to skip a write that it has;
  *  - `DeltaLog.getChanges`, the commits of a log from a version on, each with its actions, read
  *    one at a time as they are asked for;
- *  - `SetTransaction`, the action itself.
+ *  - `SetTransaction`, the action itself;
+ *  - `DeltaLog.minSetTransactionRetentionInterval`, whether a table forgets its transactions.
  *
- * What is assumed of the three is pinned by tests of Delta alone, with no code of the engine
- * in them (`DeltaSetTransactionContractSpec`): an upgrade of Delta that changes one fails
- * there, by the name of the assumption, or does not compile here.
+ * What is assumed of them is pinned by tests of Delta alone, with no code of the engine in
+ * them (`DeltaSetTransactionContractSpec`): an upgrade of Delta that changes one fails there,
+ * by the name of the assumption, or does not compile here.
  *
  * '''Two things that a table must keep for the answers to hold.'''
  *  - ''Its transactions.'' A table that sets `delta.setTransactionRetentionDuration` has Delta
  *    forget the transaction of an application that has not written for that long. A batch that
  *    was written before would then look as one that never was, and would be written again. No
- *    table of the engine sets that property, and none that the engine writes to may have it.
+ *    table of the engine sets that property. One that has it gets no answer here, and a
+ *    permanent failure in its place: whatever asks, the recovery of a batch or the write of
+ *    one, would decide by an answer that may be wrong.
  *  - ''Its commits, to say where a batch is.'' Delta removes the commits that are older than
  *    `delta.logRetentionDuration`, thirty days unless a table says otherwise, when it writes a
  *    checkpoint. The table still knows that a batch of then is written, since its transactions
@@ -95,11 +98,24 @@ final class DeltaTableTransactions(
         search(snapshot.version, firstPage.toLong)
       }
 
-  /** The log of a table and the table as it is now; none, if there is no table there. */
+  /**
+   * The log of a table and the table as it is now; none, if there is no table there.
+   *
+   * @throws RunFailedException a permanent failure, for a table that forgets its transactions
+   */
   private def current(table: TableLocation): Option[(DeltaLog, Snapshot)] = {
     val log = DeltaLog.forTable(spark, new Path(table.uri))
     val snapshot = log.update()
-    Option.when(snapshot.version >= 0)((log, snapshot))
+    Option.when(snapshot.version >= 0) {
+      // Asked as Delta itself asks whether to drop a transaction when it computes a state.
+      if (DeltaLog.minSetTransactionRetentionInterval(snapshot.metadata).nonEmpty)
+        throw RunFailedException.permanent(
+          s"the table at ${table.uri} sets $TransactionRetention: Delta forgets the batches " +
+            "that were written to it longer ago than that, and one of them would be written " +
+            "again. Nothing is read from its log or written to it until the property is unset"
+        )
+      (log, snapshot)
+    }
   }
 
   /**
@@ -129,6 +145,9 @@ final class DeltaTableTransactions(
 object DeltaTableTransactions {
 
   val DefaultFirstPage = 16
+
+  /** The property of a table that no table of the engine may have. */
+  val TransactionRetention = "delta.setTransactionRetentionDuration"
 
   /** Pages grow by this: a log of any length is listed a few times, and not once a commit. */
   private val Growth = 8L

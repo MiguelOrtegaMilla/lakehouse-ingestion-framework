@@ -16,7 +16,15 @@ import lakehouse.ingestion.core.config.{
   SourceId,
   TableLocation
 }
-import lakehouse.ingestion.core.control.{BatchId, Layer, RunId, TableTransactions, TxnAppId}
+import lakehouse.ingestion.core.control.{
+  BatchId,
+  FailureClass,
+  Layer,
+  RunId,
+  TableTransactions,
+  TxnAppId
+}
+import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
 import lakehouse.ingestion.logstore.LogStores
@@ -272,5 +280,26 @@ final class DeltaTableTransactionsSpec
     // And none of them is written again: Delta has their transaction, and skips them.
     (1L to 5L).map(seq => writeBatch(table, returns, seq)) shouldBe Seq.fill(5)(None)
     rowsOf(table) should have size 15
+  }
+
+  test("a table that forgets its transactions gets no answer, and a permanent failure for one") {
+    val table = newTable("forgetful")
+    writeBatch(table, returns, 1).value shouldBe 0
+    spark.sql(
+      s"ALTER TABLE delta.`${table.uri}` SET TBLPROPERTIES " +
+        "('delta.setTransactionRetentionDuration' = 'interval 30 days')"
+    ): Unit
+
+    // The batch is there, and within the time that the table keeps it for: the answer would
+    // be right today, and is not given, since it is the next that would be wrong.
+    Seq[() => Any](
+      () => delta.lastVersion(table, TxnAppId.of(returns, Layer.Bronze)),
+      () => delta.committedAt(table, batch(returns, 1))
+    ).foreach { ask =>
+      val refused = intercept[RunFailedException](ask())
+      refused.failure shouldBe FailureClass.Permanent
+      refused.getMessage should include(DeltaTableTransactions.TransactionRetention)
+      refused.getMessage should include(table.uri)
+    }
   }
 }

@@ -24,7 +24,7 @@ import org.scalatest.matchers.should.Matchers
  * These are characterisation tests, as those of `DeltaLogStoreContractSpec` are. They test
  * Delta, and no code of the engine is in them. Each pins a behaviour of a class that is not
  * Delta's API and that the engine asks: `Snapshot.transactions`, `DeltaLog.getChanges`,
- * `SetTransaction`. A Delta upgrade that changes one of these facts fails here, with the name
+ * `SetTransaction`, `DeltaLog.minSetTransactionRetentionInterval`. A Delta upgrade that changes one of these facts fails here, with the name
  * of the assumption it breaks, before it can make the engine take a batch that is written for
  * one that is not, or record it at the version of another commit (ADR-0014, upgrade procedure).
  *
@@ -152,11 +152,15 @@ final class DeltaSetTransactionContractSpec
     val path = tablePath("forgetful")
     write(path, Seq("orders-1"), Some(Orders -> 1L))
     DeltaLog.forTable(spark, path).update().transactions shouldBe Map(Orders -> 1L)
+    // Whether a table forgets is asked of Delta as Delta asks itself, and it does not say so
+    // of a table that has only the properties it was made with.
+    retentionOf(path) shouldBe None
 
     spark.sql(
       s"ALTER TABLE delta.`$path` SET TBLPROPERTIES " +
         "('delta.setTransactionRetentionDuration' = 'interval 1 second')"
     ): Unit
+    retentionOf(path) shouldBe Some(1000L)
     // The transaction is dropped when the state of the table is computed after its second is
     // over, by the clock of this machine: asked until it is.
     eventually(30.seconds.fromNow) {
@@ -217,6 +221,10 @@ final class DeltaSetTransactionContractSpec
       }
       .save(path)
   }
+
+  /** For how long a table keeps a transaction, in milliseconds; none, if for ever. */
+  private def retentionOf(path: String): Option[Long] =
+    DeltaLog.minSetTransactionRetentionInterval(DeltaLog.forTable(spark, path).update().metadata)
 
   /** Every row of a table as it was at a version, sorted. */
   private def rowsAt(path: String, version: Long): Seq[String] =
