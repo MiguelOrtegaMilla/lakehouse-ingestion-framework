@@ -55,6 +55,13 @@ object Main {
      */
     val Usage = 64
 
+    /**
+     * An exception that nothing classified: a mistake in the application itself. `EX_SOFTWARE`
+     * of `sysexits.h`. Nothing gives it yet: until `Main` catches what nothing else did (P8),
+     * such an exception ends the process with the JVM's own 1.
+     */
+    val Internal = 70
+
     /** Every code, with what it is called in a report. */
     val All: Seq[(Int, String)] = Seq(
       Ok -> "ok",
@@ -62,7 +69,8 @@ object Main {
       Transient -> "transient failure",
       Permanent -> "permanent failure",
       DataThreshold -> "data threshold exceeded",
-      Usage -> "usage error"
+      Usage -> "usage error",
+      Internal -> "internal error"
     )
   }
 
