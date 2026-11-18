@@ -4,6 +4,7 @@ import java.io.PrintStream
 import java.nio.file.Paths
 
 import lakehouse.ingestion.core.config._
+import lakehouse.ingestion.engine.control.DatabaseFailure
 
 /**
  * The entry point of the application: a command and its options.
@@ -231,8 +232,8 @@ object Main {
               case Some(failure) =>
                 err.println(s"error: ${failure.message}")
                 failure match {
-                  case _: Migrations.Unreachable => Exit.Transient
-                  case _: Migrations.Refused => Exit.Permanent
+                  case _: DatabaseFailure.Unreachable => Exit.Transient
+                  case _: DatabaseFailure.Refused => Exit.Permanent
                 }
             }
         }

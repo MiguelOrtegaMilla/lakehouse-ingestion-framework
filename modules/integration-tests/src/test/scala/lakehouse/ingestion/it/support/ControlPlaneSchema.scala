@@ -8,6 +8,7 @@ import java.sql.{Connection, SQLException}
 import scala.util.Using
 
 import lakehouse.ingestion.cli.Main
+import lakehouse.ingestion.core.config.{ConfigLoader, Loaded, Profile}
 
 /**
  * The schemas of a deployment, applied the way a deployment applies them: by the command
@@ -35,31 +36,65 @@ object ControlPlaneSchema {
     def errors: Seq[String] = err.linesIterator.toSeq
   }
 
+  private val ExampleTls = "tls: { mode: disable }"
+
   /**
    * The example profile, in a file, with both of its databases at `url`.
    *
    * @param url where the databases are; that of `pg`, unless a test wants one that is not there
+   * @param rootCertificate with it, both databases are reached with `verify-full` against it;
+   *   without it, with no TLS, as the example has them
    */
-  def profile(pg: BootstrappedPostgres, url: Option[String] = None): Path = {
+  def profile(
+      pg: BootstrappedPostgres,
+      url: Option[String] = None,
+      rootCertificate: Option[Path] = None
+  ): Path = {
     val example = new String(
       Files.readAllBytes(BootstrappedPostgres.repoRoot().resolve("conf/app/local.example.yaml")),
       UTF_8
     )
-    require(example.split(java.util.regex.Pattern.quote(ExampleUrl), -1).length == 3)
+    def twice(text: String): Boolean =
+      example.split(java.util.regex.Pattern.quote(text), -1).length == 3
+    require(twice(ExampleUrl) && twice(ExampleTls), "the example profile is not as this expects it")
+    val tls = rootCertificate.fold(ExampleTls) { certificate =>
+      s"tls: { mode: verify-full, root_certificate: $certificate }"
+    }
     val file = Files.createTempFile("profile-", ".yaml")
     file.toFile.deleteOnExit()
     Files.write(
       file,
-      example.replace(ExampleUrl, url.getOrElse(pg.jdbcUrl(Database))).getBytes(UTF_8)
+      example
+        .replace(ExampleUrl, url.getOrElse(pg.jdbcUrl(Database)))
+        .replace(ExampleTls, tls)
+        .getBytes(UTF_8)
     )
   }
 
+  /** That profile, read as the application reads it. */
+  def loaded(
+      pg: BootstrappedPostgres,
+      url: Option[String] = None,
+      rootCertificate: Option[Path] = None
+  ): Profile =
+    ConfigLoader.loadProfile(profile(pg, url, rootCertificate)) match {
+      case Right(Loaded(valid, _)) => valid
+      case Left(errors) =>
+        throw new IllegalStateException(errors.toChain.toList.map(_.message).mkString("; "))
+    }
+
+  /** The environment in which the references of the example profile point at the passwords of `pg`. */
+  def environment(pg: BootstrappedPostgres): Map[String, String] = Map(
+    "INGEST_CONTROL_PASSWORD" -> pg.password(Engine),
+    "INGEST_COORDINATION_PASSWORD" -> pg.password("ingest_coordination")
+  )
+
   /** Runs `migrate` on the database of `pg`, as the migrator and with its password. */
-  def migrate(pg: BootstrappedPostgres): Ran =
+  def migrate(pg: BootstrappedPostgres, rootCertificate: Option[Path] = None): Ran =
     command(Map(PasswordVariable -> pg.password(Migrator)))(
       "migrate",
       "--profile",
-      profile(pg).toString,
+      profile(pg, rootCertificate = rootCertificate).toString,
       "--password",
       s"env:$PasswordVariable"
     )

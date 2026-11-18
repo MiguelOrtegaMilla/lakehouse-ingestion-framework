@@ -9,7 +9,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.cli.{Main, Migrations}
 import lakehouse.ingestion.core.config.{ConfigLoader, Secret, SqlIdentifier}
-import lakehouse.ingestion.engine.control.ControlSchema
+import lakehouse.ingestion.engine.control.{ControlSchema, DatabaseFailure}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, ControlPlaneSchema}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.logstore.coordination.PostgresCoordinationStore
@@ -179,7 +179,7 @@ final class MigrateCommandSpec
     val refused = Migrations
       .migrate(control, SqlIdentifier.parse(Migrator).value, new Secret(pg.password(Migrator)))
 
-    refused.left.value shouldBe Migrations.Refused(
+    refused.left.value shouldBe DatabaseFailure.Refused(
       "the schema control is at version '1' with every migration applied, and this application " +
         "needs version 2: it was not built whole"
     )

@@ -1,9 +1,7 @@
 package lakehouse.ingestion.cli
 
-import java.sql.SQLException
-
 import lakehouse.ingestion.core.config.{DatabaseConnection, Profile, Secret, SqlIdentifier}
-import lakehouse.ingestion.engine.control.{ControlSchema, PostgresJdbc}
+import lakehouse.ingestion.engine.control.{ControlSchema, DatabaseFailure, PostgresJdbc}
 import lakehouse.ingestion.logstore.coordination.PostgresCoordinationStore
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.FlywayException
@@ -58,16 +56,6 @@ object Migrations {
    */
   final case class Migrated(schema: String, applied: Int, version: String)
 
-  sealed trait Failure {
-    def message: String
-  }
-
-  /** The database was not there to be asked: running again may do. */
-  final case class Unreachable(message: String) extends Failure
-
-  /** The database said no, or the migrations are not what it has: running again will not do. */
-  final case class Refused(message: String) extends Failure
-
   /**
    * Brings a schema to the version of this application.
    *
@@ -77,7 +65,11 @@ object Migrations {
    *
    * @param user the role that owns the schema
    */
-  def migrate(target: Target, user: SqlIdentifier, password: Secret): Either[Failure, Migrated] = {
+  def migrate(
+      target: Target,
+      user: SqlIdentifier,
+      password: Secret
+  ): Either[DatabaseFailure, Migrated] = {
     val source = new PGSimpleDataSource()
     source.setUrl(target.connection.url.value)
     PostgresJdbc.forMigrations(target.connection).foreach { case (name, value) =>
@@ -108,7 +100,7 @@ object Migrations {
         Right(Migrated(target.schema, result.migrationsExecuted, version))
       else
         Left(
-          Refused(
+          DatabaseFailure.Refused(
             s"the schema ${target.schema} is at version '$version' with every migration applied, " +
               s"and this application needs version ${target.version}: it was not built whole"
           )
@@ -118,17 +110,7 @@ object Migrations {
     }
   }
 
-  /**
-   * The classification of errors is its own work (P8). This is the least of it: a database that
-   * is not there, or is starting or stopping, from one that answered and said no.
-   */
-  private def failure(target: Target, e: FlywayException): Failure = {
-    val state = Iterator
-      .iterate[Throwable](e)(_.getCause)
-      .takeWhile(_ != null)
-      .take(16)
-      .collectFirst { case sql: SQLException if sql.getSQLState != null => sql.getSQLState }
-
+  private def failure(target: Target, e: FlywayException): DatabaseFailure = {
     // Flyway's message has the database's own, the state, and the statement of a migration that
     // failed. Its rules of dashes are for a terminal that this is not.
     val said = Option(e.getMessage)
@@ -137,9 +119,6 @@ object Migrations {
       .map(_.trim)
       .filter(line => line.nonEmpty && !line.forall(_ == '-'))
       .mkString("\n  ")
-    val message = s"the schema ${target.schema} was not migrated: $said"
-
-    if (state.exists(code => code.startsWith("08") || code.startsWith("57P"))) Unreachable(message)
-    else Refused(message)
+    DatabaseFailure.of(s"the schema ${target.schema} was not migrated", e, said)
   }
 }
