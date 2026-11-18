@@ -5,7 +5,7 @@ package lakehouse.ingestion.core.config
  * not repeated: it may hold characters that are not what they look like, or that a terminal
  * obeys, and the code point says which one it is.
  */
-private[config] object Unwritten {
+private[core] object Unwritten {
 
   /** `'x' (U+0078)` for what ASCII prints, and the code point with its Unicode name otherwise. */
   def describe(codePoint: Int): String = {
