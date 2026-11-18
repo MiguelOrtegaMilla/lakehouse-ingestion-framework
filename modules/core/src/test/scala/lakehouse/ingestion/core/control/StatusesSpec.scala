@@ -1,0 +1,72 @@
+package lakehouse.ingestion.core.control
+
+import org.scalatest.EitherValues
+import org.scalatest.funsuite.AnyFunSuite
+import org.scalatest.matchers.should.Matchers
+
+/** How a run and a batch stand, and what each may come to (ADR-0005, ADR-0006). */
+final class StatusesSpec extends AnyFunSuite with Matchers with EitherValues {
+
+  import RunStatus._
+
+  test("the statuses of a run have the names of the contract") {
+    // They are in a column of the audit trail and in every query on it: pinned by their text.
+    RunStatus.All.map(_.name) shouldBe
+      Seq("RUNNING", "SUCCEEDED", "FAILED", "SKIPPED_LOCKED", "ABANDONED")
+    RunStatus.All.foreach(status => RunStatus.parse(status.name).value shouldBe status)
+    RunStatus.parse("Running").left.value shouldBe
+      "must be one of RUNNING, SUCCEEDED, FAILED, SKIPPED_LOCKED, ABANDONED"
+    RunStatus.parse("FENCED").isLeft shouldBe true
+  }
+
+  test("a run is born running, or skipped because the lease is taken") {
+    RunStatus.AtBirth shouldBe Set(Running, SkippedLocked)
+    Running.ended shouldBe false
+    RunStatus.All.filter(_.ended) shouldBe Seq(Succeeded, Failed, SkippedLocked, Abandoned)
+  }
+
+  test("a run that is running succeeds, fails or is abandoned, and nothing else changes") {
+    val allowed = for {
+      from <- RunStatus.All
+      to <- RunStatus.All
+      if RunStatus.mayBecome(from, to)
+    } yield from -> to
+
+    allowed shouldBe Seq(Running -> Succeeded, Running -> Failed, Running -> Abandoned)
+  }
+
+  test("what ended stays as it ended: a zombie that reports late changes nothing") {
+    RunStatus.All.filter(_.ended).foreach { ended =>
+      RunStatus.All
+        .foreach(to => withClue(s"$ended -> $to")(RunStatus.mayBecome(ended, to) shouldBe false))
+    }
+    // The run that was taken over is told so by its row, whatever it says afterwards.
+    RunStatus.mayBecome(Abandoned, Failed) shouldBe false
+    RunStatus.mayBecome(Abandoned, Succeeded) shouldBe false
+    // And a run that was skipped never ran.
+    RunStatus.mayBecome(SkippedLocked, Running) shouldBe false
+    RunStatus.mayBecome(Running, SkippedLocked) shouldBe false
+    RunStatus.mayBecome(Running, Running) shouldBe false
+  }
+
+  test("the statuses of a batch have the names of the contract") {
+    BatchStatus.All.map(_.name) shouldBe Seq("PLANNED", "COMMITTED", "ABANDONED")
+    BatchStatus.All.foreach(status => BatchStatus.parse(status.name).value shouldBe status)
+    BatchStatus.parse("RUNNING").left.value shouldBe "must be one of PLANNED, COMMITTED, ABANDONED"
+  }
+
+  test("a batch that is planned is committed or abandoned, and stays so") {
+    import BatchStatus._
+    val allowed = for {
+      from <- BatchStatus.All
+      to <- BatchStatus.All
+      if BatchStatus.mayBecome(from, to)
+    } yield from -> to
+
+    allowed shouldBe Seq(Planned -> Committed, Planned -> Abandoned)
+    Planned.ended shouldBe false
+    // A number belongs to one plan for ever: a committed batch is not planned again.
+    BatchStatus.mayBecome(Committed, Planned) shouldBe false
+    BatchStatus.mayBecome(Abandoned, Planned) shouldBe false
+  }
+}
