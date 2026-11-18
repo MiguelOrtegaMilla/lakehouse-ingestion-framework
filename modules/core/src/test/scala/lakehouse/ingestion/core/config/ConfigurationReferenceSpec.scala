@@ -102,6 +102,7 @@ final class ConfigurationReferenceSpec extends AnyFunSuite with Matchers with Ei
       |    password: { secretRef: "file:/run/secrets/coordination" }
       |    tls: { mode: verify-full, root_certificate: /etc/ssl/certs/ca.pem }
       |retries: { budget: 2m, first_backoff: 1s, max_backoff: 30s }
+      |leases: { ttl: 2m }
       |spark:
       |  master: "local[2]"
       |  settings: { spark.sql.shuffle.partitions: 4 }

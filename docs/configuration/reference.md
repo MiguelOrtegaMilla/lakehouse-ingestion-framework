@@ -50,6 +50,8 @@ retries:
   budget: 2m
   first_backoff: 1s
   max_backoff: 30s
+leases:
+  ttl: 2m
 spark:
   master: "local[2]"
   settings:
@@ -68,6 +70,7 @@ spark:
 | `retries.budget` | For how long the engine goes on with a step that fails with an error that passes. A [duration](#a-duration), `1s` to `1d` | `2m` |
 | `retries.first_backoff` | The wait before the second attempt. `100ms` to `1h` | `1s` |
 | `retries.max_backoff` | The longest wait between two attempts. `100ms` to `1h` | `30s` |
+| `leases.ttl` | For how long a run holds the lease of its source without renewing it. A run renews it every third of this, so a run that dies leaves its source taken for this long before another may have it. A [duration](#a-duration), `10s` to `1d` | `2m` |
 | `spark.master` | `local`, `local[N]`, `local[*]`, or `spark://host:port` for a Spark Standalone cluster | required |
 | `spark.settings` | Spark settings to add, by their key. A value is text, a number or a boolean | none |
 
@@ -79,6 +82,7 @@ Rules about several fields of a profile:
 - **The two databases have a role each.** `databases.control.user` and `databases.coordination.user` are two roles, each with the privileges of its own work.
 - **The backoffs fit**: `first_backoff` ≤ `max_backoff` ≤ `budget`.
 - **The retry budget is longer than the LogStore itself waits.** `retries.budget` must be longer than three times `databases.coordination.timeouts.connect`: 15 s with the defaults. A commit without the coordination database takes that long to fail, and a shorter budget would give up on outages that would have passed.
+- **A lease outlasts a slow renewal.** `leases.ttl` must be at least three times `databases.control.timeouts.connect` plus `databases.control.timeouts.statement`: 45 s with the defaults. A lease is renewed every third of its time to live, and a renewal can take that long to be answered; a shorter lease would be lost to a renewal that was still waiting. A run that has seen no renewal for five sixths of the time to live stops working, before its lease expires.
 - **Spark settings name no LogStore, no master and no credential.** A key must start with `spark.`. `spark.master` is the field above, `spark.delta.logStore.*` is the engine's, and a key with `password`, `secret`, `token` or `access.key` in it is refused: object storage takes its credentials from the environment or from a Hadoop credential provider.
 
 What is valid and warned of:

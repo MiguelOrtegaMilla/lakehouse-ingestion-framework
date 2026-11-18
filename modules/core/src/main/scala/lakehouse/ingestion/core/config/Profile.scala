@@ -22,6 +22,7 @@ final case class Profile(
     landing: Profile.Landing,
     databases: Profile.Databases,
     retries: Profile.Retries,
+    leases: Profile.Leases,
     spark: Profile.Spark
 )
 
@@ -99,6 +100,24 @@ object Profile {
   }
 
   /**
+   * For how long a run holds the lease of its source without renewing it (ADR-0006). A run
+   * renews its lease every third of it. One that dies renews nothing, and its source is taken
+   * that long before another run may have it: the time to live is how long a crash is waited
+   * out, and a short one is no better than a long one. It must outlast a renewal that takes as
+   * long as it may (`rules`).
+   */
+  final case class Leases(ttl: FiniteDuration)
+
+  object Leases {
+
+    /** ADR-0006: two minutes, with a renewal every forty seconds. */
+    val Default: Leases = Leases(ttl = 2.minutes)
+
+    /** A lease is renewed every third of its time to live. */
+    val RenewalsInATtl = 3
+  }
+
+  /**
    * How many times the LogStore tries the `INSERT` that takes a version before a commit fails
    * (`RetryPolicy.Default` in the LogStore's module, which `core` may not depend on; a test
    * holds the two to each other).
@@ -144,6 +163,9 @@ object Profile {
         ).mapN(Databases)
       }),
       top.orElse("retries", Retries.Default)(_.obj(retries)),
+      top.orElse("leases", Leases.Default)(
+        _.obj(_.orElse("ttl", Leases.Default.ttl)(_.duration(10.seconds, 1.day)).map(Leases.apply))
+      ),
       top.required("spark")(_.obj(spark))
     ).mapN(Profile.apply)
   }
@@ -198,7 +220,7 @@ object Profile {
 
   /** The errors and the warnings of a profile whose every field is valid by itself. */
   private[config] def rules(profile: Profile): (Chain[Problem], Chain[Problem]) = {
-    val Profile(lake, landing, databases, retries, spark) = profile
+    val Profile(lake, landing, databases, retries, leases, spark) = profile
     val local = lake.uri.isLocal
     val cluster = lake.deployment == Deployment.Cluster
     val clusterMaster = spark.master match {
@@ -206,6 +228,9 @@ object Profile {
       case _: Master.Local => false
     }
     val logStoreWait = databases.coordination.timeouts.connect * LogStoreAttempts.toLong
+    // The longest a renewal of a lease can take: a connection is waited for, and then an answer.
+    val renewal = databases.control.timeouts.connect + databases.control.timeouts.statement
+    val shortestTtl = renewal * Leases.RenewalsInATtl.toLong
 
     val errors = Chain.fromSeq(
       Seq(
@@ -265,6 +290,18 @@ object Profile {
               "coordination database before a commit fails " +
               s"(databases.coordination.timeouts.connect, ${Durations.render(databases.coordination.timeouts.connect)}, " +
               s"$LogStoreAttempts times), and a shorter budget gives up on outages that would have passed"
+          )
+        ),
+        // ADR-0006: a lease is renewed every third of its time to live.
+        Option.when(leases.ttl < shortestTtl)(
+          Problem(
+            "leases.ttl",
+            s"is ${Durations.render(leases.ttl)}, and must be at least ${Durations.render(shortestTtl)}: " +
+              s"a lease is renewed every third of it, and a renewal can take " +
+              s"${Durations.render(renewal)} (databases.control.timeouts: connect, " +
+              s"${Durations.render(databases.control.timeouts.connect)}, and statement, " +
+              s"${Durations.render(databases.control.timeouts.statement)}). A shorter lease would be " +
+              "lost to a renewal that was still waiting for its answer"
           )
         )
       ).flatten

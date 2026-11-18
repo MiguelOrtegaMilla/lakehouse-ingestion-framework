@@ -40,6 +40,13 @@ retries:
   first_backoff: 1s
   max_backoff: 30s
 
+# For how long a run holds the lease of its source without renewing it, which it does every
+# third of this. A run that dies leaves its source taken for this long. It must be at least
+# three times what a renewal can take: the connect and statement timeouts of the control
+# database, 3 x (5s + 10s) by default.
+leases:
+  ttl: 2m
+
 spark:
   master: "local[2]"
   settings:
