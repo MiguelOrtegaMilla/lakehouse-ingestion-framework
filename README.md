@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phase 2, the PostgreSQL-coordinated LogStore, is built: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Over 33 runs on two machines it acknowledged 10,954 commits and lost none; the stress job in CI ran eight writers of 500 commits each.** The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phases 2 and 3 are built.** Phase 2 is the PostgreSQL-coordinated LogStore: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Over 33 runs on two machines it acknowledged 10,954 commits and lost none. Phase 3 is the configuration: sources and profiles as files, validated whole and without a connection. The engine that runs a source comes next. The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -14,13 +14,39 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 
 | Module | Responsibility |
 |---|---|
-| `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. |
+| `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)). |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
 | `engine` | Connectors, Delta writers, control-plane repositories, engine service |
-| `cli` | Entry point, wiring, exit codes |
+| `cli` | Entry point, wiring, exit codes. So far: the command `validate`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
 The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`.
+
+## Configuration
+
+Adding a source is writing one file, [`conf/sources/<id>.yaml`](conf/sources/sales.orders.yaml): what is read, how it is loaded, and into which tables. Where the application runs is another file, the profile ([`conf/app/local.example.yaml`](conf/app/local.example.yaml)): its lake, its databases, how long it waits.
+
+```bash
+sbt "cli/run validate --profile conf/app/local.example.yaml --sources conf/sources"
+```
+
+```text
+The configuration is valid: conf/app/local.example.yaml, and 2 sources.
+The lake is file:///home/CHANGE_ME/lakehouse/lake.
+  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  17e97ccfa053
+  sales.returns  enabled  file  new_files    bronze/sales/returns                      6e7fe494c044
+```
+
+The last column is the start of the hash of the configuration that each source would run with. For a profile of your own, copy the example to `conf/app/local.yaml`, which git ignores, and put the directories of your machine in it.
+
+`validate` reads the profile and every source and says everything that is wrong in them, each mistake with its file and its field. It opens no connection, so it runs anywhere in a moment, and it ends in 0 for a valid configuration and in 4 for one that is not.
+
+- **A file is not trusted.** YAML is read without a loader that could construct anything, with limits on size, nesting and aliases, and no tag. Names and paths are allow-lists: `orders; DROP TABLE orders` is no table, and `bronze/../../x` is no path.
+- **Nothing in a file is a secret.** A password is written as where it is (`env:NAME`, `file:/run/secrets/name`), and one that is written out is refused and never repeated in an error.
+- **A field that the model does not have is an error**, with the one that was probably meant. A misspelt `watermark` does not become a full load that nobody asked for.
+- **A configuration has a version**: the SHA-256 of the profile and the source as they ran, defaults included. A change that what is already ingested cannot follow, another key or another table to read from, is found by comparing two of them.
+
+[Adding a source](docs/configuration/adding-a-source.md), step by step. [The reference](docs/configuration/reference.md) of every field, which a test holds to the code.
 
 ## Build
 
@@ -32,6 +58,7 @@ sbt compile             # compile all modules
 sbt checkBoundaries     # verify the module dependency rules
 sbt scalafmtCheckAll scalafmtSbtCheck   # formatting gate
 sbt scalafmtAll scalafmtSbt             # reformat
+sbt core/test cli/test                  # the configuration and the command line (no Docker, no Spark)
 sbt delta-pg-logstore/test              # the LogStore module's unit tests (no Docker)
 sbt integration-tests/test              # integration tests (needs Docker)
 sbt "integration-tests/testOnly lakehouse.ingestion.it.delta.*"   # Spark + Delta smoke test only (no Docker)

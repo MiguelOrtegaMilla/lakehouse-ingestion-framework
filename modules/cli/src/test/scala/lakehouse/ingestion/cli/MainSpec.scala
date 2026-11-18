@@ -64,6 +64,20 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     lines should have size 4
   }
 
+  test("validate: what the README and the guide show for the examples is what the command prints") {
+    // The documentation shows the output for the examples of the repository. If the examples
+    // change, or the way a configuration is hashed, this fails and says what to show instead.
+    val printed = run("validate", "--profile", exampleProfile, "--sources", exampleSources).out
+      .replace(s"$repository/", "")
+      .trim
+
+    Seq("README.md", "docs/configuration/adding-a-source.md").foreach { document =>
+      withClue(s"$document should show:\n$printed\n") {
+        example(document) should include(s"```text\n$printed\n```")
+      }
+    }
+  }
+
   test("validate: the options are taken in any order") {
     run(
       "validate",
