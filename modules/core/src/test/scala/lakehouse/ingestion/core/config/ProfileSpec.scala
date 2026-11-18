@@ -94,6 +94,8 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
     )
     profile.spark.settings shouldBe empty
     profile.databases.control.tls shouldBe Tls.Disabled
+    // ADR-0006: two minutes, renewed every forty seconds.
+    profile.leases shouldBe Profile.Leases(ttl = 2.minutes)
   }
 
   test("everything wrong in a file is said at once, each with its field") {
@@ -247,6 +249,46 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
     )
     errorsOf(patient).head should include("retries.budget is 2m, and must be longer than 3m")
     Profile.load(File, patient + "retries: { budget: 5m }\n").isRight shouldBe true
+  }
+
+  test("a lease outlasts a renewal that takes as long as it may") {
+    // Renewed every third of it; a renewal waits 5s for a connection and 10s for its answer.
+    Profile.load(File, Valid + "leases: { ttl: 45s }\n").value.value.leases.ttl shouldBe 45.seconds
+    errorsOf(Valid + "leases: { ttl: 44s }\n") shouldBe Seq(
+      s"$File: leases.ttl is 44s, and must be at least 45s: a lease is renewed every third of " +
+        "it, and a renewal can take 15s (databases.control.timeouts: connect, 5s, and statement, " +
+        "10s). A shorter lease would be lost to a renewal that was still waiting for its answer"
+    )
+
+    // It follows the timeouts of the control plane, and of no other database.
+    val quick = changed(
+      "password: { secretRef: \"env:INGEST_CONTROL_PASSWORD\" }",
+      "password: { secretRef: \"env:INGEST_CONTROL_PASSWORD\" }\n    timeouts: { connect: 1s, statement: 3s }"
+    )
+    Profile.load(File, quick + "leases: { ttl: 12s }\n").isRight shouldBe true
+    errorsOf(quick + "leases: { ttl: 11s }\n").head should include(
+      "leases.ttl is 11s, and must be at least 12s"
+    )
+
+    val patient = changed(
+      "password: { secretRef: \"env:INGEST_CONTROL_PASSWORD\" }",
+      "password: { secretRef: \"env:INGEST_CONTROL_PASSWORD\" }\n    timeouts: { statement: 1m }"
+    )
+    // The default is refused as well, when the timeouts are made longer than it can bear.
+    errorsOf(patient).head should include("leases.ttl is 2m, and must be at least 195s")
+    Profile.load(File, patient + "leases: { ttl: 5m }\n").isRight shouldBe true
+  }
+
+  test("a lease is ten seconds to a day, and nothing else is said of leases") {
+    errorsOf(Valid + "leases: { ttl: 9s }\n") shouldBe
+      Seq(s"$File: leases.ttl is 9s, and the shortest it may be is 10s")
+    errorsOf(Valid + "leases: { ttl: 2d }\n") shouldBe
+      Seq(s"$File: leases.ttl is 2d, and the longest it may be is 1d")
+    errorsOf(Valid + "leases: { ttl: 120 }\n").head should startWith(s"$File: leases.ttl ")
+    errorsOf(Valid + "leases: { ttl: 2m, heartbeat: 40s }\n") shouldBe
+      Seq(s"$File: leases.heartbeat is not a field that is known here")
+    // A section with nothing in it has the default.
+    Profile.load(File, Valid + "leases: {}\n").value.value.leases shouldBe Profile.Leases.Default
   }
 
   test("the backoffs fit in each other and in the budget") {

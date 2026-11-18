@@ -99,6 +99,7 @@ object ConfigVersion {
       "first_backoff" -> duration(profile.retries.firstBackoff),
       "max_backoff" -> duration(profile.retries.maxBackoff)
     ),
+    "leases" -> Json.obj("ttl" -> duration(profile.leases.ttl)),
     "spark" -> Json.obj(
       "master" -> text(profile.spark.master.value),
       "settings" -> Json.fromFields(profile.spark.settings.map { case (key, value) =>

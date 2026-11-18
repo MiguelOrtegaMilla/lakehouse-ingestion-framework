@@ -3,6 +3,7 @@ package lakehouse.ingestion.it.control
 import java.sql.Connection
 import java.time.Instant
 
+import scala.concurrent.duration._
 import scala.util.Using
 
 import lakehouse.ingestion.cli.Main
@@ -39,9 +40,12 @@ trait ControlPlaneSuite extends BeforeAndAfterAll with EitherValues with OptionV
   override def afterAll(): Unit =
     try database.close()
     finally {
-      pg.stop()
+      stopServers()
       super.afterAll()
     }
+
+  /** Stops what `pg` was started with: itself, unless a suite put something in front of it. */
+  protected def stopServers(): Unit = pg.stop()
 
   /** A source of the repository's examples, under a name of the test's own. */
   protected def source(id: String, change: String => String = identity): Source = {
@@ -71,6 +75,27 @@ trait ControlPlaneSuite extends BeforeAndAfterAll with EitherValues with OptionV
   }
 
   protected def epoch(value: Long): Epoch = Epoch.of(value).value
+
+  /** Another instance of the application: a pool of its own to the same control plane. */
+  protected def anotherInstance(): ControlDatabase =
+    ControlDatabase.open(profile.databases.control, SecretResolver(environment(pg).get)).value
+
+  /** Waits, by the clock of the database, until the lease of `key` has expired. */
+  protected def awaitExpiry(key: LeaseKey, within: FiniteDuration = 30.seconds): Unit = {
+    val deadline = System.nanoTime() + within.toNanos
+    def expired: Boolean = asSuperuser { c =>
+      query(
+        c,
+        "SELECT expires_at < now() FROM control.source_lease WHERE lease_key = ?",
+        key.value
+      ) ==
+        Seq(Seq("t"))
+    }
+    while (!expired) {
+      require(System.nanoTime() < deadline, s"the lease of $key did not expire in $within")
+      Thread.sleep(50)
+    }
+  }
 
   /** The time of the database, which is the one the control plane goes by. */
   protected def databaseNow(): Instant = database.run { c =>

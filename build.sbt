@@ -82,7 +82,7 @@ lazy val engine = module("engine", artifact = "engine")
     // The engine checks the version of its schema, and never migrates it. And it reads JSON
     // with the safe reader of `core`, not with circe's parser.
     rules(forbidden = Seq(Forbid.flyway, Forbid.jawn)),
-    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, scalatest),
+    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, slf4jApi, scalatest),
     // What a run records as the version of the application that ran it: the version of the
     // build and the commit it was built from (project/ApplicationVersion.scala).
     Compile / resourceGenerators += Def.task {

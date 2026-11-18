@@ -100,8 +100,12 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
 
   test("this configuration has this hash, until the way it is written down changes") {
     // The hash of every snapshot that is stored depends on how a configuration is written
-    // down here. If this fails for a change that was meant, SchemaVersion goes up with it.
-    version().hash shouldBe "9faee5e5282dec48de9856af119acdc466ff946c726a50d474bca797888f6108"
+    // down here. If this fails because what was there is written another way, a field under
+    // another name or a value in another form, SchemaVersion goes up with it. If it fails
+    // because a field was added, with its default, the hash here changes and nothing else: such
+    // a field changes every hash when the application is upgraded, and the version of the
+    // application that a run records tells that apart (ADR-0007). `leases.ttl` was one (P4.5).
+    version().hash shouldBe "7f109213979a70fbab0a644c327630e1ea1cf2d2f03828831e2c4edb0cb56500"
   }
 
   test("two files that say the same have one hash, however they say it") {
