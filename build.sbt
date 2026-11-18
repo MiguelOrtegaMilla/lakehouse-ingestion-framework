@@ -81,7 +81,7 @@ lazy val engine = module("engine", artifact = "engine")
   .settings(
     // The engine checks the version of its schema, and never migrates it.
     rules(forbidden = Seq(Forbid.flyway)),
-    libraryDependencies ++= Seq(sparkSql, deltaSpark, scalatest)
+    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, scalatest)
   )
 
 /** Entry point, argument parsing, wiring, exit codes. */

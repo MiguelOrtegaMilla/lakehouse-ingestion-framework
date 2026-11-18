@@ -10,6 +10,7 @@ import scala.util.Using
 
 import com.github.dockerjava.api.command.CreateContainerCmd
 import com.github.dockerjava.api.model.Capability
+import org.testcontainers.DockerClientFactory
 import org.testcontainers.containers.{GenericContainer, Network}
 import org.testcontainers.containers.wait.strategy.Wait
 import org.testcontainers.utility.{DockerImageName, MountableFile}
@@ -25,6 +26,26 @@ final class BootstrappedPostgres private (
     container: BootstrappedPostgres.Container,
     passwords: Map[String, String]
 ) {
+
+  /** The host the server is reached at from the tests: the one its certificate is for. */
+  def host: String = container.getHost
+
+  /**
+   * The certificate of the authority that signed the server's, in a file, when the server was
+   * started as one that takes TLS alone. It is what a client is given to trust.
+   */
+  lazy val rootCertificate: Path =
+    BootstrappedPostgres.writeTempCertificate(exec("sh", "-c", "cat \"$PGDATA/ca.crt\""))
+
+  /** The certificate of an authority that signed nothing here, in a file. */
+  def anotherAuthority(): Path = BootstrappedPostgres.writeTempCertificate(
+    exec(
+      "sh",
+      "-c",
+      "openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=Another authority' " +
+        "-keyout /tmp/other.key -out /tmp/other.crt 2>/dev/null && cat /tmp/other.crt"
+    )
+  )
 
   def jdbcUrl(database: String): String =
     s"jdbc:postgresql://${container.getHost}:${container.getMappedPort(BootstrappedPostgres.Port)}/$database"
@@ -95,13 +116,22 @@ object BootstrappedPostgres {
   val NetworkAlias = "postgres"
   private val InitDir = "/docker-entrypoint-initdb.d"
   private val SuperuserSecret = "pg_superuser"
+  // On the classpath of the tests: what makes the server one that takes TLS alone.
+  private val TlsOnlyScript = "postgres/90-tls-only.sh"
+  // Executable: the entrypoint runs such a script in a shell of its own, and sources the rest.
+  private val Executable = Integer.parseInt("755", 8)
   // Mode 0644: the container runs as uid 999, the files are copied in as root.
   private val ReadableByAll = Integer.parseInt("644", 8)
 
   final class Container(image: DockerImageName) extends GenericContainer[Container](image)
 
-  /** @param network a Docker network to join, where other containers reach it as `NetworkAlias` */
-  def start(network: Option[Network] = None): BootstrappedPostgres = {
+  /**
+   * @param network a Docker network to join, where other containers reach it as `NetworkAlias`
+   * @param tlsOnly a server with a certificate of its own, that lets nobody in over TCP without
+   *   TLS (ADR-0013 §5). Its certificate is for the host the tests reach it at and for
+   *   `NetworkAlias`, signed by an authority that is made with it (`rootCertificate`)
+   */
+  def start(network: Option[Network] = None, tlsOnly: Boolean = false): BootstrappedPostgres = {
     val root = repoRoot()
     val passwords = (RuntimeRoles :+ Superuser).map(_ -> randomPassword()).toMap
 
@@ -131,6 +161,18 @@ object BootstrappedPostgres {
         MountableFile.forHostPath(writeTempSecret(password), ReadableByAll),
         secretPath(secretName)
       )
+    }
+
+    if (tlsOnly) {
+      val host = DockerClientFactory.instance().dockerHostIpAddress()
+      // An address is named in a certificate as one, and not as a name.
+      val kind = if (host.matches("[0-9.]+") || host.contains(":")) "IP" else "DNS"
+      container
+        .withEnv("TLS_SUBJECT_ALT_NAMES", s"$kind:$host,DNS:$NetworkAlias")
+        .withCopyFileToContainer(
+          MountableFile.forClasspathResource(TlsOnlyScript, Executable),
+          s"$InitDir/90-tls-only.sh"
+        )
     }
 
     network.foreach(n => container.withNetwork(n).withNetworkAliases(NetworkAlias))
@@ -168,6 +210,13 @@ object BootstrappedPostgres {
     sys.props.get("repo.root").map(Paths.get(_)).getOrElse {
       throw new IllegalStateException("system property repo.root is not set (see build.sbt)")
     }
+
+  private def writeTempCertificate(pem: String): Path = {
+    require(pem.startsWith("-----BEGIN CERTIFICATE-----"), "the container gave no certificate")
+    val file = Files.createTempFile("pg-authority-", ".crt")
+    file.toFile.deleteOnExit()
+    Files.write(file, (pem + "\n").getBytes(StandardCharsets.UTF_8))
+  }
 
   private val random = new SecureRandom()
 
