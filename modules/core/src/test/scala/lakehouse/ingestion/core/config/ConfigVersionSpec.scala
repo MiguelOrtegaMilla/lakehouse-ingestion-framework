@@ -84,6 +84,20 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     )
   }
 
+  test("a content that is read back has the hash it was stored under, however it is written") {
+    val v = version()
+    ConfigVersion.hashOf(v.content) shouldBe v.hash
+    // As a database gives it back: other spaces, the keys in another order.
+    val readBack = io.circe.Json.fromJsonObject(
+      io.circe.JsonObject.fromIterable(v.content.asObject.get.toList.reverse)
+    )
+    readBack.spaces2 should not be v.text
+    ConfigVersion.hashOf(readBack) shouldBe v.hash
+    ConfigVersion.hashOf(
+      v.content.mapObject(_.add("extra", io.circe.Json.True))
+    ) should not be v.hash
+  }
+
   test("this configuration has this hash, until the way it is written down changes") {
     // The hash of every snapshot that is stored depends on how a configuration is written
     // down here. If this fails for a change that was meant, SchemaVersion goes up with it.

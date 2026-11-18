@@ -81,7 +81,17 @@ lazy val engine = module("engine", artifact = "engine")
   .settings(
     // The engine checks the version of its schema, and never migrates it.
     rules(forbidden = Seq(Forbid.flyway)),
-    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, scalatest)
+    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, circeParser, scalatest),
+    // What a run records as the version of the application that ran it: the version of the
+    // build and the commit it was built from (project/ApplicationVersion.scala).
+    Compile / resourceGenerators += Def.task {
+      val file =
+        (Compile / resourceManaged).value / "lakehouse-ingestion" / "application.properties"
+      val built = ApplicationVersion.of(version.value, (LocalRootProject / baseDirectory).value)
+      val content = s"version=$built\n"
+      if (!file.exists || IO.read(file) != content) IO.write(file, content)
+      Seq(file)
+    }.taskValue
   )
 
 /** Entry point, argument parsing, wiring, exit codes. */

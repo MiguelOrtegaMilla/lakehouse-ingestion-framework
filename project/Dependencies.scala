@@ -72,6 +72,8 @@ object Dependencies {
 
   val catsCore = "org.typelevel" %% "cats-core" % Versions.cats
   val circeCore = "io.circe" %% "circe-core" % Versions.circe
+  // Reads back the JSON that the control plane stores: a snapshot of configuration, a plan.
+  val circeParser = "io.circe" %% "circe-parser" % Versions.circe
   // YAML 1.2. `core` builds JSON from the events of its parser, with no loader between them
   // (ADR-0013 §5, SafeYaml).
   val snakeyamlEngine = "org.snakeyaml" % "snakeyaml-engine" % Versions.snakeyamlEngine
