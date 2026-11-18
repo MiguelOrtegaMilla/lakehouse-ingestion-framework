@@ -440,6 +440,33 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     lease(orders).holder.value.run shouldBe ended.start.id
   }
 
+  test(
+    "a run does not end as succeeded past a batch that is planned: the way past it is to commit it"
+  ) {
+    val orders = newSource()
+    val delta = new SimulatedDelta
+    val leased = open(orders)
+    val planned = leased.plan(range(0, 10))
+
+    val refused = intercept[IllegalStateException](leased.finish(RunEnd.Succeeded()))
+
+    refused.getMessage shouldBe
+      s"the run ${leased.start.id} cannot end as succeeded: the batch ${planned.id} is planned " +
+      "and not committed. A run succeeds past a batch by committing it"
+    run(leased.start.id).status shouldBe RunStatus.Running
+    batch(planned.id).status shouldBe BatchStatus.Planned
+    lease(orders).holder.value.run shouldBe leased.start.id
+    // It may say that it failed, and it may commit the batch.
+    finish(leased, orders, delta, planned) shouldBe true
+    run(leased.start.id).status shouldBe RunStatus.Succeeded
+
+    // With nothing planned, a run that found nothing to do ends as succeeded.
+    val idle = open(orders)
+    idle.planned() shouldBe None
+    idle.finish(RunEnd.Succeeded()) shouldBe true
+    run(idle.start.id).batch shouldBe None
+  }
+
   test("the state of a source only moves forward") {
     val orders = newSource()
     val delta = new SimulatedDelta

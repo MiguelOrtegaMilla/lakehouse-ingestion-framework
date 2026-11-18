@@ -265,6 +265,46 @@ final class LeasesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite 
     next.finish(RunEnd.Succeeded()) shouldBe true
   }
 
+  test("a run that ends while another takes its lease over waits for it, and does not deadlock") {
+    // Found by the review of P4: a takeover locks the lease and then ends the run that held it;
+    // a run that ended itself first and gave the lease up after held the two the other way
+    // round, and PostgreSQL ended one of them as a deadlock.
+    val orders = newSource()
+    val leased = open(orders).value
+    val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+    try
+      Using.resource(anotherInstance()) { other =>
+        // What a takeover does, in its order, held between its two steps.
+        val finishing = other.transaction { c =>
+          query(
+            c,
+            "SELECT 1 FROM control.source_lease WHERE lease_key = ? FOR UPDATE",
+            leased.start.leaseKey.value
+          ): Unit
+          val ending = pool.submit[Boolean](() =>
+            leased.finish(RunEnd.Failed(FailureClass.Transient, "it stopped by itself"))
+          )
+          // Until the run that is ending waits for a lock.
+          val deadline = System.nanoTime() + 10.seconds.toNanos
+          def waiting: Boolean = asSuperuser { s =>
+            query(
+              s,
+              "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND usename = 'ingest_control'"
+            ).head.head.toInt > 0
+          }
+          while (!waiting && System.nanoTime() < deadline) Thread.sleep(20)
+          waiting shouldBe true
+          Runs.abandon(c, leased.start.id) shouldBe true
+          ending
+        }
+
+        // The takeover went through, and the run was told that another had ended it.
+        finishing.get(20, java.util.concurrent.TimeUnit.SECONDS) shouldBe false
+        run(leased.start.id).status shouldBe RunStatus.Abandoned
+      }
+    finally pool.shutdown()
+  }
+
   test("a renewal holds the lease for its time to live again, counted from the renewal") {
     val orders = newSource()
     val key = LeaseKey.of(orders.id, Layer.Bronze)

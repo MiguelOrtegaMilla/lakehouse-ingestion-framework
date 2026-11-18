@@ -28,23 +28,52 @@ final class ControlDatabase private (pool: HikariDataSource) extends AutoCloseab
 
   /**
    * Runs `body` in one transaction: all that it changes is committed when it returns, and none
-   * of it if it throws.
+   * of it if it does not return, whatever it ends with.
+   *
+   * "Whatever" is every `Throwable`, and not only the exceptions that are safe to catch. An
+   * interrupt or an error of the JVM in the middle of `body` leaves a transaction that is half
+   * done, and the one way a connection is given back to its pool, with auto-commit on, commits
+   * whatever is pending on it. So what `body` did is rolled back first, for whatever reason it
+   * stopped, and auto-commit is turned on again only once nothing is pending.
+   *
+   * @throws java.sql.SQLException what the database or the driver said. On a connection that
+   *   broke it is the error that broke it, and what failed after it is with it as suppressed
    */
   @throws[SQLException]
   def transaction[T](body: Connection => T): T =
     Using.resource(pool.getConnection) { connection =>
       connection.setAutoCommit(false)
-      try {
-        val result = body(connection)
-        connection.commit()
-        result
-      } catch {
-        case NonFatal(failure) =>
-          try connection.rollback()
-          catch { case NonFatal(also) => failure.addSuppressed(also) }
-          throw failure
-      } finally connection.setAutoCommit(true)
+      val result =
+        try {
+          val value = body(connection)
+          connection.commit()
+          value
+        } catch {
+          case failure: Throwable =>
+            undo(connection, failure)
+            throw failure
+        }
+      connection.setAutoCommit(true)
+      result
     }
+
+  /** Rolls back what is pending on `connection`, on the way out with `failure`. */
+  private def undo(connection: Connection, failure: Throwable): Unit = {
+    val undone =
+      try {
+        connection.rollback()
+        true
+      } catch {
+        case also: Throwable =>
+          failure.addSuppressed(also)
+          false
+      }
+    try
+      // Nothing is pending: the connection goes back to the pool as it came. Otherwise it does
+      // not go back at all. Closed, what is pending on it is rolled back by the server.
+      if (undone) connection.setAutoCommit(true) else pool.evictConnection(connection)
+    catch { case also: Throwable => failure.addSuppressed(also) }
+  }
 
   override def close(): Unit = pool.close()
 }
