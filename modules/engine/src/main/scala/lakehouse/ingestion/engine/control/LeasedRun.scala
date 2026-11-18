@@ -1,8 +1,9 @@
 package lakehouse.ingestion.engine.control
 
-import java.sql.SQLException
+import java.sql.{Connection, SQLException}
 import java.time.Instant
 
+import io.circe.Json
 import lakehouse.ingestion.core.config.ConfigVersion
 import lakehouse.ingestion.core.control._
 import org.slf4j.LoggerFactory
@@ -37,6 +38,103 @@ final class LeasedRun private (
 
   /** What to do the moment the lease is lost: stop what the run is in the middle of. */
   def onLost(callback: LeaseLoss => Unit): Unit = heartbeat.onLost(callback)
+
+  /**
+   * The batch that a run before this one planned and did not commit, if there is one (ADR-0005
+   * §3, step 2). It is this run's to finish: to run again, or only to account for, as the
+   * table says (`Recovery`).
+   *
+   * @throws LeaseLostException if the lease is another run's by now
+   */
+  @throws[SQLException]
+  @throws[LeaseLostException]
+  def planned(): Option[PlannedBatch] = holding { connection =>
+    val found = Batches.planned(connection, start.txnAppId)
+    found.foreach(batch => Runs.took(connection, start.id, batch.id))
+    found
+  }
+
+  /**
+   * Writes the plan of the next batch down, before anything of it is read: the write-ahead
+   * step. Whatever happens to this run from here on, the next one finds the plan and reads
+   * what it says, no more and no less.
+   *
+   * @throws LeaseLostException if the lease is another run's by now
+   * @throws java.sql.SQLException with state 23505 if a batch is planned already: it is to be
+   *   finished first (`planned`)
+   */
+  @throws[SQLException]
+  @throws[LeaseLostException]
+  def plan(plan: Json): PlannedBatch = holding { connection =>
+    val batch = Batches.plan(connection, start, plan)
+    Runs.took(connection, start.id, batch.id)
+    batch
+  }
+
+  /**
+   * Commits a batch whose data is in its tables (ADR-0005 §3, steps 7 and 8): moves the state
+   * of the source past it, marks the batch committed with what it wrote, ends the run as
+   * succeeded, and gives the lease up. All of it in one transaction, on condition that the
+   * lease is still this run's under its epoch, or none of it.
+   *
+   * @param watermark where the next batch starts from; none, for a source that has none
+   * @return false if the lease is another run's: this process was a zombie, and nothing was
+   *   changed. The batch is the other run's to finish, and the data that this one wrote is
+   *   in the table once all the same, by the number of the batch
+   * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
+   *   committed: it is not the planned one, or the state is past it. Nothing was changed
+   */
+  @throws[SQLException]
+  def commit(
+      batch: BatchId,
+      watermark: Option[Json],
+      outputs: Seq[BatchOutput],
+      counts: RunCounts = RunCounts.Nothing
+  ): Boolean = {
+    require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
+    // Before the lease stops being renewed: a watermark that cannot be stored is a mistake of
+    // whoever gave it, and no reason to let the lease go.
+    watermark.foreach(Batches.readable("watermark", _))
+    heartbeat.close()
+    database.transaction { connection =>
+      Leases.holds(connection, start.leaseKey, start.id, epoch) && {
+        // Each says whether it did. One that did not is a state that is not what this run
+        // took it for, and the transaction ends with nothing done.
+        def must(done: Boolean, what: String): Unit =
+          if (!done) throw new IllegalStateException(s"the batch $batch was not committed: $what")
+
+        must(
+          SourceStates
+            .advance(connection, start.source, start.layer, watermark, batch.seq, start.id),
+          s"the state of ${start.txnAppId} is at this batch already, or past it"
+        )
+        must(Batches.commit(connection, batch, start.id, outputs), "it is not a planned batch")
+        must(
+          Runs.end(connection, start.id, RunEnd.Succeeded(counts)),
+          s"the run ${start.id} is not running"
+        )
+        must(
+          Leases.release(connection, start.leaseKey, start.id, epoch),
+          "its lease could not be given up"
+        )
+        true
+      }
+    }
+  }
+
+  /**
+   * Runs `body` in a transaction that has the lease locked, and found it to be this run's. What
+   * `body` writes is then written by the holder of the lease, whatever happens next.
+   */
+  private def holding[T](body: Connection => T): T = {
+    val done = database.transaction { connection =>
+      Option.when(Leases.holds(connection, start.leaseKey, start.id, epoch))(body(connection))
+    }
+    done.getOrElse {
+      heartbeat.taken()
+      throw new LeaseLostException(start.leaseKey.value, LeaseLoss.TakenOver)
+    }
+  }
 
   /**
    * Ends the run, and gives its lease up, in one transaction. The lease is no longer renewed,
