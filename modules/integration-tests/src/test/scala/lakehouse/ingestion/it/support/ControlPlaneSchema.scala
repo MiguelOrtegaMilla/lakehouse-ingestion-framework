@@ -83,6 +83,12 @@ object ControlPlaneSchema {
         throw new IllegalStateException(errors.toChain.toList.map(_.message).mkString("; "))
     }
 
+  /** The text of an example source of the repository, as `sales.orders`. */
+  def exampleSource(id: String): String = new String(
+    Files.readAllBytes(BootstrappedPostgres.repoRoot().resolve(s"conf/sources/$id.yaml")),
+    UTF_8
+  )
+
   /** The environment in which the references of the example profile point at the passwords of `pg`. */
   def environment(pg: BootstrappedPostgres): Map[String, String] = Map(
     "INGEST_CONTROL_PASSWORD" -> pg.password(Engine),

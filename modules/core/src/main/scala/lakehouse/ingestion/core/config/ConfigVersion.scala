@@ -58,8 +58,14 @@ object ConfigVersion {
       .deepDropNullValues
     val origin =
       "source.connector.type" +: source.connector.origin.map(field => s"source.connector.$field")
-    ConfigVersion(sha256(print(content)), content, origin.toVector)
+    ConfigVersion(hashOf(content), content, origin.toVector)
   }
+
+  /**
+   * The hash that a content has. A snapshot that is read back from where it was stored has the
+   * hash it was stored under, or it is not the configuration that the run was told.
+   */
+  def hashOf(content: Json): String = sha256(print(content))
 
   private def print(content: Json): String = content.noSpacesSortKeys
 
