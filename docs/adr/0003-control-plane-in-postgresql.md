@@ -42,6 +42,15 @@ Separate roles:
 
 In production these would be separate instances. The coordination store sits on the commit path and needs the stricter availability.
 
+*As built (P4.2 to P4.6, reviewed in P4.7, 2026-11-18):* migration V1 of the schema `control`, the command `migrate`, and `ControlDatabase` with the repositories that run on it.
+
+- **The tables of V1** are `ingestion_run`, `ingestion_batch`, `source_state`, `source_lease`, `config_snapshot` and `schema_version`. The rest of the model comes with the phases that use it, each in a migration of its own: a migration that is merged is not edited.
+- **What the database guarantees, whatever the code does.** A run that is not `RUNNING` and a batch that is not `PLANNED` cannot be changed, by a trigger, whoever asks. At most one batch of a sequence is planned. The holder of a lease is a run that exists. A row cannot say of itself what cannot be: a run that is running and finished, a batch that is committed by no run. The names of the statuses, layers, kinds of run and classes of failure are those of the model, held to it by a test.
+- **The engine checks the version of the schema when it opens its connection, and migrates nothing.** `migrate` applies the migrations as the role that owns the schemas, with a password that is in no profile. The build forbids Flyway to `engine`.
+- **`ControlDatabase` is a pool of two connections**: one for the run, one for the heartbeat of its lease. Several runs in one process would share them, and a heartbeat that waits for a connection is a renewal that is late: how many runs a process has at once, and with how many connections, is P5's to settle.
+- **The repositories are functions on a connection**, with no interface over them: whoever calls them decides what is one transaction. They are tested against a real PostgreSQL, as the role of the engine.
+- **The JSON that is stored is read back by the safe reader of the configuration** (`StoredJson`), and the engine has no JSON parser of its own: the one that circe has was refused by the dependency review, and its fixed versions are built for a Scala newer than the build's (discovery §17, P4.4).
+
 ## Alternatives
 
 | Option | Verdict |

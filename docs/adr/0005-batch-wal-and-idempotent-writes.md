@@ -60,6 +60,18 @@ With concurrent writers, `batch_seq` order is **not** commit order: seq 10 can c
 
 Silver `MERGE` uses Delta's session-level `spark.databricks.delta.write.txnAppId` / `txnVersion` (internal confs, present in 4.4). They are **session-scoped**, so every concurrent task uses its own `SparkSession` (`spark.newSession()`); otherwise parallel tasks in one JVM would overwrite each other's settings. To be verified in P10.
 
+*As built (P4.1, P4.4 and P4.6, reviewed in P4.7, 2026-11-18):* the model in `core` (`RunId`, `TxnAppId`, `BatchSeq`, `Recovery`), and `Runs`, `Batches`, `SourceStates` and `LeasedRun` in `engine`. The side of Delta is P5's: what is here is tested against a Delta that is simulated.
+
+- **Step 2 is `LeasedRun.planned` and `Recovery.of`.** The decision is a function of one number: the last `txnVersion` that a table has committed under the `txnAppId` of the batch. `TableTransactions` is that one question. The table that is asked is the one a batch writes last, its data after its quarantine: once that one has the batch, every table has.
+- **Step 3: a plan is written once, and nothing can change it.** The role of the engine has no `UPDATE` on the plan, a number is the key of one row, and at most one batch of a sequence is `PLANNED` at a time, by a partial unique index. A plan that could not be read back is not written down.
+- **Step 7 is one transaction, and it is all of it or none** (`LeasedRun.commit`). Each of its statements says whether it did, and one that did not ends the transaction with nothing done and an error that says which. The state only moves forward.
+- **A transaction is ended by a commit or by a rollback, and by nothing else.** The review of P4 found that the helper that runs a transaction rolled back only on the exceptions that are safe to catch, and then gave the connection back with auto-commit turned on, which commits what is pending. An interrupt in the middle of step 7 would have committed half of it. It now rolls back on anything, and a connection whose rollback fails is closed and not given back.
+- **Step 8 is in the transaction of step 7**: the lease is given up with the commit of the state.
+- **Zombies (§4).** `commit` answers "no" to a run whose lease is another's, and `planned` and `plan` stop it. Its run is `ABANDONED` by then, which nothing changes.
+- **A run does not end as `SUCCEEDED` past a batch that is planned.** The only way past a batch is to commit it; a run with nothing planned and nothing to do ends as succeeded with no batch.
+- **What a batch wrote is a list of tables with their versions**, and not a mapping by table: a path may be longer than a key that can be read back, and a list can be asked which batch wrote a version.
+- **Left to P5:** what reads the last `txnVersion` from the log of a table; the version of the table at which a batch was committed, for a batch that is rolled forward or whose write was skipped; and writing the quarantine of a batch before its data.
+
 ## Alternatives
 
 | Option | Verdict |
