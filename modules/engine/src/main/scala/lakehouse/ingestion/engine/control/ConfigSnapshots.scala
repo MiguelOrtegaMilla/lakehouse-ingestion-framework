@@ -5,7 +5,6 @@ import java.sql.{Connection, SQLException}
 import scala.util.Using
 
 import io.circe.Json
-import io.circe.parser
 import lakehouse.ingestion.core.config.{ConfigVersion, SourceId}
 import lakehouse.ingestion.core.control.Layer
 
@@ -27,9 +26,16 @@ object ConfigSnapshots {
    * whoever runs with it and however often.
    *
    * @return whether it was new
+   * @throws java.lang.IllegalArgumentException if the configuration could not be read back
+   *   (`StoredJson`): it is not stored, and the run that came with it does not start
    */
   @throws[SQLException]
-  def store(connection: Connection, source: SourceId, version: ConfigVersion): Boolean =
+  def store(connection: Connection, source: SourceId, version: ConfigVersion): Boolean = {
+    StoredJson.readable(version.content).left.foreach { reason =>
+      throw new IllegalArgumentException(
+        s"the configuration of $source cannot be stored, since it could not be read back: $reason"
+      )
+    }
     Using.resource(
       connection.prepareStatement(
         """INSERT INTO control.config_snapshot (config_hash, source_id, content)
@@ -42,6 +48,7 @@ object ConfigSnapshots {
       statement.setString(3, version.text)
       statement.executeUpdate() == 1
     }
+  }
 
   @throws[SQLException]
   def find(connection: Connection, hash: String): Option[Stored] =
@@ -83,9 +90,13 @@ object ConfigSnapshots {
       Using.resource(statement.executeQuery()) { rows =>
         Option.when(rows.next()) {
           val hash = rows.getString(1)
-          val content = parser.parse(rows.getString(2)).getOrElse {
-            throw new IllegalStateException(s"the snapshot $hash is not JSON as it was stored")
-          }
+          val content = StoredJson
+            .parse(rows.getString(2))
+            .fold(
+              reason =>
+                throw new IllegalStateException(s"the snapshot $hash cannot be read back: $reason"),
+              identity
+            )
           Stored(hash, content)
         }
       }

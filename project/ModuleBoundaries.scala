@@ -40,6 +40,9 @@ object ModuleBoundaries {
     // ingests ever is (ADR-0013 §3): it is the command line's, and no library's.
     val flyway: Forbidden = Forbidden("org.flywaydb")
     val jdbc: Seq[Forbidden] = Seq(Forbidden("org.postgresql"), Forbidden("com.zaxxer"), flyway)
+    // The JSON parser behind circe-parser. The versions that limit the depth of what they read
+    // are built with a Scala newer than the build's (Dependencies.circeCore).
+    val jawn: Forbidden = Forbidden("org.typelevel", "jawn-")
   }
 
   /**
