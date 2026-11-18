@@ -65,21 +65,35 @@ final case class SourceState(
 )
 
 /**
- * The one thing that recovery asks of a table (ADR-0005 §3, step 2).
+ * What the engine asks a table about the batches that were written to it (ADR-0005 §3).
  *
  * Delta keeps, in the log of each table, the last `txnVersion` that was committed to it under
  * each `txnAppId`. That is all the control plane needs to know of Delta to tell a batch whose
  * data is in its table from one whose data is not, and it is asked through this, so that the
  * decision is the same whatever reads the log.
+ *
+ * The table is asked, and not the process that wrote to it: a batch may have been written by a
+ * run that died before it said so, and the answer is then the table's alone.
  */
 trait TableTransactions {
 
   /**
-   * The last `txnVersion` that `table` has committed under `app`.
+   * The last `txnVersion` that `table` has committed under `app`: what recovery decides by
+   * (step 2).
    *
    * @return none, if it has committed nothing under it, or is not there yet
    */
   def lastVersion(table: TableLocation, app: TxnAppId): Option[Long]
+
+  /**
+   * The version of `table` at which `batch` was committed to it: where its rows are, which is
+   * what a batch records of what it wrote (step 7, `BatchOutput`). A run asks it for a batch
+   * that it wrote itself, and for one that it found written by a run before it.
+   *
+   * @return none, if the batch is not in the table, or its commit is no longer in the history
+   *   that the table keeps
+   */
+  def committedAt(table: TableLocation, batch: BatchId): Option[Long]
 }
 
 /**
