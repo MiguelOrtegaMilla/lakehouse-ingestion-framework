@@ -61,8 +61,10 @@ sbt scalafmtAll scalafmtSbt             # reformat
 sbt core/test cli/test                  # the configuration and the command line (no Docker, no Spark)
 sbt delta-pg-logstore/test              # the LogStore module's unit tests (no Docker)
 sbt integration-tests/test              # integration tests (needs Docker)
-sbt "integration-tests/testOnly lakehouse.ingestion.it.delta.*"   # Spark + Delta smoke test only (no Docker)
+sbt "integration-tests/testOnly *DeltaSmokeSpec"   # Spark + Delta smoke test only (no Docker)
 sbt "integration-tests/testOnly *DeltaLogStoreContractSpec"   # what Delta asks of a LogStore (no Docker)
+sbt "integration-tests/testOnly *DeltaSetTransactionContractSpec"   # what Delta records of an idempotent write, and how it is read back (no Docker)
+sbt "integration-tests/testOnly *DeltaTableTransactionsSpec"   # which batches a real table has, and at which version (needs Docker)
 sbt "integration-tests/testOnly *PostgresLogStoreDeltaSpec"   # Delta on the PostgreSQL-coordinated LogStore (needs Docker)
 sbt "integration-tests/testOnly *PostgresLogStoreEndToEndSpec"   # the operations of an ingestion on it: idempotent append, MERGE, OPTIMIZE, VACUUM, checkpoints (needs Docker)
 sbt "delta-pg-logstore/testOnly * -- -z F14"   # the tests of one fault scenario of ADR-0004, here F14

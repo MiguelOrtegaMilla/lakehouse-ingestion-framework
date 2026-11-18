@@ -1,6 +1,9 @@
 package lakehouse.ingestion.it.delta
 
 import java.nio.file.Files
+import java.nio.file.attribute.FileTime
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -18,11 +21,15 @@ import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
 import lakehouse.ingestion.logstore.LogStores
 import org.apache.hadoop.fs.Path
+import org.apache.spark.sql.delta.DeltaLog
 
 /**
  * What a real Delta table says of its batches, read from its log through the coordinated
  * LogStore (P5.4): the contract that the simulation of P4 passes too, and what only a real
  * table can get wrong.
+ *
+ * What is assumed of Delta itself in the answers is pinned apart, with no code of the engine
+ * (`DeltaSetTransactionContractSpec`).
  */
 final class DeltaTableTransactionsSpec
     extends TableTransactionsContract
@@ -46,15 +53,29 @@ final class DeltaTableTransactionsSpec
       rows: Seq[String]
   ): Option[Long] = {
     val before = versionOf(table.uri)
-    frame(rows).write
+    val after =
+      append(table, batch, rows, Some(CommitMetadata(RunId.generate(), source, batch).text))
+    Option.when(after > before)(after)
+  }
+
+  /**
+   * An idempotent append, with whatever its commit is to say of itself.
+   *
+   * @return the version of the table after it
+   */
+  private def append(
+      table: TableLocation,
+      batch: BatchId,
+      rows: Seq[String],
+      userMetadata: Option[String]
+  ): Long = {
+    val writer = frame(rows).write
       .format("delta")
       .mode("append")
       .option("txnAppId", batch.app.value)
       .option("txnVersion", batch.seq.value)
-      .option(CommitMetadata.WriteOption, CommitMetadata(RunId.generate(), source, batch).text)
-      .save(table.uri)
-    val after = versionOf(table.uri)
-    Option.when(after > before)(after)
+    userMetadata.fold(writer)(writer.option(CommitMetadata.WriteOption, _)).save(table.uri)
+    versionOf(table.uri)
   }
 
   override protected def rowsOf(table: TableLocation): Seq[String] =
@@ -66,7 +87,7 @@ final class DeltaTableTransactionsSpec
     rows.toDF("value")
   }
 
-  /** A commit of some other writer: no batch, and whatever it says of itself. */
+  /** A commit of some other writer: no transaction, and whatever it says of itself. */
   private def foreign(table: TableLocation, userMetadata: Option[String]): Long = {
     val writer = frame(Seq("not a batch")).write.format("delta").mode("append")
     userMetadata.fold(writer)(writer.option(CommitMetadata.WriteOption, _)).save(table.uri)
@@ -137,26 +158,29 @@ final class DeltaTableTransactionsSpec
     writeBatch(table, returns, 2) shouldBe None
   }
 
-  test("a history longer than a page is read further back, across checkpoints") {
-    val table = newTable("long-history")
-    val small = new DeltaTableTransactions(spark, firstPage = 2)
+  test("a log longer than a page is read further back, across checkpoints") {
+    val table = newTable("long-log")
+    val one = new DeltaTableTransactions(spark, firstPage = 1)
+    val two = new DeltaTableTransactions(spark, firstPage = 2)
     // A checkpoint every three commits: the state of the table is then read from one, and the
-    // commits before it are still in the history.
+    // commits before it are still in the log.
     val interval = "spark.databricks.delta.properties.defaults.checkpointInterval"
     spark.conf.set(interval, "3")
     val versions =
-      try (1L to 9L).map(seq => writeBatch(table, returns, seq).value)
+      try (1L to 10L).map(seq => writeBatch(table, returns, seq).value)
       finally spark.conf.unset(interval)
 
     Files.exists(logOf(table.uri).resolve("_last_checkpoint")) shouldBe true
-    versions shouldBe (0L to 8L)
-    small.lastVersion(table, TxnAppId.of(returns, Layer.Bronze)) shouldBe Some(9)
-    // The last two are in the first page, of two commits; the others in the next, of sixteen.
-    (1L to 9L).map(seq => small.committedAt(table, batch(returns, seq)).value) shouldBe versions
-    (1L to 9L).map(seq => delta.committedAt(table, batch(returns, seq)).value) shouldBe versions
+    versions shouldBe (0L to 9L)
+    one.lastVersion(table, TxnAppId.of(returns, Layer.Bronze)) shouldBe Some(10)
+    // Three pages: the last commit, the eight before it, and the first of the table.
+    (1L to 10L).map(seq => one.committedAt(table, batch(returns, seq)).value) shouldBe versions
+    // Two: the last two commits, and the other eight in a page of sixteen.
+    (1L to 10L).map(seq => two.committedAt(table, batch(returns, seq)).value) shouldBe versions
+    (1L to 10L).map(seq => delta.committedAt(table, batch(returns, seq)).value) shouldBe versions
   }
 
-  test("a history that ends on the edge of a page is read to its end, and no further") {
+  test("a log that ends on the edge of a page is read to its beginning, and no further") {
     // A number that was passed over is looked for in every commit: two commits and pages of
     // one, then of eight, and then nothing is left to read.
     val table = newTable("page-edge")
@@ -172,7 +196,7 @@ final class DeltaTableTransactionsSpec
       .committedAt(table, batch(returns, 2)) shouldBe None
   }
 
-  test("commits that are not the engine's are passed over, whatever they say of themselves") {
+  test("commits that are of no batch are passed over, whatever they say of themselves") {
     val table = newTable("other-writers")
     val small = new DeltaTableTransactions(spark, firstPage = 2)
 
@@ -202,5 +226,51 @@ final class DeltaTableTransactionsSpec
     // The batch is still to be written, and is: its rows get in, at a version of their own.
     writeBatch(table, returns, 2).value shouldBe 2
     delta.committedAt(table, batch(returns, 2)) shouldBe Some(2)
+  }
+
+  test("a batch is where its transaction is, whatever any commit says of itself") {
+    val table = newTable("exact")
+    def saying(source: SourceId, seq: Long): Option[String] =
+      Some(CommitMetadata(RunId.generate(), source, batch(source, seq)).text)
+
+    // Batch 1 says nothing of itself, and batch 2 says that it is a batch of another source.
+    append(table, batch(returns, 1), Seq("returns-1"), None) shouldBe 0
+    append(table, batch(returns, 2), Seq("returns-2"), saying(orders, 7)) shouldBe 1
+    // Then two commits that are of no batch say that they are the two, after them.
+    foreign(table, saying(returns, 1)) shouldBe 2
+    foreign(table, saying(returns, 2)) shouldBe 3
+
+    delta.committedAt(table, batch(returns, 1)) shouldBe Some(0)
+    delta.committedAt(table, batch(returns, 2)) shouldBe Some(1)
+    delta.lastVersion(table, TxnAppId.of(orders, Layer.Bronze)) shouldBe None
+    delta.committedAt(table, batch(orders, 7)) shouldBe None
+  }
+
+  test("a batch whose commit the log no longer keeps is known to be written, and not where") {
+    val table = newTable("cleaned-up")
+    val two = new DeltaTableTransactions(spark, firstPage = 2)
+    (1L to 5L).map(seq => writeBatch(table, returns, seq).value) shouldBe (0L to 4L)
+
+    // Forty days pass, which is more than the thirty that Delta keeps a commit for, and a
+    // checkpoint is written, which is when it cleans a log up.
+    val fortyDaysAgo = FileTime.from(Instant.now().minus(40, ChronoUnit.DAYS))
+    (0L to 4L).foreach(version =>
+      Files.setLastModifiedTime(commitFile(table.uri, version), fortyDaysAgo)
+    )
+    val log = DeltaLog.forTable(spark, table.uri)
+    log.checkpoint(log.update())
+    (0L to 4L).filter(version => Files.exists(commitFile(table.uri, version))) shouldBe Seq(4L)
+    // A run that starts remembers nothing of the table: its state comes from the checkpoint.
+    DeltaLog.clearCache()
+
+    Seq(delta, two).foreach { asked =>
+      asked.lastVersion(table, TxnAppId.of(returns, Layer.Bronze)) shouldBe Some(5)
+      asked.committedAt(table, batch(returns, 5)) shouldBe Some(4)
+      (1L to 4L).map(seq => asked.committedAt(table, batch(returns, seq))) shouldBe
+        Seq.fill(4)(None)
+    }
+    // And none of them is written again: Delta has their transaction, and skips them.
+    (1L to 5L).map(seq => writeBatch(table, returns, seq)) shouldBe Seq.fill(5)(None)
+    rowsOf(table) should have size 15
   }
 }
