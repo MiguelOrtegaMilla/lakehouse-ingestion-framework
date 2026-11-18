@@ -32,6 +32,22 @@ A **lease** row per lease key in `control.source_lease`:
 - **Fencing token:** every state-changing statement includes `WHERE epoch = :epoch`, so a zombie that lost its lease cannot advance state (ADR-0005 §4).
 - **Release:** a normal end clears the holder. A crash leaves the lease to expire, so there are no orphan locks.
 
+*As built (P4.5 and P4.6, reviewed in P4.7, 2026-11-18):* `Leases`, `LeaseHeartbeat` and `LeasedRun` in `engine`, and `LeaseTiming` in `core`.
+
+- **A lease and the run that takes it are one transaction.** The row of the lease is locked while it is looked at, so of the runs that ask at the same moment one is answered and the others wait for it and are recorded as `SKIPPED_LOCKED`. The run whose lease expired is marked `ABANDONED` in that transaction: a status that the decision does not name, for a run that ended halfway and said nothing.
+- **Whether a lease has expired is judged by the time at which the transaction started**, which is what `now()` is. A transaction that waited for the row may skip a lease that has just expired. It never takes one early.
+- **A renewal that fails is not a lease that is lost.** The decision has a run flagged as fenced when a renewal fails. As built, a renewal is due a third of the time to live after the one before was asked for, and one that fails is tried again every twelfth. A run loses its lease in one of two ways: the database answers that the lease is another's, or the run has seen no renewal succeed for five sixths of the time to live, counted from when the last one that did was asked for.
+- **Self-fencing: the run stops by its own count, before the database's runs out.** The database counts the whole time to live from when it got the request, the run five sixths of it from when it sent the request. The count is kept apart from the renewals, so a renewal that hangs does not delay it. The sixth between the two is what their clocks may differ by, and it has three limits, none of which the lease can remove:
+  - the database counts by the time of day of its machine, which may be stepped forward: 866 ms at once was measured on a WSL2 machine. A step beyond the margin lets another run take a lease that its holder still counts as good;
+  - the run counts by a clock that does not count the time its machine is suspended. A run that is resumed after its lease expired still has time on its count, and learns that the lease is gone at its next renewal, a third of the time to live later at most;
+  - a process that is frozen while its machine runs is stopped at the first thing it asks, and not before.
+
+  In all three it is the epoch that keeps the run from advancing anything (ADR-0005 §4). Self-fencing makes the time a zombie works as short as a process can.
+- **"Every state-changing statement includes `WHERE epoch = :epoch`" is, as built, a lock** (`Leases.holds`). Each transaction that advances the state starts by locking the row of the lease and asking whether it is its run's under its epoch. That holds for everything the transaction then does, a takeover waits for it to end, and no other table needs a column for the epoch. A lease that has expired and that nobody took is still its holder's: what keeps two runs apart is whose the row is, and no time.
+- **The lease is locked first by every transaction that touches both it and a run.** The review of P4 found one that did not: a run that ended itself and then gave its lease up held the two rows in the order opposite to a takeover's, and PostgreSQL ended one of them as a deadlock.
+- **Nothing around the heartbeat may stop it.** Whoever asked to be told that the lease is lost is told before anything is logged, nothing is logged while the state of the heartbeat is held, a log line that fails is only missing, a task that ends in an error says so, and closing a heartbeat interrupts none of its threads. The first version did none of this, and one interrupt in the middle of the first log line of a process left it with no logging and a heartbeat that told nobody anything.
+- **`leases.ttl`** is `10s` to `1d`, `2m` by default, and at least three times the connect and statement timeouts of the control database: a renewal that takes as long as it may still arrives in time.
+
 ## Alternatives
 
 | Option | Verdict |

@@ -97,6 +97,13 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
   - P2a: as `ingest_coordination`, `CREATE TABLE`, `DELETE FROM commit_entry` and any read of `control` fail with SQLState `42501` (`CoordinationSchemaSpec`, with the rest of what each role is denied).
   - P4: `ingest_control` cannot write `delta_coordination`.
 
+*As built (P4.2, 2026-11-18):* the grants of `ingest_control` are in the migration V1 of `control`, and `ControlSchemaSpec` tests each as that role.
+
+- It adds rows, and moves a run and a batch to their end. Its `UPDATE` is granted by column: who ran, with which configuration and under which epoch, and the plan of a batch, are written once.
+- It has no `DELETE` on any table of the schema, so a defect in the engine cannot erase the audit trail. How long the trail is kept is the maintenance role's, later.
+- No other runtime role has anything in `control`, and `ingest_control` has nothing in `delta_coordination`.
+- `ingest_migrator` is used by the command `migrate` and by nothing else. Its password is given to the command by reference, and one that is written out on the command line is refused and not repeated.
+
 ### 4. Dependency vulnerability scanning in CI (Required)
 
 - **Alerts.** CI submits the resolved sbt dependency graph to GitHub, which turns on Dependabot alerts. GitHub does not parse sbt builds by itself; the submission API is how sbt projects get a dependency graph.
@@ -139,6 +146,12 @@ Discovery v2 §11 rated separate roles as *Recommended*. **They are now Required
 - **The JSON is built from the events of the parser**, which yields them one at a time, with no recursion, and constructs nothing. There is no tree and no loader, so there is nothing for a tag to construct and no stack for a document to exhaust. Plain scalars are read with the engine's own resolver for the JSON schema of YAML 1.2: `yes`, `no`, `True`, `~`, `007` and `${HOME}` are strings, and `<<` is no merge.
 - **What is refused**, each with its line and column: a document over 256 KiB; nesting beyond 32; more than 8 aliases, of any kind; an alias with no anchor before it, or inside the collection that its anchor names; every tag; a key twice in one mapping; a key that is not a scalar; a number that JSON does not have (`.inf`); a file that does not hold exactly one document.
 - **Nothing was lost by it.** Over a corpus of 69 documents the two gave the same JSON for every document that both accept. They differed in the two failures above, in `${HOME}`, in tags, which circe-yaml accepts, and in the wording of refusals.
+
+*As built (P4.3, 2026-11-18):* TLS to PostgreSQL, for the control plane, the migrations and the LogStore.
+
+- **The mode is always said to the driver** (`PostgresJdbc`, `LogStoreSettings`): `disable` or `verify-full` with its root. The driver's own default, `prefer`, tries TLS and goes on without it, which is neither mode of a profile.
+- **A certificate that is not trusted is a permanent failure**, though the driver reports it as a connection that failed: one that another authority signed, or that is for another host, is as wrong the next time.
+- **`TlsOnlyPostgresSpec`** runs the command `migrate`, the connection of the engine and the LogStore against a PostgreSQL that lets nobody in over TCP without TLS. Each reaches it with `verify-full`, and each is refused with TLS off. TLS for the JDBC connector comes with it (P6).
 
 ### 6. Enterprise / future
 

@@ -26,13 +26,16 @@ final class LeaseLostException(val lease: String, val loss: LeaseLoss)
  * machines by a jump: a WSL2 machine was seen to step it forward by most of a second at a
  * time. A lease of two minutes bears jumps of twenty seconds between two renewals.
  *
- * What it does not do is make a run safe. A process that is frozen for longer than its lease,
- * by its machine or by its own garbage collector, counts nothing while it is frozen, and wakes
- * up a zombie. So does one whose database had its clock moved forward by more than that sixth:
- * its lease is taken while its own count still has time on it, and it finds out at its next
- * renewal. What keeps a zombie from doing harm is the epoch, on every statement that advances
- * the state of a source, and the identity of a batch, in the table. This makes the time in
- * which a zombie works at all as short as a process can make it.
+ * What it does not do is make a run safe. A process that is frozen past its lease, by its own
+ * garbage collector or by whoever stopped it, does nothing to stop itself while it is frozen:
+ * it is stopped at the first thing it asks when it wakes, and what it was in the middle of was
+ * not. A machine that is suspended is worse. The clock that the run counts by does not count
+ * the time the machine was asleep, so the run wakes with time still on its count, and learns
+ * that its lease is gone at its next renewal, a third of the time to live later at most. So
+ * does a run whose database had its clock moved forward by more than that sixth. What keeps a
+ * zombie from doing harm is the epoch, on every transaction that advances the state of a
+ * source, and the identity of a batch, in the table. This makes the time in which a zombie
+ * works at all as short as a process can make it.
  *
  * The count is kept apart from the renewals. A renewal that hangs, on a network that stopped
  * answering, does not keep the lease from running out on time.
