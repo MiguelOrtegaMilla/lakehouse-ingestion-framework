@@ -42,7 +42,7 @@ final class SimulatedDelta extends TableTransactions {
       .maxOption
   }
 
-  /** The version at which a batch was committed to a table, as the history of the table has it. */
+  /** The version at which a batch was committed to a table, as the log of the table has it. */
   override def committedAt(table: TableLocation, batch: BatchId): Option[Long] = synchronized {
     Some(tables.getOrElse(table, Vector.empty).indexWhere(_.batch == batch).toLong).filter(_ >= 0)
   }

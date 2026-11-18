@@ -90,8 +90,8 @@ trait TableTransactions {
    * what a batch records of what it wrote (step 7, `BatchOutput`). A run asks it for a batch
    * that it wrote itself, and for one that it found written by a run before it.
    *
-   * @return none, if the batch is not in the table, or its commit is no longer in the history
-   *   that the table keeps
+   * @return none, if the batch is not in the table, or its commit is no longer in the log that
+   *   the table keeps
    */
   def committedAt(table: TableLocation, batch: BatchId): Option[Long]
 }

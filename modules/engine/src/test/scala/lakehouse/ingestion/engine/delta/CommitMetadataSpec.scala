@@ -1,17 +1,14 @@
 package lakehouse.ingestion.engine.delta
 
-import java.util.UUID
-
+import io.circe.Json
 import lakehouse.ingestion.core.config.SourceId
 import lakehouse.ingestion.core.control.{BatchId, BatchSeq, Layer, RunId, TxnAppId}
+import lakehouse.ingestion.engine.control.StoredJson
 import org.scalatest.{EitherValues, OptionValues}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-/**
- * What a commit of the engine says of itself, and that the `userMetadata` of any other commit
- * is not taken for it (ADR-0005 §3, step 5).
- */
+/** What a commit of the engine says of itself (ADR-0005 §3, step 5). */
 final class CommitMetadataSpec
     extends AnyFunSuite
     with Matchers
@@ -21,74 +18,27 @@ final class CommitMetadataSpec
   private val run = RunId.parse("019a9a2c-7f3e-7c4d-8a1b-2c3d4e5f6a7b").value
   private val source = SourceId.parse("sales.returns").value
   private val batch = BatchId(TxnAppId.of(source, Layer.Bronze), BatchSeq.of(42).value)
-  private val metadata = CommitMetadata(run, source, batch)
 
-  test("a commit says its run and its batch in one form, which other readers depend on") {
-    // What DESCRIBE HISTORY shows, and what the views of the lineage read (P11): a name or an
-    // order that changes here changes for them.
-    metadata.text shouldBe
+  test("a commit says its run and its batch in one form, which its readers depend on") {
+    // What DESCRIBE HISTORY shows next to a version: a name or an order that changes here
+    // changes for whoever reads it there.
+    CommitMetadata(run, source, batch).text shouldBe
       """{"run_id":"019a9a2c-7f3e-7c4d-8a1b-2c3d4e5f6a7b","source_id":"sales.returns",""" +
       """"txn_app_id":"sales.returns/bronze","batch_seq":42}"""
     CommitMetadata.WriteOption shouldBe "userMetadata"
   }
 
-  test("what a commit says is read back as it was written, however it is spaced or ordered") {
-    CommitMetadata.parse(metadata.text).value shouldBe metadata
-    CommitMetadata
-      .parse(
-        """{ "batch_seq": 42, "txn_app_id": "sales.returns/bronze",
-          |  "source_id": "sales.returns", "run_id": "019a9a2c-7f3e-7c4d-8a1b-2c3d4e5f6a7b" }""".stripMargin
-      )
-      .value shouldBe metadata
-    // The largest number of a batch, and the longest id of a source.
+  test("the largest number of a batch and the longest id of a source are said whole") {
     val longest = SourceId.parse("s" * SourceId.MaxBytes).value
-    val last = CommitMetadata(
-      run,
-      longest,
-      BatchId(TxnAppId.of(longest, Layer.Silver), BatchSeq.of(Long.MaxValue).value)
+    val app = TxnAppId.of(longest, Layer.Silver)
+    val last = CommitMetadata(run, longest, BatchId(app, BatchSeq.of(Long.MaxValue).value))
+
+    last.text should not include "\n"
+    StoredJson.parse(last.text).value shouldBe Json.obj(
+      "run_id" -> Json.fromString(run.toString),
+      "source_id" -> Json.fromString(longest.value),
+      "txn_app_id" -> Json.fromString(app.value),
+      "batch_seq" -> Json.fromLong(Long.MaxValue)
     )
-    CommitMetadata.parse(last.text).value shouldBe last
-  }
-
-  test("a later version may say more, and what it adds is let be") {
-    val more = metadata.text.dropRight(1) + ""","config_hash":"0123abcd","attempt":2}"""
-    CommitMetadata.parse(more).value shouldBe metadata
-  }
-
-  test("the userMetadata of a commit that is not the engine's is not read as one") {
-    val notOurs = Seq(
-      "",
-      "nightly compaction",
-      "42",
-      "null",
-      "[1, 2, 3]",
-      "{}",
-      """{"job":"optimize","started_by":"operator"}""",
-      // Not whole.
-      metadata.text.replace(""""batch_seq":42""", """"batch":42"""),
-      metadata.text.replace(""","batch_seq":42""", ""),
-      metadata.text.replace(""""run_id":"019a9a2c-7f3e-7c4d-8a1b-2c3d4e5f6a7b",""", ""),
-      // Not what the engine writes: a number as text, a batch before the first, a run id
-      // that is no UUID of version 7, a sequence that is none.
-      metadata.text.replace(""""batch_seq":42""", """"batch_seq":"42""""),
-      metadata.text.replace(""""batch_seq":42""", """"batch_seq":0"""),
-      metadata.text.replace(""""batch_seq":42""", """"batch_seq":4.2"""),
-      metadata.text.replace(run.toString, UUID.randomUUID().toString),
-      metadata.text.replace(run.toString, "not-a-run"),
-      metadata.text.replace("sales.returns/bronze", "sales.returns/gold"),
-      metadata.text.replace("sales.returns/bronze", "../bronze"),
-      // Cut short, or not JSON at all.
-      metadata.text.dropRight(1),
-      metadata.text + metadata.text,
-      "{\"run_id\": !!binary x}"
-    )
-    notOurs.foreach(text => withClue(text)(CommitMetadata.parse(text) shouldBe None))
-  }
-
-  test("text that is larger or deeper than a commit of the engine's is not read at all") {
-    val padded = metadata.text.dropRight(1) + s""","note":"${"x" * 4096}"}"""
-    CommitMetadata.parse(padded) shouldBe None
-    val nested = metadata.text.dropRight(1) + ""","more":{"deep":{"deeper":1}}}"""
-    CommitMetadata.parse(nested) shouldBe None
   }
 }

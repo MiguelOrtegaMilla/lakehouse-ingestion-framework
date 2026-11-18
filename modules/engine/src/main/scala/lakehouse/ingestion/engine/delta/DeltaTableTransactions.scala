@@ -1,11 +1,13 @@
 package lakehouse.ingestion.engine.delta
 
-import io.delta.tables.DeltaTable
+import scala.annotation.tailrec
+
 import lakehouse.ingestion.core.config.TableLocation
 import lakehouse.ingestion.core.control.{BatchId, TableTransactions, TxnAppId}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
+import org.apache.spark.sql.delta.actions.{Action, SetTransaction}
 
 /**
  * What a Delta table says of the batches that were written to it, read from its log (ADR-0005
@@ -16,97 +18,146 @@ import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
  * that died, a zombie, another source of the same table. So each answer starts by listing the
  * log anew (`update`), through the LogStore of the session, which is the coordinated one.
  *
- * '''One class of Delta's that is not its API.''' The last `txnVersion` of an application is in
- * the state of a snapshot (`Snapshot.transactions`), which Delta keeps to skip a write that it
- * has, and shows through no public method. It is asked here and nowhere else (discovery §20):
- * an upgrade of Delta that moves it breaks this file, and the tests of this file say so. The
- * history of a table is read through the public `DeltaTable.history`.
+ * '''Both answers are Delta's own.''' A write that names its transaction (`txnAppId`,
+ * `txnVersion`) has it recorded by Delta in the commit of its rows, as an action of that commit
+ * (`txn` in the log, `SetTransaction` here), and Delta skips the write if the table has that
+ * transaction already. So the commit that holds the transaction of a batch is the commit of the
+ * batch, and no other is. Nothing is taken from what a commit says of itself
+ * (`CommitMetadata`), which any writer of a table may set as it likes.
  *
- * '''A table must keep its transactions.''' Delta drops the transaction of an application that
- * has not written for `delta.setTransactionRetentionDuration`, if a table sets that property.
- * No table of the engine does: with it, a batch that was written long ago would look as one
- * that never was, and would be written again.
+ * '''What is used of Delta that is not its API''' (discovery §5, R3). Delta shows neither
+ * answer through a public method, so three of its own classes are asked, in this file and in
+ * no other:
+ *  - `Snapshot.transactions`, the last transaction of each application, which Delta keeps in
+ *    the state of a table to skip a write that it has;
+ *  - `DeltaLog.getChanges`, the commits of a log from a version on, each with its actions, read
+ *    one at a time as they are asked for;
+ *  - `SetTransaction`, the action itself.
+ *
+ * What is assumed of the three is pinned by tests of Delta alone, with no code of the engine
+ * in them (`DeltaSetTransactionContractSpec`): an upgrade of Delta that changes one fails
+ * there, by the name of the assumption, or does not compile here.
+ *
+ * '''Two things that a table must keep for the answers to hold.'''
+ *  - ''Its transactions.'' A table that sets `delta.setTransactionRetentionDuration` has Delta
+ *    forget the transaction of an application that has not written for that long. A batch that
+ *    was written before would then look as one that never was, and would be written again. No
+ *    table of the engine sets that property, and none that the engine writes to may have it.
+ *  - ''Its commits, to say where a batch is.'' Delta removes the commits that are older than
+ *    `delta.logRetentionDuration`, thirty days unless a table says otherwise, when it writes a
+ *    checkpoint. The table still knows that a batch of then is written, since its transactions
+ *    are in the checkpoint, and no longer at which version. That is asked when a batch is
+ *    written, or soon after by the run that recovers it, and what was answered is kept by the
+ *    control plane (`BatchOutput`), which does not forget it with the log.
  *
  * @param spark the session of the run, whose configuration names the LogStore
- * @param firstPage how many commits of a history are looked at first. The commit of a batch
- *   that is asked for is nearly always among the last of its table: the run has just made it,
- *   or the run before died making it
+ * @param firstPage how many commits of a log are read first. The commit of a batch that is
+ *   asked for is nearly always among the last of its table: the run has just made it, or the
+ *   run before died making it
  */
 final class DeltaTableTransactions(
     spark: SparkSession,
     firstPage: Int = DeltaTableTransactions.DefaultFirstPage
 ) extends TableTransactions {
-  import DeltaTableTransactions.Commit
+  import DeltaTableTransactions._
 
-  require(firstPage >= 1, s"a page of a history has a commit at least, not $firstPage")
+  require(firstPage >= 1, s"a page of a log has a commit at least, not $firstPage")
 
   override def lastVersion(table: TableLocation, app: TxnAppId): Option[Long] =
-    snapshot(table).flatMap(_.transactions.get(app.value))
+    current(table).flatMap { case (_, snapshot) => snapshot.transactions.get(app.value) }
 
   /**
-   * The history is looked at from its end, a page at a time and each page larger than the one
-   * before, until a commit that names the batch is found (`CommitMetadata`) or there is no
-   * history left. If several commits of a page name it, it is the last of them: the rows of a
-   * batch are in its table by the last commit that the batch made there.
+   * The log is read from its end, a page of commits at a time and each page larger than the
+   * one before, until a commit that holds the transaction of the batch is found or the log has
+   * no older commit. Delta lets one commit hold it; were there several, by a writer that goes
+   * around Delta, it is the last.
    *
-   * It is only looked at for a batch that the table has, by Delta's own account of it
-   * (`lastVersion`). One whose number the table has not reached is in no commit, and saying so
-   * takes no reading of a history to its beginning.
-   *
-   * '''What decides and what describes.''' Whether a batch is in a table is Delta's to say, by
-   * the transaction that it records with the write, and nothing else is asked. Where it is, is
-   * read from what the commit says of itself, which is text that any writer of the table may
-   * set. So a writer that is not the engine can, at worst, make a batch be recorded at another
-   * version than its own; it cannot make one be taken for written, nor written twice.
+   * The log is only read for a batch that the table has, by its state (`lastVersion`). One
+   * whose number the table has not reached is in no commit, and saying so takes no reading of
+   * a log to its beginning.
    */
   override def committedAt(table: TableLocation, batch: BatchId): Option[Long] =
-    lastVersion(table, batch.app).filter(_ >= batch.seq.value).flatMap { _ =>
-      @scala.annotation.tailrec
-      def search(limit: Int): Option[Long] = {
-        val page = history(table, limit)
-        val found = page.collect {
-          case Commit(Some(version), Some(text))
-              if CommitMetadata.parse(text).exists(_.batch == batch) =>
-            version
-        }
-        // A page that is not full has the first commit that the table keeps: older ones were
-        // cleaned up with its log, and what they were is not known any more.
-        if (found.nonEmpty) Some(found.max)
-        else if (page.size < limit) None
-        else search(larger(limit))
+    current(table)
+      .filter { case (_, snapshot) =>
+        snapshot.transactions.get(batch.app.value).exists(_ >= batch.seq.value)
       }
-      search(firstPage)
-    }
+      .flatMap { case (log, snapshot) =>
+        @tailrec
+        def search(last: Long, size: Long): Option[Long] = {
+          val first = if (size > last) 0L else last - size + 1
+          val page = read(log, first, last, batch)
+          // A page that does not start where it was asked from starts at the first commit that
+          // the log keeps: the older ones went with its cleanup, and what they held is not
+          // known any more.
+          if (page.found.nonEmpty || first == 0 || !page.first.contains(first)) page.found
+          else search(first - 1, larger(size))
+        }
+        search(snapshot.version, firstPage.toLong)
+      }
 
-  /** The table as it is now; none, if there is no table there. */
-  private def snapshot(table: TableLocation): Option[Snapshot] = {
-    val current = DeltaLog.forTable(spark, new Path(table.uri)).update()
-    Option.when(current.version >= 0)(current)
+  /** The log of a table and the table as it is now; none, if there is no table there. */
+  private def current(table: TableLocation): Option[(DeltaLog, Snapshot)] = {
+    val log = DeltaLog.forTable(spark, new Path(table.uri))
+    val snapshot = log.update()
+    Option.when(snapshot.version >= 0)((log, snapshot))
   }
 
-  /** The last `limit` commits of a table, or all that it keeps if they are fewer. */
-  private def history(table: TableLocation, limit: Int): Seq[Commit] =
-    DeltaTable
-      .forPath(spark, table.uri)
-      .history(limit)
-      .select("version", "userMetadata")
-      .collect()
-      .toSeq
-      .map { row =>
-        Commit(Option.unless(row.isNullAt(0))(row.getLong(0)), Option(row.getString(1)))
+  /**
+   * The commits of a log from version `first` to version `last`, each read whole and looked at
+   * for the transaction of `batch`.
+   */
+  private def read(log: DeltaLog, first: Long, last: Long, batch: BatchId): Page = {
+    // Delta lists the log here, and reads a commit when the iterator is asked for it.
+    val commits = log.getChanges(first)
+    @tailrec
+    def next(page: Page): Page =
+      if (!commits.hasNext) page
+      else {
+        val (version, actions) = commits.next()
+        if (version > last) page
+        else {
+          val seen = page.saw(version, holds(actions, batch))
+          // After the last of the page the iterator is let be: asking it whether there is
+          // more costs nothing, and taking what follows would read a commit of no use.
+          if (version == last) seen else next(seen)
+        }
       }
-
-  private def larger(limit: Int): Int =
-    math.min(limit.toLong * DeltaTableTransactions.Growth, Int.MaxValue.toLong).toInt
+    next(Page.Empty)
+  }
 }
 
 object DeltaTableTransactions {
 
-  /** A commit as a history shows it: both are there for a commit that Delta wrote whole. */
-  final private case class Commit(version: Option[Long], userMetadata: Option[String])
-
   val DefaultFirstPage = 16
 
-  /** Pages grow by this, so that a history is read at most a seventh more than once. */
-  private val Growth = 8
+  /** Pages grow by this: a log of any length is listed a few times, and not once a commit. */
+  private val Growth = 8L
+
+  private def larger(size: Long): Long =
+    if (size > Long.MaxValue / Growth) Long.MaxValue else size * Growth
+
+  /**
+   * What a part of a log gave.
+   *
+   * @param first the oldest version that was read: the one asked from, unless the log does not
+   *   keep it any more
+   * @param found the version of the commit that holds the transaction looked for
+   */
+  final private case class Page(first: Option[Long], found: Option[Long]) {
+    def saw(version: Long, holds: Boolean): Page =
+      Page(first.orElse(Some(version)), if (holds) Some(version) else found)
+  }
+
+  private object Page {
+    val Empty: Page = Page(None, None)
+  }
+
+  /**
+   * Whether a commit holds the transaction of a batch. An action that this version of Delta
+   * does not know is read as none, and is passed over with the rest.
+   */
+  private def holds(actions: Seq[Action], batch: BatchId): Boolean = actions.exists {
+    case SetTransaction(app, version, _) => app == batch.app.value && version == batch.seq.value
+    case _ => false
+  }
 }
