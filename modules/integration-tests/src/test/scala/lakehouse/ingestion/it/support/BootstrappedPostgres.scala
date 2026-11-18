@@ -164,7 +164,7 @@ object BootstrappedPostgres {
   /** The compose file that defines the local service; the single source of the image. */
   def composeFile: Path = repoRoot().resolve("docker/docker-compose.yml")
 
-  private def repoRoot(): Path =
+  private[support] def repoRoot(): Path =
     sys.props.get("repo.root").map(Paths.get(_)).getOrElse {
       throw new IllegalStateException("system property repo.root is not set (see build.sbt)")
     }

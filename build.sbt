@@ -79,8 +79,9 @@ lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
 lazy val engine = module("engine", artifact = "engine")
   .dependsOn(core, deltaPgLogstore)
   .settings(
-    rules(forbidden = Nil),
-    libraryDependencies ++= Seq(sparkSql, deltaSpark)
+    // The engine checks the version of its schema, and never migrates it.
+    rules(forbidden = Seq(Forbid.flyway)),
+    libraryDependencies ++= Seq(sparkSql, deltaSpark, scalatest)
   )
 
 /** Entry point, argument parsing, wiring, exit codes. */
@@ -88,7 +89,7 @@ lazy val cli = module("cli", artifact = "cli")
   .dependsOn(engine)
   .settings(
     rules(forbidden = Nil),
-    libraryDependencies += scalatest,
+    libraryDependencies ++= flyway :+ scalatest,
     Compile / mainClass := Some("lakehouse.ingestion.cli.Main"),
     // `sbt "cli/run validate …"`: a process of its own, so that its exit code is the command's
     // and not the end of sbt, started where sbt was, so that paths are those of the repository.
@@ -130,7 +131,7 @@ lazy val integrationTests = module("integration-tests", artifact = "integration-
       deltaSparkTest,
       log4jSlf4j,
       log4jCore
-    ) ++ flywayTest,
+    ),
     // The suites use repository files (compose file, init scripts) through this path.
     Test / javaOptions += s"-Drepo.root=${(LocalRootProject / baseDirectory).value}"
   )

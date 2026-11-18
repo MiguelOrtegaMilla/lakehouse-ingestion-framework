@@ -149,7 +149,21 @@ The bootstrap script (`docker/postgres/init/`) runs only on an empty volume. Aft
 
 Least-privilege roles: [ADR-0013](docs/adr/0013-application-security-baseline.md) §3. `PostgresBootstrapSpec` tests the bootstrap against the same image and scripts.
 
-The tables of `delta_coordination`, and the privileges on them, come from the migrations that `delta-pg-logstore` ships (`src/main/resources/db/migration/delta_coordination`). `CoordinationSchemaSpec` applies them with Flyway, as `ingest_migrator`, and tests what each role may and may not do.
+The tables of the two schemas, and the privileges on them, come from migrations: `engine` ships those of `control`, and `delta-pg-logstore` those of `delta_coordination` (`src/main/resources/db/migration/` in each). The command `migrate` applies them, as the role that owns the schemas. Its password is in no profile: the command is told where it is.
+
+```bash
+export INGEST_MIGRATOR_PASSWORD="$(cat docker/secrets/ingest_migrator_password)"
+sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATOR_PASSWORD"
+```
+
+```text
+control: version 1, 1 migration applied (jdbc:postgresql://localhost:5432/ingestion_control)
+delta_coordination: version 3, 3 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+```
+
+It can be run again at any time: a schema that is at its version is left as it is. The engine and the LogStore run no DDL. Each checks the version of its schema before it touches a table, and refuses to work on another.
+
+`ControlSchemaSpec` and `CoordinationSchemaSpec` test what the constraints of each schema guarantee whatever the code does, and what each role may and may not do; `MigrateCommandSpec`, the command against a database as the bootstrap leaves it.
 
 ## License
 

@@ -49,6 +49,21 @@ final class StatusesSpec extends AnyFunSuite with Matchers with EitherValues {
     RunStatus.mayBecome(Running, Running) shouldBe false
   }
 
+  test("a run is of a kind, and a regular run is the one there is so far") {
+    RunKind.All.map(_.name) shouldBe Seq("regular")
+    RunKind.parse("regular").value shouldBe RunKind.Regular
+    // A backfill has a kind of its own when there are backfills (P7), and not before.
+    RunKind.parse("backfill").left.value shouldBe "must be one of regular"
+  }
+
+  test("a failure has one of the four classes of the requirements") {
+    // RF-14: transient, permanent, data, conflict. They are a column of the audit trail.
+    FailureClass.All.map(_.name) shouldBe Seq("transient", "conflict", "permanent", "data")
+    FailureClass.All.foreach(failure => FailureClass.parse(failure.name).value shouldBe failure)
+    FailureClass.parse("TRANSIENT").left.value shouldBe
+      "must be one of transient, conflict, permanent, data"
+  }
+
   test("the statuses of a batch have the names of the contract") {
     BatchStatus.All.map(_.name) shouldBe Seq("PLANNED", "COMMITTED", "ABANDONED")
     BatchStatus.All.foreach(status => BatchStatus.parse(status.name).value shouldBe status)

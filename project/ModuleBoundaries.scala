@@ -36,8 +36,10 @@ object ModuleBoundaries {
     // Every log4j module, the API included: a library logs through slf4j-api and leaves the
     // logging backend to the application that runs it.
     val log4j: Forbidden = Forbidden("org.apache.logging.log4j")
-    val jdbc: Seq[Forbidden] =
-      Seq(Forbidden("org.postgresql"), Forbidden("com.zaxxer"), Forbidden("org.flywaydb"))
+    // What applies migrations. It runs as the role that owns the schemas, which nothing that
+    // ingests ever is (ADR-0013 §3): it is the command line's, and no library's.
+    val flyway: Forbidden = Forbidden("org.flywaydb")
+    val jdbc: Seq[Forbidden] = Seq(Forbidden("org.postgresql"), Forbidden("com.zaxxer"), flyway)
   }
 
   /**

@@ -3,15 +3,18 @@ package lakehouse.ingestion.cli
 import java.io.PrintStream
 import java.nio.file.Paths
 
-import lakehouse.ingestion.core.config.{ConfigLoader, Configuration, ConfigVersion, Loaded}
+import lakehouse.ingestion.core.config._
 
 /**
  * The entry point of the application: a command and its options.
  *
- * `validate` is the one command so far. It reads a configuration and says everything that is
- * wrong in it, without opening a connection: it is what a pull request that changes a source is
- * checked with, and what the other commands will do first (ADR-0007: the whole configuration is
- * validated before any data is touched).
+ *  - `validate` reads a configuration and says everything that is wrong in it, without opening
+ *    a connection: it is what a pull request that changes a source is checked with, and what
+ *    the other commands do first (ADR-0007: the whole configuration is validated before any
+ *    data is touched);
+ *  - `migrate` brings the schemas of a deployment to the version of this application. It is the
+ *    one command that connects as the role that owns them (ADR-0013 §3), and that role's
+ *    password is in no profile: the command is told where it is.
  */
 object Main {
 
@@ -74,17 +77,29 @@ object Main {
     )
   }
 
+  /** The role that owns the schemas, unless the command is told another (ADR-0013 §3). */
+  val Migrator = "ingest_migrator"
+
   val Usage: String =
-    """usage: lakehouse-ingestion validate --profile <file> --sources <directory>
-      |
-      |  validate   Reads the profile and every source, and says everything that is wrong in
-      |             them. No connection is opened: it runs anywhere, in a moment.
-      |
-      |  --profile  the file of the profile, as conf/app/local.yaml
-      |  --sources  the directory of the sources, one .yaml file for each, as conf/sources
-      |
-      |exit codes: 0 the configuration is valid; 4 the configuration is not valid;
-      |            64 the command line is not one""".stripMargin
+    s"""usage: lakehouse-ingestion validate --profile <file> --sources <directory>
+       |       lakehouse-ingestion migrate --profile <file> --password <reference> [--user <role>]
+       |
+       |  validate    Reads the profile and every source, and says everything that is wrong in
+       |              them. No connection is opened: it runs anywhere, in a moment.
+       |  migrate     Brings the schemas of the control plane and of the commit coordination to
+       |              the version of this application, in the databases of the profile, as the
+       |              role that owns them.
+       |
+       |  --profile   the file of the profile, as conf/app/local.yaml
+       |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
+       |  --password  where the password of that role is, and never the password itself:
+       |              env:NAME or file:/run/secrets/name
+       |  --user      the role that owns the schemas; $Migrator unless said
+       |
+       |exit codes: 0 the configuration is valid, or the schemas are at their version;
+       |            3 a database could not be reached, and running again may do;
+       |            4 the configuration is not valid, or a database refused;
+       |            64 the command line is not one""".stripMargin
 
   def main(args: Array[String]): Unit = sys.exit(run(args.toSeq, System.out, System.err))
 
@@ -93,11 +108,33 @@ object Main {
    *
    * @param out what the command says of what it did
    * @param err errors and warnings, one on each line
+   * @param environment how a variable is looked up; the environment of the process, unless a
+   *   test says otherwise
    */
-  def run(args: Seq[String], out: PrintStream, err: PrintStream): Int = args.toList match {
+  def run(
+      args: Seq[String],
+      out: PrintStream,
+      err: PrintStream,
+      environment: String => Option[String] = sys.env.get
+  ): Int = args.toList match {
     case "validate" :: options =>
       parse(options, Set("--profile", "--sources")) match {
         case Right(found) => validate(found("--profile"), found("--sources"), out, err)
+        case Left(problem) => usage(problem, err)
+      }
+    case "migrate" :: options =>
+      val asked = for {
+        found <- parse(options, Set("--profile", "--password"), optional = Set("--user"))
+        // What is wrong is said, and what was typed is not: it may be the password itself.
+        password <- SecretRef.parse(found("--password")).left.map(reason => s"--password $reason")
+        user <- SqlIdentifier
+          .parse(found.getOrElse("--user", Migrator))
+          .left
+          .map(reason => s"--user $reason")
+      } yield (found("--profile"), user, password)
+      asked match {
+        case Right((profile, user, password)) =>
+          migrate(profile, user, password, SecretResolver(environment), out, err)
         case Left(problem) => usage(problem, err)
       }
     case ("--help" | "-h" | "help") :: Nil =>
@@ -113,15 +150,17 @@ object Main {
     Exit.Usage
   }
 
-  /** `--name value` pairs: each of `names` once, and nothing else. */
+  /** `--name value` pairs: each of `required` once, each of `optional` once at most. */
   private def parse(
       options: List[String],
-      names: Set[String]
+      required: Set[String],
+      optional: Set[String] = Set.empty
   ): Either[String, Map[String, String]] = {
+    val names = required ++ optional
     def go(rest: List[String], found: Map[String, String]): Either[String, Map[String, String]] =
       rest match {
         case Nil =>
-          (names -- found.keySet).toSeq.sorted match {
+          (required -- found.keySet).toSeq.sorted match {
             case Seq() => Right(found)
             case missing => Left(s"${missing.mkString(" and ")} must be given")
           }
@@ -149,6 +188,62 @@ object Main {
         out.println(report(profile, configuration))
         Exit.Ok
     }
+
+  /**
+   * The profile is validated whole first, and the password is looked for, before a connection
+   * is opened. Then each schema in its turn: the first that fails ends the command, and what
+   * was migrated before it stays migrated, which running the command again finds.
+   */
+  private def migrate(
+      profile: String,
+      user: SqlIdentifier,
+      password: SecretRef,
+      secrets: SecretResolver,
+      out: PrintStream,
+      err: PrintStream
+  ): Int =
+    ConfigLoader.loadProfile(Paths.get(profile)) match {
+      case Left(errors) =>
+        errors.toChain.toVector.foreach(error => err.println(error.message))
+        err.println("The profile is not valid, and nothing was migrated.")
+        Exit.Permanent
+
+      case Right(Loaded(valid, warnings)) =>
+        warnings.foreach(warning => err.println(s"warning: ${warning.message}"))
+        secrets.resolve(password) match {
+          case Left(problem) =>
+            err.println(s"error: --password $problem")
+            Exit.Permanent
+
+          case Right(secret) =>
+            val failed = Migrations
+              .targets(valid)
+              .iterator
+              .map { target =>
+                val result = Migrations.migrate(target, user, secret)
+                result.foreach(done => out.println(migrated(done, target)))
+                result
+              }
+              .collectFirst { case Left(failure) => failure }
+
+            failed match {
+              case None => Exit.Ok
+              case Some(failure) =>
+                err.println(s"error: ${failure.message}")
+                failure match {
+                  case _: Migrations.Unreachable => Exit.Transient
+                  case _: Migrations.Refused => Exit.Permanent
+                }
+            }
+        }
+    }
+
+  private def migrated(done: Migrations.Migrated, target: Migrations.Target): String = {
+    val what =
+      if (done.applied == 0) "nothing to apply"
+      else s"${counted(done.applied, "migration")} applied"
+    s"${done.schema}: version ${done.version}, $what (${target.connection.url.value})"
+  }
 
   /** What a valid configuration is: its sources, each with the version it would run with. */
   private def report(profile: String, configuration: Configuration): String = {

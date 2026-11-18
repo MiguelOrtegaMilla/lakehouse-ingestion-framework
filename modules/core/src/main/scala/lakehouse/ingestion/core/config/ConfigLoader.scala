@@ -55,6 +55,15 @@ object ConfigLoader {
     Configuration.load(readProfile.toOption, readSources.flatMap(_.toSeq), unread, kinds)
   }
 
+  /**
+   * A profile alone, for a command that has no source to read: one that works on the databases
+   * of a deployment, as the one that applies migrations.
+   */
+  def loadProfile(profile: Path): Either[NonEmptyChain[ConfigError], Loaded[Profile]] =
+    read(profile).left
+      .map(NonEmptyChain.one)
+      .flatMap(file => Profile.load(file.name, file.text))
+
   /** The files of the directory that are sources, or why an entry of it is in the way. */
   private def list(directory: Path): Either[ConfigError, Seq[Either[ConfigError, Path]]] =
     if (!Files.isDirectory(directory))
