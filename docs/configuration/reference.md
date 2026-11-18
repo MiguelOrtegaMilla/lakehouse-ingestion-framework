@@ -154,7 +154,7 @@ A table of a relational database. PostgreSQL, for now. It loads by `full` or by 
 
 ### The `file` connector
 
-Files that are left in a directory of the landing zone. It loads by `new_files`.
+Files that are left in a directory of the landing zone. It loads by `new_files`. The directory is listed, and not the directories under it; a file whose name starts with `.` or `_` is never taken.
 
 <!-- fields: connector file -->
 | Field | Takes | Left out |
@@ -162,6 +162,8 @@ Files that are left in a directory of the landing zone. It loads by `new_files`.
 | `connector.path` | The directory: a [path](#a-relative-path) relative to `landing.root` | required |
 | `connector.format` | `csv`, `json` or `parquet` | required |
 | `connector.pattern` | Which files of the directory, by their name: letters, digits, `_`, `-`, `.`, and the wildcards `*` and `?`. As `returns-*.csv` | every file |
+| `connector.min_file_age` | How long a file goes unchanged before it is taken as complete: one that is still being written would be ingested cut short. A [duration](#a-duration), `0s` to `1d`; `0s` is warned of | `1m` |
+| `connector.max_files_per_batch` | The most files that one batch takes, `1` to `10000`. The rest are the next run's | `1000` |
 
 Rules about several fields of a source:
 
@@ -170,6 +172,7 @@ Rules about several fields of a source:
 - **Each layer has a table of its own.** The Silver table is not the Bronze table, nor inside it, nor around it.
 - **`key_reconciliation` is for incremental loads**, and `deletes` needs `targets.silver`: deletes are marked in Silver.
 - **A mask needs `targets.silver`** to be applied in.
+- **The columns that the engine adds to every row are not the source's**: `_run_id`, `_batch_seq`, `_ingested_at`, `_source_file`, `_source_id` and `_rescued_data`, case aside, since Spark tells column names apart without it. None of them is a key, a watermark, the column of `deleted_flag`, a column under `columns`, or the new name of a rename. `targets.silver.partition_by` may have `_source_id`, written so: it is what a table that several sources merge into is partitioned by. A source whose data has a column of one of those names renames it (`schema.renames`, whose old name may be one); otherwise its run fails, and names the column.
 
 ## How values are written
 
@@ -245,6 +248,7 @@ They are applied to the sources that are valid by themselves.
 - **An id belongs to one source**, and a source is in the file of its name.
 - **A table has one layer.** What one source writes as its Bronze table, no other writes as its Silver table.
 - **No table is inside another.**
+- **Two file sources do not read one directory**, whatever their patterns, and disabled sources too: each would ingest its files. A directory inside another source's is allowed, since neither lists the other's.
 - **A Silver table that several sources merge into** is partitioned, the same way by all of them, and each of its partition columns is one of the keys of each source or is `_source_id`. That column is the engine's own: it is part of every key without being written in one. A table that one source writes is partitioned as that source likes, and several sources may append to one Bronze table as it is.
 
 ## Validating

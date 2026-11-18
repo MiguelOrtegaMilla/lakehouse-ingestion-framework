@@ -1,0 +1,6 @@
+# Two patterns that match no name in common are still one directory: refused (discovery §17, P5).
+id: shop.returns
+connector: { type: file, path: shop/drop, format: csv, pattern: "returns-*.csv" }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/shop/returns }

@@ -102,6 +102,16 @@ object Read {
       case None => fail(s"must be a number between 0 and 1, and is ${kind(json)}")
     }
 
+    /** A whole number within bounds, both of which a field of the configuration may reach. */
+    def integer(min: Int, max: Int): Result[Int] = json.asNumber match {
+      case Some(number) =>
+        number.toInt match {
+          case Some(whole) if whole >= min && whole <= max => valid(whole)
+          case _ => fail(s"must be a whole number from $min to $max")
+        }
+      case None => fail(s"must be a whole number from $min to $max, and is ${kind(json)}")
+    }
+
     /** One of a few words. */
     def oneOf[A](choices: (String, A)*): Result[A] = {
       val words = choices.map(_._1)

@@ -1,0 +1,3 @@
+sources/shop.orders.yaml: connector.path is shop/drop, which is the path of sources/shop.refunds.yaml, sources/shop.returns.yaml as well: two file sources of one path would each ingest what is there, into two tables or twice into one
+sources/shop.refunds.yaml: connector.path is shop/drop, which is the path of sources/shop.orders.yaml, sources/shop.returns.yaml as well: two file sources of one path would each ingest what is there, into two tables or twice into one
+sources/shop.returns.yaml: connector.path is shop/drop, which is the path of sources/shop.orders.yaml, sources/shop.refunds.yaml as well: two file sources of one path would each ingest what is there, into two tables or twice into one

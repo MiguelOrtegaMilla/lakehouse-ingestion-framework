@@ -1,0 +1,7 @@
+# Disabled, and refused all the same: it is enabled by a change that validation sees alone.
+id: shop.refunds
+enabled: false
+connector: { type: file, path: shop/drop, format: json }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/shop/refunds }
