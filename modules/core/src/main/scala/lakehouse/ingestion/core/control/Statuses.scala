@@ -49,6 +49,54 @@ object RunStatus {
 }
 
 /**
+ * What a run is for (ADR-0005 §2). A regular run ingests what is new, in full or by its
+ * watermark or its files. A backfill has a kind of its own, with its own sequence of batches,
+ * and comes with backfills (P7). The names are those of `run_kind` in the control plane.
+ */
+sealed abstract class RunKind(val name: String) {
+  override def toString: String = name
+}
+
+object RunKind {
+
+  case object Regular extends RunKind("regular")
+
+  val All: Seq[RunKind] = Seq(Regular)
+
+  def parse(name: String): Either[String, RunKind] =
+    All.find(_.name == name).toRight(s"must be one of ${All.map(_.name).mkString(", ")}")
+}
+
+/**
+ * Why a run failed, as far as what to do next goes (discovery §14). The names are those of
+ * `error_class` in the audit trail. Telling an error of one class from one of another, and the
+ * kinds of conflict apart, is the classification of errors (P8).
+ */
+sealed abstract class FailureClass(val name: String) {
+  override def toString: String = name
+}
+
+object FailureClass {
+
+  /** It may pass: a connection lost, a timeout, the coordination database not answering. */
+  case object Transient extends FailureClass("transient")
+
+  /** Another writer changed the table between the plan and the commit. */
+  case object Conflict extends FailureClass("conflict")
+
+  /** Running again does not mend it: credentials, a missing table, a configuration. */
+  case object Permanent extends FailureClass("permanent")
+
+  /** More rows were rejected than the source allows. */
+  case object Data extends FailureClass("data")
+
+  val All: Seq[FailureClass] = Seq(Transient, Conflict, Permanent, Data)
+
+  def parse(name: String): Either[String, FailureClass] =
+    All.find(_.name == name).toRight(s"must be one of ${All.map(_.name).mkString(", ")}")
+}
+
+/**
  * How a batch stands (ADR-0005 §3). The names are those of `control.ingestion_batch.status`.
  *
  *  - `PLANNED`: its plan is written down, before anything is read. It is the write-ahead step:

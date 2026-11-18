@@ -120,12 +120,15 @@ object Dependencies {
   val testcontainersToxiproxy =
     "org.testcontainers" % "testcontainers-toxiproxy" % Versions.testcontainers % Test
 
-  // Migrations (ADR-0002). Test-only until a module applies them itself (the control plane, P4):
-  // the LogStore ships its migrations as SQL and never runs them (ADR-0004, deviation 10).
-  val flywayTest: Seq[ModuleID] =
-    Seq("flyway-core", "flyway-database-postgresql").map(
-      "org.flywaydb" % _ % Versions.flyway % Test
-    )
+  // Migrations (ADR-0002). What the command `migrate` applies those of both schemas with, and
+  // nothing else of the application uses: the engine and the LogStore ship their migrations as
+  // SQL and never run them (ADR-0013 §3; ADR-0004, deviation 10). Flyway's own dependencies are
+  // optional, but for lombok, which is what it is compiled with and nothing that runs.
+  val flyway: Seq[ModuleID] =
+    Seq("flyway-core", "flyway-database-postgresql").map { artifact =>
+      ("org.flywaydb" % artifact % Versions.flyway).exclude("org.projectlombok", "lombok")
+    }
+
   val log4jSlf4j = "org.apache.logging.log4j" % "log4j-slf4j2-impl" % Versions.log4j % Test
   val log4jCore = "org.apache.logging.log4j" % "log4j-core" % Versions.log4j % Test
 }

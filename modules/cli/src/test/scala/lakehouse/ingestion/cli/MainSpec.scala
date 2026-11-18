@@ -13,10 +13,17 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   import MainSpec.Ran
 
-  private def run(args: String*): Ran = {
+  private def run(args: String*): Ran = runWith(Map.empty)(args: _*)
+
+  /** With an environment of the test's own: no command of a test reads that of the build. */
+  private def runWith(environment: Map[String, String])(args: String*): Ran = {
     val (out, err) = (new ByteArrayOutputStream, new ByteArrayOutputStream)
-    val exit =
-      Main.run(args, new PrintStream(out, true, "UTF-8"), new PrintStream(err, true, "UTF-8"))
+    val exit = Main.run(
+      args,
+      new PrintStream(out, true, "UTF-8"),
+      new PrintStream(err, true, "UTF-8"),
+      environment.get
+    )
     Ran(exit, out.toString("UTF-8"), err.toString("UTF-8"))
   }
 
@@ -171,9 +178,9 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("the usage says which code is which") {
-    Main.Usage should include(
-      "exit codes: 0 the configuration is valid; 4 the configuration is not valid;"
-    )
+    Main.Usage should include("exit codes: 0 the configuration is valid, or the schemas are at")
+    Main.Usage should include("3 a database could not be reached, and running again may do;")
+    Main.Usage should include("4 the configuration is not valid, or a database refused;")
     Main.Usage should include("64 the command line is not one")
   }
 
@@ -225,6 +232,83 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
     ran.exit shouldBe Main.Exit.Usage
     ran.errors.head shouldBe "error: '[2Jvalidate' is not a command"
+  }
+
+  // What `migrate` does to a database is tested against one (MigrateCommandSpec, in the
+  // integration tests). Here is what it refuses before it opens a connection.
+
+  test("migrate: a command line that is not one ends in 64, before anything is read") {
+    val wrong = Seq(
+      Seq("migrate") -> "error: --password and --profile must be given",
+      Seq("migrate", "--profile", exampleProfile) -> "error: --password must be given",
+      Seq("migrate", "--password", "env:P") -> "error: --profile must be given",
+      Seq("migrate", "--profile", exampleProfile, "--password", "env:P", "--sources", "x") ->
+        "error: '--sources' is not an option of this command",
+      Seq("migrate", "--profile", exampleProfile, "--password", "env:P", "--user") ->
+        "error: --user has no value after it",
+      Seq("migrate", "--profile", exampleProfile, "--password", "env:") ->
+        "error: --password has env: without the name of an environment variable after it"
+    )
+
+    wrong.foreach { case (args, problem) =>
+      withClue(args.mkString(" ")) {
+        val ran = run(args: _*)
+        ran.exit shouldBe Main.Exit.Usage
+        ran.errors.head shouldBe problem
+        ran.out shouldBe empty
+      }
+    }
+  }
+
+  test("migrate: a password that is written out is refused, and is not said again") {
+    val ran = run("migrate", "--profile", exampleProfile, "--password", "s3cr3t-Pa55word")
+
+    ran.exit shouldBe Main.Exit.Usage
+    ran.errors.head shouldBe
+      "error: --password is not a reference: write env:NAME or file:/absolute/path, never the secret"
+    ran.err should not include "s3cr3t"
+    ran.out shouldBe empty
+  }
+
+  test("migrate: a role that is not the name of one is refused, and is not said again") {
+    val ran =
+      run("migrate", "--profile", exampleProfile, "--password", "env:P", "--user", "x; DROP ROLE y")
+
+    ran.exit shouldBe Main.Exit.Usage
+    ran.errors.head should startWith("error: --user ")
+    ran.errors.head should not include "DROP"
+  }
+
+  test("migrate: a profile that is not valid ends in 4, and no connection is opened") {
+    val missing =
+      run("migrate", "--profile", work.resolve("none.yaml").toString, "--password", "env:P")
+    missing.exit shouldBe Main.Exit.Permanent
+    missing.errors.head should endWith("none.yaml: does not exist")
+    missing.errors.last shouldBe "The profile is not valid, and nothing was migrated."
+
+    val profile = write(
+      work.resolve("migrate/profile.yaml"),
+      example("conf/app/local.example.yaml").replace("tls: { mode: disable }", "tls: { mode: off }")
+    )
+    val wrong = run("migrate", "--profile", profile.toString, "--password", "env:P")
+    wrong.exit shouldBe Main.Exit.Permanent
+    wrong.errors.count(_.contains(".tls.mode")) shouldBe 2
+    wrong.errors.last shouldBe "The profile is not valid, and nothing was migrated."
+    wrong.out shouldBe empty
+  }
+
+  test("migrate: a password that is not where the command was told ends in 4") {
+    val unset = run("migrate", "--profile", exampleProfile, "--password", "env:MIGRATOR_PASSWORD")
+    unset.exit shouldBe Main.Exit.Permanent
+    unset.errors.last shouldBe
+      "error: --password cannot read the secret env:MIGRATOR_PASSWORD: the variable is not set"
+
+    val noFile = run("migrate", "--profile", exampleProfile, "--password", "file:/run/secrets/none")
+    noFile.exit shouldBe Main.Exit.Permanent
+    noFile.errors.last should startWith(
+      "error: --password cannot read the secret file:/run/secrets/none: "
+    )
+    noFile.out shouldBe empty
   }
 
   test("help is asked for, and is not an error") {

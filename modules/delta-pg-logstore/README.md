@@ -20,7 +20,7 @@ Everything fails closed. If PostgreSQL does not answer, nothing is written and n
 
 ## Using it
 
-**The schema.** The migrations are on the classpath, under `db/migration/delta_coordination`. Run them with Flyway as the role that owns schema `delta_coordination`. The LogStore runs no DDL: it checks the schema version and refuses to work on another one.
+**The schema.** The migrations are on the classpath, under `db/migration/delta_coordination`. Run them with Flyway as the role that owns schema `delta_coordination`; in this repository the command `migrate` of the application does. The LogStore runs no DDL: it checks the schema version and refuses to work on another one.
 
 **The roles** ([ADR-0013](../../docs/adr/0013-application-security-baseline.md) §3). The commit path connects as a role that can add rows and mark an entry complete, and nothing else. An operator's tools connect as another one.
 
