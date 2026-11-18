@@ -1,5 +1,6 @@
 package lakehouse.ingestion.it.control
 
+import io.circe.Json
 import lakehouse.ingestion.core.config.{ConfigVersion, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control.{ConfigSnapshots, Runs}
@@ -80,6 +81,83 @@ final class ConfigSnapshotsSpec extends AnyFunSuite with Matchers with ControlPl
     // Through jsonb and back, which keeps neither the order of the keys nor the spaces: what
     // is read is still the configuration that the hash is of.
     ConfigVersion.hashOf(stored.content) shouldBe version.hash
+  }
+
+  test("whatever JSON has in it, PostgreSQL writes it and it is read back the same") {
+    // Not a configuration: every kind of value and of character, through a real jsonb. A
+    // jsonb cannot hold U+0000, and nothing else is left out.
+    val controls = (0x01 to 0x1f).map(_.toChar).mkString
+    val document = Json.obj(
+      "numbers" -> Json.arr(
+        Json.fromInt(0),
+        Json.fromLong(Long.MinValue),
+        Json.fromBigInt(BigInt("123456789012345678901234567890")),
+        Json.fromBigDecimal(BigDecimal("0.010")),
+        Json.fromBigDecimal(BigDecimal("1E+30")),
+        Json.fromDoubleOrNull(1.5e-7)
+      ),
+      "values" -> Json
+        .arr(Json.True, Json.False, Json.Null, Json.obj(), Json.arr(), Json.fromString("")),
+      "like yaml" -> Json.arr(
+        Seq(
+          "yes",
+          "null",
+          "~",
+          "10",
+          "1e3",
+          "*alias",
+          "&anchor",
+          "!tag",
+          "- item",
+          "key: value",
+          "# no",
+          "{a: 1}"
+        )
+          .map(Json.fromString): _*
+      ),
+      "characters" -> Json.arr(
+        Seq(
+          controls,
+          "quote\" backslash\\ slash/ tab\t line\n",
+          "del\u007f c1\u0081\u009f nel\u0085 ls\u2028 ps\u2029 bom\ufeff",
+          "\ufffe and \uffff",
+          "áéíóú ñ — € 你好 мир עברית",
+          "beyond the first plane: 😀 𝄞 𠜎"
+        ).map(Json.fromString): _*
+      ),
+      "a key with \"quotes\", a \\ and 你好 😀" -> Json.fromInt(1),
+      ("k" * 1022) -> Json.fromString("the longest key there is")
+    )
+    val hash = "c" * 64
+
+    database.run { c =>
+      update(
+        c,
+        "INSERT INTO control.config_snapshot (config_hash, source_id, content) VALUES (?, 'test.source', ?::jsonb)",
+        hash,
+        document.noSpaces
+      )
+    } shouldBe 1
+
+    database.run(ConfigSnapshots.find(_, hash)).value.content shouldBe document
+  }
+
+  test("a configuration that could not be read back is not stored") {
+    val orders = source(newSourceId().value)
+    val version = versionOf(orders)
+    // As a setting of Spark with a key that no file of configuration is likely to have.
+    val unreadable = version.copy(
+      hash = "d" * 64,
+      content = version.content.mapObject(_.add("k" * 2000, Json.Null))
+    )
+
+    val refused = intercept[IllegalArgumentException] {
+      database.run(ConfigSnapshots.store(_, orders.id, unreadable))
+    }
+    refused.getMessage should startWith(
+      s"the configuration of ${orders.id} cannot be stored, since it could not be read back: "
+    )
+    database.run(ConfigSnapshots.find(_, unreadable.hash)) shouldBe None
   }
 
   test("what is stored says where a password is, and never the password") {

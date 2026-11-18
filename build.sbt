@@ -79,9 +79,10 @@ lazy val deltaPgLogstore = module("delta-pg-logstore", artifact = "pg-logstore")
 lazy val engine = module("engine", artifact = "engine")
   .dependsOn(core, deltaPgLogstore)
   .settings(
-    // The engine checks the version of its schema, and never migrates it.
-    rules(forbidden = Seq(Forbid.flyway)),
-    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, circeParser, scalatest),
+    // The engine checks the version of its schema, and never migrates it. And it reads JSON
+    // with the safe reader of `core`, not with circe's parser.
+    rules(forbidden = Seq(Forbid.flyway, Forbid.jawn)),
+    libraryDependencies ++= Seq(sparkSql, deltaSpark, postgresJdbc, hikari, scalatest),
     // What a run records as the version of the application that ran it: the version of the
     // build and the commit it was built from (project/ApplicationVersion.scala).
     Compile / resourceGenerators += Def.task {

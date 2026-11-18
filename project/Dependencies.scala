@@ -71,9 +71,12 @@ object Dependencies {
     )
 
   val catsCore = "org.typelevel" %% "cats-core" % Versions.cats
+  // circe-core alone, and not circe-parser. Its JSON parser, jawn, has no limit on the depth of
+  // what it reads until 1.7.0 (GHSA-cc4v-rvgp-2pf3, GHSA-w4cm-gvhj-cgw6), and 1.7.0 is built
+  // with Scala 2.13.18, which the build does not take, as circe from 0.14.16 on. Text is read
+  // into Json by SafeYaml, with its own limits, JSON included (StoredJson, in `engine`).
+  // `checkBoundaries` fails if jawn comes back (ModuleBoundaries).
   val circeCore = "io.circe" %% "circe-core" % Versions.circe
-  // Reads back the JSON that the control plane stores: a snapshot of configuration, a plan.
-  val circeParser = "io.circe" %% "circe-parser" % Versions.circe
   // YAML 1.2. `core` builds JSON from the events of its parser, with no loader between them
   // (ADR-0013 §5, SafeYaml).
   val snakeyamlEngine = "org.snakeyaml" % "snakeyaml-engine" % Versions.snakeyamlEngine
