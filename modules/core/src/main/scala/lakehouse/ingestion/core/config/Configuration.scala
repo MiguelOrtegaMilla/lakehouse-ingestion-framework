@@ -16,9 +16,6 @@ object Configuration {
   /** A file of configuration: its name, for the errors, and what is written in it. */
   final case class File(name: String, text: String)
 
-  /** The column that the engine adds to every row: the source it came from. */
-  val SourceIdColumn = "_source_id"
-
   /**
    * Reads and validates a configuration. Every file is read whatever is wrong in the others, so
    * the errors are those of all of them, and then the rules that are about more than one source
@@ -79,7 +76,8 @@ object Configuration {
   /** The errors of sources that are each valid, in the order of their files. */
   private[config] def across(sources: Vector[(String, Source)]): Chain[ConfigError] =
     Chain.fromSeq(
-      (named(sources) ++ repeated(sources) ++ layers(sources) ++ fanIn(sources))
+      (named(sources) ++ repeated(sources) ++ layers(sources) ++ fanIn(sources) ++
+        exclusive(sources))
         .sortBy(error => (error.file, error.field))
     )
 
@@ -165,13 +163,13 @@ object Configuration {
             at(
               "targets.silver.partition_by",
               s"is empty, and $table: a table that several sources merge into is partitioned by " +
-                s"the column that separates them, as $SourceIdColumn (ADR-0010)"
+                s"the column that separates them, as ${EngineColumns.SourceId} (ADR-0010)"
             )
           )
         else
           silver.partitionBy.zipWithIndex.collect {
             case (column, index)
-                if column.value != SourceIdColumn && !source.keys.contains(column) =>
+                if column.value != EngineColumns.SourceId && !source.keys.contains(column) =>
               at(
                 s"targets.silver.partition_by[$index]",
                 s"is $column, which is not one of keys, and $table: there a row is found by " +
@@ -179,6 +177,33 @@ object Configuration {
               )
           }
       }
+    }
+  }
+
+  /**
+   * A place that a source has to itself (`ConnectorConfig.exclusive`) is read by one source of
+   * its kind: two that read one directory of the landing zone would each ingest its files, into
+   * two tables or twice into one. Disabled sources too, as every rule here: a configuration is
+   * valid whole, and a source is enabled by a change that validation sees alone.
+   */
+  private def exclusive(sources: Vector[(String, Source)]): Seq[ConfigError] = {
+    val claims = for {
+      (file, source) <- sources
+      (field, place) <- source.connector.exclusive
+    } yield (file, source.connector.kind, field, place)
+
+    claims.groupBy { case (_, kind, field, place) => (kind, field, place) }.toSeq.flatMap {
+      case ((kind, field, place), same) if same.size > 1 =>
+        val files = same.map(_._1)
+        files.map { file =>
+          ConfigError(
+            file,
+            Some(s"connector.$field"),
+            s"is $place, which is the $field of ${others(file, files)} as well: two $kind " +
+              s"sources of one $field would each ingest what is there, into two tables or twice into one"
+          )
+        }
+      case _ => Nil
     }
   }
 

@@ -135,9 +135,16 @@ final class ConfigLoaderSpec
       "copy.yaml" -> source("shop.orders")
     )
 
+    // A copy reads the directory of the source as well, and is told so with the rest.
+    def onePath(file: String, other: String): String =
+      s"${sources.resolve(file)}: connector.path is shop/orders, which is the path of " +
+        s"${sources.resolve(other)} as well: two file sources of one path would each ingest " +
+        "what is there, into two tables or twice into one"
     errorsOf(profile, sources) shouldBe Seq(
+      onePath("copy.yaml", "shop.orders.yaml"),
       s"${sources.resolve("copy.yaml")}: id is shop.orders, and a source is in the file of its name, shop.orders.yaml",
       s"${sources.resolve("copy.yaml")}: id is shop.orders, which is the id of ${sources.resolve("shop.orders.yaml")} as well",
+      onePath("shop.orders.yaml", "copy.yaml"),
       s"${sources.resolve("shop.orders.yaml")}: id is shop.orders, which is the id of ${sources.resolve("copy.yaml")} as well"
     )
   }

@@ -97,6 +97,8 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
     connector.path.value shouldBe "sales/returns"
     connector.format shouldBe FileConnectorConfig.Format.Csv
     connector.pattern.map(_.value) shouldBe Some("returns-*.csv")
+    connector.minFileAge shouldBe 1.minute
+    connector.maxFilesPerBatch shouldBe 1000
     source.load shouldBe Load.NewFiles
     source.enabled shouldBe true
     source.keys shouldBe empty
@@ -395,5 +397,138 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
       .foreach(text =>
         withClue(s"[$text]")(FileConnectorConfig.Pattern.parse(text).isLeft shouldBe true)
       )
+  }
+
+  /** The least a file source can say. */
+  private val Files_ =
+    """id: sales.returns
+      |connector: { type: file, path: sales/returns, format: csv }
+      |load: { mode: new_files }
+      |targets:
+      |  bronze: { table: bronze/sales/returns }
+      |""".stripMargin
+
+  private def fileConnector(fields: String): Loaded[FileConnectorConfig] = {
+    val loaded =
+      Source.load(File, Files_.replace("format: csv }", s"format: csv, $fields }")).value
+    Loaded(loaded.value.connector.asInstanceOf[FileConnectorConfig], loaded.warnings)
+  }
+
+  private def fileErrors(fields: String): Seq[String] =
+    errorsOf(Files_.replace("format: csv }", s"format: csv, $fields }"))
+
+  test("how old a file must be to be taken, and how many one batch takes, have bounds") {
+    fileConnector("min_file_age: 5m, max_files_per_batch: 50").value shouldBe
+      FileConnectorConfig(
+        RelativePath.parse("sales/returns").value,
+        FileConnectorConfig.Format.Csv,
+        None,
+        minFileAge = 5.minutes,
+        maxFilesPerBatch = 50
+      )
+    fileConnector("min_file_age: 1d, max_files_per_batch: 10000").value.maxFilesPerBatch shouldBe
+      10000
+
+    fileErrors("min_file_age: 2d") shouldBe
+      Seq(s"$File: connector.min_file_age is 2d, and the longest it may be is 1d")
+    fileErrors("min_file_age: 60") shouldBe
+      Seq(s"$File: connector.min_file_age has no unit: write it as 500ms, 30s, 10m, 2h or 7d")
+    Seq("0", "10001", "-1", "2.5").foreach { count =>
+      withClue(count)(
+        fileErrors(s"max_files_per_batch: $count") shouldBe
+          Seq(s"$File: connector.max_files_per_batch must be a whole number from 1 to 10000")
+      )
+    }
+    fileErrors("max_files_per_batch: \"50\"") shouldBe Seq(
+      s"$File: connector.max_files_per_batch must be a whole number from 1 to 10000, and is text"
+    )
+  }
+
+  test("a file that may be taken the moment it appears is warned of") {
+    val Loaded(connector, warnings) = fileConnector("min_file_age: 0s")
+    connector.minFileAge shouldBe Duration.Zero
+    warnings.map(_.message) shouldBe Seq(
+      s"$File: connector.min_file_age is 0s: a file that is still being written may be taken, " +
+        "and ingested cut short"
+    )
+  }
+
+  test("how soon a file is taken, and how many at once, are not where the rows come from") {
+    val connector = fileConnector("min_file_age: 5m").value
+    connector.origin shouldBe Seq("path", "pattern")
+    // A file source has its directory to itself, and a JDBC source shares its table.
+    connector.exclusive shouldBe Some("path" -> "sales/returns")
+    Source.load(File, Jdbc).value.value.connector.exclusive shouldBe None
+  }
+
+  test("a source never names a column of the engine where a column of its own goes") {
+    val engine = "is _run_id, which is _run_id: a column that the engine adds to every row, " +
+      "and not one of the source. A source that has a column of that name renames it " +
+      "(schema.renames)"
+    errorsOf(Merged.replace("keys: [order_id]", "keys: [order_id, _run_id]")) shouldBe
+      Seq(s"$File: keys[1] $engine")
+    errorsOf(Merged.replace("column: updated_at", "column: _run_id")) shouldBe
+      Seq(s"$File: load.watermark.column $engine")
+    errorsOf(Merged + "deletes: { strategy: deleted_flag, column: _run_id }\n") shouldBe
+      Seq(s"$File: deletes.column $engine")
+    errorsOf(Merged + "columns: { _run_id: { pii: email } }\n") shouldBe
+      Seq(s"$File: columns._run_id $engine")
+    errorsOf(Merged + "schema: { renames: { run_id: _run_id } }\n") shouldBe
+      Seq(s"$File: schema.renames.run_id $engine")
+    errorsOf(
+      Merged.replace("silver/sales/orders }", "silver/sales/orders, partition_by: [_run_id] }")
+    ) shouldBe Seq(s"$File: targets.silver.partition_by[0] $engine")
+  }
+
+  test("every column of the engine is reserved, case aside, and no other name is") {
+    EngineColumns.All shouldBe Seq(
+      "_run_id",
+      "_batch_seq",
+      "_ingested_at",
+      "_source_file",
+      "_source_id",
+      "_rescued_data"
+    )
+    EngineColumns.All.foreach { column =>
+      withClue(column)(
+        errorsOf(Merged.replace("keys: [order_id]", s"keys: [${column.toUpperCase}]")) shouldBe
+          Seq(
+            s"$File: keys[0] is ${column.toUpperCase}, which is $column, case aside: a column " +
+              "that the engine adds to every row, and not one of the source. A source that has " +
+              "a column of that name renames it (schema.renames)"
+          )
+      )
+    }
+    // A name that starts with an underscore is a source's like any other.
+    Seq("_id", "_run", "run_id", "_source_ids", "__run_id").foreach { name =>
+      withClue(name)(
+        Source.load(File, Merged.replace("keys: [order_id]", s"keys: [$name]")).isRight shouldBe
+          true
+      )
+    }
+  }
+
+  test("a column of the engine may be renamed away, and Silver is partitioned by _source_id") {
+    // The source has a column _run_id of its own: the way out is to rename it.
+    val renamed =
+      Source.load(File, Merged + "schema: { renames: { _run_id: source_run_id } }\n").value.value
+    renamed.schema.renames shouldBe Map("_run_id" -> id("source_run_id"))
+
+    val byWriter = Merged.replace(
+      "silver/sales/orders }",
+      "silver/sales/orders, partition_by: [_source_id] }"
+    )
+    Source.load(File, byWriter).value.value.targets.silver.map(_.partitionBy) shouldBe
+      Some(Vector(id("_source_id")))
+    errorsOf(byWriter.replace("[_source_id]", "[_Source_Id]")) shouldBe Seq(
+      s"$File: targets.silver.partition_by[0] is _Source_Id, which is the engine's _source_id: " +
+        "it is written as the engine writes it"
+    )
+    // Not a key: it is part of every key without being written in one.
+    errorsOf(Merged.replace("keys: [order_id]", "keys: [order_id, _source_id]")) shouldBe Seq(
+      s"$File: keys[1] is _source_id, which is _source_id: a column that the engine adds to " +
+        "every row, and not one of the source. A source that has a column of that name " +
+        "renames it (schema.renames)"
+    )
   }
 }

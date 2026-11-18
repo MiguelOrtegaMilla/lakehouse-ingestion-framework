@@ -1,0 +1,5 @@
+id: shop.late_orders
+connector: { type: file, path: shop/orders/late, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/shop/late_orders }

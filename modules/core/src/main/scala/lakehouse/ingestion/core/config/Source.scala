@@ -491,7 +491,60 @@ object Source {
               "is set, and there is no targets.silver to mask it in"
             )
         } ++ repeated("keys", source.keys) ++
-        silver.toSeq.flatMap(s => repeated("targets.silver.partition_by", s.partitionBy))
+        silver.toSeq.flatMap(s => repeated("targets.silver.partition_by", s.partitionBy)) ++
+        engineColumns(source)
     )
+  }
+
+  /**
+   * The columns of the engine where a column of the source goes (`EngineColumns`): a key that
+   * is the engine's column says nothing of the row, and a column of the source by one of those
+   * names would be two columns of one name in a table. `_source_id` is what a table that
+   * several sources merge into is partitioned by, and is right there, written as the engine
+   * writes it.
+   *
+   * The old name of a rename is the source's, and may be one of them: renaming is the way out
+   * for a source that has such a column (P9).
+   */
+  private def engineColumns(source: Source): Seq[Problem] = {
+    def engines(field: String, name: String): Option[Problem] =
+      EngineColumns.reserved(name).map { column =>
+        val which = if (column == name) column else s"$column, case aside"
+        Problem(
+          field,
+          s"is $name, which is $which: a column that the engine adds to every row, and not one " +
+            "of the source. A source that has a column of that name renames it (schema.renames)"
+        )
+      }
+
+    def named(field: String, names: Vector[SqlIdentifier]): Seq[Problem] =
+      names.zipWithIndex.flatMap { case (name, index) => engines(s"$field[$index]", name.value) }
+
+    val partitions = source.targets.silver.toVector.flatMap(_.partitionBy.zipWithIndex).flatMap {
+      case (name, _) if name.value == EngineColumns.SourceId => None
+      case (name, index) if EngineColumns.reserved(name.value).contains(EngineColumns.SourceId) =>
+        Some(
+          Problem(
+            s"targets.silver.partition_by[$index]",
+            s"is ${name.value}, which is the engine's ${EngineColumns.SourceId}: it is written " +
+              "as the engine writes it"
+          )
+        )
+      case (name, index) => engines(s"targets.silver.partition_by[$index]", name.value)
+    }
+
+    named("keys", source.keys) ++
+      (source.load match {
+        case Load.Incremental(watermark, _) =>
+          engines("load.watermark.column", watermark.column.value)
+        case _ => None
+      }) ++
+      source.deletes.collect { case Deletes.DeletedFlag(column) => column }.flatMap { column =>
+        engines("deletes.column", column.value)
+      } ++
+      source.columns.keys.flatMap(name => engines(s"columns.$name", name)) ++
+      source.schema.renames.toSeq.flatMap { case (old, to) =>
+        engines(s"schema.renames.$old", to.value)
+      } ++ partitions
   }
 }

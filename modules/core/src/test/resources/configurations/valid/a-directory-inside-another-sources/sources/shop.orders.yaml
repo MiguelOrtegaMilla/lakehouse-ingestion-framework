@@ -1,0 +1,6 @@
+# A file source lists its directory and not the ones under it: shop/orders/late is another's.
+id: shop.orders
+connector: { type: file, path: shop/orders, format: csv }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/shop/orders }

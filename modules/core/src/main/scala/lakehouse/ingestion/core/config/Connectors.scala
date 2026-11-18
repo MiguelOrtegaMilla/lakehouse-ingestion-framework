@@ -1,5 +1,7 @@
 package lakehouse.ingestion.core.config
 
+import scala.concurrent.duration._
+
 import cats.syntax.all._
 import io.circe.Json
 import lakehouse.ingestion.core.config.Read.{Obj, Problem, Result}
@@ -28,6 +30,15 @@ trait ConnectorConfig {
    * one of them.
    */
   def origin: Seq[String]
+
+  /**
+   * A place that the source has to itself among the sources of its kind, by the path of its
+   * field in the section and its value: one from which what is read is taken once, so that two
+   * sources that read it would both take the same thing. The directory of a file source is
+   * one: each file is ingested once, by the source whose directory it is in. A table of a
+   * database is not: two sources may read one table, each for its own purpose.
+   */
+  def exclusive: Option[(String, String)] = None
 }
 
 /**
@@ -94,29 +105,70 @@ object JdbcConnector extends ConnectorKind {
 }
 
 /**
- * Files that are left in a directory of the landing zone.
+ * Files that are left in a directory of the landing zone. The directory is listed, and not the
+ * directories under it.
  *
  * @param path the directory, relative to the profile's `landing.root` (ADR-0013 §2)
  * @param pattern which files of the directory, by their name; all of them if it is left out
+ * @param minFileAge how long a file goes unchanged before it is taken as complete: one that is
+ *   still being written would be ingested cut short (ADR-0008, the "complete file" rule)
+ * @param maxFilesPerBatch the most files that one batch takes. A plan names every file of its
+ *   batch, and is written down whole before anything is read (ADR-0005 §3)
  */
 final case class FileConnectorConfig(
     path: RelativePath,
     format: FileConnectorConfig.Format,
-    pattern: Option[FileConnectorConfig.Pattern]
+    pattern: Option[FileConnectorConfig.Pattern],
+    minFileAge: FiniteDuration = FileConnectorConfig.DefaultMinFileAge,
+    maxFilesPerBatch: Int = FileConnectorConfig.DefaultMaxFilesPerBatch
 ) extends ConnectorConfig {
 
   override def kind: String = FileConnector.name
 
+  override def warnings: Seq[Problem] =
+    Option
+      .when(minFileAge == Duration.Zero)(
+        Problem(
+          "connector.min_file_age",
+          "is 0s: a file that is still being written may be taken, and ingested cut short"
+        )
+      )
+      .toSeq
+
   override def canonical: Json = Json.obj(
     "path" -> Json.fromString(path.value),
     "format" -> Json.fromString(format.name),
-    "pattern" -> pattern.fold(Json.Null)(p => Json.fromString(p.value))
+    "pattern" -> pattern.fold(Json.Null)(p => Json.fromString(p.value)),
+    "min_file_age" -> Json.fromString(Durations.render(minFileAge)),
+    "max_files_per_batch" -> Json.fromInt(maxFilesPerBatch)
   )
 
+  /** The directory and the names. How soon a file is taken, and how many at once, are not. */
   override def origin: Seq[String] = Seq("path", "pattern")
+
+  /**
+   * The directory, whatever the pattern: whether two patterns can match one name has an
+   * answer, and code to keep it right that buys nothing (discovery §17, P5). A directory inside
+   * another source's is not this one, and is allowed: neither source lists the other's.
+   */
+  override def exclusive: Option[(String, String)] = Some("path" -> path.value)
 }
 
 object FileConnectorConfig {
+
+  /** Long enough for a copy of a file that is not small, and short for one that waits. */
+  val DefaultMinFileAge: FiniteDuration = 1.minute
+
+  /** A file whose writer stopped for longer than this is not one that is being written. */
+  val MaxMinFileAge: FiniteDuration = 1.day
+
+  val DefaultMaxFilesPerBatch = 1000
+
+  /**
+   * A plan of this many files, each with a name of the longest a name may be, stays well within
+   * what the control plane stores of a plan (8 Mi characters).
+   */
+  val MaxFilesPerBatch = 10000
 
   sealed abstract class Format(val name: String)
 
@@ -170,6 +222,12 @@ object FileConnector extends ConnectorKind {
     (
       section.required("path")(_.text(RelativePath.parse)),
       section.required("format")(_.oneOf(FileConnectorConfig.Format.All.map(f => f.name -> f): _*)),
-      section.optional("pattern")(_.text(FileConnectorConfig.Pattern.parse))
+      section.optional("pattern")(_.text(FileConnectorConfig.Pattern.parse)),
+      section.orElse("min_file_age", FileConnectorConfig.DefaultMinFileAge)(
+        _.duration(Duration.Zero, FileConnectorConfig.MaxMinFileAge)
+      ),
+      section.orElse("max_files_per_batch", FileConnectorConfig.DefaultMaxFilesPerBatch)(
+        _.integer(1, FileConnectorConfig.MaxFilesPerBatch)
+      )
     ).mapN(FileConnectorConfig.apply)
 }

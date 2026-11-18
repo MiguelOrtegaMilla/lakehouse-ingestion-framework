@@ -1,0 +1,5 @@
+id: shop.orders
+connector: { type: file, path: shop/drop, format: csv, pattern: "orders-*.csv" }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/shop/orders }
