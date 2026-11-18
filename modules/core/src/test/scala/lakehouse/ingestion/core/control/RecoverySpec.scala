@@ -39,6 +39,9 @@ final class RecoverySpec extends AnyFunSuite with Matchers with EitherValues {
       asked :+= ((table, app))
       versions.get((table, app))
     }
+    // Recovery decides by the last version alone: where a batch is, is asked after.
+    override def committedAt(table: TableLocation, batch: BatchId): Option[Long] =
+      fail("the decision asked where a batch was committed")
   }
 
   test("with no batch planned there is nothing to recover, and no table is asked") {
