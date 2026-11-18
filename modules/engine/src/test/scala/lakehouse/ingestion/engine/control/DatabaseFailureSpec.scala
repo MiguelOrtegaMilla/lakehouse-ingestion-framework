@@ -20,7 +20,8 @@ final class DatabaseFailureSpec extends AnyFunSuite with Matchers {
       "57P01" -> "the server is being shut down",
       "57P03" -> "the server is starting",
       "57014" -> "the statement ran past its timeout",
-      "40001" -> "the transaction lost to another"
+      "40001" -> "the transaction lost to another",
+      "40P01" -> "the database broke a deadlock by ending this transaction"
     )
     passing.foreach { case (state, what) =>
       withClue(s"$state, $what: ")(DatabaseFailure.mayPass(sql(state)) shouldBe true)

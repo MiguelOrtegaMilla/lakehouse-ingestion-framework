@@ -147,13 +147,27 @@ final class LeasedRun private (
    *   and nothing was changed
    * @throws java.sql.SQLException if the control plane could not be told. The run stays
    *   `RUNNING` and its lease expires: the next run of the source takes it over
+   * @throws java.lang.IllegalStateException if it is to end as succeeded with a batch of its
+   *   sequence planned and not committed: the only way past a batch is `commit`. Nothing was
+   *   changed, and the lease is no longer renewed
    */
   @throws[SQLException]
   def finish(end: RunEnd): Boolean = {
     heartbeat.close()
     database.transaction { connection =>
+      // The lease first, as in every transaction that touches both it and the run. A run that
+      // takes the lease over locks the lease and then ends this run; this one, ending itself
+      // first and giving the lease up after, would wait for it while it waits for this.
+      val held = Leases.holds(connection, start.leaseKey, start.id, epoch)
+      if (held && end.status == RunStatus.Succeeded)
+        Batches.planned(connection, start.txnAppId).foreach { batch =>
+          throw new IllegalStateException(
+            s"the run ${start.id} cannot end as succeeded: the batch ${batch.id} is planned and " +
+              "not committed. A run succeeds past a batch by committing it"
+          )
+        }
       val ended = Runs.end(connection, start.id, end)
-      Leases.release(connection, start.leaseKey, start.id, epoch): Unit
+      if (held) Leases.release(connection, start.leaseKey, start.id, epoch): Unit
       ended
     }
   }

@@ -113,6 +113,61 @@ final class ControlDatabaseSpec
     }
   }
 
+  test("a transaction that ends in an interrupt, or in an error of the JVM, commits nothing") {
+    // Neither is an exception that it is safe to catch, and both leave a transaction half done.
+    // A connection given back with auto-commit turned on commits what is pending on it: what
+    // was written must be taken back first, whatever the transaction ended with.
+    opened() { database =>
+      val before = snapshots(database)
+
+      intercept[InterruptedException] {
+        database.transaction { c =>
+          update(c, insertSnapshot('e')): Unit
+          throw new InterruptedException("the thread was interrupted")
+        }
+      }
+      snapshots(database) shouldBe before
+
+      intercept[LinkageError] {
+        database.transaction { c =>
+          update(c, insertSnapshot('f')): Unit
+          throw new LinkageError("a class that could not be loaded")
+        }
+      }
+      snapshots(database) shouldBe before
+      // And the connection went back to the pool as one that commits each statement by itself.
+      (1 to 4).foreach(_ => database.run(_.getAutoCommit) shouldBe true)
+    }
+  }
+
+  test("a connection that breaks in a transaction is reported as what broke it, and may pass") {
+    opened() { database =>
+      val before = snapshots(database)
+
+      val failure = intercept[SQLException] {
+        database.transaction { c =>
+          update(c, insertSnapshot('9')): Unit
+          // The server closes this very connection, as when it is restarted.
+          val backend = query(c, "SELECT pg_backend_pid()").head.head.toInt
+          Using.resource(pg.connectAsSuperuser(Database)) { s =>
+            query(s, s"SELECT pg_terminate_backend($backend)"): Unit
+          }
+          Thread.sleep(200)
+          update(c, insertSnapshot('8'))
+        }
+      }
+
+      // What the server said, and not what the rollback of a closed connection said after it.
+      failure.getSQLState should (startWith("57P") or startWith("08"))
+      failure.getMessage should not be "Connection is closed"
+      failure.getSuppressed should not be empty
+      DatabaseFailure.mayPass(failure) shouldBe true
+      // Nothing of it stayed, and the pool gives a connection that works.
+      snapshots(database) shouldBe before
+      database.transaction(c => update(c, insertSnapshot('9'))) shouldBe 1
+    }
+  }
+
   test("a statement that runs past its timeout is cancelled by the server, and the pool goes on") {
     opened(control.copy(timeouts = Timeouts(connect = 5.seconds, statement = 1.second))) {
       database =>

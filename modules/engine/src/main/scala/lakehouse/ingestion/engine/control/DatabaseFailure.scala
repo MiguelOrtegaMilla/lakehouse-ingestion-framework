@@ -26,10 +26,12 @@ object DatabaseFailure {
   /**
    * SQLStates of what may pass (discovery §14): a connection that failed or was lost (class
    * 08), a server that is starting or stopping (57P), a statement that was cancelled for
-   * running too long (57014), and a transaction that lost to another (40001).
+   * running too long (57014), and a transaction that lost to another, by a conflict (40001) or
+   * because the database broke a deadlock by ending it (40P01).
    */
   private def passes(state: String): Boolean =
-    state.startsWith("08") || state.startsWith("57P") || state == "57014" || state == "40001"
+    state.startsWith("08") || state.startsWith("57P") || state == "57014" ||
+      state == "40001" || state == "40P01"
 
   /**
    * Whether running again may do, without anybody having changed anything.
