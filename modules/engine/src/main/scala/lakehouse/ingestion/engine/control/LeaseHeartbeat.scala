@@ -97,6 +97,12 @@ final class LeaseHeartbeat(lease: String, timing: LeaseTiming, askedAt: Long, re
   }
 
   /**
+   * The database said that the lease is another's, to something else than a renewal that
+   * asked: the run is told now, and not at the next renewal.
+   */
+  def taken(): Unit = tell(lock.synchronized(if (over) None else lose(LeaseLoss.TakenOver)))
+
+  /**
    * What to do the moment the lease is lost, besides answering `verify`: stop what a run is in
    * the middle of, as the jobs of Spark. It is called once, on a thread of the heartbeat or on
    * the one that found the lease run out; at once, if the lease is lost already.

@@ -113,6 +113,27 @@ object Runs {
     }
 
   /**
+   * Records the batch that a running run has taken on: the one it planned, or the one it found
+   * planned by a run before it. One batch may be the batch of several runs, of which one
+   * commits it.
+   *
+   * @return false if the run was not `RUNNING`, and nothing was changed
+   */
+  @throws[SQLException]
+  def took(connection: Connection, run: RunId, batch: BatchId): Boolean =
+    Using.resource(
+      connection.prepareStatement(
+        "UPDATE control.ingestion_run SET batch_seq = ? " +
+          "WHERE run_id = ? AND txn_app_id = ? AND status = 'RUNNING'"
+      )
+    ) { statement =>
+      statement.setLong(1, batch.seq.value)
+      statement.setObject(2, run.uuid)
+      statement.setString(3, batch.app.value)
+      statement.executeUpdate() == 1
+    }
+
+  /**
    * Marks a run that is running as `ABANDONED`: said by the run that takes over its lease, which
    * expired. The run that held it died, or stopped renewing, and ended halfway without a word.
    *

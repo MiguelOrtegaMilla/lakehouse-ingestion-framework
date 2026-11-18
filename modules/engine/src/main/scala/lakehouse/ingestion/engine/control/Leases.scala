@@ -157,6 +157,31 @@ object Leases {
     }
 
   /**
+   * Whether the lease is `run`'s under `epoch`, with its row locked until the transaction ends.
+   *
+   * It is how a statement that advances the state of a source is made conditional on the epoch
+   * (ADR-0005 §3, step 7): asked first in the transaction, it holds for everything that the
+   * transaction then does. A run that would take the lease over waits for the transaction to
+   * end, and one that already took it has changed the epoch, so the answer is no.
+   *
+   * A lease that has expired and that nobody took is still its holder's: what keeps two runs
+   * apart is whose the row is, and no time.
+   */
+  @throws[SQLException]
+  def holds(connection: Connection, key: LeaseKey, run: RunId, epoch: Epoch): Boolean =
+    Using.resource(
+      connection.prepareStatement(
+        """SELECT 1 FROM control.source_lease
+          | WHERE lease_key = ? AND holder_run_id = ? AND epoch = ? FOR UPDATE""".stripMargin
+      )
+    ) { statement =>
+      statement.setString(1, key.value)
+      statement.setObject(2, run.uuid)
+      statement.setLong(3, epoch.value)
+      Using.resource(statement.executeQuery())(_.next())
+    }
+
+  /**
    * Gives the lease up, if it is still `run`'s under `epoch`: the next run has it at once, and
    * does not wait for it to expire. Its epoch stays, for the next taking to count from.
    *
