@@ -438,6 +438,46 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
     }
   }
 
+  test("a file is taken by a batch that exists, with a size and a time to the millisecond") {
+    val source = newSource()
+    val run = RunId.generate()
+    as(Engine) { c =>
+      snapshot(c)
+      insertRun(c, source, run)()
+      insertBatch(c, source, 1, run)()
+
+      def file(columns: (String, String)*): String =
+        insert(
+          c,
+          "processed_file",
+          Seq(
+            "source_id" -> text(source),
+            "path" -> "'in/a.csv'",
+            "size" -> "10",
+            "modified_at" -> "'2026-11-18T10:00:00.123Z'",
+            "txn_app_id" -> text(s"$source/bronze"),
+            "batch_seq" -> "1"
+          )
+        )(columns: _*)
+
+      file()
+      withClue("the same file again: ")(sqlState(file()) shouldBe UniqueViolation)
+      // Written again under its path, it is another file.
+      file("size" -> "11")
+      file("modified_at" -> "'2026-11-18T10:00:00.124Z'")
+
+      withClue("finer than a millisecond: ")(
+        sqlState(file("modified_at" -> "'2026-11-18T10:00:00.1231Z'")) shouldBe CheckViolation
+      )
+      withClue("a size that is none: ")(
+        sqlState(file("path" -> "'in/b.csv'", "size" -> "-1")) shouldBe CheckViolation
+      )
+      withClue("taken by a batch that is none: ")(
+        sqlState(file("path" -> "'in/c.csv'", "batch_seq" -> "2")) shouldBe ForeignKeyViolation
+      )
+    }
+  }
+
   test("a lease is held whole or not at all, by a run that exists when its transaction ends") {
     val key = s"${newSource()}/bronze"
     as(Engine) { c =>
@@ -498,6 +538,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "DELETE FROM control.config_snapshot",
       "DELETE FROM control.source_state",
       "DELETE FROM control.source_lease",
+      "DELETE FROM control.processed_file",
       "TRUNCATE control.ingestion_run",
       // A run ends, and is counted. Who ran, what, with which configuration and under which
       // epoch never change.
@@ -517,6 +558,10 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "UPDATE control.ingestion_batch SET planned_at = now()",
       // What a run was told is written once.
       "UPDATE control.config_snapshot SET content = '{}'::jsonb",
+      // That a file was taken, and by which batch, is written once: taking it again is an
+      // operator's decision (P7).
+      "UPDATE control.processed_file SET batch_seq = 9",
+      "UPDATE control.processed_file SET size = 0",
       // The schema version is the migrator's to set.
       "INSERT INTO control.schema_version (singleton, version) VALUES (false, 1)",
       "UPDATE control.schema_version SET version = 9",
@@ -544,6 +589,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
     val denied = Seq(
       "SELECT * FROM control.ingestion_run",
       "SELECT * FROM control.source_state",
+      "SELECT * FROM control.processed_file",
       "SELECT version FROM control.schema_version",
       "INSERT INTO control.source_lease (lease_key) VALUES ('test.source/bronze')",
       "UPDATE control.source_lease SET epoch = epoch + 1",

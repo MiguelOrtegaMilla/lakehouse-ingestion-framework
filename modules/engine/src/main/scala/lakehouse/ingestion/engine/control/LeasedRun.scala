@@ -4,8 +4,9 @@ import java.sql.{Connection, SQLException}
 import java.time.Instant
 
 import io.circe.Json
-import lakehouse.ingestion.core.config.ConfigVersion
+import lakehouse.ingestion.core.config.{ConfigVersion, RelativePath}
 import lakehouse.ingestion.core.control._
+import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
 import org.slf4j.LoggerFactory
 
 /**
@@ -72,24 +73,36 @@ final class LeasedRun private (
   }
 
   /**
+   * The files of `directory` with these names that batches of the source have taken: what a
+   * file source plans its next batch without (`FilePlanner`).
+   */
+  @throws[SQLException]
+  def processed(directory: RelativePath, names: Seq[String]): Set[LandedFile] =
+    database.run(ProcessedFiles.among(_, start.source, directory, names))
+
+  /**
    * Commits a batch whose data is in its tables (ADR-0005 §3, steps 7 and 8): moves the state
-   * of the source past it, marks the batch committed with what it wrote, ends the run as
-   * succeeded, and gives the lease up. All of it in one transaction, on condition that the
-   * lease is still this run's under its epoch, or none of it.
+   * of the source past it, records the files it took, marks the batch committed with what it
+   * wrote, ends the run as succeeded, and gives the lease up. All of it in one transaction, on
+   * condition that the lease is still this run's under its epoch, or none of it.
    *
    * @param watermark where the next batch starts from; none, for a source that has none
+   * @param files the plan of the batch, for a file source: its files are recorded as taken. It
+   *   must be the plan that was written down for the batch
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed. The batch is the other run's to finish, and the data that this one wrote is
    *   in the table once all the same, by the number of the batch
    * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
-   *   committed: it is not the planned one, or the state is past it. Nothing was changed
+   *   committed: it is not the planned one, the state is past it, `files` is not its plan, or a
+   *   file of it was taken already. Nothing was changed
    */
   @throws[SQLException]
   def commit(
       batch: BatchId,
       watermark: Option[Json],
       outputs: Seq[BatchOutput],
-      counts: RunCounts = RunCounts.Nothing
+      counts: RunCounts = RunCounts.Nothing,
+      files: Option[FilePlan] = None
   ): Boolean = {
     require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
     // Before the lease stops being renewed: a watermark that cannot be stored is a mistake of
@@ -108,6 +121,20 @@ final class LeasedRun private (
             .advance(connection, start.source, start.layer, watermark, batch.seq, start.id),
           s"the state of ${start.txnAppId} is at this batch already, or past it"
         )
+        files.foreach { plan =>
+          // The files that are recorded are those that the batch read: the plan that was
+          // written down for it, and not what a caller says it was.
+          val written = Batches.planned(connection, start.txnAppId).filter(_.id == batch)
+          must(written.nonEmpty, "it is not a planned batch")
+          must(
+            written.exists(planned => FilePlan.fromJson(planned.plan) == Right(plan)),
+            "the files given are not those of its plan"
+          )
+          must(
+            ProcessedFiles.record(connection, start.source, batch, plan),
+            "a file of its plan was taken by a batch already"
+          )
+        }
         must(Batches.commit(connection, batch, start.id, outputs), "it is not a planned batch")
         must(
           Runs.end(connection, start.id, RunEnd.Succeeded(counts)),
