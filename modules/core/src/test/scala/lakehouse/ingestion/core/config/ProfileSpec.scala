@@ -67,7 +67,7 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
     loaded.left.map(_.toChain.toVector.map(_.message)) shouldBe a[Right[_, _]]
     val profile = loaded.value.value
     loaded.value.warnings shouldBe empty
-    profile.lake.uri.value shouldBe "file:///home/CHANGE_ME/lakehouse/lake"
+    profile.lake.uri.value shouldBe "file:///home/CHANGE_ME/lakehouse-data/lake"
     profile.lake.deployment shouldBe Deployment.SingleMachine
     profile.databases.control.user.value shouldBe "ingest_control"
     profile.databases.coordination.password shouldBe SecretRef.Env("INGEST_COORDINATION_PASSWORD")

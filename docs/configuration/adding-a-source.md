@@ -85,9 +85,9 @@ A configuration that is valid, here the examples of the repository with the exam
 
 ```text
 The configuration is valid: conf/app/local.example.yaml, and 2 sources.
-The lake is file:///home/CHANGE_ME/lakehouse/lake.
-  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  78dd136c673a
-  sales.returns  enabled  file  new_files    bronze/sales/returns                      0e31fa35b306
+The lake is file:///home/CHANGE_ME/lakehouse-data/lake.
+  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  7164d9df522d
+  sales.returns  enabled  file  new_files    bronze/sales/returns                      3aaedd31ad26
 ```
 
 The last column is the start of the hash of the configuration that each source would run with.

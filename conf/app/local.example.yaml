@@ -8,12 +8,15 @@ lake:
   # A directory that lasts, in the Linux file system: never one under /mnt/c, and never /tmp.
   # The coordination database keeps the commits of every table of the lake. If the lake were
   # emptied under it, the LogStore would find those commits missing and refuse to write.
-  uri: "file:///home/CHANGE_ME/lakehouse/lake"
+  # The engine does not make it, nor the landing root: make both once, by hand,
+  #   mkdir -p ~/lakehouse-data/lake ~/lakehouse-data/landing
+  # A root that is missing is more often a disk that is not mounted, and a run refuses it.
+  uri: "file:///home/CHANGE_ME/lakehouse-data/lake"
   deployment: single-machine
 
 landing:
   # Where files to ingest are left. The paths of file sources are relative to it.
-  root: "file:///home/CHANGE_ME/lakehouse/landing"
+  root: "file:///home/CHANGE_ME/lakehouse-data/landing"
 
 databases:
   # One PostgreSQL holds both schemas here, and each has a role of its own (ADR-0003, ADR-0013).
