@@ -63,7 +63,7 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     ran.err shouldBe empty
     val lines = ran.out.linesIterator.toVector
     lines.head shouldBe s"The configuration is valid: $exampleProfile, and 2 sources."
-    lines(1) shouldBe "The lake is file:///home/CHANGE_ME/lakehouse/lake."
+    lines(1) shouldBe "The lake is file:///home/CHANGE_ME/lakehouse-data/lake."
     lines(2) should fullyMatch regex
       """  sales\.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  [0-9a-f]{12}"""
     lines(3) should fullyMatch regex
@@ -137,7 +137,7 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     val profile = write(
       work.resolve("warned/profile.yaml"),
       example("conf/app/local.example.yaml")
-        .replace("file:///home/CHANGE_ME/lakehouse/lake", "file:///tmp/lake")
+        .replace("file:///home/CHANGE_ME/lakehouse-data/lake", "file:///tmp/lake")
     )
 
     val ran = run("validate", "--profile", profile.toString, "--sources", exampleSources)
