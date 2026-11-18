@@ -157,7 +157,8 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
       3 -> "transient failure",
       4 -> "permanent failure",
       5 -> "data threshold exceeded",
-      64 -> "usage error"
+      64 -> "usage error",
+      70 -> "internal error"
     )
     Main.Exit.All.map(_._1).distinct should have size Main.Exit.All.size.toLong
     // A command line that is wrong must not look like a lease that is taken, which an
@@ -165,6 +166,8 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
     Main.Exit.Usage should not be Main.Exit.SkippedLocked
     (Main.Exit.Ok, Main.Exit.SkippedLocked, Main.Exit.Transient) shouldBe ((0, 2, 3))
     (Main.Exit.Permanent, Main.Exit.DataThreshold, Main.Exit.Usage) shouldBe ((4, 5, 64))
+    // Decided for P8, and here already so that nothing else takes the number.
+    Main.Exit.Internal shouldBe 70
   }
 
   test("the usage says which code is which") {
