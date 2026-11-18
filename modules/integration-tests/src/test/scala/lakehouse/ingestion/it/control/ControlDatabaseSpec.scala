@@ -8,7 +8,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.cli.Main
 import lakehouse.ingestion.core.config.{DatabaseConnection, PostgresUrl, SecretResolver, Timeouts}
-import lakehouse.ingestion.engine.control.{ControlDatabase, DatabaseFailure}
+import lakehouse.ingestion.engine.control.{ControlDatabase, ControlSchema, DatabaseFailure}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, ControlPlaneSchema}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.{BeforeAndAfterAll, EitherValues}
@@ -225,14 +225,14 @@ final class ControlDatabaseSpec
         update(c, s"UPDATE control.schema_version SET version = $version") shouldBe 1: Unit
       }
 
-    setVersion(2)
+    setVersion(ControlSchema.Version + 1)
     try {
       val failure = ControlDatabase.open(control, secrets).left.value
       failure shouldBe a[DatabaseFailure.Refused]
       failure.message should include(
-        "is at version 2, and this application was built for version 1"
+        "is at version 3, and this application was built for version 2"
       )
-    } finally setVersion(1)
+    } finally setVersion(ControlSchema.Version)
     opened()(one(_, "SELECT 1") shouldBe "1")
   }
 

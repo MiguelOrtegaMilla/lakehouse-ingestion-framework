@@ -161,7 +161,7 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 ```
 
 ```text
-control: version 1, 1 migration applied (jdbc:postgresql://localhost:5432/ingestion_control)
+control: version 2, 2 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 delta_coordination: version 3, 3 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 
