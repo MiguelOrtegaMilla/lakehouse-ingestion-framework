@@ -200,13 +200,22 @@ object ConfigVersion {
       path.foldLeft(content.hcursor: ACursor)(_.downField(_)).focus.filterNot(_.isNull)
     def shown(value: Json): String = value.asString.getOrElse(value.noSpaces)
 
-    /** A field that both have, with two values. */
-    def changed(consequence: String, path: String*): Option[BreakingChange] =
+    /** A field that both have, with two values that are not the `same`. */
+    def differs(
+        same: (Json, Json) => Boolean
+    )(consequence: String, path: String*): Option[BreakingChange] =
       for {
         was <- at(last, path: _*)
         is <- at(now.content, path: _*)
-        if was != is
+        if !same(was, is)
       } yield BreakingChange(path.head, path.tail.mkString("."), shown(was), shown(is), consequence)
+
+    def changed(consequence: String, path: String*): Option[BreakingChange] =
+      differs(_ == _)(consequence, path: _*)
+
+    /** A key is its columns, in whatever order a file lists them. */
+    def sameColumns(was: Json, is: Json): Boolean =
+      was.asArray.map(_.toSet) == is.asArray.map(_.toSet)
 
     val incremental = Some(Json.fromString(Load.Mode.Incremental.name))
     val byWatermark =
@@ -253,7 +262,7 @@ object ConfigVersion {
         .flatten,
       Option
         .when(mergedBefore)(
-          changed(
+          differs(sameColumns)(
             "the rows already in Silver were merged by the old key, and would not be found by the new one",
             "source",
             "keys"

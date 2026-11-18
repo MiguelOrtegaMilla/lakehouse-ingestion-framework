@@ -326,6 +326,13 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
   test("a mask needs Silver to be applied in") {
     errorsOf(Jdbc + "columns:\n  email: { pii: email, silver: { mask: hmac } }\n") shouldBe
       Seq(s"$File: columns.email.silver.mask is set, and there is no targets.silver to mask it in")
+    // Every column that is masked is said, not the first alone.
+    errorsOf(
+      Jdbc + "columns:\n  phone: { silver: { mask: redact } }\n  email: { pii: email, silver: { mask: hmac } }\n"
+    ) shouldBe Seq(
+      s"$File: columns.email.silver.mask is set, and there is no targets.silver to mask it in",
+      s"$File: columns.phone.silver.mask is set, and there is no targets.silver to mask it in"
+    )
     // Tagging a column is not masking it: Bronze alone may say what it holds.
     Source
       .load(File, Jdbc + "columns:\n  email: { pii: email }\n")

@@ -481,15 +481,16 @@ object Source {
             "deletes",
             "is set, and there is no targets.silver: deletes are marked in Silver (ADR-0009)"
           )
-        },
-        source.columns.collectFirst {
+        }
+      ).flatten ++
+        // Every column that is masked, not the first alone: a file's mistakes are all said.
+        source.columns.toSeq.collect {
           case (name, ColumnSpec(_, Some(_))) if silver.isEmpty =>
             Problem(
               s"columns.$name.silver.mask",
               "is set, and there is no targets.silver to mask it in"
             )
-        }
-      ).flatten ++ repeated("keys", source.keys) ++
+        } ++ repeated("keys", source.keys) ++
         silver.toSeq.flatMap(s => repeated("targets.silver.partition_by", s.partitionBy))
     )
   }

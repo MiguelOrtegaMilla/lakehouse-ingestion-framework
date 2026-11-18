@@ -174,7 +174,7 @@ object Profile {
     ).mapN((master, settings) => Spark(master, SortedMap.from(settings)))
 
   private def sparkSetting(key: String, value: Node): Result[(String, String)] = {
-    val lower = key.toLowerCase
+    val lower = key.toLowerCase(java.util.Locale.ROOT)
     if (!key.startsWith("spark."))
       value.fail("is not a Spark setting: its key must start with spark.")
     else if (key == "spark.master") value.fail("is set by the field master of this profile")

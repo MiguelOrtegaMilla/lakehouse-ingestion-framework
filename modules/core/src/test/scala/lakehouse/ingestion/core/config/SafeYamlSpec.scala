@@ -293,6 +293,27 @@ final class SafeYamlSpec extends AnyFunSuite with Matchers with EitherValues {
     refusal.message should include("line 2")
   }
 
+  test("a file as an editor on any system saves it is read: a byte order mark, CRLF line ends") {
+    val expected = obj("id" -> str("sales.orders"), "keys" -> Json.arr(str("order_id")))
+
+    SafeYaml.parse("\uFEFFid: sales.orders\nkeys: [order_id]\n").value shouldBe expected
+    SafeYaml.parse("id: sales.orders\r\nkeys: [order_id]\r\n").value shouldBe expected
+    SafeYaml.parse("id: sales.orders   \nkeys: [order_id]\n\n\n").value shouldBe expected
+  }
+
+  test("a character that is no text is refused: a NUL, a bell, a tab that indents") {
+    SafeYaml.parse("id: sales\u0000orders\n").left.value shouldBe a[Malformed]
+    SafeYaml.parse("id: sales\u0007orders\n").left.value shouldBe a[Malformed]
+    val tab = SafeYaml.parse("load:\n\tmode: full\n").left.value
+    tab shouldBe a[Malformed]
+    tab.message should include("line 2, column 1")
+  }
+
+  test("a directive does not change how a document is read") {
+    // A file that declares YAML 1.1 is read as every other: `yes` is text.
+    SafeYaml.parse("%YAML 1.1\n---\nenabled: yes\n").value shouldBe obj("enabled" -> str("yes"))
+  }
+
   test("a refusal says what is wrong and where") {
     DuplicateKey("id", Some(Position(3, 1))).message shouldBe
       "the key 'id' appears twice in one mapping (line 3, column 1)"

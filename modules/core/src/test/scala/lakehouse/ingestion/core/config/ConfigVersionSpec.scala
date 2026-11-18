@@ -377,6 +377,24 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     fields(version(), feed("https://a.example/orders", "T1")) shouldBe Seq("connector.type")
   }
 
+  test("a key is its columns, in whatever order a file lists them") {
+    val two = changed(SourceText, "keys: [order_id]", "keys: [order_id, line]")
+    val swapped = changed(SourceText, "keys: [order_id]", "keys: [line, order_id]")
+
+    // Another order is another text, and so another hash: the content is what was written.
+    version(swapped).hash should not be version(two).hash
+    // It is the same key: what was merged by it is found by it.
+    breaking(version(swapped), last = version(two)) shouldBe empty
+    breaking(version(two), last = version(swapped)) shouldBe empty
+    // A partitioning, though, is its columns in their order: that is how a table is laid out.
+    val byDayThenShop =
+      changed(SourceText, "partition_by: [order_day]", "partition_by: [order_day, shop]")
+    val byShopThenDay =
+      changed(SourceText, "partition_by: [order_day]", "partition_by: [shop, order_day]")
+    breaking(version(byShopThenDay), last = version(byDayThenShop)).map(_.take(28)) shouldBe
+      Seq("targets.silver.partition_by ")
+  }
+
   test("every breaking change of a configuration is said, not the first alone") {
     val now = version(
       changed(
