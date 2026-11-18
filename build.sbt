@@ -86,7 +86,15 @@ lazy val engine = module("engine", artifact = "engine")
 /** Entry point, argument parsing, wiring, exit codes. */
 lazy val cli = module("cli", artifact = "cli")
   .dependsOn(engine)
-  .settings(rules(forbidden = Nil))
+  .settings(
+    rules(forbidden = Nil),
+    libraryDependencies += scalatest,
+    Compile / mainClass := Some("lakehouse.ingestion.cli.Main"),
+    // `sbt "cli/run validate …"`: a process of its own, so that its exit code is the command's
+    // and not the end of sbt, started where sbt was, so that paths are those of the repository.
+    run / fork := true,
+    run / baseDirectory := (LocalRootProject / baseDirectory).value
+  )
 
 /**
  * Stress runs (the LogStore spikes, ADR-0004 §7.3): tests tagged `StressTest`. They take minutes

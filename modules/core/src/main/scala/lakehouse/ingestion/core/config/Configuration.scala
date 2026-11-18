@@ -30,24 +30,42 @@ object Configuration {
       profile: File,
       sources: Seq[File],
       kinds: Seq[ConnectorKind] = ConnectorKind.BuiltIn
+  ): Either[NonEmptyChain[ConfigError], Loaded[Configuration]] =
+    load(Some(profile), sources, Chain.empty, kinds)
+
+  /**
+   * As `load`, for files of which some could not be read at all. Those that could are read and
+   * validated all the same, so that what is wrong in them is said with what could not be read.
+   *
+   * @param profile `None` if the file of the profile could not be read
+   * @param unread why each file that could not be read was not
+   */
+  private[config] def load(
+      profile: Option[File],
+      sources: Seq[File],
+      unread: Chain[ConfigError],
+      kinds: Seq[ConnectorKind]
   ): Either[NonEmptyChain[ConfigError], Loaded[Configuration]] = {
-    val readProfile = Profile.load(profile.name, profile.text)
+    val readProfile = profile.map(file => Profile.load(file.name, file.text))
     val readSources =
       sources.sortBy(_.name).map(file => file.name -> Source.load(file.name, file.text, kinds))
     val valid = readSources.collect { case (name, Right(loaded)) => name -> loaded.value }.toVector
 
     val errors =
-      Chain.fromSeq(readProfile.left.toSeq.flatMap(_.toChain.toList)) ++
+      unread ++
+        Chain.fromSeq(readProfile.toSeq.flatMap(_.left.toSeq.flatMap(_.toChain.toList))) ++
         Chain.fromSeq(readSources.flatMap(_._2.left.toSeq.flatMap(_.toChain.toList))) ++
         across(valid)
 
     (readProfile, NonEmptyChain.fromChain(errors)) match {
-      case (Right(loaded), None) =>
+      case (Some(Right(loaded)), None) =>
         val warnings = loaded.warnings ++ readSources.flatMap(_._2.toSeq.flatMap(_.warnings))
         Right(Loaded(Configuration(loaded.value, valid.map(_._2).sortBy(_.id.value)), warnings))
       case (_, Some(found)) => Left(found)
-      // Not reached: the errors of a profile that is not valid are among those above.
-      case (Left(found), None) => Left(found)
+      // Not reached: a profile that is missing or not valid has its error among those above.
+      case (Some(Left(found)), None) => Left(found)
+      case (None, None) =>
+        Left(NonEmptyChain.one(ConfigError("the profile", None, "was not read")))
     }
   }
 
