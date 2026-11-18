@@ -185,10 +185,40 @@ object FileConnectorConfig {
    * run of characters and for any one. It has no `/`, so it never leads out of its directory.
    */
   final class Pattern private (val value: String) extends AnyVal {
+
+    /**
+     * Whether `name` is one of the files of the pattern: the whole name, character for
+     * character, with `*` for any run of characters, none included, and `?` for any one. A
+     * character is a code point, and case counts.
+     */
+    def matches(name: String): Boolean =
+      Pattern.matches(value.codePoints.toArray, name.codePoints.toArray)
+
     override def toString: String = value
   }
 
   object Pattern {
+
+    /**
+     * The usual match of a glob without classes: it goes forward, and on a mismatch it goes back
+     * to the last `*` and lets it take one character more. Each `*` is gone back to at most once
+     * for each character of the name, so it takes time of the length of the name times the
+     * length of the pattern, and never more, whatever the name is.
+     */
+    private def matches(pattern: Array[Int], name: Array[Int]): Boolean = {
+      // p, n: where the pattern and the name are; star: the last `*` seen, and the place in the
+      // name that it was taking from.
+      @scala.annotation.tailrec
+      def go(p: Int, n: Int, star: Int, from: Int): Boolean =
+        if (n < name.length) {
+          if (p < pattern.length && (pattern(p) == '?' || pattern(p) == name(n)))
+            go(p + 1, n + 1, star, from)
+          else if (p < pattern.length && pattern(p) == '*') go(p + 1, n, p, n)
+          else if (star >= 0) go(star + 1, from + 1, star, from + 1)
+          else false
+        } else pattern.drop(p).forall(_ == '*')
+      go(0, 0, -1, 0)
+    }
 
     private def allowed(c: Int): Boolean =
       (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
