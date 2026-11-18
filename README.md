@@ -83,6 +83,8 @@ GitHub Actions ([`ci.yml`](.github/workflows/ci.yml)) runs on every push to `mai
 
 The stress runs have a workflow of their own ([`stress.yml`](.github/workflows/stress.yml)), on demand and every Monday, and not on pull requests: they take more than an hour and are evidence under load, not a gate. It runs `scripts/stress-logstore.sh` with the natural race at eight writers and 500 commits each, shows what each run's verifier found in the job summary, and keeps every report as an artifact. A change to the LogStore is run through it by hand, on its branch, before it is merged.
 
+Every job that runs sbt is set up by one local action ([`setup-build`](.github/actions/setup-build/action.yml)): the JDK, sbt, and the cache of what sbt downloads. The cache is found by the hash of the build definition, or failing that by the newest there is, so a change to the build downloads what it changed and not everything again. The job that runs the tests saves it; the others read it. What is left to download is asked of Maven Central through `scripts/retry-on-429.sh`, which waits and tries again if the answer is 429 (Too Many Requests), and only then: any other failure is the build's own.
+
 The workflow token is read-only; only the submission job may write, to the dependency graph. Dependabot proposes updates for the pinned actions. The security baseline behind these checks is [ADR-0013](docs/adr/0013-application-security-baseline.md) §4–5.
 
 ```bash

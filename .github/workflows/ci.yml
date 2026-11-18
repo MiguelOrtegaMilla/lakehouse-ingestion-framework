@@ -41,6 +41,10 @@ jobs:
       - uses: ./.github/actions/setup-build
         with:
           save-cache: "true"
+      # sbt itself, the plugins and every library, before anything is compiled: the one step
+      # that needs Maven Central, and the one that is tried again if it answers 429.
+      - name: Resolve the build
+        run: scripts/retry-on-429.sh sbt -batch update
       # Unit and integration tests. The integration tests start PostgreSQL with Testcontainers
       # (Docker is on the runner). Stress runs are tagged and left out (`sbt stress`).
       - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries Test/compile test
@@ -73,11 +77,12 @@ jobs:
       # The same setup, and the same cache, as the job that runs the tests. It reads the cache
       # and does not save it: that job's is the whole one.
       - uses: ./.github/actions/setup-build
-      - name: Test the manifest merge
+      - name: Test the scripts
         run: python3 -I -B -m unittest discover -s scripts
       # One manifest for the whole build: per-project manifests all point at build.sbt, and
       # dependency review then saw unchanged libraries as removed and added
-      # (scripts/merge_dependency_manifests.py).
+      # (scripts/merge_dependency_manifests.py). The script resolves the build, and tries again
+      # if Maven Central answers 429 (scripts/retry-on-429.sh).
       - name: Generate the dependency snapshot
         env:
           # On a pull request GITHUB_SHA is the merge commit; dependency review looks up the head.
