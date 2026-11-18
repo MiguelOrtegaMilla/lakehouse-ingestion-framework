@@ -14,8 +14,11 @@
 # The command's output, both streams, goes to standard output; what this script says, to
 # standard error. The exit code is that of the last attempt.
 # Environment:
-#   RETRY_WAITS  the seconds to wait before each further attempt, which is also how many
-#                there are (default "30 60 120": four attempts, three and a half minutes)
+#   RETRY_WAITS     the seconds to wait before each further attempt, which is also how many
+#                   there are (default "30 60 120": four attempts, three and a half minutes)
+#   RETRY_SBT_OPTS  if set, the attempts after the first are run with SBT_OPTS set to it: for
+#                   sbt, another order of repositories, with a mirror before the one that
+#                   answered 429. Waiting is then not all there is to try
 set -uo pipefail
 
 if (($# == 0)); then
@@ -57,4 +60,7 @@ while true; do
   [[ "${GITHUB_ACTIONS:-}" == "true" ]] && echo "::warning title=Rate limited by the repository::$message"
   sleep "$wait"
   attempt=$((attempt + 1))
+  if [[ -n "${RETRY_SBT_OPTS:-}" ]]; then
+    export SBT_OPTS="$RETRY_SBT_OPTS"
+  fi
 done

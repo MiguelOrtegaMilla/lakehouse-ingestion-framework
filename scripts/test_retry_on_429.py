@@ -32,6 +32,7 @@ class RetryOn429Test(unittest.TestCase):
                     runs=$(($(cat "$COUNT" 2>/dev/null || echo 0) + 1))
                     echo "$runs" >"$COUNT"
                     echo "attempt $runs with $*"
+                    echo "SBT_OPTS=${SBT_OPTS-unset}"
                     if ((runs <= FAILURES)); then
                       echo "$SAYS" >&2
                       exit "$EXIT_CODE"
@@ -67,7 +68,9 @@ class RetryOn429Test(unittest.TestCase):
         self.assertEqual(ran.returncode, 0)
         self.assertEqual(self.runs(), 1)
         # Its arguments reach it as they were given, and its output is passed on.
-        self.assertEqual(ran.stdout, "attempt 1 with update two words\ndone\n")
+        self.assertEqual(
+            ran.stdout, "attempt 1 with update two words\nSBT_OPTS=unset\ndone\n"
+        )
         self.assertEqual(ran.stderr, "")
 
     def test_a_429_is_waited_out_and_the_command_run_again(self):
@@ -141,6 +144,31 @@ class RetryOn429Test(unittest.TestCase):
 
         self.assertEqual(ran.returncode, 0)
         self.assertIn("::warning title=Rate limited by the repository::", ran.stdout)
+
+    def test_the_attempts_after_a_429_are_run_with_other_options_of_sbt_if_there_are(self):
+        ran = self.run_script(
+            self.command(2, JDK_429), SBT_OPTS="-Dfirst=1", RETRY_SBT_OPTS="-Dmirror=first -Dx=2"
+        )
+
+        self.assertEqual(ran.returncode, 0)
+        options = [line for line in ran.stdout.splitlines() if line.startswith("SBT_OPTS=")]
+        # The first attempt as it was asked, and every one after it with the others.
+        self.assertEqual(
+            options,
+            ["SBT_OPTS=-Dfirst=1", "SBT_OPTS=-Dmirror=first -Dx=2", "SBT_OPTS=-Dmirror=first -Dx=2"],
+        )
+
+    def test_without_other_options_every_attempt_is_run_as_the_first(self):
+        ran = self.run_script(self.command(1, JDK_429), SBT_OPTS="-Dfirst=1")
+
+        options = [line for line in ran.stdout.splitlines() if line.startswith("SBT_OPTS=")]
+        self.assertEqual(options, ["SBT_OPTS=-Dfirst=1", "SBT_OPTS=-Dfirst=1"])
+
+    def test_a_command_that_succeeds_is_never_run_with_the_other_options(self):
+        ran = self.run_script(self.command(0, ""), SBT_OPTS="-Dfirst=1", RETRY_SBT_OPTS="-Dmirror=first")
+
+        self.assertIn("SBT_OPTS=-Dfirst=1", ran.stdout)
+        self.assertNotIn("mirror", ran.stdout)
 
     def test_what_is_not_a_use_of_it_is_refused(self):
         self.assertEqual(self.run_script().returncode, 2)

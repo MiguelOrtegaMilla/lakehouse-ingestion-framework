@@ -2,8 +2,8 @@
 # Writes the dependency snapshot that CI submits to GitHub's dependency graph (ADR-0013 §4).
 #
 # The graph is resolved by the Scala Center's sbt-github-dependency-submission plugin, the same one
-# the scalacenter/sbt-dependency-submission action runs, and is added to the build only for this
-# run, as the action does. Its per-project manifests are then merged into one
+# the scalacenter/sbt-dependency-submission action runs. It is one of the plugins of the build
+# (project/plugins.sbt). Its per-project manifests are then merged into one
 # (merge_dependency_manifests.py explains why).
 #
 # Usage: scripts/dependency-snapshot.sh <output.json>
@@ -14,8 +14,6 @@
 #                        correlator replaces the previous one instead of adding to it
 set -euo pipefail
 
-plugin_version='3.2.2'
-
 out="${1:?usage: scripts/dependency-snapshot.sh <output.json>}"
 : "${SNAPSHOT_SHA:?}" "${SNAPSHOT_REF:?}" "${SNAPSHOT_CORRELATOR:?}"
 [[ "$SNAPSHOT_CORRELATOR" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid SNAPSHOT_CORRELATOR" >&2; exit 2; }
@@ -24,13 +22,10 @@ out="$(realpath -m "$out")"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 
-plugin_file='project/zz-dependency-submission.sbt'
 outputs="$(mktemp)"
 raw=''
-cleanup() { rm -f "$plugin_file" "$outputs" ${raw:+"$raw"}; }
+cleanup() { rm -f "$outputs" ${raw:+"$raw"}; }
 trap cleanup EXIT
-
-printf 'addSbtPlugin("ch.epfl.scala" %% "sbt-github-dependency-submission" %% "%s")\n' "$plugin_version" >"$plugin_file"
 
 # The plugin takes the commit and ref from GITHUB_SHA and GITHUB_REF, and reports the path of the
 # snapshot it writes through GITHUB_OUTPUT. These are set for sbt only.
