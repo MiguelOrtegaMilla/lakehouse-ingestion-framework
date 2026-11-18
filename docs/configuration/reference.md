@@ -156,6 +156,8 @@ A table of a relational database. PostgreSQL, for now. It loads by `full` or by 
 
 Files that are left in a directory of the landing zone. It loads by `new_files`. The directory is listed, and not the directories under it; a file whose name starts with `.` or `_` is never taken.
 
+A file is taken once, and is known by its name, its size and when it was last changed. **A file that is written again under the same name is another file, and is ingested again, whole, into Bronze**, as is one that is only touched: Bronze keeps what was received, and does not compare a file with another. The rows that the two have in common are then in Bronze twice, each with its batch, and it is Silver that keeps one of them, by `keys`. A producer that corrects a file writes a new one; one that appends to a file it already left makes its rows arrive twice.
+
 <!-- fields: connector file -->
 | Field | Takes | Left out |
 |---|---|---|
