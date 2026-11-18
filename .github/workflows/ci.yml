@@ -37,14 +37,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The JDK comes from .sdkmanrc, the same pin as local development.
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+      # The JDK, sbt, and the cache of what sbt downloads. This job is the one that saves it.
+      - uses: ./.github/actions/setup-build
         with:
-          distribution: temurin
-          java-version-file: .sdkmanrc
-          cache: sbt
-      # The sbt launcher; the build's sbt version comes from project/build.properties.
-      - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+          save-cache: "true"
       # Unit and integration tests. The integration tests start PostgreSQL with Testcontainers
       # (Docker is on the runner). Stress runs are tagged and left out (`sbt stress`).
       - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries Test/compile test
@@ -74,12 +70,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version-file: .sdkmanrc
-          cache: sbt
-      - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+      # The same setup, and the same cache, as the job that runs the tests. It reads the cache
+      # and does not save it: that job's is the whole one.
+      - uses: ./.github/actions/setup-build
       - name: Test the manifest merge
         run: python3 -I -B -m unittest discover -s scripts
       # One manifest for the whole build: per-project manifests all point at build.sbt, and

@@ -51,13 +51,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The JDK comes from .sdkmanrc, the same pin as local development.
-      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
-        with:
-          distribution: temurin
-          java-version-file: .sdkmanrc
-          cache: sbt
-      - uses: sbt/setup-sbt@b113b960ba361e87e08ce02a390d51871b7ee459 # v1.5.13
+      # The JDK, sbt, and the cache that the tests of ci.yml save.
+      - uses: ./.github/actions/setup-build
       # The four suites: Delta's default LogStore (RED), where a lost commit is the expected
       # result, and PostgresLogStore (GREEN) with its kills and its outage of PostgreSQL.
       - name: Stress runs
