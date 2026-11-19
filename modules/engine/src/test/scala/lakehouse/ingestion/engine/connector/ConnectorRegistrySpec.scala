@@ -134,5 +134,9 @@ object ConnectorRegistrySpec {
 
     override def read(source: Source, config: Says, plan: Json, context: ReadContext): ReadResult =
       throw new UnsupportedOperationException("not read here")
+
+    /** A source that says one thing has nothing to move: no watermark, and no files. */
+    override def progress(source: Source, config: Says, plan: Json): Progress =
+      Progress(watermark = None, files = None)
   }
 }

@@ -373,8 +373,9 @@ final class LandingSpec
     landingZone.confirm(config(), plan).value.identities shouldBe Vector(identityOf(a))
 
     write(a, bytes = 6)
-    landingZone.confirm(config(), plan).left.value shouldBe
-      Vector("'a.csv' is of 6 bytes, and was of 5")
+    val changed = landingZone.confirm(config(), plan).left.value
+    changed shouldBe Vector(Landing.NotAsPlanned("a.csv", "is of 6 bytes, and was of 5"))
+    changed.map(_.toString) shouldBe Vector("'a.csv' is of 6 bytes, and was of 5")
   }
 
   test(
@@ -395,9 +396,12 @@ final class LandingSpec
     Files.delete(orders.resolve("b.csv"))
 
     landingZone.confirmAgain(config(), plan, before).left.value shouldBe Vector(
-      s"'a.csv' is another file of the file system than the one that was read (${identityOf(a)}, " +
-        s"and was $was)",
-      "'b.csv' is not there any more, or is a directory now"
+      Landing.NotAsPlanned(
+        "a.csv",
+        s"is another file of the file system than the one that was read (${identityOf(a)}, " +
+          s"and was $was)"
+      ),
+      Landing.NotAsPlanned("b.csv", "is not there any more, or is a directory now")
     )
   }
 

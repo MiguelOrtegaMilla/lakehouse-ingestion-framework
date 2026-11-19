@@ -96,6 +96,20 @@ final class AConnectorOfItsOwnSpec
 
     failure.failure shouldBe FailureClass.Permanent
   }
+
+  test("what the commit of a plan records is said by its connector, from the plan alone") {
+    val bound = registry.bind(numbers)
+    val plan = bound.plan(planContext(watermark = Some(Json.fromLong(3)))).value
+
+    // Where the next batch starts from, which the engine keeps and gives back (`PlanContext`).
+    bound.progress(plan) shouldBe Progress(watermark = Some(Json.fromLong(6)), files = None)
+    bound.progress(plan).bytes shouldBe None
+    val next = bound.plan(planContext(watermark = bound.progress(plan).watermark)).value
+    ids(bound.read(next, ReadContext(spark))) shouldBe Seq(6L, 7L, 8L)
+
+    (the[RunFailedException] thrownBy bound.progress(Json.obj())).failure shouldBe
+      FailureClass.Permanent
+  }
 }
 
 object AConnectorOfItsOwnSpec {
@@ -136,16 +150,24 @@ object AConnectorOfItsOwnSpec {
         plan: Json,
         context: ReadContext
     ): ReadResult = {
+      val (from, to) = rangeOf(source, plan)
+      ReadResult(context.spark.range(from, to).toDF("id"), unparsed = None)
+    }
+
+    /** The next batch counts on from where this one ends. */
+    override def progress(source: Source, config: Counting, plan: Json): Progress =
+      Progress(watermark = Some(Json.fromLong(rangeOf(source, plan)._2)), files = None)
+
+    private def rangeOf(source: Source, plan: Json): (Long, Long) = {
       val at = plan.hcursor
       val range = (
         at.get[Int]("version").toOption.filter(_ == 1),
         at.get[Long]("from").toOption,
         at.get[Long]("to").toOption
       ).mapN((_, from, to) => (from, to))
-      val (from, to) = range.getOrElse(
+      range.getOrElse(
         throw RunFailedException.permanent(s"the plan of ${source.id} is not of version 1")
       )
-      ReadResult(context.spark.range(from, to).toDF("id"), unparsed = None)
     }
   }
 }
