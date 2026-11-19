@@ -14,6 +14,7 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
 
   private var registrations = Map.empty[TableUri, Registration]
   private var entries = Map.empty[(TableUri, Long), CommitEntry]
+  private var epochs = Map.empty[String, Long]
   private var lastGeneration = 0L
 
   /** A generation that no registration of this registry has had. Called under the lock. */
@@ -54,26 +55,39 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
 
   override def take(claim: Claim): TakeResult = synchronized {
     val key = (claim.table, claim.version)
-    registrations.get(claim.table) match {
-      case None => TakeResult.NotRegistered
-      case Some(registration) =>
-        entries.get(key) match {
-          case Some(owner) if owner.tempPath == claim.tempPath => TakeResult.Taken
-          case Some(owner) => TakeResult.TakenBy(owner)
-          case None if registration.generation != claim.generation =>
-            TakeResult.RegistrationChanged
-          case None =>
-            entries += key -> CommitEntry(
-              claim.table,
-              claim.version,
-              claim.tempPath,
-              complete = false,
-              claim.writerInstance,
-              claim.runId
-            )
-            TakeResult.Taken
-        }
-    }
+    val owner = entries.get(key)
+    val outOfTurn = claim.epoch.filterNot(epoch => epochs.get(epoch.key).contains(epoch.epoch))
+    // A version that is the claim's already is its own whatever was announced since; and a
+    // claim out of its turn is told so before anything else.
+    if (owner.exists(_.tempPath == claim.tempPath)) TakeResult.Taken
+    else if (outOfTurn.nonEmpty)
+      TakeResult.EpochNotInForce(outOfTurn.flatMap(e => epochs.get(e.key)))
+    else
+      registrations.get(claim.table) match {
+        case None => TakeResult.NotRegistered
+        case Some(registration) =>
+          owner match {
+            case Some(other) => TakeResult.TakenBy(other)
+            case None if registration.generation != claim.generation =>
+              TakeResult.RegistrationChanged
+            case None =>
+              entries += key -> CommitEntry(
+                claim.table,
+                claim.version,
+                claim.tempPath,
+                complete = false,
+                claim.writerInstance,
+                claim.runId
+              )
+              TakeResult.Taken
+          }
+      }
+  }
+
+  override def announce(epoch: WriterEpoch): Long = synchronized {
+    val inForce = math.max(epochs.getOrElse(epoch.key, 0L), epoch.epoch)
+    epochs += epoch.key -> inForce
+    inForce
   }
 
   override def complete(table: TableUri, version: Long, tempPath: String): Boolean =

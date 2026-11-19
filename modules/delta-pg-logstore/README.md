@@ -52,6 +52,17 @@ commits.contention          // versions lost to other writers
 commits.contentionAtInsert  // of them, the ones lost while both were committing the version
 ```
 
+**Epochs** (optional, ADR-0019). An application that lets one writer at a time do some work, and numbers the writers that take it over, can have the LogStore hold each writer to its turn. The writer announces its epoch before it asks a table anything, and commits inside a context that names it:
+
+```scala
+val turn = WriterEpoch("sales.orders/bronze", leaseEpoch)
+if (WriterEpochs.announce(spark.sessionState.newHadoopConf(), turn) != turn.epoch) stop() // a later one is in force
+val commits = CommitContext.forRun(runId, turn)
+commits.attribute { rows.write.format("delta").mode("append").save(path) }
+```
+
+A commit made in such a context takes its version only while its epoch is the one in force under its key. Otherwise it is refused with `EpochNotInForceException`, which is not retried, by the LogStore or by Delta: the writer has lost its turn. A claim and an announcement of one key exclude each other in the database, so once an announcement has returned, a commit under an earlier epoch is either recorded, where the next reader of the table finds it, or will never be. A commit that names no epoch is held to none.
+
 **Tables.** A table created through the LogStore is registered by its first commit. A table that exists already is adopted (below). Commits to any other table are refused.
 
 ## What an operator does
@@ -104,6 +115,7 @@ Around the scenarios:
 
 - **What Delta asks of a LogStore** is pinned by `DeltaLogStoreContractSpec`, over a LogStore that records its calls: which files Delta writes through it, on which thread, how it retries.
 - **Every implementation of the coordination store and of the registry's maintenance** passes one contract suite: `CoordinationStoreContract` and `RegistryMaintenanceContract`, in memory and on PostgreSQL.
+- **The epoch of a writer** (ADR-0019) is in that contract, in `PostgresLogStoreWriteSpec` and `CommitContextSpec` for the protocol, in `PostgresLogStoreDeltaSpec` for Delta, and in `WriterEpochRaceSpec`, which forces both orders of a claim and an announcement on a real PostgreSQL with transactions that are left open.
 - **The operations of an ingestion** run with Delta in `PostgresLogStoreEndToEndSpec`: an idempotent append, `MERGE`, `UPDATE`, `DELETE`, `OPTIMIZE`, `VACUUM`, checkpoints, the log cleanup, and the creation of a table by two transactions at once.
 - **Several processes at once**, and processes killed at random, are the stress run of P2b.
 
@@ -118,6 +130,8 @@ Around the scenarios:
 - **The database must not lose a transaction it acknowledged.** If it does, a published commit has no entry and the table is tainted: closed, and a false alarm.
 - **In a cluster, executors may need the database**: resolving a timestamp to a version over a long history lists the log in tasks (ADR-0004 §3.9).
 
+- **The epochs of a key are forgotten by hand.** An epoch in force only grows. An application that starts its numbers again, as one whose own database is made anew, has every commit refused until an operator deletes the rows of its keys from `delta_coordination.writer_epoch`, with the maintenance role (ADR-0019).
+
 **Not built**
 
 - **Only `file://`.** The storage interface has one implementation; other schemes are refused at startup. `s3a://` is planned (E1).
@@ -125,7 +139,7 @@ Around the scenarios:
 
 **Found by the review of P2a, and open**
 
-- **The schema version is checked once.** A store checks it before its first operation. A process that is running when a later migration is applied does not notice until it restarts. With V3 it does not go on unnoticed for long: its next claim names no generation, and the database refuses it.
+- **The schema version is checked once.** A store checks it before its first operation. A process that is running when a later migration is applied does not notice until it restarts. With V3 it does not go on unnoticed for long: its next claim names no generation, and the database refuses it. V4 does not stop it: its claims are those of version 3, which name no epoch, and are taken as such. A writer of the version before is therefore held to no epoch until it is restarted, and writers are to be stopped for that migration.
 - **A taint is not held to a generation.** A reader that stalls between finding a foreign commit and recording it, while the table is dropped, its registry reset and a table created in its place, taints the new table: closed, and a false alarm. (A writer's claim is held to the registration it read; see above.)
 - **The table id in the registry is informative.** A table created through the LogStore is registered with the `metaData.id` of the first writer that tried to create it. If that writer lost version 0 to another, the id in the registry is not the table's. Nothing reads it; the log is the source.
 - **`collectTemps` is not built for large logs.** It asks the registry once for each temporary file, and compares a file with its commit by reading both.

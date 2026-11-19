@@ -12,7 +12,8 @@ import lakehouse.ingestion.logstore.coordination.{
   Readoption,
   RegistryChange,
   TableUri,
-  TakeResult
+  TakeResult,
+  WriterEpoch
 }
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
@@ -20,7 +21,8 @@ import org.scalatest.matchers.should.Matchers
 
 /**
  * The coordination schema upgraded under a registry that is in use: tables and entries made by
- * version 2 of the schema, then migration V3 (the generation of a registration, ADR-0004 §3.5).
+ * version 2 of the schema, then migration V3 (the generation of a registration, ADR-0004 §3.5)
+ * and migration V4 (the epoch of a writer, ADR-0019).
  * `CoordinationSchemaSpec` has the schema as the migrations build it on an empty database.
  */
 final class CoordinationSchemaUpgradeSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
@@ -70,7 +72,8 @@ final class CoordinationSchemaUpgradeSpec extends AnyFunSuite with Matchers with
     CoordinationSchema.migrate(pg, upTo = "2").migrationsExecuted shouldBe 2
     val (one, other) = asCommitPath(c => (tableOfVersion2(c), tableOfVersion2(c)))
 
-    CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 1
+    // V3, and V4 on top of it: the store works with the schema that it was built for.
+    CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 2
 
     val commitPath = CoordinationStores.settings(pg.jdbcUrl(CoordinationSchema.Database), pg)
     val operator = CoordinationStores.settings(
@@ -102,6 +105,28 @@ final class CoordinationSchemaUpgradeSpec extends AnyFunSuite with Matchers with
         RegistryChange.Applied(Readoption(None, Nil))
       store.take(stalled) shouldBe TakeResult.RegistrationChanged
       store.take(claim(store, other, 4L)) shouldBe TakeResult.Taken
+
+      // V4: the entries that were there name no epoch, and a table of then is written under
+      // one from now on, and under none as before.
+      asCommitPath { c =>
+        Using.resource(
+          c.prepareStatement(
+            "SELECT count(*) FROM delta_coordination.commit_entry " +
+              "WHERE epoch_key IS NOT NULL OR epoch IS NOT NULL"
+          )
+        ) { statement =>
+          Using.resource(statement.executeQuery()) { rows =>
+            rows.next()
+            rows.getInt(1) shouldBe 0
+          }
+        }
+      }
+      val turn = WriterEpoch("upgraded.orders/bronze", 1L)
+      store.take(claim(store, other, 5L).copy(epoch = Some(turn))) shouldBe
+        TakeResult.EpochNotInForce(None)
+      store.announce(turn) shouldBe 1L
+      store.take(claim(store, other, 5L).copy(epoch = Some(turn))) shouldBe TakeResult.Taken
+      store.take(claim(store, other, 6L)) shouldBe TakeResult.Taken
     }
   }
 }

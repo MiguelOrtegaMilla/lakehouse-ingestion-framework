@@ -3,6 +3,7 @@ package lakehouse.ingestion.logstore
 import java.io.IOException
 import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{FileAlreadyExistsException, Files}
+import java.util.UUID
 
 import scala.jdk.CollectionConverters._
 import scala.util.Using
@@ -150,6 +151,108 @@ final class PostgresLogStoreWriteSpec extends AnyFunSuite with Matchers with Lak
     Files.exists(lake.commitFile(1)) shouldBe false
     lake.temps shouldBe tempsBefore
     lake.entry(1) shouldBe None
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A writer that commits under an epoch (ADR-0019)
+  // ---------------------------------------------------------------------------------------------
+
+  test("a commit under the epoch in force is written, and one under none is written as before") {
+    val lake = new Lake().withCommits(last = 0)
+    val turn = WriterEpoch("sales.orders/bronze", 4L)
+    lake.memory.announce(turn) shouldBe 4L
+    val run = CommitContext.forRun(UUID.randomUUID(), turn)
+
+    run.attribute(lake.commit(1)(append(1)))
+    // Outside any context, and inside one that names no epoch: an operator's OPTIMIZE, a
+    // writer that no lease numbers. They are held to no epoch, whatever is in force.
+    lake.commit(2)(append(2))
+    CommitContext.forRun(UUID.randomUUID()).attribute(lake.commit(3)(append(3)))
+
+    (1L to 3L).map(lake.committed) shouldBe (1L to 3L).map(append)
+    (1L to 3L).map(lake.entry(_).value.complete) shouldBe Seq(true, true, true)
+    lake.entry(1).value.runId shouldBe Some(run.runId)
+  }
+
+  test("a commit under an epoch that a later one replaced is refused, once, and leaves nothing") {
+    val lake = new Lake().withCommits(last = 0)
+    val lost = WriterEpoch("sales.orders/bronze", 4L)
+    lake.memory.announce(lost) shouldBe 4L
+    val zombie = CommitContext.forRun(UUID.randomUUID(), lost)
+    zombie.attribute(lake.commit(1)(append(1)))
+    // Another run takes the work over, and says so before it asks the table anything.
+    lake.memory.announce(WriterEpoch("sales.orders/bronze", 5L)) shouldBe 5L
+    val (tempsBefore, takesBefore) = (lake.temps, lake.store.calls.count(_ == Take))
+
+    val refused = the[EpochNotInForceException] thrownBy zombie.attribute(lake.commit(2)(append(2)))
+
+    refused.table shouldBe lake.table
+    (refused.version, refused.epoch, refused.inForce) shouldBe ((2L, lost, Some(5L)))
+    refused.getMessage should include("commits under epoch 4 of sales.orders/bronze")
+    refused.getMessage should include("the epoch in force is 5")
+    // Not the exception that Delta answers by trying the next version, nor a refusal of the
+    // table: the table is fine, and its writer is not.
+    refused should not be a[FileAlreadyExistsException]
+    refused should not be a[WriteRefusedException]
+    // It is an answer of the store, and not a step that failed: it is asked once.
+    lake.store.calls.count(_ == Take) - takesBefore shouldBe 1
+    Files.exists(lake.commitFile(2)) shouldBe false
+    lake.entry(2) shouldBe None
+    lake.temps shouldBe tempsBefore
+    // And it is not counted as a version lost to another writer.
+    zombie.contention shouldBe 0L
+
+    // The run that has the turn writes the version, and the table goes on.
+    val holder = CommitContext.forRun(UUID.randomUUID(), WriterEpoch("sales.orders/bronze", 5L))
+    holder.attribute(lake.commit(2)(append(2)))
+    lake.entry(2).value.runId shouldBe Some(holder.runId)
+  }
+
+  test(
+    "a commit under an epoch that was never announced is refused: a writer says its turn first"
+  ) {
+    val lake = new Lake().withCommits(last = 0)
+    val unannounced =
+      CommitContext.forRun(UUID.randomUUID(), WriterEpoch("sales.returns/bronze", 1L))
+
+    val refused =
+      the[EpochNotInForceException] thrownBy unannounced.attribute(lake.commit(1)(append(1)))
+
+    refused.inForce shouldBe None
+    refused.getMessage should include("no epoch of that key was announced")
+    lake.entry(1) shouldBe None
+  }
+
+  test("a table is not made by a writer out of its turn") {
+    val lake = new Lake
+    lake.memory.announce(WriterEpoch("sales.orders/bronze", 2L)) shouldBe 2L
+    val zombie = CommitContext.forRun(UUID.randomUUID(), WriterEpoch("sales.orders/bronze", 1L))
+
+    an[EpochNotInForceException] should be thrownBy zombie.attribute(lake.commit(0)(Creation))
+
+    Files.exists(lake.commitFile(0)) shouldBe false
+    lake.entry(0) shouldBe None
+    lake.temps shouldBe empty
+  }
+
+  test("F15: a version taken in its turn while the reply was lost is committed, turn over or not") {
+    val lake = new Lake().withCommits(last = 0)
+    val turn = WriterEpoch("sales.orders/bronze", 1L)
+    lake.memory.announce(turn) shouldBe 1L
+    val run = CommitContext.forRun(UUID.randomUUID(), turn)
+    // The INSERT lands and its reply does not; before the writer asks again, another run has
+    // taken the work over. The commit exists: it is published, and its bytes are not thrown
+    // away, which would leave a version that nothing could publish.
+    lake.store.failNext(
+      Take,
+      ReplyLostAnd(() => lake.memory.announce(WriterEpoch("sales.orders/bronze", 2L)): Unit)
+    )
+
+    run.attribute(lake.commit(1)(append(1)))
+
+    lake.committed(1) shouldBe append(1)
+    lake.entry(1).value.complete shouldBe true
+    lake.store.calls.count(_ == Take) shouldBe 3 // the creation, and this commit twice
   }
 
   test("F9: a table deleted and created again at its path is refused until its registry is reset") {
