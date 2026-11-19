@@ -56,3 +56,14 @@ With ADR-0005 alone, that batch stays `PLANNED`. Every run of the source finds i
   - whether Delta takes a commit that has a transaction and no data;
   - how recovery tells a tombstone from the data of a batch. A run that died between the tombstone and the abandonment leaves a batch that is `PLANNED` and whose number is in the table: today that reads as "written", and rolling it forward would record its files as taken with none of their rows in Bronze.
 - **The replay of a batch that a run inherits gives it up the same way** (P5.10): a file that changed fails the read of whoever replays the plan, and the same question to the table decides.
+
+## As built (P5.8, 2026-11-19)
+
+- **The signal is `SourceChangedException`**, in the connector contract (`engine.connector`). It carries a summary for a person and each thing that changed, by the name the plan has it under, with how. The file connector raises it from both of its looks at the files of a plan (`Landing.confirm`, `Landing.confirmAgain`): before Spark reads them, and after.
+- **The question to the table is `Recovery.of`**, the one function that decides a recovery, asked of the table of Bronze of the source.
+- **Giving up is `LeasedRun.abandon`**: the batch, the end of the run and the lease in one transaction, on condition of the epoch, as `commit` is. A zombie is answered "no", and if the check of the lease were not there, the end of its run, which another run wrote, would still stop it.
+- **What an abandoned batch keeps** (migration V3 of the schema `control`): `abandoned_by_run`, `abandoned_at`, `abandon_reason` and `abandon_detail`. The detail is `{"changed": [{"item", "change"}, …], "total": n}`, with the first thousand things that changed: the plan of the batch names every file, and the detail must be one that can be read back.
+- **The run** ends `FAILED` with the class `transient`, and its message says the batch and the reason. `IngestionService` reports it as an outcome of its own (`GivenUp`), which the command `run` turns into exit code 3 (P5.12).
+- **A batch that the table has** ends the run with an `IllegalStateException`, which nothing classifies. The run is left as a process that died leaves it, and the batch is still `PLANNED`.
+- **Tests** (`IngestionServiceSpec`, `BatchesSpec`, `ProcessedFilesSpec`, `ControlSchemaSpec`, `ControlSchemaUpgradeSpec`): a file written again and one removed between the plan and the read, on disk; a file changed while it is read; the batch written to its table by another writer before the file changes; a lease taken over before the batch is given up; and the run after, which takes the changed file as a new file in the next batch.
+

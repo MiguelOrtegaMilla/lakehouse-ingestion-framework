@@ -158,13 +158,17 @@ Files that are left in a directory of the landing zone. It loads by `new_files`.
 
 A file is taken once, and is known by its name, its size and when it was last changed. **A file that is written again under the same name is another file, and is ingested again, whole, into Bronze**, as is one that is only touched: Bronze keeps what was received, and does not compare a file with another. The rows that the two have in common are then in Bronze twice, each with its batch, and it is Silver that keeps one of them, by `keys`. A producer that corrects a file writes a new one; one that appends to a file it already left makes its rows arrive twice.
 
+**A file that changes while its batch is ingested costs one run, and does not stop its source.** `min_file_age` keeps a file out of a batch until it has gone unchanged for that long. That is a guess about its producer, and not a promise from it. If a file is written again, or removed, after its batch was planned and before it is read, nothing of the batch is written: the batch is given up, with the reason and the files that changed recorded with it in the control plane (`ingestion_batch`, `ABANDONED`), and the run ends in 3. The next run plans anew, and takes the file as it is by then, as a new file ([ADR-0018](../adr/0018-a-run-gives-up-a-batch-whose-source-changed.md)). A source whose runs often end so has a producer that is slower than its `min_file_age`: raise it.
+
+A file with no record, empty or with a header alone, is recorded as taken and writes nothing. The table of a source is made by its first batch that has rows.
+
 <!-- fields: connector file -->
 | Field | Takes | Left out |
 |---|---|---|
 | `connector.path` | The directory: a [path](#a-relative-path) relative to `landing.root` | required |
 | `connector.format` | `csv`, `json` or `parquet` | required |
 | `connector.pattern` | Which files of the directory, by their name: letters, digits, `_`, `-`, `.`, and the wildcards `*` and `?`. As `returns-*.csv` | every file |
-| `connector.min_file_age` | How long a file goes unchanged before it is taken as complete: one that is still being written would be ingested cut short. A [duration](#a-duration), `0s` to `1d`; `0s` is warned of | `1m` |
+| `connector.min_file_age` | How long a file goes unchanged before it is taken as complete: one that is still being written would be ingested cut short, and one that changes after its batch was planned costs a run. A [duration](#a-duration), `0s` to `1d`; `0s` is warned of | `1m` |
 | `connector.max_files_per_batch` | The most files that one batch takes, `1` to `10000`. The rest are the next run's | `1000` |
 
 Rules about several fields of a source:
