@@ -7,6 +7,7 @@ import io.circe.Json
 import lakehouse.ingestion.core.config.{ConfigVersion, RelativePath}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
+import lakehouse.ingestion.engine.connector.FileRegistry
 import org.slf4j.LoggerFactory
 
 /**
@@ -28,7 +29,8 @@ final class LeasedRun private (
     val epoch: Epoch,
     val tookOver: Option[RunId],
     heartbeat: LeaseHeartbeat
-) extends AutoCloseable {
+) extends AutoCloseable
+    with FileRegistry {
 
   /** Why the lease is lost, if it is. */
   def lost: Option[LeaseLoss] = heartbeat.lost
@@ -77,7 +79,7 @@ final class LeasedRun private (
    * file source plans its next batch without (`FilePlanner`).
    */
   @throws[SQLException]
-  def processed(directory: RelativePath, names: Seq[String]): Set[LandedFile] =
+  override def processed(directory: RelativePath, names: Seq[String]): Set[LandedFile] =
     database.run(ProcessedFiles.among(_, start.source, directory, names))
 
   /**
