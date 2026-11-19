@@ -101,7 +101,8 @@ final class ControlSchemaUpgradeSpec
     val ran = ControlPlaneSchema.migrate(pg)
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
-    ran.lines.head shouldBe s"control: version 3, 1 migration applied (${pg.jdbcUrl(Database)})"
+    // V3, and V4 on top of it: the engine works on the schema that it was built for.
+    ran.lines.head shouldBe s"control: version 4, 2 migrations applied (${pg.jdbcUrl(Database)})"
     as(Engine) { c =>
       ControlSchema.verify(c) shouldBe Right(())
 
@@ -110,9 +111,14 @@ final class ControlSchemaUpgradeSpec
       stillPlanned.status shouldBe BatchStatus.Planned
       stillPlanned.abandoned shouldBe None
       Batches.planned(c, planned.app).value.id shouldBe planned
+      // V4: a batch of before says no table of its own, planned or ended, and the run that
+      // finishes it asks the one that its source names.
+      Seq(planned, committed, abandoned).map(Batches.find(c, _).value.target) shouldBe
+        Seq(None, None, None)
+      Batches.planned(c, planned.app).value.target shouldBe None
       val stillCommitted = Batches.find(c, committed).value
       stillCommitted.status shouldBe BatchStatus.Committed
-      stillCommitted.outputs.value.map(_.version) shouldBe Vector(4L)
+      stillCommitted.outputs.value.map(_.version) shouldBe Vector(Some(4L))
       stillCommitted.abandoned shouldBe None
 
       // What was given up by hand says that it was, and that nobody said why.

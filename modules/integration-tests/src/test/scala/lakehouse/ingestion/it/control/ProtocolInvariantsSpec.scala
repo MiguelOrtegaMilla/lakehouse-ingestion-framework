@@ -112,7 +112,7 @@ final class ProtocolInvariantsSpec extends AnyFunSuite with Matchers with Contro
       try
         (zombie.batch, random.nextInt(4)) match {
           case (Some(batch), 0 | 1) => writeAndCommit(zombie.leased, batch): Unit
-          case (None, 0 | 1) => zombie.leased.plan(range(zombie.from)): Unit
+          case (None, 0 | 1) => zombie.leased.plan(range(zombie.from), targetOf(orders.id)): Unit
           case (_, 2) =>
             zombie.leased.finish(RunEnd.Failed(FailureClass.Transient, "it woke up")): Unit
           case _ => zombie.leased.finish(RunEnd.Succeeded()): Unit

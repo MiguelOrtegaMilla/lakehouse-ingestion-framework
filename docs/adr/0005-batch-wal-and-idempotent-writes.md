@@ -76,6 +76,14 @@ Silver `MERGE` uses Delta's session-level `spark.databricks.delta.write.txnAppId
 - **What a batch wrote is a list of tables with their versions**, and not a mapping by table: a path may be longer than a key that can be read back, and a list can be asked which batch wrote a version.
 - **Left to P5:** what reads the last `txnVersion` from the log of a table; the version of the table at which a batch was committed, for a batch that is rolled forward or whose write was skipped; and writing the quarantine of a batch before its data.
 
+*As built (P5.10, 2026-11-19):* the side of Delta, in `IngestionService`.
+
+- **Step 2 on real tables.** A run that finds a batch planned asks the table of its data, and rolls the batch forward or runs its plan again (`Recovery.of`). A roll-forward reads nothing: what the commit records is said by the connector from the plan alone, and the versions that the batch wrote are read from the logs of its tables, the quarantine included if it has the batch. A replay is the path of a new batch; what a table has of it already is skipped by Delta.
+- **The table that is asked is the one that the batch was planned for.** The location of the table is written down with the plan (`ingestion_batch.target_table`, migration V4 of the schema `control`), by the run that plans the batch, and cannot be changed afterwards. A run whose configuration names another table for the source by then is refused, as a permanent failure: the other table has no batch of it, and would be given the rows a second time. A batch that was planned before V4 says none, and is finished in the table that the configuration names.
+- **A version that the log no longer keeps is recorded as not known**, and not made up (`BatchOutput.version`, `"version": null` in `outputs`). A table keeps its transactions for ever and its commits for thirty days by default: a batch that a run left written, and that nobody finished for longer than that, is known to be in the table and no longer at which version. The state is rolled forward all the same. Refusing would leave a source that cannot go on and a batch that must not be given up, since its rows are there.
+- **What a run that rolled a batch forward counts:** that it read nothing, which it knows. The rows that the batch wrote and the records that it rejected were the dead run's to count.
+- **The answer of a table holds for the run that asked** (ADR-0019): it announced its epoch before it asked, so no run that held the lease before can commit after the answer.
+
 ## Alternatives
 
 | Option | Verdict |

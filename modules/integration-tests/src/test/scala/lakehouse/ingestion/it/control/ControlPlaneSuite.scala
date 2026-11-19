@@ -6,10 +6,20 @@ import java.time.Instant
 import scala.concurrent.duration._
 import scala.util.Using
 
+import io.circe.Json
 import lakehouse.ingestion.cli.Main
-import lakehouse.ingestion.core.config.{ConfigVersion, Profile, SecretResolver, Source, SourceId}
+import lakehouse.ingestion.core.config.{
+  ConfigVersion,
+  PathTableLocator,
+  Profile,
+  RelativePath,
+  SecretResolver,
+  Source,
+  SourceId,
+  TableLocation
+}
 import lakehouse.ingestion.core.control._
-import lakehouse.ingestion.engine.control.{Application, ConfigSnapshots, ControlDatabase}
+import lakehouse.ingestion.engine.control.{Application, ConfigSnapshots, ControlDatabase, LeasedRun}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, ControlPlaneSchema}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.{BeforeAndAfterAll, EitherValues, OptionValues, Suite}
@@ -75,6 +85,19 @@ trait ControlPlaneSuite extends BeforeAndAfterAll with EitherValues with OptionV
   }
 
   protected def epoch(value: Long): Epoch = Epoch.of(value).value
+
+  /**
+   * Where a batch of `source` is planned to write, for the tests that write to no table: the
+   * table of Bronze that a source of that id would have, under the lake of the profile.
+   */
+  protected def targetOf(source: SourceId): TableLocation =
+    new PathTableLocator(profile.lake.uri)
+      .locate(RelativePath.parse(s"bronze/${source.value.replace('.', '/')}").value)
+
+  /** A plan written down by a test that is not about where its batch writes. */
+  implicit final protected class PlansOfATest(leased: LeasedRun) {
+    def plan(plan: Json): PlannedBatch = leased.plan(plan, targetOf(leased.start.source))
+  }
 
   /** Another instance of the application: a pool of its own to the same control plane. */
   protected def anotherInstance(): ControlDatabase =

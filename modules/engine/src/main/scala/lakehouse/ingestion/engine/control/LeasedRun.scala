@@ -4,7 +4,7 @@ import java.sql.{Connection, SQLException}
 import java.time.Instant
 
 import io.circe.Json
-import lakehouse.ingestion.core.config.{ConfigVersion, RelativePath}
+import lakehouse.ingestion.core.config.{ConfigVersion, RelativePath, TableLocation}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
 import lakehouse.ingestion.engine.connector.FileRegistry
@@ -62,14 +62,16 @@ final class LeasedRun private (
    * step. Whatever happens to this run from here on, the next one finds the plan and reads
    * what it says, no more and no less.
    *
+   * @param target the table that the batch is to write its data to: the one that the run that
+   *   finishes the batch asks whether it has it
    * @throws LeaseLostException if the lease is another run's by now
    * @throws java.sql.SQLException with state 23505 if a batch is planned already: it is to be
    *   finished first (`planned`)
    */
   @throws[SQLException]
   @throws[LeaseLostException]
-  def plan(plan: Json): PlannedBatch = holding { connection =>
-    val batch = Batches.plan(connection, start, plan)
+  def plan(plan: Json, target: TableLocation): PlannedBatch = holding { connection =>
+    val batch = Batches.plan(connection, start, plan, target)
     Runs.took(connection, start.id, batch.id)
     batch
   }

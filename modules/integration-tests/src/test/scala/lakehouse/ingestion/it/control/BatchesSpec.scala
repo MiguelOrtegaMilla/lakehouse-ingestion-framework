@@ -180,6 +180,35 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     state(orders).value shouldBe moved
   }
 
+  test("a batch says where it was planned to write, to whichever run finishes it") {
+    val orders = newSource()
+    val dead = open(orders)
+    // The table of the source, as the run that plans the batch has it from its configuration.
+    val planned = dead.plan(range(0, 10), bronze(orders))
+    planned.target shouldBe Some(bronze(orders).uri)
+    dies(dead)
+
+    // The run after it is told the table with the plan, whatever its own configuration says.
+    val after = open(orders)
+    val found = after.planned().value
+    after.close()
+    found shouldBe planned
+    found.target shouldBe Some(bronze(orders).uri)
+    batch(planned.id).target shouldBe Some(bronze(orders).uri)
+    // And it is not the engine's to change, as the plan is not.
+    val refused = intercept[SQLException] {
+      database.run { c =>
+        update(
+          c,
+          "UPDATE control.ingestion_batch SET target_table = 'file:///lake/elsewhere' " +
+            "WHERE txn_app_id = ?",
+          planned.id.app.value
+        )
+      }
+    }
+    refused.getSQLState shouldBe "42501"
+  }
+
   test("the next batch has the next number, and starts from where the state is") {
     val orders = newSource()
     val delta = new SimulatedDelta

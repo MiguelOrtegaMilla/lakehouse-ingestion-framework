@@ -21,15 +21,37 @@ final case class BatchId(app: TxnAppId, seq: BatchSeq) {
  * @param plan what is to be read, as its connector wrote it: a range of a watermark, a set of
  *   files. The control plane does not read it, and nothing ever changes it
  * @param plannedBy the run that planned it, which need not be the one that commits it
+ * @param target where the batch was planned to write its data: the location of the table, as
+ *   the run that planned it had it from its configuration. It is written down with the plan,
+ *   and nothing ever changes it: the run that recovers the batch asks that table whether it has
+ *   the batch, and no other. None, for a batch that was planned before the control plane kept
+ *   it (schema version 3)
  */
-final case class PlannedBatch(id: BatchId, plan: Json, plannedBy: RunId, plannedAt: Instant)
+final case class PlannedBatch(
+    id: BatchId,
+    plan: Json,
+    plannedBy: RunId,
+    plannedAt: Instant,
+    target: Option[String] = None
+)
 
 /**
  * What a batch wrote: a table, by the name its source gives it, and the version of the table
  * at which the batch was committed to it.
+ *
+ * @param version none, if the batch is known to be in the table and at which version is not: a
+ *   run that finds a batch written by a run before it reads the version from the log of the
+ *   table, which keeps its commits for a time and no longer (`delta.logRetentionDuration`). A
+ *   version that is not known is said so, and never made up
  */
-final case class BatchOutput(table: RelativePath, version: Long) {
-  require(version >= 0, s"a table has no version $version")
+final case class BatchOutput(table: RelativePath, version: Option[Long]) {
+  require(version.forall(_ >= 0), s"a table has no version ${version.getOrElse(0L)}")
+}
+
+object BatchOutput {
+
+  /** A batch at a version of a table that is known: the one that whoever wrote it was told. */
+  def apply(table: RelativePath, version: Long): BatchOutput = BatchOutput(table, Some(version))
 }
 
 /**
@@ -53,6 +75,7 @@ final case class BatchAbandonment(
  * A batch as the control plane has it.
  *
  * @param abandoned who gave it up and why, for a batch that is `ABANDONED`, and for no other
+ * @param target where it was planned to write its data (`PlannedBatch.target`)
  */
 final case class BatchRecord(
     id: BatchId,
@@ -60,6 +83,7 @@ final case class BatchRecord(
     layer: Layer,
     kind: RunKind,
     plan: Json,
+    target: Option[String],
     status: BatchStatus,
     plannedBy: RunId,
     plannedAt: Instant,

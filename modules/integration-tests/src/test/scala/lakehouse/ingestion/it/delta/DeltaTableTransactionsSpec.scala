@@ -27,7 +27,7 @@ import lakehouse.ingestion.core.control.{
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
-import lakehouse.ingestion.logstore.LogStores
+import lakehouse.ingestion.logstore.{LakeFixture, LogStores}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.DeltaLog
 
@@ -280,6 +280,40 @@ final class DeltaTableTransactionsSpec
     // And none of them is written again: Delta has their transaction, and skips them.
     (1L to 5L).map(seq => writeBatch(table, returns, seq)) shouldBe Seq.fill(5)(None)
     rowsOf(table) should have size 15
+  }
+
+  test("a commit that took its version and is not published yet is in what a table says") {
+    val app = TxnAppId.of(returns, Layer.Bronze)
+    // The commit of a batch as Delta writes one: what it did, and the transaction of the batch.
+    def commitOf(batch: BatchId): Seq[String] = Seq(
+      """{"commitInfo":{"timestamp":1763200000000,"operation":"WRITE","operationParameters":{"mode":"Append"}}}""",
+      s"""{"txn":{"appId":"${batch.app.value}","version":${batch.seq.value},"lastUpdated":1763200000000}}"""
+    )
+
+    // A run that lost its lease writes batch 2 before the lease is taken again, and dies
+    // between the registry and the log: its commit exists, and has no name in the log yet.
+    val table = newTable("taken-not-published")
+    writeBatch(table, returns, 1).value shouldBe 0
+    dieAfterTaking(table.uri, 1L, commitOf(batch(returns, 2)))
+    Files.exists(commitFile(table.uri, 1)) shouldBe false
+    entry(table.uri, 1L).complete shouldBe false
+
+    // The run that recovers the batch is answered with it: whoever lists the log of a table
+    // publishes the commit that was taken first (ADR-0004 §3.3), so the answer is the table's
+    // as the registry has it, and not as the storage happened to be.
+    delta.lastVersion(table, app) shouldBe Some(2)
+    delta.committedAt(table, batch(returns, 2)) shouldBe Some(1)
+    Files.exists(commitFile(table.uri, 1)) shouldBe true
+    entry(table.uri, 1L).complete shouldBe true
+
+    // The same for a table that is not there yet, whose first commit is the one taken.
+    val unborn = newTable("taken-before-it-was-there")
+    Files.createDirectories(logOf(unborn.uri))
+    dieAfterTaking(unborn.uri, 0L, LakeFixture.Creation :+ commitOf(batch(returns, 1)).last)
+    Files.exists(commitFile(unborn.uri, 0)) shouldBe false
+    delta.lastVersion(unborn, app) shouldBe Some(1)
+    delta.committedAt(unborn, batch(returns, 1)) shouldBe Some(0)
+    Files.exists(commitFile(unborn.uri, 0)) shouldBe true
   }
 
   test("a table that forgets its transactions gets no answer, and a permanent failure for one") {
