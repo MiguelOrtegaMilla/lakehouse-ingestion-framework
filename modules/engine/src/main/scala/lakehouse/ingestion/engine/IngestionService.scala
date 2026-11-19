@@ -3,6 +3,8 @@ package lakehouse.ingestion.engine
 import java.io.IOException
 import java.time.{Clock, Instant}
 
+import scala.util.control.NonFatal
+
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
   ConfigVersion,
@@ -97,19 +99,38 @@ import org.slf4j.LoggerFactory
  * force. So a run that is taken over while it works is stopped at its next commit, to any
  * table, and what the run that took over was told by the tables stays true.
  *
+ * '''A run that loses its lease stops working''' (ADR-0006). That is what keeps a run from
+ * reading what nobody will commit; what keeps it from doing harm is the epoch, above.
+ *  - The jobs of Spark that the run is in the middle of are stopped the moment the lease is
+ *    lost, by the run's own count or by what the control plane answered (`LeasedRun.onLost`,
+ *    `RunJobs`). Who started one is told at once, and no thread is interrupted.
+ *  - A job that is not running yet cannot be stopped, so the run asks for its lease before each
+ *    step that starts one or writes a table: the read, the counts of what was read, the
+ *    quarantine, the data (`LeasedRun.verify`, which asks nobody: it is the run's count).
+ *  - The steps of the control plane are not asked for so: each asks the database, in its own
+ *    transaction and under the epoch, which is the answer that counts. A run whose count ran
+ *    out with its data written, and that the control plane still has as the holder of its
+ *    lease, commits its batch.
+ *
  * '''How a run ends.'''
  *  - A failure that says its class (`RunFailedException`) ends the run as `FAILED` with it, and
  *    gives the lease up. The batch, if one was planned, stays planned.
  *  - A run that finds its lease another's, where it asks the control plane, at its commit, or
  *    by a commit to a table that is refused for its epoch, stops there. It is not tried again
  *    and it says nothing to the control plane, where the run that took over has ended it.
+ *  - A run whose lease ran out by its own count stops as well, and reports a transient failure.
+ *    It tells the control plane so once: if the lease is still its own there, the run is
+ *    `FAILED` and the lease is given up, so that the next run does not wait for it to expire.
+ *    If the control plane does not answer, which is most often why the lease ran out, the
+ *    lease expires and the run that takes it over marks this one `ABANDONED`.
+ *  - Whatever a run fails with once its lease is lost, it ends as a run that lost its lease:
+ *    the error of a job that was stopped, in whatever Spark wrapped it, and any other. A run
+ *    without its lease has nothing else to say of its source that counts, and what it failed
+ *    with is logged whole, as the cause, for the mistake that it may be.
  *  - Any other exception is let through, and nothing is said to the control plane: the lease is
  *    no longer renewed, and what is left is what a process that died leaves. The run that takes
  *    the lease over marks this one `ABANDONED`. Telling such errors apart is the classification
  *    of errors (P8).
- *
- * '''What is not here yet.''' A lease that is lost is found out where the control plane is
- * asked and where a table is written; stopping the jobs of Spark at once is P5.11.
  *
  * @param lake the root of the lake of the profile: every table of a source is under it
  * @param clock what "now" is for a plan, and when the rows of a batch were read
@@ -157,23 +178,87 @@ final class IngestionService(
     LeasedRun.open(database, start, config, timing) match {
       case Left(skipped) => Outcome.Skipped(start.id, skipped.holder, skipped.until)
       case Right(leased) =>
-        try new Attempt(leased, bound).run()
+        val jobs = new RunJobs(spark, start.id)
+        // Before the first job of the run: what is running when the lease is lost is stopped.
+        leased.onLost { loss =>
+          jobs.stop(s"the run ${start.id} lost the lease of ${start.leaseKey}: ${loss.reason}")
+        }
+        try jobs.during(new Attempt(leased, bound).run())
         catch {
           // Before anything else: whatever it is wrapped in, it says that the lease is lost.
           case refused: Throwable if outOfTurn(refused).nonEmpty =>
             leased.close()
             fenced(start, outOfTurn(refused).fold("")(_.getMessage))
+          case lost: LeaseLostException => stopped(leased, lost.loss, failedWith = None)
+          // Whatever it is, it is of a run that is over: a job that was stopped, most often.
+          case NonFatal(failure) if leased.lost.nonEmpty =>
+            stopped(leased, leased.lost.get, failedWith = Some(failure))
           case failed: RunFailedException =>
             log.error(s"the run ${start.id} of ${source.id} failed (${failed.failure})", failed)
             ended(leased, RunEnd.Failed(failed.failure, failed.getMessage))
-          case lost: LeaseLostException =>
-            leased.close()
-            fenced(start, lost.getMessage)
           case unclassified: Throwable =>
             // Nothing is said of it: the lease runs out, as that of a process that died.
             leased.close()
             throw unclassified
         }
+    }
+  }
+
+  /**
+   * Ends a run that has lost its lease, as its heartbeat or the control plane told it. It may
+   * pass, so it is reported as a transient failure.
+   *
+   * What the run says to the control plane depends on how the lease was lost, and what comes
+   * of it is the database's to decide, as ever (`LeasedRun.finish`):
+   *  - ''another run holds it'': nothing. That run has ended this one, as `ABANDONED`;
+   *  - ''it ran out by the count of the run'': that it failed, once. A control plane that has
+   *    the lease as this run's still takes it, and the lease is given up. One that does not
+   *    answer is why the lease ran out, most often: the lease expires then.
+   *
+   * @param failedWith what the run failed with, if it was not with the loss itself: the error
+   *   of a job that was stopped, or anything else. It is logged whole, since a mistake of the
+   *   application that happens as a lease is lost is still one to look into
+   */
+  private def stopped(
+      leased: LeasedRun,
+      loss: LeaseLoss,
+      failedWith: Option[Throwable]
+  ): Outcome = {
+    val start = leased.start
+    failedWith.foreach { failure =>
+      log.error(
+        s"the run ${start.id} failed after it lost the lease of ${start.leaseKey} " +
+          s"(${loss.reason}), and ends as a run that lost its lease. What it failed with " +
+          "follows: the error of a job of Spark that was stopped is expected, and any other " +
+          "is to be looked into",
+        failure
+      )
+    }
+    loss match {
+      case LeaseLoss.TakenOver =>
+        leased.close()
+        fenced(start, loss.reason)
+      case _: LeaseLoss.NotRenewed =>
+        val message = s"the run ${start.id} lost the lease of ${start.leaseKey}: " +
+          s"${loss.reason}. It stopped working, and committed nothing more: what it left is " +
+          "finished by the next run of the source"
+        log.error(message)
+        val told =
+          try Right(leased.finish(RunEnd.Failed(FailureClass.Transient, message)))
+          catch { case NonFatal(untold) => Left(untold) }
+        told match {
+          case Right(true) =>
+            log.info(s"the run ${start.id} is recorded as failed, and its lease is given up")
+          case Right(false) =>
+            log.info(s"the run ${start.id} was ended by the run that took its lease")
+          case Left(untold) =>
+            log.warn(
+              s"the control plane could not be told that the run ${start.id} stopped. Its " +
+                "lease expires, and the run that takes it over ends this one",
+              untold
+            )
+        }
+        Outcome.Failed(start.id, FailureClass.Transient, message)
     }
   }
 
@@ -185,7 +270,7 @@ final class IngestionService(
   /**
    * A run whose lease is another's. What it did is not committed, and its row says `ABANDONED`,
    * written by the run that took its place: there is nothing for it to say but to stop. It may
-   * pass, so it is reported as a transient failure (P5.11).
+   * pass, so it is reported as a transient failure.
    */
   private def fenced(start: RunStart, how: String): Outcome = {
     val message = s"the run ${start.id} lost the lease of ${start.leaseKey}: $how. Nothing of " +
@@ -343,6 +428,8 @@ final class IngestionService(
     private def ingest(batch: PlannedBatch): Outcome = {
       // Before the read: a plan that says nothing of what its commit records is not read.
       val progress = bound.progress(batch.plan)
+      // Nor is anything read by a run that has lost its lease.
+      leased.verify()
       val read =
         try Right(bound.read(batch.plan, ReadContext(spark)))
         catch { case changed: SourceChangedException => Left(changed) }
@@ -354,6 +441,8 @@ final class IngestionService(
       val readAt = clock.instant()
       hooks.at(FaultPoint.AfterRead, batch)
 
+      // A run that lost its lease while it read counts nothing, and writes nothing.
+      leased.verify()
       // Of what Spark keeps of the read (`ReadResult`): the files are not read again.
       val rows = read.rows.count()
       val unparsed = read.unparsed.fold(0L)(_.count())
@@ -367,6 +456,7 @@ final class IngestionService(
       // The quarantine before the data (ADR-0005 §3, step 5), and whatever becomes of the batch:
       // a record that was rejected is there to be looked at, the more so when there are too many.
       val apart = read.unparsed.filter(_ => unparsed > 0).map { records =>
+        leased.verify()
         val written = this.written(quarantine, batch) {
           new QuarantineWriter(confinement, tables, commits)
             .write(quarantine, QuarantineBatch(start.id, source.id, batch.id, readAt), records)
@@ -380,6 +470,7 @@ final class IngestionService(
       else {
         // A batch with no rows writes nothing to Bronze, and its table is not touched.
         val data = Option.when(rows > 0) {
+          leased.verify()
           val written = this.written(table, batch) {
             new BronzeWriter(confinement, tables, commits)
               .write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows)
