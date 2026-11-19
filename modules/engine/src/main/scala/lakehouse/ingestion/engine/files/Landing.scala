@@ -10,7 +10,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.Using
 
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RootUri}
-import lakehouse.ingestion.core.files.{FileIdentity, FileName, FilePlan, Listed, PlannedFile}
+import lakehouse.ingestion.core.files.{FileName, FilePlan, LandedFile, Listed}
 import lakehouse.ingestion.engine.RunFailedException
 
 /**
@@ -29,10 +29,11 @@ import lakehouse.ingestion.engine.RunFailedException
  * inside it is let be, and the file is read through it.
  *
  * A name may lead to another file at any moment: a producer that writes a file again, renames
- * another over it, or changes a link. So each file is listed with which file of the file system
- * it is (`FileIdentity`), its size and its time, all from one look at it, and the plan keeps
- * them. A read of the plan confirms them just before Spark reads the files and again just after
- * (`confirm`, P5.7). What that leaves open is said where the read is (`FileSourceConnector`).
+ * another over it, or changes a link. A plan keeps each file by its size and its time, as
+ * `processed_file` does. Just before Spark reads the files, each must still have them, and which
+ * file of the file system it is (`FileIdentity`) is taken then, from the same look; just after,
+ * each must still be that file, with that size and that time (`confirm`, `confirmAgain`, P5.7).
+ * What that leaves open is said where the read is (`FileSourceConnector`).
  * A hard link is a file like any other, and Linux lets a process make one only to a file that
  * it owns or may write (`fs.protected_hardlinks`).
  *
@@ -76,51 +77,86 @@ final class Landing(root: RootUri) {
         s"the directory ${config.path} of the landing zone has ${Landing.files(problems.size)} " +
           s"that no run may read, and nothing was planned: ${Landing.some(problems.sorted)}"
       )
-    looked.collect { case (_, Right(listed)) => listed }
+    looked.collect { case (name, Right(stat)) => stat.listed(name) }
   }
 
   /**
-   * Where the files of a plan are, if each of its names still leads to the file that was planned:
-   * the same file of the file system, of the same size and the same time, under the root.
+   * Where the files of a plan are, just before they are read, if each of its names still leads to
+   * a file of the size and the time that were planned, under the root; and which file of the file
+   * system each is, from the same look, for `confirmAgain` to compare.
    *
-   * @return the path of each file of the plan, in its directory as it is resolved, in the order
-   *   of the plan; or what is not as it was planned, for each name that is not
+   * Which file it is was not planned: a plan outlives the process that made it, and a restart of
+   * the machine or of its container may number the same disk otherwise (`FileIdentity`).
+   *
+   * @return the files of the plan, in its directory as it is resolved, in the order of the plan;
+   *   or what is not as it was planned, for each name that is not
    * @throws RunFailedException a permanent failure, for a root or a directory that is not there,
    *   is not a directory, or is outside the root
    * @throws IllegalArgumentException if the plan is of another directory than the source's
    */
   @throws[IOException]
-  def confirm(config: FileConnectorConfig, plan: FilePlan): Either[Vector[String], Vector[Path]] = {
+  def confirm(
+      config: FileConnectorConfig,
+      plan: FilePlan
+  ): Either[Vector[String], Landing.Confirmed] =
+    looks(config, plan)((_, _) => None).map(found => new Landing.Confirmed(plan, found))
+
+  /**
+   * Whether the files of a plan are still, just after they were read, those that `confirm` found
+   * just before: the same file of the file system, of the size and the time that were planned.
+   *
+   * @return what is not as it was, for each name that is not
+   * @throws IllegalArgumentException if what was confirmed is of another plan
+   */
+  @throws[IOException]
+  def confirmAgain(
+      config: FileConnectorConfig,
+      plan: FilePlan,
+      before: Landing.Confirmed
+  ): Either[Vector[String], Unit] = {
+    require(before.plan == plan, "what was confirmed is of another plan")
+    looks(config, plan) { (index, now) =>
+      val was = before.identities(index)
+      Option.when(now != was)(
+        s"is another file of the file system than the one that was read ($now, and was $was)"
+      )
+    }.map(_ => ())
+  }
+
+  /**
+   * Each file of a plan as it is now, if every name leads to a file of the planned size and time,
+   * which `otherwise` finds nothing against, given its place in the plan and its identity.
+   */
+  private def looks(config: FileConnectorConfig, plan: FilePlan)(
+      otherwise: (Int, FileIdentity) => Option[String]
+  ): Either[Vector[String], Vector[(Path, FileIdentity)]] = {
     require(plan.directory == config.path, s"the plan is of ${plan.directory}, not ${config.path}")
     val (rootReal, directory) = locate(config)
 
-    val found = plan.planned.map { planned =>
-      val name = planned.name.value
+    val found = plan.files.zipWithIndex.map { case (file, index) =>
+      val name = file.name.value
       val entry = directory.resolve(name)
       val now = look(entry, name, rootReal)
         .getOrElse(Left("is not there any more, or is a directory now"))
-        .flatMap(listed => changes(planned, listed).toLeft(entry))
+        .flatMap { stat =>
+          val problems = otherwise(index, stat.identity).toSeq ++ changes(file, stat)
+          if (problems.isEmpty) Right(entry -> stat.identity) else Left(problems.mkString(", "))
+        }
       now.left.map(problem => s"'$name' $problem")
     }
     val problems = found.collect { case Left(problem) => problem }
-    if (problems.nonEmpty) Left(problems) else Right(found.collect { case Right(path) => path })
+    if (problems.nonEmpty) Left(problems) else Right(found.collect { case Right(file) => file })
   }
 
-  /** How a file is not the one that was planned, if it is not. */
-  private def changes(planned: PlannedFile, now: Listed): Option[String] = {
-    val was = planned.file
+  /** How a file is not of the size and the time that were planned, if it is not. */
+  private def changes(planned: LandedFile, now: Landing.Stat): Seq[String] = {
+    val modifiedAt = Instant.ofEpochMilli(now.modifiedAt)
     Seq(
-      Option.when(now.identity != planned.identity)(
-        s"is another file of the file system (${now.identity}, and was ${planned.identity})"
-      ),
-      Option.when(now.size != was.size)(s"is of ${now.size} bytes, and was of ${was.size}"),
-      Option.when(now.modifiedAt != was.modifiedAt)(
-        s"was changed at ${now.modifiedAt}, and was of ${was.modifiedAt}"
+      Option.when(now.size != planned.size)(s"is of ${now.size} bytes, and was of ${planned.size}"),
+      Option.when(modifiedAt != planned.modifiedAt)(
+        s"was changed at $modifiedAt, and was of ${planned.modifiedAt}"
       )
-    ).flatten match {
-      case Seq() => None
-      case some => Some(some.mkString(", "))
-    }
+    ).flatten
   }
 
   /** The real root, and the real directory of the source, which is under it. */
@@ -164,10 +200,14 @@ final class Landing(root: RootUri) {
    * @return none for a directory, a link to one, and an entry that is gone since it was listed:
    *   its producer took it back, and it is not the source's any more
    */
-  private def look(entry: Path, name: String, rootReal: Path): Option[Either[String, Listed]] =
+  private def look(
+      entry: Path,
+      name: String,
+      rootReal: Path
+  ): Option[Either[String, Landing.Stat]] =
     stat(entry, LinkOption.NOFOLLOW_LINKS).flatMap { own =>
       if (own.isDirectory) None
-      else if (FileName.parse(name).isLeft) Some(Right(own.listed(name)))
+      else if (FileName.parse(name).isLeft) Some(Right(own))
       else if (!own.isSymbolicLink) Some(file(name, own))
       else
         real(entry, missing = "is a symbolic link to nothing") match {
@@ -183,8 +223,8 @@ final class Landing(root: RootUri) {
     }
 
   /** What is read under a name: a file, and nothing else. */
-  private def file(name: String, stat: Landing.Stat): Either[String, Listed] =
-    if (stat.isRegularFile) Right(stat.listed(name))
+  private def file(name: String, stat: Landing.Stat): Either[String, Landing.Stat] =
+    if (stat.isRegularFile) Right(stat)
     else
       Left(
         "is not a file but a pipe, a socket or a device: a read of it could wait for ever, or " +
@@ -230,6 +270,22 @@ final class Landing(root: RootUri) {
 
 object Landing {
 
+  /**
+   * The files of a plan as they were found just before they were read: where each is, and which
+   * file of the file system it was. It lives as long as the read, and is never written down.
+   */
+  final class Confirmed private[files] (
+      private[files] val plan: FilePlan,
+      found: Vector[(Path, FileIdentity)]
+  ) {
+
+    /** Where each file of the plan is, in its directory as it is resolved, in the plan's order. */
+    val paths: Vector[Path] = found.map(_._1)
+
+    /** Which file of the file system each was, in the plan's order. */
+    val identities: Vector[FileIdentity] = found.map(_._2)
+  }
+
   final private[files] case class Stat(
       isDirectory: Boolean,
       isRegularFile: Boolean,
@@ -238,8 +294,7 @@ object Landing {
       modifiedAt: Long,
       identity: FileIdentity
   ) {
-    def listed(name: String): Listed =
-      Listed(name, size, Instant.ofEpochMilli(modifiedAt), identity)
+    def listed(name: String): Listed = Listed(name, size, Instant.ofEpochMilli(modifiedAt))
   }
 
   /** The attributes of the `unix` view that a look reads, which Linux and macOS have. */

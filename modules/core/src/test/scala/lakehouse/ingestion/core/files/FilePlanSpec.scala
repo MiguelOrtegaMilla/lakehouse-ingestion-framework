@@ -36,10 +36,7 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
 
   /** A file changed `age` before `Now`. */
   private def listed(name: String, size: Long = 100, age: FiniteDuration = 1.hour): Listed =
-    Listed(name, size, Now.minusMillis(age.toMillis), identity(name))
-
-  /** A file of its own for each name, as a directory has. */
-  private def identity(name: String): FileIdentity = FileIdentity(2049, name.hashCode.toLong.abs)
+    Listed(name, size, Now.minusMillis(age.toMillis))
 
   private def landed(file: Listed): LandedFile =
     LandedFile(FileName.parse(file.name).value, file.size, file.modifiedAt)
@@ -169,9 +166,6 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
     filePlan.directory shouldBe Directory
     filePlan.names.map(_.value) shouldBe Vector("c.csv", "b.csv", "a.csv")
     filePlan.files shouldBe Vector(listing(1), listing(0), listing(2)).map(landed)
-    // Each with the file of the file system that its name led to when the directory was listed.
-    filePlan.planned.map(_.identity) shouldBe
-      Vector(listing(1), listing(0), listing(2)).map(_.identity)
     filePlan.bytes shouldBe 300
     waiting shouldBe 1
     leftOver shouldBe 0
@@ -190,10 +184,10 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
   }
 
   test("a file is complete once it is min_file_age old, to the millisecond") {
-    val atTheAge = Listed("ready.csv", 1, Now.minusMillis(60000), identity("ready.csv"))
-    val justYounger = Listed("almost.csv", 1, Now.minusMillis(59999), identity("almost.csv"))
+    val atTheAge = Listed("ready.csv", 1, Now.minusMillis(60000))
+    val justYounger = Listed("almost.csv", 1, Now.minusMillis(59999))
     // A clock that is behind the file system's makes a file from the future: it waits.
-    val fromTheFuture = Listed("ahead.csv", 1, Now.plusMillis(5000), identity("ahead.csv"))
+    val fromTheFuture = Listed("ahead.csv", 1, Now.plusMillis(5000))
 
     val Planned(filePlan, waiting, _) = planned(plan(Seq(atTheAge, justYounger, fromTheFuture)))
     filePlan.names.map(_.value) shouldBe Vector("ready.csv")
@@ -281,9 +275,8 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
   test("a listing has each name once, and a time to the millisecond") {
     an[IllegalArgumentException] should be thrownBy
       FilePlanner.plan(config(), Seq(listed("a.csv"), listed("a.csv")), Set.empty, Now)
-    an[IllegalArgumentException] should be thrownBy
-      Listed("a.csv", 1, Now.plusNanos(1), identity("a.csv"))
-    an[IllegalArgumentException] should be thrownBy Listed("a.csv", -1, Now, identity("a.csv"))
+    an[IllegalArgumentException] should be thrownBy Listed("a.csv", 1, Now.plusNanos(1))
+    an[IllegalArgumentException] should be thrownBy Listed("a.csv", -1, Now)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -293,29 +286,20 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
   private val Written = FilePlan(
     Directory,
     Vector(
-      PlannedFile(
-        LandedFile(FileName.parse("returns 1.csv").value, 0, Instant.parse("2026-11-18T10:00:00Z")),
-        FileIdentity(2049, 1)
-      ),
-      PlannedFile(
-        LandedFile(
-          FileName.parse("devoluciones-año.csv").value,
-          123456789012L,
-          Instant.parse("2026-11-18T10:00:00.123Z")
-        ),
-        // What the JDK gives of a number that does not fit in 63 bits: a negative one.
-        FileIdentity(Long.MaxValue, Long.MinValue)
+      LandedFile(FileName.parse("returns 1.csv").value, 0, Instant.parse("2026-11-18T10:00:00Z")),
+      LandedFile(
+        FileName.parse("devoluciones-año.csv").value,
+        123456789012L,
+        Instant.parse("2026-11-18T10:00:00.123Z")
       )
     )
   )
 
   test("a plan is written in one form, which changes only with its version") {
     Written.toJson.noSpaces shouldBe
-      """{"version":2,"directory":"sales/returns","files":[""" +
-      """{"name":"returns 1.csv","size":0,"modified_at":"2026-11-18T10:00:00Z",""" +
-      """"device":2049,"inode":1},""" +
-      """{"name":"devoluciones-año.csv","size":123456789012,"modified_at":"2026-11-18T10:00:00.123Z",""" +
-      """"device":9223372036854775807,"inode":-9223372036854775808}]}"""
+      """{"version":1,"directory":"sales/returns","files":[""" +
+      """{"name":"returns 1.csv","size":0,"modified_at":"2026-11-18T10:00:00Z"},""" +
+      """{"name":"devoluciones-año.csv","size":123456789012,"modified_at":"2026-11-18T10:00:00.123Z"}]}"""
   }
 
   test("a plan is read back as it was written, from its text as well") {
@@ -326,13 +310,10 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
 
   test("a plan of the largest batch, with the longest names, is read back") {
     val files = (1 to FileConnectorConfig.MaxFilesPerBatch).toVector.map { i =>
-      PlannedFile(
-        LandedFile(
-          FileName.parse(f"$i%05d" + "ñ" * 125).value, // 255 bytes
-          Long.MaxValue,
-          Instant.parse("2026-11-18T10:00:00.123Z")
-        ),
-        FileIdentity(Long.MinValue, Long.MinValue)
+      LandedFile(
+        FileName.parse(f"$i%05d" + "ñ" * 125).value, // 255 bytes
+        Long.MaxValue,
+        Instant.parse("2026-11-18T10:00:00.123Z")
       )
     }
     val largest = FilePlan(Directory, files)
@@ -351,8 +332,8 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
     def refusal(json: Json): String = FilePlan.fromJson(json).left.value
 
     refusal(Json.fromString("a plan")) shouldBe "is not an object"
-    refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(1)))) shouldBe
-      "is of version 1, and this application reads version 2"
+    refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(2)))) shouldBe
+      "is of version 2, and this application reads version 1"
     refusal(without("directory")) shouldBe "has no directory"
     refusal(Written.toJson.mapObject(_.add("extra", Json.True))) shouldBe "has a field extra"
     refusal(Written.toJson.mapObject(_.add("directory", Json.fromString("../x")))) shouldBe
@@ -375,11 +356,6 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
       withFile(_.mapObject(_.add("modified_at", Json.fromString("2026-11-18T10:00:00.000001Z"))))
     ) shouldBe "files[0].modified_at is not to the millisecond"
     refusal(withFile(_.mapObject(_.remove("size")))) shouldBe "files[0] has no size"
-    refusal(withFile(_.mapObject(_.remove("inode")))) shouldBe "files[0] has no inode"
-    refusal(withFile(_.mapObject(_.add("device", Json.fromString("2049"))))) shouldBe
-      "files[0].device is not a number"
-    refusal(withFile(_.mapObject(_.add("inode", Json.fromDoubleOrNull(1.5))))) shouldBe
-      "files[0].inode is not a number"
     // A number written as text is not one, though circe's decoders would take it.
     refusal(Written.toJson.mapObject(_.add("version", Json.fromString("1")))) shouldBe
       "version is not a whole number"
