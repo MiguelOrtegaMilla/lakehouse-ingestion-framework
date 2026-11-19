@@ -48,7 +48,12 @@ object LogReader {
       ),
       StructField("add", pathStruct),
       StructField("remove", pathStruct),
-      StructField("commitInfo", StructType(Seq(StructField("operation", StringType)))),
+      StructField(
+        "commitInfo",
+        StructType(
+          Seq(StructField("operation", StringType), StructField("userMetadata", StringType))
+        )
+      ),
       StructField(CorruptRecord, StringType)
     )
   )
@@ -61,13 +66,15 @@ object LogReader {
    * commit files and the registry are looked at after that.
    *
    * @param registry reads the registry of the table, for a run on `PostgresLogStore`
+   * @param epochs reads the epochs of the run, for one whose writers commit under them
    */
   def verify(
       spark: SparkSession,
       run: StressRun,
       expected: Verifier.Expected,
       writers: Seq[StressHarness.WriterOutcome],
-      registry: Option[() => RegistryView] = None
+      registry: Option[() => RegistryView] = None,
+      epochs: Option[() => EpochsView] = None
   ): Verifier.Report = {
     val tables = Reader.all.map(r => r -> tableView(spark, run.tableUri, r))
     Verifier.verify(
@@ -76,7 +83,8 @@ object LogReader {
       logView(spark, run.tableDir),
       tables,
       diskView(run.tableDir),
-      registry.map(_.apply())
+      registry.map(_.apply()),
+      epochs.map(_.apply())
     )
   }
 
@@ -263,7 +271,13 @@ object LogReader {
             .map(t => Txn(t.getAs[String]("appId"), t.getAs[Long]("version"))),
           added = paths("add"),
           removed = paths("remove"),
-          operation = rows.flatMap(struct(_, "commitInfo")).headOption.map(_.getAs[String](0))
+          operation = rows.flatMap(struct(_, "commitInfo")).headOption.map(_.getAs[String](0)),
+          // What the writer of the commit said of its epoch, in the commit itself.
+          epoch = rows
+            .flatMap(struct(_, "commitInfo"))
+            .headOption
+            .flatMap(info => Option(info.getAs[String]("userMetadata")))
+            .flatMap(Turn.epochIn)
         )
       )
     }

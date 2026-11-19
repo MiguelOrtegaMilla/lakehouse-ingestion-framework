@@ -21,9 +21,13 @@ object RegistryReader {
 
   private val Entries =
     """SELECT version, complete, run_id::text,
-      |       (EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)::bigint
+      |       (EXTRACT(EPOCH FROM (completed_at - created_at)) * 1000)::bigint,
+      |       epoch_key, epoch
       |FROM delta_coordination.commit_entry
       |WHERE table_uri = ? ORDER BY version""".stripMargin
+
+  private val EpochsInForce =
+    "SELECT epoch_key, epoch FROM delta_coordination.writer_epoch WHERE epoch_key = ANY (?)"
 
   /** @param tableUri the key the table is coordinated under */
   def view(connection: Connection, tableUri: String): RegistryView = {
@@ -41,11 +45,15 @@ object RegistryReader {
           .takeWhile(_.next())
           .map { row =>
             val took = row.getLong(4)
+            val complete = Option.unless(row.wasNull())(took)
+            val epoch = row.getLong(6)
             RegistryEntry(
               row.getLong(1),
               row.getBoolean(2),
               Option(row.getString(3)),
-              Option.unless(row.wasNull())(took)
+              complete,
+              Option(row.getString(5)),
+              Option.unless(row.wasNull())(epoch)
             )
           }
           .toList
@@ -53,4 +61,17 @@ object RegistryReader {
     }
     RegistryView(registration.map(_._1), registration.flatMap(_._2), entries)
   }
+
+  /** The epoch in force under each of `keys` that has one (ADR-0019). */
+  def epochsInForce(connection: Connection, keys: Seq[String]): Map[String, Long] =
+    Using.resource(connection.prepareStatement(EpochsInForce)) { statement =>
+      statement.setArray(1, connection.createArrayOf("text", keys.toArray[AnyRef]))
+      Using.resource(statement.executeQuery()) { rows =>
+        Iterator
+          .continually(rows)
+          .takeWhile(_.next())
+          .map(row => row.getString(1) -> row.getLong(2))
+          .toMap
+      }
+    }
 }

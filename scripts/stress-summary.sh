@@ -14,7 +14,7 @@ field() {
 
 echo "## LogStore stress runs"
 echo
-echo "Runs named \`red\` are on Delta's default LogStore, where a lost commit is the expected result. Runs named \`green\` are on \`PostgresLogStore\`, and must lose none."
+echo "Runs named \`red\` are on Delta's default LogStore, where a lost commit is the expected result. Runs named \`green\` are on \`PostgresLogStore\`, and must lose none. In the runs named \`epoch\` every writer commits under an epoch and is taken over as it commits: an anomaly there is also a commit made after a later epoch was announced."
 echo
 echo "| Run | Acknowledged | Lost | Verifier |"
 echo "|---|---|---|---|"

@@ -19,6 +19,34 @@ final class StressRun private (val root: Path) {
 
   def journal(writer: Int): Path = root.resolve("journals").resolve(s"${name(writer)}.acks")
 
+  /**
+   * The journal of the process of a writer that commits under `epoch` (ADR-0019). The first
+   * process of a writer, and one that commits under no epoch, have the journal of the writer.
+   * A process that takes a writer over has one of its own: the process before it may still be
+   * running, and writing to its own.
+   */
+  def journal(writer: Int, epoch: Int): Path =
+    if (epoch <= 1) journal(writer)
+    else root.resolve("journals").resolve(s"${name(writer)}.e$epoch.acks")
+
+  /**
+   * What the processes of a writer wrote down of their turns, one line for each, before its
+   * first commit: its epoch, its run, the batch that the table said the writer was at once the
+   * epoch was announced, and how long the announcement took (`LogModel.Turn`).
+   */
+  def turns(writer: Int): Path = root.resolve("journals").resolve(s"${name(writer)}.turns")
+
+  /** The key that the epochs of a writer are of: its own in every run, in a store they share. */
+  def epochKey(writer: Int): String = s"${root.getFileName}/${name(writer)}"
+
+  /** Created by a process that is to take a writer over, once it could. It then waits. */
+  def turnReady(writer: Int, epoch: Int): Path =
+    root.resolve("barrier").resolve(s"${name(writer)}.e$epoch.ready")
+
+  /** Created by the orchestrator to let that process go: it announces its epoch, and commits. */
+  def turnGo(writer: Int, epoch: Int): Path =
+    root.resolve("barrier").resolve(s"${name(writer)}.e$epoch.go")
+
   def log(writer: Int): Path = root.resolve("logs").resolve(s"${name(writer)}.log")
 
   /**
@@ -36,6 +64,11 @@ final class StressRun private (val root: Path) {
 
   /** What the writer's Delta and Hadoop resolved (`WriterProbe`), written as it exits. */
   def probe(writer: Int): Path = root.resolve("probes").resolve(s"${name(writer)}.properties")
+
+  /** The probe of the process of a writer under `epoch`: as its journal, one for each process. */
+  def probe(writer: Int, epoch: Int): Path =
+    if (epoch <= 1) probe(writer)
+    else root.resolve("probes").resolve(s"${name(writer)}.e$epoch.properties")
 
   /** The Markdown report of the run (`StressReport`), next to the evidence it summarises. */
   def report: Path = root.resolve("report.md")

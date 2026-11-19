@@ -27,6 +27,15 @@ import lakehouse.ingestion.it.stress.StressHarness.WriterOutcome
  * no other file of the log has one that does not match it. A run without a registry, on
  * Delta's default LogStore, is held to none of these: there a sidecar is ordinary, and a stale
  * one is reported as an observation.
+ *
+ * A run whose writers commit under epochs (ADR-0019) is held to one thing more
+ * (`EpochsView`): '''no commit of an epoch is made once a later epoch of its key was
+ * announced'''. Each process writes down, before its first commit, the batch that the table
+ * said its writer was at once its epoch was announced. A commit under an earlier epoch that is
+ * of a later batch than that was taken behind the back of the process that asked: it is what a
+ * run of the engine that lost its lease must never do to the run that took its place. The
+ * epoch of a commit is read from the commit file, where its writer said it, and compared with
+ * what the registry recorded and with the run of the process that had that turn.
  */
 object Verifier {
 
@@ -172,6 +181,68 @@ object Verifier {
       val kind = "StaleSidecar"
       def detail = s"the .crc sidecar of _delta_log/$file does not match the file"
     }
+
+    /**
+     * A commit under an epoch that was made after a later epoch of its key was announced
+     * (ADR-0019): the process that announced the later one was told by the table that the
+     * writer was at batch `told`, and this commit is of a batch beyond it.
+     */
+    final case class CommitAfterLaterEpoch(
+        version: Long,
+        writer: String,
+        txnVersion: Long,
+        epoch: Long,
+        later: Long,
+        told: Long
+    ) extends Anomaly {
+      val kind = "CommitAfterLaterEpoch"
+      def detail =
+        s"version $version, $writer txnVersion=$txnVersion, was committed under epoch $epoch, " +
+          s"and the process that announced epoch $later was then told by the table that the " +
+          s"writer was at batch $told: the commit was taken after a later epoch was announced"
+    }
+
+    /** A commit of a writer under an earlier epoch than a commit of it lower in the log. */
+    final case class EpochWentBack(
+        version: Long,
+        writer: String,
+        epoch: Long,
+        after: Long,
+        afterEpoch: Long
+    ) extends Anomaly {
+      val kind = "EpochWentBack"
+      def detail =
+        s"version $version, a commit of $writer under epoch $epoch, comes after version " +
+          s"$after, a commit of it under epoch $afterEpoch"
+    }
+
+    /**
+     * What a commit says of its epoch, what the registry recorded of it and the turn of the
+     * process that made it are not one and the same; or the commit says none.
+     */
+    final case class EpochMismatch(version: Long, writer: String, reason: String) extends Anomaly {
+      val kind = "EpochMismatch"
+      def detail = s"version $version, a commit of $writer: $reason"
+    }
+
+    /** The epoch in force under the key of a writer is not that of its last process. */
+    final case class WrongEpochInForce(
+        writer: String,
+        key: String,
+        inForce: Option[Long],
+        last: Long
+    ) extends Anomaly {
+      val kind = "WrongEpochInForce"
+      def detail =
+        s"the epoch in force under $key is ${inForce.fold("none")(_.toString)}, and the last " +
+          s"process of $writer announced $last"
+    }
+
+    /** What the processes of a writer wrote of their turns contradicts itself: a harness bug. */
+    final case class InconsistentTurns(writer: String, reason: String) extends Anomaly {
+      val kind = "InconsistentTurns"
+      def detail = s"$writer: $reason"
+    }
   }
 
   import Anomaly._
@@ -188,7 +259,9 @@ object Verifier {
       writers: Seq[WriterOutcome],
       commitSidecars: Seq[Long] = Nil,
       staleSidecars: Seq[String] = Nil,
-      registry: Option[RegistryView] = None
+      registry: Option[RegistryView] = None,
+      epochs: Option[EpochsView] = None,
+      commitsByEpoch: Map[(String, Long), Int] = Map.empty
   )
 
   final case class Report(anomalies: Seq[Anomaly], summary: Summary) {
@@ -199,6 +272,8 @@ object Verifier {
   /**
    * @param registry the registry of the table, for a run on `PostgresLogStore`; `None` for a
    *   run that was not coordinated, which is then held to none of the registry's rules
+   * @param epochs the epochs of the run, for one whose writers commit under them; `None` for a
+   *   run whose writers commit under none
    */
   def verify(
       expected: Expected,
@@ -206,7 +281,8 @@ object Verifier {
       log: LogView,
       tables: Seq[(Reader, Either[String, TableView])],
       disk: DiskView,
-      registry: Option[RegistryView] = None
+      registry: Option[RegistryView] = None,
+      epochs: Option[EpochsView] = None
   ): Report = {
     val states = writers.map(w => StressTable.writerId(w.writer) -> commitStates(w, expected))
     val occurrences = txnOccurrences(log)
@@ -219,7 +295,8 @@ object Verifier {
           case (reader, Left(error)) => Seq(UnreadableTable(reader, error))
           case (reader, Right(view)) => tableAnomalies(reader, expected, occurrences, log, view)
         } ++
-        registry.toSeq.flatMap(coordinationAnomalies(_, log, writers))
+        registry.toSeq.flatMap(coordinationAnomalies(_, log, writers)) ++
+        epochs.toSeq.flatMap(epochAnomalies(_, log, registry, writers))
 
     val acked = states.map(_._2.values.count(_ == CommitState.Acked)).sum
     Report(
@@ -239,9 +316,117 @@ object Verifier {
         writers = writers,
         commitSidecars = log.commitSidecars,
         staleSidecars = log.staleSidecars,
-        registry = registry
+        registry = registry,
+        epochs = epochs,
+        commitsByEpoch = log.commits
+          .flatMap(c => for (txn <- c.txns.headOption; epoch <- c.epoch) yield (txn.appId, epoch))
+          .groupMapReduce(identity)(_ => 1)(_ + _)
       )
     )
+  }
+
+  /**
+   * What a run whose writers commit under epochs must leave (ADR-0019).
+   *
+   * The epoch of a commit is the one that the commit itself says, in its file. For each writer:
+   *
+   *   - every commit says an epoch, which is one that a process of the writer had; the registry
+   *     recorded that epoch under the key of the writer, and the run of that process;
+   *   - '''no commit under an epoch is of a batch beyond what a process of a later epoch was
+   *     told''' by the table once it had announced its own. It is the invariant: such a commit
+   *     was made after a later epoch was announced, behind the back of whoever asked;
+   *   - along the versions of the table, the epoch of the commits of a writer never goes back;
+   *   - the epoch in force at the end is that of its last process.
+   */
+  private def epochAnomalies(
+      epochs: EpochsView,
+      log: LogView,
+      registry: Option[RegistryView],
+      writers: Seq[WriterOutcome]
+  ): Seq[Anomaly] = {
+    val entries = registry.toSeq.flatMap(_.entries).map(e => e.version -> e).toMap
+
+    writers.map(w => StressTable.writerId(w.writer)).sorted.flatMap { writer =>
+      val turns = epochs.turns.filter(_.writer == writer).sortBy(_.epoch)
+      val key = epochs.keys.get(writer)
+      val commits = log.commits.sortBy(_.version).flatMap { commit =>
+        commit.txns.headOption.filter(_.appId == writer).map(txn => (commit, txn.version))
+      }
+
+      val ofTheTurns = Seq(
+        turns.nonEmpty -> "no process of it wrote its turn down",
+        (turns.map(_.epoch) == (1L to turns.size.toLong)) ->
+          s"its turns are of epochs ${turns.map(_.epoch).mkString(", ")}, and not 1 to ${turns.size}",
+        (turns.map(_.told) == turns.map(_.told).sorted) ->
+          s"its processes were told batches ${turns.map(_.told).mkString(", ")}, which go back",
+        (turns.map(_.run).distinct.size == turns.size) -> "two of its processes ran as one run",
+        key.nonEmpty -> "its epochs have no key"
+      ).collect { case (false, reason) => InconsistentTurns(writer, reason) }
+
+      val ofTheCommits = commits.flatMap { case (commit, batch) =>
+        def mismatch(reason: String) = EpochMismatch(commit.version, writer, reason)
+        commit.epoch match {
+          case None => Seq(mismatch("it says no epoch"))
+          case Some(epoch) =>
+            turns.find(_.epoch == epoch) match {
+              case None =>
+                Seq(mismatch(s"it says epoch $epoch, and no process of the writer had that turn"))
+              case Some(turn) =>
+                val recorded = entries.get(commit.version).toSeq.flatMap { entry =>
+                  val ofTheEntry = entry.epochKey.zip(entry.epoch)
+                  Seq(
+                    (ofTheEntry == key.map(_ -> epoch)) ->
+                      (s"it says epoch $epoch, and the registry recorded " +
+                        ofTheEntry.fold("none")(e => s"epoch ${e._2} of ${e._1}")),
+                    entry.runId.contains(turn.run) ->
+                      (s"it says epoch $epoch, whose process ran as ${turn.run}, and its entry " +
+                        s"names ${entry.runId.getOrElse("no run")}")
+                  ).collect { case (false, reason) => mismatch(reason) }
+                }
+                val behind = Option.when(batch <= turn.told)(
+                  InconsistentTurns(
+                    writer,
+                    s"version ${commit.version} is of batch $batch under epoch $epoch, whose " +
+                      s"process was told that the table had batch ${turn.told} already"
+                  )
+                )
+                // The first of the later epochs that it got past, if it got past any.
+                val after =
+                  turns.find(later => later.epoch > epoch && batch > later.told).map { later =>
+                    CommitAfterLaterEpoch(
+                      commit.version,
+                      writer,
+                      batch,
+                      epoch,
+                      later.epoch,
+                      later.told
+                    )
+                  }
+                recorded ++ behind ++ after
+            }
+        }
+      }
+
+      val stated = commits.flatMap { case (commit, _) => commit.epoch.map(commit.version -> _) }
+      val wentBack = stated
+        .scanLeft(Option.empty[(Long, Long)] -> Option.empty[Anomaly]) {
+          case ((highest, _), (version, epoch)) =>
+            highest match {
+              case Some((at, top)) if epoch < top =>
+                highest -> Some(EpochWentBack(version, writer, epoch, at, top))
+              case _ => Some(version -> epoch) -> None
+            }
+        }
+        .flatMap(_._2)
+
+      val inForce = for {
+        last <- turns.lastOption.toSeq
+        of <- key.toSeq
+        if !epochs.inForce.get(of).contains(last.epoch)
+      } yield WrongEpochInForce(writer, of, epochs.inForce.get(of), last.epoch)
+
+      ofTheTurns ++ ofTheCommits ++ wentBack ++ inForce
+    }
   }
 
   /**

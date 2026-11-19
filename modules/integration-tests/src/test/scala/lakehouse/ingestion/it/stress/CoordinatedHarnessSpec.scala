@@ -287,6 +287,84 @@ final class CoordinatedHarnessSpec
       Some(CoordinatedStressSuite.BatchCommit(taken, outcomes.head.runs.headOption))
   }
 
+  test(
+    "a writer that is taken over is refused at its next commit, and the other goes on from the table"
+  ) {
+    val run = newRun("taken-over")
+    val commits = 24
+    val settings = Settings(
+      writers = 1,
+      commits = commits,
+      rowsPerCommit = 4,
+      // Slow enough to be still committing when the process that takes it over has started.
+      extraJvmOptions = coordinatedJvmOptions :+ delay(FaultPoint.BeforeInsert, millis = 1000),
+      guard = true,
+      epochs = true
+    )
+    var taken = Option.empty[(LogModel.Turn, Seq[(Int, Int)])]
+
+    val outcome = StressHarness
+      .run(
+        run,
+        settings,
+        chaos => {
+          // A second process of the writer, under the next epoch, while the first commits. The
+          // first is not killed, and is told nothing.
+          chaos.awaitAcknowledged(0, batches = 2)
+          chaos.standBy(0) shouldBe 2
+          val turn = chaos.takeOver(0)
+          taken = Some(turn -> chaos.awaitSuperseded(0))
+        }
+      )
+      .loneElement
+
+    val (turn, superseded) = taken.getOrElse(fail("the writer was not taken over"))
+    // The process that took over announced its epoch, and was told by the table which batch
+    // the writer was at: one that the first had committed, with batches left to commit.
+    (turn.writer, turn.epoch) shouldBe (("writer-0", 2L))
+    withClue(logOf(outcome).linesIterator.filterNot(_.contains(" INFO ")).take(20).mkString("\n")) {
+      turn.told should (be >= 2L and be < commits.toLong)
+    }
+    // The first went on, and the LogStore refused its next commit for its epoch.
+    superseded shouldBe Seq(1 -> StressWriter.ExitCode.OutOfTurn)
+    withClue(logOf(outcome)) {
+      outcome.exitCode shouldBe StressWriter.ExitCode.Ok
+      outcome.journal.acked shouldBe (1L to commits.toLong).toVector
+      logOf(outcome) should include("the writer commits under epoch 1 of")
+    }
+    outcome.processes.map(p => p.epoch -> p.exitCode) shouldBe
+      Seq(1 -> StressWriter.ExitCode.OutOfTurn, 2 -> StressWriter.ExitCode.Ok)
+    // Each of them acknowledged what it committed: the first up to what the table said, and
+    // the second from the batch after.
+    outcome.processes.head.acked.take(turn.told.toInt) shouldBe (1L to turn.told).toVector
+    outcome.processes(1).acked.lastOption shouldBe Some(commits.toLong)
+    outcome.turns.map(t => (t.epoch, t.told)) shouldBe Seq((1L, 0L), (2L, turn.told))
+    outcome.runs should have size 2
+
+    // Every commit says the epoch of the process that made it, in its own file: the first up
+    // to the batch that the table said, the second after it, and never the first again.
+    LogReader
+      .logView(spark, run.tableDir)
+      .commits
+      .flatMap(commit => commit.txns.headOption.map(_.version -> commit.epoch)) shouldBe
+      (1L to commits.toLong).map(batch => batch -> Some(if (batch <= turn.told) 1L else 2L))
+
+    // And the verifier of the spikes finds every batch once, each commit in its turn, the
+    // registry with the epoch of each, and the last epoch in force.
+    val report = verify(run, settings, Seq(outcome))
+    withClue(report.anomalies.map(_.detail).mkString("\n")) { report.isClean shouldBe true }
+    report.summary.lost shouldBe 0
+    report.summary.epochs.map(_.inForce) shouldBe Some(Map(run.epochKey(0) -> 2L))
+    report.summary.commitsByEpoch shouldBe Map(
+      ("writer-0", 1L) -> turn.told.toInt,
+      ("writer-0", 2L) -> (commits - turn.told.toInt)
+    )
+    registryView(run).entries.drop(1).map(e => (e.epochKey, e.epoch)).distinct shouldBe Seq(
+      (Some(run.epochKey(0)), Some(1L)),
+      (Some(run.epochKey(0)), Some(2L))
+    )
+  }
+
   test("PostgreSQL killed in the middle of a run: the writers repeat their batch, once each") {
     val run = newRun("postgres-killed")
     val commits = 6

@@ -448,4 +448,185 @@ final class VerifierSpec extends AnyFunSuite with Matchers with LoneElement {
       "writer-1: exit code 1 contradicts the journal (2 acks, failure None)"
     )
   }
+  // ---------------------------------------------------------------------------------------------
+  // A run whose writers commit under epochs (ADR-0019)
+  // ---------------------------------------------------------------------------------------------
+
+  private def key(w: Int) = s"run/${id(w)}"
+
+  /** Writer 0 is taken over once, by a process that the table told of its batch 2; writer 1 never. */
+  private val turns = Seq(
+    Turn(id(0), 1, "run-a", told = 0, announceMillis = 3),
+    Turn(id(0), 2, "run-b", told = 2, announceMillis = 40),
+    Turn(id(1), 1, "run-c", told = 0, announceMillis = 2)
+  )
+
+  private def epochsOf(
+      ofTurns: Seq[Turn] = turns,
+      inForce: Map[String, Long] = Map(key(0) -> 2, key(1) -> 1)
+  ) =
+    EpochsView(Map(id(0) -> key(0), id(1) -> key(1)), ofTurns, inForce)
+
+  /** The interleaved run, each commit saying the epoch that `epochOf` gives it. */
+  private def underEpochs(epochOf: (Int, Long) => Option[Long]): LogView = {
+    val log = logOf(interleaved)
+    log.copy(commits = log.commits.map { commit =>
+      commit.txns.headOption.fold(commit) { txn =>
+        commit.copy(epoch = epochOf(txn.appId.stripPrefix("writer-").toInt, txn.version))
+      }
+    })
+  }
+
+  /** As the turns say: writer 0 under epoch 1 up to its batch 2, and under epoch 2 after. */
+  private val inTurn: (Int, Long) => Option[Long] = {
+    case (0, batch) => Some(if (batch <= 2) 1L else 2L)
+    case _ => Some(1L)
+  }
+
+  private def runUnderEpochs(
+      log: LogView,
+      epochs: EpochsView = epochsOf(),
+      registry: Option[RegistryView] = None
+  ): Report =
+    Verifier.verify(
+      expected,
+      allOk,
+      log,
+      Seq(Reader.Default -> Right(consistentTable(log))),
+      DiskView(log.everAdded),
+      registry,
+      Some(epochs)
+    )
+
+  test("a run whose writers were taken over, each commit in its turn, is clean") {
+    val report = runUnderEpochs(underEpochs(inTurn))
+
+    report.anomalies shouldBe empty
+    report.summary.commitsByEpoch shouldBe
+      Map((id(0), 1L) -> 2, (id(0), 2L) -> 1, (id(1), 1L) -> 3)
+    report.summary.epochs shouldBe Some(epochsOf())
+  }
+
+  test(
+    "a commit under an epoch, of a batch beyond what a later epoch was told, is CommitAfterLaterEpoch"
+  ) {
+    // The process of epoch 2 announced, was told that writer 0 was at batch 2, and then the
+    // process of epoch 1 committed batch 3: the commit was taken after the later epoch.
+    val report = runUnderEpochs(underEpochs {
+      case (0, _) => Some(1L)
+      case _ => Some(1L)
+    })
+
+    report.anomalies shouldBe Seq(
+      CommitAfterLaterEpoch(version = 5, id(0), txnVersion = 3, epoch = 1, later = 2, told = 2)
+    )
+    report.anomalies.loneElement.detail shouldBe
+      "version 5, writer-0 txnVersion=3, was committed under epoch 1, and the process that " +
+      "announced epoch 2 was then told by the table that the writer was at batch 2: the commit " +
+      "was taken after a later epoch was announced"
+    // The commits that the process made in its turn are none of it.
+    report.count("EpochWentBack") shouldBe 0
+  }
+
+  test(
+    "a commit of a writer under an earlier epoch than one before it in the log is EpochWentBack"
+  ) {
+    // Told of batch 1, the process of epoch 2 commits batch 2; batch 3 is of epoch 1 again.
+    val told1 = turns.map(t => if (t.epoch == 2) t.copy(told = 1) else t)
+    val report = runUnderEpochs(
+      underEpochs {
+        case (0, 2L) => Some(2L)
+        case _ => Some(1L)
+      },
+      epochsOf(told1)
+    )
+
+    report.anomalies shouldBe Seq(
+      CommitAfterLaterEpoch(version = 5, id(0), txnVersion = 3, epoch = 1, later = 2, told = 1),
+      EpochWentBack(version = 5, id(0), epoch = 1, after = 3, afterEpoch = 2)
+    )
+  }
+
+  test("a commit that says no epoch, or one that no process had, is EpochMismatch") {
+    val report = runUnderEpochs(underEpochs {
+      case (0, 1L) => None
+      case (1, 3L) => Some(7L)
+      case other => inTurn.tupled(other)
+    })
+
+    report.anomalies.map(_.detail) shouldBe Seq(
+      "version 1, a commit of writer-0: it says no epoch",
+      "version 6, a commit of writer-1: it says epoch 7, and no process of the writer had that turn"
+    )
+    report.anomalies.map(_.kind).distinct shouldBe Seq("EpochMismatch")
+  }
+
+  test("a commit whose epoch or run the registry recorded otherwise is EpochMismatch") {
+    val log = underEpochs(inTurn)
+    def entry(commit: Commit, epochKey: Option[String], epoch: Option[Long], run: String) =
+      RegistryEntry(commit.version, complete = true, Some(run), Some(5), epochKey, epoch)
+    // As the turns say, but for three entries: one of another epoch, one of no epoch, and one
+    // under the run of the process that had the other turn.
+    val entries = log.commits.map { commit =>
+      commit.txns.headOption match {
+        case None => RegistryEntry(commit.version, complete = true, None)
+        case Some(Txn("writer-0", 1)) => entry(commit, Some(key(0)), Some(2), "run-a")
+        case Some(Txn("writer-0", 2)) => entry(commit, None, None, "run-a")
+        case Some(Txn("writer-0", 3)) => entry(commit, Some(key(0)), Some(2), "run-a")
+        case Some(Txn(_, _)) => entry(commit, Some(key(1)), Some(1), "run-c")
+      }
+    }
+    val writers = Seq(
+      allOk.head.copy(runs = Seq("run-a", "run-b")),
+      allOk(1).copy(runs = Seq("run-c"))
+    )
+    val report = Verifier.verify(
+      expected,
+      writers,
+      log,
+      Seq(Reader.Default -> Right(consistentTable(log))),
+      DiskView(log.everAdded),
+      Some(RegistryView(Some(-1), None, entries)),
+      Some(epochsOf())
+    )
+
+    report.anomalies.map(_.detail) shouldBe Seq(
+      "version 1, a commit of writer-0: it says epoch 1, and the registry recorded epoch 2 of run/writer-0",
+      "version 3, a commit of writer-0: it says epoch 1, and the registry recorded none",
+      "version 5, a commit of writer-0: it says epoch 2, whose process ran as run-b, and its " +
+        "entry names run-a"
+    )
+  }
+
+  test("the epoch in force at the end is that of the last process of each writer") {
+    val behind =
+      runUnderEpochs(underEpochs(inTurn), epochsOf(inForce = Map(key(0) -> 1, key(1) -> 1)))
+    val none = runUnderEpochs(underEpochs(inTurn), epochsOf(inForce = Map(key(0) -> 2)))
+
+    behind.anomalies shouldBe Seq(WrongEpochInForce(id(0), key(0), Some(1), 2))
+    none.anomalies shouldBe Seq(WrongEpochInForce(id(1), key(1), None, 1))
+  }
+
+  test("turns that contradict themselves, or the commits made in them, are InconsistentTurns") {
+    val skipped = turns.map(t => if (t.epoch == 2) t.copy(epoch = 3) else t)
+    val oneRun = turns.map(t => if (t.epoch == 2) t.copy(run = "run-a") else t)
+    val noTurns = turns.filterNot(_.writer == id(1))
+    // The process of epoch 2 was told that the table had batch 3, and committed batch 3.
+    val toldTooMuch = turns.map(t => if (t.epoch == 2) t.copy(told = 3) else t)
+
+    def reasons(ofTurns: Seq[Turn], inForce: Map[String, Long] = Map(key(0) -> 2, key(1) -> 1)) =
+      runUnderEpochs(underEpochs(inTurn), epochsOf(ofTurns, inForce)).anomalies.collect {
+        case InconsistentTurns(writer, reason) => s"$writer: $reason"
+      }
+
+    reasons(skipped, Map(key(0) -> 3, key(1) -> 1)) shouldBe
+      Seq("writer-0: its turns are of epochs 1, 3, and not 1 to 2")
+    reasons(oneRun) shouldBe Seq("writer-0: two of its processes ran as one run")
+    reasons(noTurns) shouldBe Seq("writer-1: no process of it wrote its turn down")
+    reasons(toldTooMuch) shouldBe Seq(
+      "writer-0: version 5 is of batch 3 under epoch 2, whose process was told that the table " +
+        "had batch 3 already"
+    )
+  }
+
 }

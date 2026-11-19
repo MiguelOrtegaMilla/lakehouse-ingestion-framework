@@ -12,15 +12,20 @@ import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Success, Try, Using}
 
 import io.delta.tables.DeltaTable
+import lakehouse.ingestion.it.stress.LogModel.Turn
 import lakehouse.ingestion.it.support.LocalSparkSuite
+import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import lakehouse.ingestion.logstore.{
   CommitContext,
+  EpochNotInForceException,
   PostgresLogStore,
   StartupGuard,
-  StartupRefusedException
+  StartupRefusedException,
+  WriterEpochs
 }
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.delta.DeltaLog
 
 /**
  * One stress writer: the `main` of each writer JVM that `StressHarness` launches.
@@ -49,6 +54,15 @@ import org.apache.spark.sql.SparkSession
  * whether the commit was made, and Delta skips a batch that is in the table: that is how the
  * engine is to treat a batch whose outcome it does not know.
  *
+ * A writer that is given an epoch (`WriterConfig.epoch`) commits under it (ADR-0019), as a run
+ * of the engine commits under the epoch of its lease. Before it commits anything it announces
+ * its epoch, asks the table which batch the writer is at, writes both down
+ * (`StressRun.turns`), and goes on from the batch after: what recovery does. Every commit
+ * names the epoch, to the LogStore through its commit context and in the commit itself. A
+ * process that takes a writer over (`WriterConfig.takesOver`) does so while the process before
+ * it may still be committing. That one is told nothing: its next commit is refused by the
+ * LogStore, and it stops (`ExitCode.OutOfTurn`).
+ *
  * The exit code tells the orchestrator how far the writer got (`ExitCode`).
  */
 object StressWriter {
@@ -75,6 +89,13 @@ object StressWriter {
      * The table was not touched. (The exit code the discovery gives the engine for the same.)
      */
     val Refused = 4
+
+    /**
+     * The process commits under an epoch, and another process has taken its writer over: the
+     * epoch in force is a later one. It stopped at the first commit that failed after that,
+     * with nothing of the batch committed by it.
+     */
+    val OutOfTurn = 5
   }
 
   private val BarrierPoll = 5.millis
@@ -95,7 +116,7 @@ object StressWriter {
         val id = StressTable.writerId(config.writer)
         val opened = Try {
           val run = StressRun.at(config.runDir)
-          val journal = run.journal(config.writer)
+          val journal = run.journal(config.writer, config.epoch)
           run -> (if (config.restarted) AckJournal.reopen(journal) else AckJournal.open(journal))
         }
         opened match {
@@ -124,10 +145,29 @@ object StressWriter {
               ExitCode.SetupFailed
             case Right(probe) =>
               val started = System.nanoTime()
-              val commits = CommitContext.forRun(UUID.randomUUID())
+              val turn = Option.when(config.epoch > 0)(
+                WriterEpoch(run.epochKey(config.writer), config.epoch.toLong)
+              )
+              val commits = turn.fold(CommitContext.forRun(UUID.randomUUID()))(
+                CommitContext.forRun(UUID.randomUUID(), _)
+              )
               recordRun(run, config, commits.runId)
               val code =
-                try commitAll(spark, config, run, journal, commits)
+                try
+                  turn.fold(commitAll(spark, config, run, journal, commits, None)) { epoch =>
+                    takeTurn(spark, config, run, epoch, commits.runId) match {
+                      case None => ExitCode.OutOfTurn
+                      case Some(told) =>
+                        commitAll(
+                          spark,
+                          config.copy(firstCommit = told.toInt + 1),
+                          run,
+                          journal,
+                          commits,
+                          Some(epoch)
+                        )
+                    }
+                  }
                 finally
                   probe
                     .copy(
@@ -137,7 +177,7 @@ object StressWriter {
                       contentionAtInsert = commits.contentionAtInsert,
                       faultWaits = WriterProbe.faultWaitsOfThisJvm
                     )
-                    .write(run.probe(config.writer))
+                    .write(run.probe(config.writer, config.epoch))
               val elapsed = (System.nanoTime() - started).nanos.toMillis
               println(s"$id: exit code $code after $elapsed ms")
               code
@@ -208,43 +248,84 @@ object StressWriter {
         throw new StartupRefusedException(
           Seq(s"Delta resolves ${probe.logStore} for ${run.tableUri}, not $coordinated")
         )
-      // The barrier is for the writers that start a run together.
-      if (!config.restarted) {
+      // The barrier is for the writers that start a run together. A process that takes a
+      // writer over says that it could, and waits to be let go.
+      if (config.takesOver) {
+        Files.createFile(run.turnReady(config.writer, config.epoch))
+        await(run.turnGo(config.writer, config.epoch), config.startTimeout.fromNow)
+      } else if (!config.restarted) {
         Files.createFile(run.readyMarker(config.writer))
-        awaitStart(run, config.startTimeout.fromNow)
+        await(run.startSignal, config.startTimeout.fromNow)
       }
       probe
     }.toEither
 
+  /**
+   * Takes the turn of the process at its writer, as a run of the engine does when it holds its
+   * lease (ADR-0019): announces the epoch, and only then asks the table which batch the writer
+   * is at. What the table says is written down with the turn, before anything is committed.
+   *
+   * @return the batch that the table said the writer was at; none, if a later epoch is in force
+   *   already, and the turn is another's
+   */
+  private def takeTurn(
+      spark: SparkSession,
+      config: WriterConfig,
+      run: StressRun,
+      epoch: WriterEpoch,
+      runId: UUID
+  ): Option[Long] = {
+    val asked = System.nanoTime()
+    val inForce = WriterEpochs.announce(spark.sessionState.newHadoopConf(), epoch)
+    val announceMillis = (System.nanoTime() - asked).nanos.toMillis
+    Option.when(inForce == epoch.epoch) {
+      // The question of recovery: the last transaction of the writer that the table has.
+      val told = DeltaLog
+        .forTable(spark, run.tableUri)
+        .update()
+        .transactions
+        .getOrElse(StressTable.writerId(config.writer), 0L)
+      val turn =
+        Turn(StressTable.writerId(config.writer), epoch.epoch, runId.toString, told, announceMillis)
+      appendLine(run.turns(config.writer), turn.line)
+      told
+    }
+  }
+
   /** Adds the run of this process to the writer's runs, on disk before its first commit. */
   private def recordRun(run: StressRun, config: WriterConfig, runId: UUID): Unit =
+    appendLine(run.runs(config.writer), runId.toString)
+
+  /** One whole line added to a file that several processes add to, on disk when it returns. */
+  private def appendLine(file: java.nio.file.Path, line: String): Unit =
     Using.resource(
       FileChannel.open(
-        run.runs(config.writer),
+        file,
         StandardOpenOption.CREATE,
         StandardOpenOption.WRITE,
         StandardOpenOption.APPEND
       )
     ) { channel =>
-      channel.write(ByteBuffer.wrap(s"$runId\n".getBytes(UTF_8))): Unit
+      channel.write(ByteBuffer.wrap(s"$line\n".getBytes(UTF_8))): Unit
       channel.force(true)
     }
 
   @tailrec
-  private def awaitStart(run: StressRun, deadline: Deadline): Unit =
-    if (!Files.exists(run.startSignal)) {
-      if (deadline.isOverdue())
-        throw new IllegalStateException(s"no start signal at ${run.startSignal}")
+  private def await(signal: java.nio.file.Path, deadline: Deadline): Unit =
+    if (!Files.exists(signal)) {
+      if (deadline.isOverdue()) throw new IllegalStateException(s"no signal at $signal")
       Thread.sleep(BarrierPoll.toMillis)
-      awaitStart(run, deadline)
+      await(signal, deadline)
     }
 
+  /** @param turn the epoch that the process commits under, if it has one */
   private def commitAll(
       spark: SparkSession,
       config: WriterConfig,
       run: StressRun,
       journal: AckJournal,
-      commits: CommitContext
+      commits: CommitContext,
+      turn: Option[WriterEpoch]
   ): Int = {
     val id = StressTable.writerId(config.writer)
 
@@ -257,6 +338,10 @@ object StressWriter {
           case Success(()) =>
             journal.ack(k)
             loop(k + 1, None)
+          // Before anything else: a process whose turn is over stops, and repeats nothing.
+          case Failure(error) if turn.exists(outOfTurn(spark, _, error)) =>
+            report(id, s"commit txnVersion=$k was not made: the turn is another's", error)
+            ExitCode.OutOfTurn
           case Failure(error) =>
             val until = repeatUntil.getOrElse(config.repeatFor.fromNow)
             if (until.hasTimeLeft()) {
@@ -273,8 +358,8 @@ object StressWriter {
     loop(config.firstCommit.toLong, None)
   }
 
-  private def append(spark: SparkSession, config: WriterConfig, run: StressRun, k: Long): Unit =
-    spark
+  private def append(spark: SparkSession, config: WriterConfig, run: StressRun, k: Long): Unit = {
+    val write = spark
       .createDataFrame(
         StressTable.rows(config.writer, k, config.rowsPerCommit).asJava,
         StressTable.schema
@@ -284,7 +369,27 @@ object StressWriter {
       .mode("append")
       .option("txnAppId", StressTable.writerId(config.writer))
       .option("txnVersion", k)
-      .save(run.tableUri)
+    // What the commit itself says of the epoch of its writer, for whoever reads the log. A
+    // process that commits under none says nothing, and its commits are as they always were.
+    (if (config.epoch > 0) write.option("userMetadata", Turn.metadata(config.epoch.toLong))
+     else write).save(run.tableUri)
+  }
+
+  /**
+   * Whether a commit failed because the turn of the process is over. The LogStore says so when
+   * it refuses the commit for its epoch. A commit may also fail on the process that took over,
+   * before it reaches the LogStore: Delta refuses a transaction when another has committed for
+   * the same writer meanwhile. So a process whose commit failed asks which epoch is in force.
+   */
+  private def outOfTurn(spark: SparkSession, turn: WriterEpoch, error: Throwable): Boolean = {
+    val refused = Iterator
+      .iterate(error)(_.getCause)
+      .takeWhile(_ != null)
+      .take(64)
+      .exists(_.isInstanceOf[EpochNotInForceException])
+    refused || Try(WriterEpochs.announce(spark.sessionState.newHadoopConf(), turn)).toOption
+      .exists(_ != turn.epoch)
+  }
 
   /**
    * Halts this JVM if the orchestrator that launched it dies (a killed sbt, a crashed test JVM).

@@ -19,6 +19,10 @@ final class WriterConfigSpec extends AnyFunSuite with Matchers {
     WriterConfig.fromArgs(inPlaceOfAKilledOne.toArgs) shouldBe Right(inPlaceOfAKilledOne)
     val repeating = config.copy(repeatFor = 90.seconds)
     WriterConfig.fromArgs(repeating.toArgs) shouldBe Right(repeating)
+    val underAnEpoch = config.copy(epoch = 3)
+    WriterConfig.fromArgs(underAnEpoch.toArgs) shouldBe Right(underAnEpoch)
+    (config.takesOver, config.copy(epoch = 1).takesOver, underAnEpoch.takesOver) shouldBe
+      ((false, false, true))
   }
 
   test("rejects malformed, unknown, missing and out-of-range arguments") {
@@ -35,7 +39,10 @@ final class WriterConfigSpec extends AnyFunSuite with Matchers {
       replaced("guard", "maybe") -> "guard must be true or false",
       replaced("first-commit", "0") -> "first-commit must be a positive integer",
       replaced("restarted", "again") -> "restarted must be true or false",
-      replaced("repeat-seconds", "-1") -> "repeat-seconds must be a non-negative integer"
+      replaced("repeat-seconds", "-1") -> "repeat-seconds must be a non-negative integer",
+      replaced("epoch", "-1") -> "epoch must be a non-negative integer",
+      replaced("epoch", "2").filterNot(_ == "restarted=false").appended("restarted=true") ->
+        "restarted and epoch are not given together"
     )
     cases.foreach { case (args, expected) =>
       WriterConfig.fromArgs(args).left.map(_.startsWith(expected)) shouldBe Left(true)
