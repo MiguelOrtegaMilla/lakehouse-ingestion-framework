@@ -8,7 +8,7 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0002](0002-technology-stack.md) | Technology stack and versions | Accepted · version rows superseded by ADR-0014 |
 | [0003](0003-control-plane-in-postgresql.md) | Control plane in PostgreSQL | Accepted |
 | [0004](0004-postgresql-coordinated-delta-logstore.md) | PostgreSQL-coordinated Delta LogStore for multi-writer tables — **highest-risk component** | Accepted · `file://` publish superseded by ADR-0015, handling of a failed publish by ADR-0017 |
-| [0005](0005-batch-wal-and-idempotent-writes.md) | Batch write-ahead log and idempotent Delta writes | Accepted |
+| [0005](0005-batch-wal-and-idempotent-writes.md) | Batch write-ahead log and idempotent Delta writes | Accepted · a second way out of a planned batch added by ADR-0018 |
 | [0006](0006-source-leases-with-epoch-fencing.md) | Source leases with expiry, heartbeat and epoch fencing | Accepted |
 | [0007](0007-metadata-format.md) | Source metadata as YAML with startup validation | Accepted |
 | [0008](0008-layer-responsibilities.md) | Layer responsibilities: Landing, Bronze, Silver (Gold out of scope) | Accepted |
@@ -21,12 +21,16 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0015](0015-hard-link-publish-on-local-file-systems.md) | Commit files on `file://` are published with a hard link | Accepted |
 | [0016](0016-delta-storage-provided-to-the-logstore-module.md) | The LogStore module takes `delta-storage` as `provided`, without Unity Catalog's client libraries | Accepted |
 | [0017](0017-a-failed-publish-is-reported-not-swallowed.md) | A publish that fails is retried and reported, not swallowed | Accepted |
+| [0018](0018-a-run-gives-up-a-batch-whose-source-changed.md) | A run gives up the batch that its source no longer has as planned | Accepted |
 
 Superseded decisions:
 - *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
 - *AD-06 "one writer per Delta table"* (discovery v1) was replaced by ADR-0004 before being recorded as an ADR.
 - *ADR-0004 §3.4, the `file://` publish* (copy to a second temporary file, then rename): replaced by ADR-0015 in P2a.
 - *ADR-0004 §3.2 and deviation 4, a failed publish is swallowed*: replaced by ADR-0017 in P2a.
+
+Amended decisions:
+- *ADR-0005 §3, a planned batch is replayed until it is committed, or given up by an operator*: ADR-0018 (P5.8) adds that the run that holds the lease gives it up when its source no longer has what the plan names. No plan is changed, and the rest of the protocol stands.
 
 Schema evolution (P9) gets its own ADR in its phase, once the policies are validated against Delta 4.4's type-widening support.
 
