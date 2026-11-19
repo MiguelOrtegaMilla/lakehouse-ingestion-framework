@@ -117,7 +117,7 @@ Around the scenarios:
 - **Every implementation of the coordination store and of the registry's maintenance** passes one contract suite: `CoordinationStoreContract` and `RegistryMaintenanceContract`, in memory and on PostgreSQL.
 - **The epoch of a writer** (ADR-0019) is in that contract, in `PostgresLogStoreWriteSpec` and `CommitContextSpec` for the protocol, in `PostgresLogStoreDeltaSpec` for Delta, and in `WriterEpochRaceSpec`, which forces both orders of a claim and an announcement on a real PostgreSQL with transactions that are left open.
 - **The operations of an ingestion** run with Delta in `PostgresLogStoreEndToEndSpec`: an idempotent append, `MERGE`, `UPDATE`, `DELETE`, `OPTIMIZE`, `VACUUM`, checkpoints, the log cleanup, and the creation of a table by two transactions at once.
-- **Several processes at once**, and processes killed at random, are the stress run of P2b.
+- **Several processes at once**, and processes killed at random, are the stress run of P2b. It also has the epochs (`SpikeGreenEpochSpec`): every writer JVM commits under an epoch and is taken over, while it commits, by a process under the next, and the verifier holds the run to no commit of an epoch after a later one was announced.
 
 ## Known limitations
 

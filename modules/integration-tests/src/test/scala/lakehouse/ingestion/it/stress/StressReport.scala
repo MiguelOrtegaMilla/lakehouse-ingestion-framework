@@ -41,6 +41,12 @@ object StressReport {
         s"is repeated for up to ${settings.repeatFor.toSeconds} s, then stops the writer"
       else "stops the writer"
     )
+  ) ++ Option.when(settings.epochs)(
+    Setting(
+      "epochs",
+      "every process commits under an epoch of the key of its writer, and is taken over by a " +
+        "process under the next (ADR-0019)"
+    )
   )
 
   /**
@@ -175,6 +181,58 @@ object StressReport {
       }
     )
 
+    // Only for a run whose writers commit under epochs: the others have nothing to say of it.
+    val epochsSection = s.epochs.toSeq.flatMap { epochs =>
+      Seq(
+        "## Epochs",
+        "Every process of a writer commits under an epoch of the key of that writer " +
+          "(ADR-0019), and writes its turn down before its first commit: the epoch that it " +
+          "announced, how long the announcement took, and the batch that the table then said " +
+          "the writer was at, from which it goes on. A process that takes a writer over does " +
+          "so while the one before it is still committing, and that one is told nothing: the " +
+          "LogStore refuses its next commit, and it exits with code " +
+          s"${StressWriter.ExitCode.OutOfTurn}. No commit under an epoch may be of a batch " +
+          "beyond what a process of a later epoch was told: it would have been made after the " +
+          "later epoch was announced. The epoch of a commit is the one that its own file says. " +
+          "A process may acknowledge a batch that another wrote, since Delta skips a batch that " +
+          "the table has, and says nothing.",
+        table(
+          Seq(
+            "Writer",
+            "Epoch",
+            "Run",
+            "Told by the table",
+            "Announcement took",
+            "Exit code",
+            "Acknowledged by it",
+            "Its commits in the log"
+          ),
+          s.writers.flatMap { w =>
+            val id = StressTable.writerId(w.writer)
+            w.turns.map { turn =>
+              val process = w.processes.find(_.epoch.toLong == turn.epoch)
+              Seq(
+                id,
+                turn.epoch.toString,
+                code(turn.run),
+                s"batch ${turn.told}",
+                s"${turn.announceMillis} ms",
+                process.fold("?")(_.exitCode.toString),
+                process.fold("?")(_.acked.size.toString),
+                s.commitsByEpoch.getOrElse((id, turn.epoch), 0).toString
+              )
+            }
+          }
+        ),
+        table(
+          Seq("Key", "Epoch in force at the end"),
+          epochs.keys.toSeq.sortBy(_._1).map { case (_, key) =>
+            Seq(code(key), epochs.inForce.get(key).fold("none")(_.toString))
+          }
+        )
+      )
+    }
+
     val otherCommits =
       if (s.otherCommits.isEmpty) "None."
       else s.otherCommits.map { case (v, op) => s"- version $v: $op" }.mkString("\n")
@@ -214,7 +272,8 @@ object StressReport {
         "run. On such a run no commit file may have a `.crc` sidecar, since a commit is " +
         "published as a hard link and not through Hadoop's checksummed file system; the other " +
         "files of the log may have one, and it must match.",
-      registrySection,
+      registrySection
+    ) ++ epochsSection ++ Seq(
       "## Readers",
       "The verifier reads the commit files as bytes, without Delta or Hadoop. Delta readers " +
         "then load the table each in its own way, and their anomalies are tagged with the " +

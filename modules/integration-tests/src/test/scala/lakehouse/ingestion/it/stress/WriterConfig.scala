@@ -25,6 +25,11 @@ import scala.concurrent.duration._
  *   failure of the batch; zero for a writer that stops at its first failure. The batch is
  *   repeated with its `txnVersion`, as the engine repeats a batch whose outcome it does not
  *   know.
+ * @param epoch the epoch that the process commits under, of the key of its writer (ADR-0019);
+ *   zero for a process that commits under none. The first process of a writer has epoch 1. One
+ *   with a later epoch takes the writer over while the process before it may still be
+ *   running: it has a journal of its own, waits to be let go and not at the start barrier,
+ *   announces its epoch, and goes on from the batch that the table then says the writer is at.
  */
 final case class WriterConfig(
     runDir: Path,
@@ -35,8 +40,12 @@ final case class WriterConfig(
     guard: Boolean,
     firstCommit: Int = 1,
     restarted: Boolean = false,
-    repeatFor: FiniteDuration = Duration.Zero
+    repeatFor: FiniteDuration = Duration.Zero,
+    epoch: Int = 0
 ) {
+
+  /** Whether the process takes its writer over from one that had the turn before it. */
+  def takesOver: Boolean = epoch > 1
 
   def toArgs: Seq[String] = Seq(
     s"${WriterConfig.RunDir}=$runDir",
@@ -47,7 +56,8 @@ final case class WriterConfig(
     s"${WriterConfig.Guard}=$guard",
     s"${WriterConfig.FirstCommit}=$firstCommit",
     s"${WriterConfig.Restarted}=$restarted",
-    s"${WriterConfig.RepeatSeconds}=${repeatFor.toSeconds}"
+    s"${WriterConfig.RepeatSeconds}=${repeatFor.toSeconds}",
+    s"${WriterConfig.Epoch}=$epoch"
   )
 }
 
@@ -62,6 +72,7 @@ object WriterConfig {
   private val FirstCommit = "first-commit"
   private val Restarted = "restarted"
   private val RepeatSeconds = "repeat-seconds"
+  private val Epoch = "epoch"
 
   private val Keys = Set(
     RunDir,
@@ -72,7 +83,8 @@ object WriterConfig {
     Guard,
     FirstCommit,
     Restarted,
-    RepeatSeconds
+    RepeatSeconds,
+    Epoch
   )
 
   def fromArgs(args: Seq[String]): Either[String, WriterConfig] = {
@@ -100,6 +112,13 @@ object WriterConfig {
         first <- positive(FirstCommit)
         restarted <- values(Restarted).toBooleanOption.toRight(s"$Restarted must be true or false")
         repeat <- nonNegative(RepeatSeconds)
+        epoch <- nonNegative(Epoch)
+        _ <- Either.cond(
+          !(restarted && epoch > 0),
+          (),
+          s"$Restarted and $Epoch are not given together: a process is started in the place of " +
+            "one that was killed, or takes over from one that is running"
+        )
       } yield WriterConfig(
         Paths.get(values(RunDir)),
         writer,
@@ -109,7 +128,8 @@ object WriterConfig {
         guard,
         first,
         restarted,
-        repeat.seconds
+        repeat.seconds,
+        epoch
       )
   }
 }

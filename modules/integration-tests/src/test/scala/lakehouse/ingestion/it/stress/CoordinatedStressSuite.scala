@@ -182,8 +182,125 @@ trait CoordinatedStressSuite extends LocalSparkSuite { self: Suite =>
       run,
       Verifier.Expected.of(settings),
       outcomes,
-      Some(() => registryView(run))
+      Some(() => registryView(run)),
+      Option.when(settings.epochs)(() => epochsView(run, outcomes))
     )
+
+  /**
+   * The epochs of a run whose writers commit under them: what its processes wrote down of
+   * their turns, and what the database has in force under their keys, read with plain SQL.
+   */
+  protected def epochsView(
+      run: StressRun,
+      outcomes: Seq[StressHarness.WriterOutcome]
+  ): LogModel.EpochsView = {
+    val keys = outcomes.map(o => StressTable.writerId(o.writer) -> run.epochKey(o.writer)).toMap
+    val inForce =
+      Using.resource(pg.observe(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)) {
+        RegistryReader.epochsInForce(_, keys.values.toSeq)
+      }
+    LogModel.EpochsView(keys, outcomes.flatMap(_.turns), inForce)
+  }
+
+  /**
+   * Holds, from now on, every claim of a version under `epoch` of `key` that takes its version,
+   * for `held`, between its `INSERT` and the end of its transaction: the claim has read the
+   * epoch in force, which was its own, and has its entry, which nobody else sees yet. It is
+   * the window in which an announcement of the next epoch must wait: one that did not would be
+   * followed by a look at a registry that does not have the commit, and then by the commit.
+   *
+   * The entry is there while the claim is held, so the version is the claim's: another writer
+   * that wants it waits, and is told that it is taken. A hold before the `INSERT` would hold a
+   * claim that then loses its version to another writer, and commits nothing.
+   *
+   * Nothing of the LogStore knows of it: it is a trigger of the test's own in the database
+   * (`installClaimHold`), which sleeps for the claims of that one epoch and of no other.
+   */
+  protected def holdClaims(key: String, epoch: Long, held: FiniteDuration): Unit =
+    asSuperuser { connection =>
+      Using.resource(
+        connection.prepareStatement(
+          "INSERT INTO stress_hold.held (epoch_key, epoch, millis) VALUES (?, ?, ?) " +
+            "ON CONFLICT (epoch_key) DO UPDATE SET epoch = EXCLUDED.epoch, millis = EXCLUDED.millis"
+        )
+      ) { statement =>
+        statement.setString(1, key)
+        statement.setLong(2, epoch)
+        statement.setLong(3, held.toMillis)
+        statement.executeUpdate(): Unit
+      }
+    }
+
+  /** Lets the claims of `key` go as they come. */
+  protected def releaseClaims(key: String): Unit = asSuperuser { connection =>
+    Using.resource(
+      connection.prepareStatement("DELETE FROM stress_hold.held WHERE epoch_key = ?")
+    ) { statement =>
+      statement.setString(1, key)
+      statement.executeUpdate(): Unit
+    }
+  }
+
+  /**
+   * Waits until a claim is being held (`holdClaims`): a session of a LogStore is asleep with
+   * its entry inserted and its transaction open, seen from outside.
+   *
+   * @throws HarnessFailure none was within `within`
+   */
+  protected def awaitHeldClaim(within: FiniteDuration): Unit = {
+    val deadline = within.fromNow
+    def held: Boolean = asSuperuser { connection =>
+      Using.resource(
+        connection.prepareStatement(
+          "SELECT count(*) FROM pg_stat_activity WHERE application_name = ? AND wait_event = 'PgSleep'"
+        )
+      ) { statement =>
+        statement.setString(1, PostgresCoordinationStore.ApplicationName)
+        Using.resource(statement.executeQuery()) { rows =>
+          rows.next()
+          rows.getInt(1) > 0
+        }
+      }
+    }
+    while (!held) {
+      if (deadline.isOverdue())
+        throw new HarnessFailure(s"no claim was seen held with its version taken within $within")
+      Thread.sleep(5)
+    }
+  }
+
+  private def asSuperuser[T](body: java.sql.Connection => T): T =
+    Using.resource(pg.observe(BootstrappedPostgres.Superuser, CoordinationSchema.Database))(body)
+
+  /**
+   * Makes the trigger that holds claims, and the table that says which. Before the writers of
+   * a run are started: a trigger is not made on a table that is being written.
+   */
+  protected def installClaimHold(): Unit = asSuperuser { connection =>
+    Using.resource(connection.createStatement()) { statement =>
+      // Fixed text of this file, never input.
+      Seq(
+        "CREATE SCHEMA IF NOT EXISTS stress_hold",
+        """CREATE TABLE IF NOT EXISTS stress_hold.held (
+          |  epoch_key text PRIMARY KEY, epoch bigint NOT NULL, millis bigint NOT NULL)""".stripMargin,
+        // As its owner: the role of the commit path has nothing in this schema.
+        """CREATE OR REPLACE FUNCTION stress_hold.hold_claim() RETURNS trigger
+          |LANGUAGE plpgsql SECURITY DEFINER AS $$
+          |DECLARE pause bigint;
+          |BEGIN
+          |  SELECT millis INTO pause FROM stress_hold.held
+          |   WHERE epoch_key = NEW.epoch_key AND epoch = NEW.epoch;
+          |  IF FOUND THEN PERFORM pg_sleep(pause / 1000.0); END IF;
+          |  RETURN NEW;
+          |END $$""".stripMargin,
+        "DROP TRIGGER IF EXISTS stress_hold_claim ON delta_coordination.commit_entry",
+        // After the row: it fires for a claim that took its version, and for no other.
+        """CREATE TRIGGER stress_hold_claim AFTER INSERT ON delta_coordination.commit_entry
+          |FOR EACH ROW WHEN (NEW.epoch_key IS NOT NULL)
+          |EXECUTE FUNCTION stress_hold.hold_claim()""".stripMargin
+      ).foreach(statement.execute(_): Unit)
+    }
+  }
 
   override def beforeAll(): Unit = {
     CoordinationSchema.migrate(pg.postgres): Unit

@@ -10,13 +10,19 @@ object LogModel {
 
   final case class Txn(appId: String, version: Long)
 
-  /** One `_delta_log/<version>.json` that parsed. */
+  /**
+   * One `_delta_log/<version>.json` that parsed.
+   *
+   * @param epoch the epoch that its writer said it committed under, in the commit itself
+   *   (`Turn.metadata`, in the `userMetadata` of the commit); none, for a commit that says none
+   */
   final case class Commit(
       version: Long,
       txns: Seq[Txn],
       added: Seq[String],
       removed: Seq[String],
-      operation: Option[String]
+      operation: Option[String],
+      epoch: Option[Long] = None
   )
 
   /** A commit file that could not be read as a commit: a malformed line, or no actions at all. */
@@ -109,7 +115,73 @@ object LogModel {
       version: Long,
       complete: Boolean,
       runId: Option[String],
-      tookMillis: Option[Long] = None
+      tookMillis: Option[Long] = None,
+      epochKey: Option[String] = None,
+      epoch: Option[Long] = None
+  )
+
+  /**
+   * The turn of one process at its writer, in a run whose writers commit under epochs
+   * (ADR-0019), as the process itself wrote it down before its first commit.
+   *
+   * @param writer the writer, by its id
+   * @param epoch the epoch that the process announced and commits under
+   * @param run the run that it attributes its commits to
+   * @param told the batch that the table said the writer was at, asked once the announcement
+   *   of the epoch had returned: zero, if it had none. The process commits from the batch after
+   * @param announceMillis how long the announcement took. One that met a commit of the epoch
+   *   before it in flight waited for it
+   */
+  final case class Turn(
+      writer: String,
+      epoch: Long,
+      run: String,
+      told: Long,
+      announceMillis: Long
+  ) {
+
+    /** As a line of the file of the turns of a writer. */
+    def line: String = s"$epoch $run $told $announceMillis"
+  }
+
+  object Turn {
+
+    /** A line of the file of the turns of `writer`; none, if it is not one. */
+    def parse(writer: String, line: String): Option[Turn] =
+      line.trim.split(" ").toList match {
+        case epoch :: run :: told :: millis :: Nil =>
+          for {
+            epoch <- epoch.toLongOption
+            told <- told.toLongOption
+            millis <- millis.toLongOption
+          } yield Turn(writer, epoch, run, told, millis)
+        case _ => None
+      }
+
+    /** What a commit says of the epoch of its writer, as the `userMetadata` of the commit. */
+    def metadata(epoch: Long): String = s"epoch=$epoch"
+
+    private val Metadata = """epoch=(\d+)""".r
+
+    /** The epoch that a commit says, from its `userMetadata`. */
+    def epochIn(userMetadata: String): Option[Long] = userMetadata match {
+      case Metadata(epoch) => epoch.toLongOption
+      case _ => None
+    }
+  }
+
+  /**
+   * The epochs of a run: what its processes said of their turns, and what the coordination
+   * database has in force at the end, read with plain SQL.
+   *
+   * @param keys the key that the epochs of each writer are of, by the id of the writer
+   * @param turns every turn of every writer
+   * @param inForce the epoch in force under each of those keys when the run was over
+   */
+  final case class EpochsView(
+      keys: Map[String, String],
+      turns: Seq[Turn],
+      inForce: Map[String, Long]
   )
 
   /**

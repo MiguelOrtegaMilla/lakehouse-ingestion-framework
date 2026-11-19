@@ -110,6 +110,7 @@ STRESS_NATURAL_RUNS=0 scripts/stress-logstore.sh   # without the ten natural run
 sbt "integration-tests/Stress/testOnly *SpikeGreenSpec"   # only the runs on PostgresLogStore (needs Docker)
 sbt "integration-tests/Stress/testOnly *SpikeGreenKillSpec"   # only the writers killed inside a commit: about 9 minutes (needs Docker)
 sbt "integration-tests/Stress/testOnly *SpikeGreenOutageSpec"   # only PostgreSQL killed in the middle of a run: about 6 minutes (needs Docker)
+sbt "integration-tests/Stress/testOnly *SpikeGreenEpochSpec"   # only the writers that commit under an epoch and are taken over as they commit (needs Docker); STRESS_TAKEOVERS says how many times each
 STRESS_WRITERS=8 STRESS_COMMITS=500 STRESS_NATURAL_RUNS=1 scripts/stress-logstore.sh   # the natural race at the size of the stress job in CI: about 9 GB of memory
 scripts/stress-summary.sh   # one row for each report in target/stress: acknowledged, lost, and what the verifier found
 ```
@@ -118,7 +119,7 @@ Each run keeps its table, writer journals, logs and probes in `target/stress/<ru
 
 ### Results: Delta's default LogStore and `PostgresLogStore`
 
-Three writer JVMs append to one table on `file://`, each in batches that carry a transaction identifier. RED is Delta's default configuration ([write-up](docs/spikes/logstore-red.md)). GREEN is the same harness and the same verifier on `PostgresLogStore` ([write-up](docs/spikes/logstore-green.md)). The runs are of 2026-11-13, 2026-11-16 and 2026-11-17, on one development machine, but for the one that says it was in CI.
+Three writer JVMs append to one table on `file://`, each in batches that carry a transaction identifier. RED is Delta's default configuration ([write-up](docs/spikes/logstore-red.md)). GREEN is the same harness and the same verifier on `PostgresLogStore` ([write-up](docs/spikes/logstore-green.md)). The runs are of 2026-11-13, 2026-11-16 and 2026-11-17, on one development machine, but for the one that says it was in CI; those under epochs are of 2026-11-19, on the same machine.
 
 | | RED: Delta's default LogStore | GREEN: `PostgresLogStore` |
 |---|---|---|
@@ -128,6 +129,7 @@ Three writer JVMs append to one table on `file://`, each in batches that carry a
 | **Every run on `PostgresLogStore`**, of the four suites, here and in CI | | **0 lost** of 10,954 commits in 33 runs: 6,477 in 21 runs on the development machine, 4,477 in the 12 runs of the stress job in CI |
 | **A writer killed** with `kill -9` inside a commit, and started again | Not run | **0 lost, 0 written twice**, of 222 batches in 4 runs: a kill before the `INSERT`, one after it, one after the publish, and six at random moments |
 | **PostgreSQL killed** in the middle of a run, and started again 30 s later | Does not apply | **0 lost, 0 written twice**, of 150 batches in 2 runs. Every attempt made meanwhile failed, 15 in each run, and was repeated |
+| **Writers under epochs, taken over as they commit** ([ADR-0019](docs/adr/0019-a-commit-names-the-epoch-of-its-lease.md)): each process commits under an epoch, and a process under the next takes its writer over while it is still committing, and is not told | Does not apply | **0 lost, 0 written twice, and no commit of an epoch after a later one was announced**, of 510 batches in 2 runs. In one, each of 4 announcements was made while a commit of the earlier epoch was held with its version taken: every one waited for it, and was then told of that batch. In the other, 6 takeovers as they came, and the LogStore refused the next commit of all 6 processes that were taken over. With the lock taken out of the claim, the first run reports a commit after a later epoch at each of its 4 takeovers |
 | **Readers** | The one that checks `.crc` sidecars fails on the replaced commit. The one that does not reads the table, without the commit | Both read every table |
 
 The rows do not say equally much, and the write-ups keep them apart:

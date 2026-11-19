@@ -5,6 +5,8 @@
 # The runs on PostgresLogStore (spike GREEN) start PostgreSQL with Testcontainers: they need Docker.
 # The whole takes about 80 minutes, most of it in the ten natural runs of the GREEN spike;
 # STRESS_NATURAL_RUNS sets another number of them, and 0 leaves them out (about 25 minutes).
+# The run of the writers under epochs (ADR-0019) that are taken over as they come has the size of
+# a natural run, and STRESS_TAKEOVERS says how many times each writer is taken over in it (2).
 # Extra arguments go to sbt before the alias, e.g. -J-Xmx2g.
 set -euo pipefail
 

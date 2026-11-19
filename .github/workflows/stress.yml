@@ -7,8 +7,16 @@
 # PostgreSQL killed among them. Before merging a change to the LogStore, run this workflow by
 # hand on the branch of the change.
 #
-# Eight writer JVMs with 512 MB of heap, the test JVM and PostgreSQL need about 9 GB: the 16 GB
-# of the runners that public repositories get.
+# The runs on PostgresLogStore include the writers under epochs (ADR-0019): every process commits
+# under an epoch of the key of its writer and is taken over, while it commits, by a process
+# under the next, which the LogStore must then prefer. Once with each announcement made while a
+# commit of the earlier epoch is being taken, and once at the size of the natural race. The
+# verifier holds those runs to one thing more: no commit of an epoch after a later one was
+# announced.
+#
+# Eight writer JVMs with 512 MB of heap, the test JVM and PostgreSQL need about 9 GB, and a
+# takeover adds a process for as long as the one before it lives: the 16 GB of the runners that
+# public repositories get.
 #
 # Every third-party action is pinned by commit SHA, as in ci.yml (scripts/check-pins.sh).
 name: Stress
@@ -23,8 +31,11 @@ on:
         description: Commits of each writer in a natural run
         default: "500"
       natural_runs:
-        description: Natural runs (0 leaves them out)
+        description: Natural runs (0 leaves them out, and the takeovers as they come with them)
         default: "1"
+      takeovers:
+        description: Times that each writer is taken over in the run under epochs
+        default: "2"
   schedule:
     # Mondays at 03:17 UTC. Off the hour, when scheduled workflows queue.
     - cron: "17 3 * * 1"
@@ -47,6 +58,7 @@ jobs:
       STRESS_WRITERS: ${{ inputs.writers || '8' }}
       STRESS_COMMITS: ${{ inputs.commits || '500' }}
       STRESS_NATURAL_RUNS: ${{ inputs.natural_runs || '1' }}
+      STRESS_TAKEOVERS: ${{ inputs.takeovers || '2' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,8 +68,9 @@ jobs:
       # Before an hour of runs, and not in the middle of them.
       - name: Resolve the build
         run: scripts/retry-on-429.sh sbt -batch update
-      # The four suites: Delta's default LogStore (RED), where a lost commit is the expected
-      # result, and PostgresLogStore (GREEN) with its kills and its outage of PostgreSQL.
+      # The five suites: Delta's default LogStore (RED), where a lost commit is the expected
+      # result, and PostgresLogStore (GREEN) with its kills, its outage of PostgreSQL, and its
+      # writers under epochs that are taken over as they commit.
       - name: Stress runs
         run: scripts/stress-logstore.sh
       - name: Summary of the runs
