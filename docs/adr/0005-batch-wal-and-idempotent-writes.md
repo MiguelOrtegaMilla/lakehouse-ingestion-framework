@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Accepted (2026-09-25) |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0004](0004-postgresql-coordinated-delta-logstore.md), [ADR-0006](0006-source-leases-with-epoch-fencing.md), [ADR-0010](0010-concurrent-write-conflict-handling.md) |
+| **Amended by** | [ADR-0018](0018-a-run-gives-up-a-batch-whose-source-changed.md) (2026-11-19): a planned batch has a second way out. The run that holds the lease gives it up when its source no longer has what the plan names and nothing of it is in its tables, and the next run plans anew (§3). The protocol below keeps its original text and points to it. |
 
 ## Context
 
@@ -39,6 +40,7 @@ Why per (source, layer):
    - **found:** read the target table's `txn` version for `txnAppId`. If it is `≥ batch_seq`, the data was committed, so **roll forward** (step 7). Otherwise **replay** exactly the persisted plan (step 4).
    - **not found:** plan (connector `plan`) and persist the batch as `PLANNED`. This is the **write-ahead** step.
 3. The plan is immutable once persisted. A `batch_seq` maps to exactly one plan, forever.
+   > **Extended by [ADR-0018](0018-a-run-gives-up-a-batch-whose-source-changed.md)** (2026-11-19): a batch whose plan the source no longer has, a file written again or gone, is given up by the run that holds the lease, if the table does not have it. It is marked `ABANDONED`, its plan stays as it was written and its number is not used again; the next run plans the next number. This step still holds: no plan is ever changed.
 4. Read (connector `read(plan)`, replayable).
 5. Write quarantine, then data, each with `txnAppId`/`txnVersion` and `userMetadata = {run_id, batch_seq, source_id}`, inside the commit context (ADR-0004 §3.7).
 6. Delta's idempotent write skips any `txnVersion ≤` the recorded one: a replay after a crash is a no-op for data already committed.
