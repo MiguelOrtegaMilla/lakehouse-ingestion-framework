@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Accepted (2026-09-25) |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0004](0004-postgresql-coordinated-delta-logstore.md), [ADR-0006](0006-source-leases-with-epoch-fencing.md), [ADR-0010](0010-concurrent-write-conflict-handling.md) |
-| **Amended by** | [ADR-0018](0018-a-run-gives-up-a-batch-whose-source-changed.md) (2026-11-19): a planned batch has a second way out. The run that holds the lease gives it up when its source no longer has what the plan names and nothing of it is in its tables, and the next run plans anew (§3). The protocol below keeps its original text and points to it. |
+| **Amended by** | [ADR-0018](0018-a-run-gives-up-a-batch-whose-source-changed.md) (2026-11-19): a planned batch has a second way out. The run that holds the lease gives it up when its source no longer has what the plan names and nothing of it is in its tables, and the next run plans anew (§3). The protocol below keeps its original text and points to it. [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md) (2026-11-19): a run that lost its lease commits to no table, since every commit names the epoch of its lease and the LogStore refuses one that is not in force (§4). |
 
 ## Context
 
@@ -53,6 +53,8 @@ Why per (source, layer):
 - If it commits data for a stale batch, Delta ignores it (`txnVersion ≤` recorded).
 - If it commits the *same* batch concurrently with the new holder, one of the two gets `ConcurrentTransactionException` (ADR-0010) and goes to the roll-forward check.
 - It cannot write a *different* plan under the same `batch_seq`: plans are immutable (step 3).
+
+> **Amended by [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md)** (P5.10, 2026-11-19): the second and third points say what Delta does with what a zombie commits. From P5.10 a zombie commits nothing. A run announces the epoch of its lease before it asks a table anything, and every commit names its epoch: the LogStore takes it only while that epoch is the one in force. What a zombie committed before the run that took over announced its own is in the table by then, and is what recovery finds (§3, step 2). Delta's idempotent write stays, for the batch that a run writes again.
 
 ### 5. Silver consumes Bronze by Delta version, not by `batch_seq`
 
