@@ -154,6 +154,32 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     )
   }
 
+  test("the files of a batch that was given up are not taken: the next batch plans them anew") {
+    val returns = fileSource()
+    val stopped = open(returns)
+    val filePlan = planned(plan(stopped, returns, Seq(listed("a.csv"), listed("b.csv"))))
+    val givenUp = stopped.plan(filePlan.toJson)
+    val why = "a.csv was written again after the batch was planned"
+
+    stopped.abandon(givenUp.id, why, None, RunEnd.Failed(FailureClass.Transient, why)) shouldBe true
+
+    rows(returns) shouldBe empty
+    database.run(SourceStates.find(_, returns.id, Layer.Bronze)) shouldBe None
+
+    // The file that was written again is another file by now; the other is the file it was.
+    val rewritten = Seq(listed("a.csv", size = 11, at = "2026-11-18T11:30:00Z"), listed("b.csv"))
+    val (next, again) = ingest(returns, rewritten)
+
+    again.names.map(_.value) shouldBe Vector("b.csv", "a.csv")
+    next.id.seq shouldBe BatchSeq.of(2).value
+    rows(returns).map(row => (row(0).split('/').last, row(1), row(4))) shouldBe Seq(
+      ("a.csv", "11", "2"),
+      ("b.csv", "10", "2")
+    )
+    // What the batch that was given up was to read is still in the log, as it was planned.
+    FilePlan.fromJson(database.run(Batches.find(_, givenUp.id)).value.plan) shouldBe Right(filePlan)
+  }
+
   test("only the files of the plan that was written down are recorded, or nothing is") {
     val returns = fileSource()
     val leased = open(returns)

@@ -32,7 +32,28 @@ final case class BatchOutput(table: RelativePath, version: Long) {
   require(version >= 0, s"a table has no version $version")
 }
 
-/** A batch as the control plane has it. */
+/**
+ * Who gave a batch up, when and why (ADR-0018): what an abandoned batch says of itself, next to
+ * the plan that was never run.
+ *
+ * @param by the run that gave it up, under the lease of its source. None, if it was not a run's
+ *   doing: an operator's, to reset a source or to reprocess it (P7)
+ * @param reason why, for a person to read
+ * @param detail what of the plan could not be run, as the engine wrote it: the control plane
+ *   does not read it
+ */
+final case class BatchAbandonment(
+    by: Option[RunId],
+    at: Instant,
+    reason: String,
+    detail: Option[Json]
+)
+
+/**
+ * A batch as the control plane has it.
+ *
+ * @param abandoned who gave it up and why, for a batch that is `ABANDONED`, and for no other
+ */
 final case class BatchRecord(
     id: BatchId,
     source: SourceId,
@@ -44,7 +65,8 @@ final case class BatchRecord(
     plannedAt: Instant,
     committedBy: Option[RunId],
     committedAt: Option[Instant],
-    outputs: Option[Vector[BatchOutput]]
+    outputs: Option[Vector[BatchOutput]],
+    abandoned: Option[BatchAbandonment]
 )
 
 /**

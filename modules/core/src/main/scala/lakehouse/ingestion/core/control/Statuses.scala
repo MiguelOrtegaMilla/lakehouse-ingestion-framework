@@ -103,11 +103,14 @@ object FailureClass {
  *    whatever happens next, the plan is there to be run again exactly as it was;
  *  - `COMMITTED`: its data is in the table and the state of its source has moved past it, in
  *    one transaction;
- *  - `ABANDONED`: an operator gave it up, to reset a source or to reprocess it (P7). Its number
+ *  - `ABANDONED`: it was given up with nothing of it in its tables, and says by whom, when and
+ *    why (`BatchAbandonment`). By the run that held the lease of its source, when the source no
+ *    longer had what the plan names: the next run plans anew (ADR-0018). Or by an operator, to
+ *    reset a source or to reprocess it (P7). Its plan stays as it was written, and its number
  *    is not used again.
  *
  * At most one batch of a `TxnAppId` is `PLANNED` at a time: the next is planned when it is
- * committed.
+ * committed, or given up.
  */
 sealed abstract class BatchStatus(val name: String, val ended: Boolean) {
   override def toString: String = name

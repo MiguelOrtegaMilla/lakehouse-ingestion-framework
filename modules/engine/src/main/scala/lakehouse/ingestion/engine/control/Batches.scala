@@ -26,7 +26,8 @@ object Batches {
 
   private val Columns =
     """txn_app_id, batch_seq, source_id, layer, run_kind, plan::text AS plan, status,
-      |planned_by_run, planned_at, committed_by_run, committed_at, outputs::text AS outputs""".stripMargin
+      |planned_by_run, planned_at, committed_by_run, committed_at, outputs::text AS outputs,
+      |abandoned_by_run, abandoned_at, abandon_reason, abandon_detail::text AS abandon_detail""".stripMargin
 
   /**
    * The batch of a sequence that is planned and not committed. There is one at most: the next
@@ -113,6 +114,49 @@ object Batches {
       statement.executeUpdate() == 1
     }
 
+  /**
+   * Marks a planned batch as given up by `run`, with why (ADR-0018). Its plan stays as it was
+   * written, and its number is not used again: the next batch of the sequence has the next.
+   *
+   * @param reason why, for a person: what is kept of it is its first `Runs.MaxMessageLength`
+   *   characters
+   * @param detail what of the plan could not be run, in a form of the caller's own
+   * @return false if the batch was not planned: it was committed already, or given up
+   * @throws java.lang.IllegalArgumentException if the reason says nothing, or the detail could
+   *   not be read back (`StoredJson`): nothing is written
+   */
+  @throws[SQLException]
+  def abandon(
+      connection: Connection,
+      batch: BatchId,
+      run: RunId,
+      reason: String,
+      detail: Option[Json]
+  ): Boolean = {
+    abandonable(reason, detail)
+    Using.resource(
+      connection.prepareStatement(
+        """UPDATE control.ingestion_batch
+          |   SET status = 'ABANDONED', abandoned_by_run = ?, abandoned_at = now(),
+          |       abandon_reason = ?, abandon_detail = ?::jsonb
+          | WHERE txn_app_id = ? AND batch_seq = ? AND status = 'PLANNED'""".stripMargin
+      )
+    ) { statement =>
+      statement.setObject(1, run.uuid)
+      statement.setString(2, reason.trim.take(Runs.MaxMessageLength))
+      statement.setString(3, detail.map(_.noSpaces).orNull)
+      statement.setString(4, batch.app.value)
+      statement.setLong(5, batch.seq.value)
+      statement.executeUpdate() == 1
+    }
+  }
+
+  /** Refuses what an abandoned batch could not say of itself, before anything is written. */
+  private[control] def abandonable(reason: String, detail: Option[Json]): Unit = {
+    require(reason.trim.nonEmpty, "a batch is not given up without a reason")
+    detail.foreach(readable("detail of why a batch is given up", _))
+  }
+
   @throws[SQLException]
   def find(connection: Connection, batch: BatchId): Option[BatchRecord] =
     Using.resource(
@@ -190,7 +234,15 @@ object Batches {
       plannedAt = instant("planned_at").get,
       committedBy = run("committed_by_run"),
       committedAt = instant("committed_at"),
-      outputs = Option(row.getString("outputs")).map(outputsOf(id, _))
+      outputs = Option(row.getString("outputs")).map(outputsOf(id, _)),
+      abandoned = instant("abandoned_at").map { at =>
+        BatchAbandonment(
+          by = run("abandoned_by_run"),
+          at = at,
+          reason = row.getString("abandon_reason"),
+          detail = Option(row.getString("abandon_detail")).map(stored(id, "abandon detail", _))
+        )
+      }
     )
   }
 
