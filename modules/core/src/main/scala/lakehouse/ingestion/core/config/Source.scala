@@ -198,7 +198,20 @@ object ColumnSpec {
 }
 
 /** @param maxRejectedRatio the share of rows of a batch that may be rejected before it is not committed */
-final case class Quality(maxRejectedRatio: Double)
+final case class Quality(maxRejectedRatio: Double) {
+
+  /**
+   * Whether `rejected` of the `read` rows of a batch are more than the source allows. The share
+   * that it allows is allowed whole: one row of a hundred is not beyond `0.01`.
+   *
+   * It is counted in decimals, as the ratio was written, and not in the doubles that it is kept
+   * in: a batch at its limit would be over it, or not, by the rounding of a product.
+   */
+  def exceededBy(rejected: Long, read: Long): Boolean = {
+    require(rejected >= 0 && rejected <= read, s"$rejected rows of $read were rejected")
+    BigDecimal(rejected) > BigDecimal(maxRejectedRatio) * BigDecimal(read)
+  }
+}
 
 object Quality {
 

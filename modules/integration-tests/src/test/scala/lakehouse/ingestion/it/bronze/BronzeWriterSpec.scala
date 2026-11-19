@@ -20,9 +20,9 @@ import lakehouse.ingestion.core.config.{
 }
 import lakehouse.ingestion.core.control.{BatchId, BatchSeq, FailureClass, Layer, RunId, TxnAppId}
 import lakehouse.ingestion.engine.RunFailedException
-import lakehouse.ingestion.engine.bronze.BronzeWriter.{AlreadyThere, Appended}
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
-import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions, Lake}
+import lakehouse.ingestion.engine.delta.BatchAppend.{AlreadyThere, Appended}
+import lakehouse.ingestion.engine.delta.{BatchAppend, CommitMetadata, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.functions.{col, udf}
@@ -74,7 +74,7 @@ final class BronzeWriterSpec
       table: TableLocation,
       batch: BronzeBatch,
       rows: DataFrame
-  ): BronzeWriter.Result =
+  ): BatchAppend.Result =
     writerOf(batch).write(table, batch, rows)
 
   /** Rows as a read of text gives them: every column a string. */
@@ -367,7 +367,7 @@ final class BronzeWriterSpec
    */
   private def whileWriting(target: TableLocation, held: BronzeBatch, heldRows: DataFrame)(
       meanwhile: => Any
-  ): Either[Throwable, BronzeWriter.Result] = {
+  ): Either[Throwable, BatchAppend.Result] = {
     val gate = Gate.close()
     val thread = Executors.newSingleThreadExecutor()
     try {

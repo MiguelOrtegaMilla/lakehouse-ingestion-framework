@@ -3,7 +3,13 @@ package lakehouse.ingestion.engine
 import java.time.{Clock, Instant}
 
 import io.circe.Json
-import lakehouse.ingestion.core.config.{ConfigVersion, PathTableLocator, RootUri, Source}
+import lakehouse.ingestion.core.config.{
+  ConfigVersion,
+  PathTableLocator,
+  RootUri,
+  Source,
+  TableLocation
+}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.connector.{
@@ -22,7 +28,8 @@ import lakehouse.ingestion.engine.control.{
   LeaseLostException,
   SourceStates
 }
-import lakehouse.ingestion.engine.delta.{DeltaTableTransactions, Lake}
+import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
+import lakehouse.ingestion.engine.quarantine.{QuarantineBatch, QuarantineWriter}
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.SparkSession
 import org.slf4j.LoggerFactory
@@ -36,8 +43,9 @@ import org.slf4j.LoggerFactory
  *  1. The plan of the next batch, by the connector of the source, written down before anything
  *     of it is read. A source with nothing new has no batch, and its run ends well.
  *  1. The read of the plan, by the connector.
- *  1. The rows, appended to the table of Bronze under the number of the batch, which Delta
- *     takes once (`BronzeWriter`).
+ *  1. The records that could not be parsed, appended to the quarantine of the source, and then
+ *     the rows, appended to its table of Bronze: each under the number of the batch, which
+ *     Delta takes once (`QuarantineWriter`, `BronzeWriter`).
  *  1. One transaction in the control plane, on condition of the epoch: the state of the source
  *     moved, the files of the batch recorded as taken, the batch committed with what it wrote,
  *     the run succeeded, the lease given up (`LeasedRun.commit`).
@@ -47,6 +55,14 @@ import org.slf4j.LoggerFactory
  * a version: a table is made by the first batch that has rows, with the columns of its source.
  * A table made from an empty batch would have the columns of the engine alone, and the next
  * batch could not be appended to it.
+ *
+ * '''More rejected records than the source allows, and the batch is not committed'''
+ * (`quality.max_rejected_ratio`, ADR-0008). The records are in quarantine by then, where
+ * whoever owns the source finds them; nothing is written to Bronze, the run ends as a data
+ * failure, and the batch stays planned: the same data gives the same result, until the source
+ * allows more or the batch is given up. The quarantine is written first so that the table of
+ * the data is the last that a batch writes, and the one that says whether the batch is written
+ * (`Recovery.of`).
  *
  * '''A plan that the source no longer has is given up''' (ADR-0018). When the connector says
  * that what the plan names changed (`SourceChangedException`), the table is asked whether the
@@ -64,10 +80,8 @@ import org.slf4j.LoggerFactory
  *    of errors (P8).
  *
  * '''What is not here yet.''' A batch that a run before this one left planned is not recovered
- * (P5.10): the run fails, and says so. Records that could not be parsed fail the batch (P5.9
- * puts them in quarantine, up to what the source allows). A lease that is lost is found out
- * where the control plane is asked, and at the commit; stopping the jobs of Spark at once is
- * P5.11.
+ * (P5.10): the run fails, and says so. A lease that is lost is found out where the control
+ * plane is asked, and at the commit; stopping the jobs of Spark at once is P5.11.
  *
  * @param lake the root of the lake of the profile: every table of a source is under it
  * @param clock what "now" is for a plan, and when the rows of a batch were read
@@ -151,9 +165,15 @@ final class IngestionService(
     private val start = leased.start
     private val source = bound.source
     private val table = locator.locate(source.targets.bronze.table)
+    private val quarantineTable = Quarantine.table(source.id, start.layer)
+    private val quarantine = locator.locate(quarantineTable)
+
+    // One for the run, kept for all its writes: what they lose to other writers is counted in it.
+    private val commits = CommitContext.forRun(start.id.uuid)
 
     def run(): Outcome = {
       confinement.confine(table)
+      confinement.confine(quarantine)
       leased.planned().foreach { left =>
         throw RunFailedException.permanent(
           s"the batch ${left.id} was planned by the run ${left.plannedBy} and not committed. " +
@@ -188,7 +208,7 @@ final class IngestionService(
       read.fold(giveUp(batch, _), finish(batch, progress, _))
     }
 
-    /** Writes what was read of a batch, and commits the batch. */
+    /** Writes what was read of a batch, its quarantine and then its data, and commits it. */
     private def finish(batch: PlannedBatch, progress: Progress, read: ReadResult): Outcome = {
       val readAt = clock.instant()
       hooks.at(FaultPoint.AfterRead, batch)
@@ -203,24 +223,40 @@ final class IngestionService(
         bytesRead = progress.bytes
       )
 
-      if (unparsed > 0) rejected(batch, unparsed, counted)
+      // The quarantine before the data (ADR-0005 §3, step 5), and whatever becomes of the batch:
+      // a record that was rejected is there to be looked at, the more so when there are too many.
+      val apart = read.unparsed.filter(_ => unparsed > 0).map { records =>
+        val written = this.written(quarantine, batch) {
+          new QuarantineWriter(confinement, tables, commits)
+            .write(quarantine, QuarantineBatch(start.id, source.id, batch.id, readAt), records)
+        }
+        hooks.at(FaultPoint.AfterQuarantineWrite, batch)
+        written
+      }
+
+      if (source.quality.exceededBy(rejected = unparsed, read = rows + unparsed))
+        tooManyRejected(batch, withWrites(counted, apart.toSeq))
       else {
-        val (outputs, counts) =
-          if (rows == 0) {
-            log.info(s"${batch.id} has no rows: nothing is written, and no table is touched")
-            (Vector.empty[BatchOutput], counted)
-          } else {
-            val written = write(batch, read, rows, readAt)
-            hooks.at(FaultPoint.AfterBronzeCommit, batch)
-            (
-              Vector(BatchOutput(source.targets.bronze.table, written.version)),
-              counted.copy(
-                rowsWritten = written.rows,
-                writeConflicts = written.conflicts,
-                commitContention = Some(Math.toIntExact(written.contention))
-              )
-            )
+        // A batch with no rows writes nothing to Bronze, and its table is not touched.
+        val data = Option.when(rows > 0) {
+          val written = this.written(table, batch) {
+            new BronzeWriter(confinement, tables, commits)
+              .write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows)
           }
+          hooks.at(FaultPoint.AfterBronzeCommit, batch)
+          written
+        }
+
+        val outputs = apart.map(write => BatchOutput(quarantineTable, write.version)).toVector ++
+          data.map(write => BatchOutput(source.targets.bronze.table, write.version))
+        val counts = withWrites(
+          // Another writer of this sequence wrote the batch, from the same plan: its rows are
+          // there once, and this run wrote none of them, nor counted them.
+          counted.copy(rowsWritten =
+            data.fold(Option(0L))(write => Option.when(write.byThisRun)(rows))
+          ),
+          apart.toSeq ++ data
+        )
 
         hooks.at(FaultPoint.BeforeStateCommit, batch)
         if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
@@ -230,38 +266,52 @@ final class IngestionService(
       }
     }
 
-    private def write(batch: PlannedBatch, read: ReadResult, rows: Long, readAt: Instant) = {
-      val commits = CommitContext.forRun(start.id.uuid)
-      val writer = new BronzeWriter(confinement, tables, commits)
-      writer.write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows) match {
-        case BronzeWriter.Appended(version, conflicts) =>
-          Written(version, Some(rows), Some(conflicts), commits.contention)
-        // Another writer of this sequence wrote the batch, from the same plan: its rows are
-        // there once, and this run wrote none of them.
-        case BronzeWriter.AlreadyThere(Some(version)) =>
-          Written(version, rows = None, conflicts = None, commits.contention)
-        case BronzeWriter.AlreadyThere(None) =>
-          throw new IllegalStateException(
-            s"the table at ${table.uri} has ${batch.id}, and no commit that its log keeps " +
-              "holds it: a batch that this run has just planned cannot be that old"
-          )
-      }
+    /** What a write of the batch to one of its tables came to. */
+    private def written(to: TableLocation, batch: PlannedBatch)(
+        write: => BatchAppend.Result
+    ): Written = write match {
+      case BatchAppend.Appended(version, conflicts) =>
+        Written(version, byThisRun = true, conflicts)
+      case BatchAppend.AlreadyThere(Some(version)) =>
+        Written(version, byThisRun = false, conflicts = 0)
+      case BatchAppend.AlreadyThere(None) =>
+        throw new IllegalStateException(
+          s"the table at ${to.uri} has ${batch.id}, and no commit that its log keeps holds " +
+            "it: a batch that this run has just planned cannot be that old"
+        )
     }
 
     /**
-     * Records that could not be parsed, before there is a quarantine to put them in (P5.9): the
-     * batch is not committed, as one that is beyond what its source allows is not.
+     * What the writes of the run cost it: how often a table changed under one, and the versions
+     * that they lost to other writers. Neither is counted for a run that wrote nothing.
      */
-    private def rejected(batch: PlannedBatch, unparsed: Long, counts: RunCounts): Outcome =
+    private def withWrites(counts: RunCounts, writes: Seq[Written]): RunCounts =
+      if (writes.isEmpty) counts
+      else
+        counts.copy(
+          writeConflicts = Some(writes.map(_.conflicts).sum),
+          commitContention = Some(Math.toIntExact(commits.contention))
+        )
+
+    /**
+     * More records were rejected than the source allows: the batch is not committed (ADR-0008,
+     * exit code 5). Its rejected records are in quarantine, and nothing of it is in Bronze.
+     */
+    private def tooManyRejected(batch: PlannedBatch, counts: RunCounts): Outcome = {
+      val (rejected, read) = (counts.rowsRejected.getOrElse(0L), counts.rowsRead.getOrElse(0L))
       ended(
         leased,
         RunEnd.Failed(
           FailureClass.Data,
-          s"$unparsed of the ${counts.rowsRead.getOrElse(0L)} records of ${batch.id} could not " +
-            "be parsed, and nothing of the batch was written: it stays planned",
+          s"$rejected of the $read records of ${batch.id} could not be parsed, which is more " +
+            s"than the share that ${source.id} allows, ${source.quality.maxRejectedRatio} " +
+            "(quality.max_rejected_ratio). The batch is not committed, and nothing of it was " +
+            s"written to Bronze: it stays planned. The records are in quarantine, at " +
+            quarantine.uri,
           counts
         )
       )
+    }
 
     /**
      * Gives up a batch whose plan the source no longer has, if its table does not have the
@@ -341,15 +391,13 @@ object IngestionService {
   )
 
   /**
-   * @param rows how many rows this run wrote; none, if the table had the batch already
-   * @param contention the versions of the table that the commit lost to other writers
+   * A table that has a batch, after a write of it.
+   *
+   * @param version where the batch is in the table
+   * @param byThisRun whether this write put it there; if not, the table had it already
+   * @param conflicts how many times the write was made again because the table had changed
    */
-  final private case class Written(
-      version: Long,
-      rows: Option[Long],
-      conflicts: Option[Int],
-      contention: Long
-  )
+  final private case class Written(version: Long, byThisRun: Boolean, conflicts: Int)
 
   /** How many things that changed are kept with a batch that is given up, of however many. */
   val ChangedKept = 1000

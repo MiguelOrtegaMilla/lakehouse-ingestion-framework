@@ -12,14 +12,20 @@ import scala.concurrent.duration._
 
 import io.circe.Json
 import io.delta.tables.DeltaTable
-import lakehouse.ingestion.core.config.{PathTableLocator, RootUri, Source, TableLocation}
+import lakehouse.ingestion.core.config.{
+  PathTableLocator,
+  RelativePath,
+  RootUri,
+  Source,
+  TableLocation
+}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.files.FilePlan
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.control._
-import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions, Lake}
+import lakehouse.ingestion.engine.delta.{BatchAppend, CommitMetadata, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
@@ -27,6 +33,7 @@ import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, LocalSparkSuite}
 import lakehouse.ingestion.logstore.CommitContext
+import org.apache.spark.sql.Row
 import org.apache.spark.sql.delta.DeltaLog
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -73,8 +80,17 @@ final class IngestionServiceSpec
   // A source, its files, and a run of it
   // ---------------------------------------------------------------------------------------------
 
-  /** A source of files of its own, with its directory made in the landing zone. */
-  private def fileSource(format: String = "csv", options: String = ""): Source = {
+  /**
+   * A source of files of its own, with its directory made in the landing zone.
+   *
+   * @param rejected the share of the records of a batch that it lets be rejected; none, unless
+   *   it says so
+   */
+  private def fileSource(
+      format: String = "csv",
+      options: String = "",
+      rejected: Option[String] = None
+  ): Source = {
     val id = newSourceId().value
     val directory = id.replace('.', '_')
     Files.createDirectories(landingDirectory.resolve(directory))
@@ -85,6 +101,7 @@ final class IngestionServiceSpec
            |connector: { type: file, path: $directory, format: $format$options }
            |load: { mode: new_files }
            |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
+           |${rejected.fold("")(share => s"quality: { max_rejected_ratio: $share }")}
            |""".stripMargin
       )
       .value
@@ -143,8 +160,23 @@ final class IngestionServiceSpec
 
   private def bronze(of: Source): TableLocation = locator.locate(of.targets.bronze.table)
 
-  private def tableIsThere(of: Source): Boolean =
-    Files.exists(Paths.get(URI.create(bronze(of).uri)))
+  private def quarantineTable(of: Source): RelativePath = Quarantine.table(of.id, Layer.Bronze)
+  private def quarantine(of: Source): TableLocation = locator.locate(quarantineTable(of))
+
+  private def isThere(table: TableLocation): Boolean =
+    Files.exists(Paths.get(URI.create(table.uri)))
+  private def tableIsThere(of: Source): Boolean = isThere(bronze(of))
+
+  /** The records in the quarantine of a source: the batch, the file and the text of each. */
+  private def quarantinedOf(of: Source): Seq[(Long, String, String)] =
+    spark.read
+      .format("delta")
+      .load(quarantine(of).uri)
+      .select("batch_seq", "source_file", "raw_record")
+      .collect()
+      .map(row => (row.getLong(0), row.getString(1).split('/').last, row.getString(2)))
+      .sorted
+      .toSeq
 
   private def tableVersion(of: Source): Long =
     DeltaLog.forTable(spark, bronze(of).uri).update().version
@@ -436,7 +468,9 @@ final class IngestionServiceSpec
       (FaultPoint.AfterBronzeCommit, "PLANNED", Some(1L), 0),
       (FaultPoint.BeforeStateCommit, "PLANNED", Some(1L), 0)
     )
-    seen.map(_._1).toSeq shouldBe FaultPoint.All
+    // Every point but the one after the quarantine, which a batch with nothing rejected has not.
+    seen.map(_._1).toSeq shouldBe FaultPoint.All.filterNot(_ == FaultPoint.AfterQuarantineWrite)
+    isThere(quarantine(orders)) shouldBe false
     batchOf(first).status shouldBe BatchStatus.Committed
     takenOf(orders) should have size 1
   }
@@ -621,7 +655,7 @@ final class IngestionServiceSpec
         bronze(orders),
         BronzeBatch(other, orders.id, batch.id, Now),
         Seq("1").toDF("id")
-      ) shouldBe BronzeWriter.Appended(0, conflicts = 0)
+      ) shouldBe BatchAppend.Appended(0, conflicts = 0)
       drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800)): Unit
     })
 
@@ -793,17 +827,86 @@ final class IngestionServiceSpec
     takenOf(orders) shouldBe empty
   }
 
-  test("records that cannot be parsed fail the batch, until there is a quarantine for them") {
+  // ---------------------------------------------------------------------------------------------
+  // Records that are rejected: the quarantine, and how many are too many
+  // ---------------------------------------------------------------------------------------------
+
+  test("records that cannot be parsed are set apart in quarantine, before the data is written") {
+    val orders = fileSource(rejected = Some("0.5"))
+    val a = drop(orders, "a.csv", "id,amount\n1,10\n2\n3,30\n")
+    val first = batchId(orders, 1)
+    val seen = mutable.Buffer.empty[(FaultPoint, Option[Long], Option[Long])]
+    // What each table has of the batch, at each point of the run.
+    val recording: FaultHooks = (point, batch) => {
+      seen += ((
+        point,
+        delta.lastVersion(quarantine(orders), batch.id.app),
+        delta.lastVersion(bronze(orders), batch.id.app)
+      ))
+      ()
+    }
+
+    val done = ingested(launch(orders, service(recording)))
+
+    // The quarantine first, and then the data: a batch whose data is written has both.
+    seen.toSeq shouldBe Seq(
+      (FaultPoint.AfterPlan, None, None),
+      (FaultPoint.AfterRead, None, None),
+      (FaultPoint.AfterQuarantineWrite, Some(1L), None),
+      (FaultPoint.AfterBronzeCommit, Some(1L), Some(1L)),
+      (FaultPoint.BeforeStateCommit, Some(1L), Some(1L))
+    )
+    seen.map(_._1).toSeq shouldBe FaultPoint.All
+
+    // What the batch wrote, in the order it wrote it, and what it counted.
+    done.outputs shouldBe Seq(
+      BatchOutput(quarantineTable(orders), 0),
+      BatchOutput(orders.targets.bronze.table, 0)
+    )
+    batchOf(first).outputs shouldBe Some(done.outputs.toVector)
+    done.counts shouldBe RunCounts(
+      rowsRead = Some(3),
+      rowsWritten = Some(2),
+      rowsRejected = Some(1),
+      bytesRead = Some(Files.size(a)),
+      writeConflicts = Some(0),
+      commitContention = Some(0)
+    )
+    runOf(done.run).counts shouldBe done.counts
+    runOf(done.run).status shouldBe RunStatus.Succeeded
+
+    // The record as it was, with where it came from; and the rows that were parsed, in Bronze.
+    quarantine(orders).uri shouldBe s"${lakeRoot.value}/_quarantine/bronze/${orders.id}"
+    spark.read.format("delta").load(quarantine(orders).uri).collect().toSeq shouldBe Seq(
+      Row(
+        done.run.toString,
+        1L,
+        s"${orders.id.value.replace('.', '_')}/a.csv",
+        "unparsed",
+        null,
+        "2",
+        Timestamp.from(Now)
+      )
+    )
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("3", 1L, "a.csv"))
+    takenOf(orders) shouldBe Seq(("a.csv", Files.size(a), 1L))
+  }
+
+  test("more rejected records than the source allows: the batch is not committed") {
+    // By default a source lets none be rejected (`quality.max_rejected_ratio`).
     val orders = fileSource()
     val a = drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    val first = batchId(orders, 1)
 
     val outcome = launch(orders)
 
     outcome match {
       case Outcome.Failed(_, failure, message) =>
         failure shouldBe FailureClass.Data
-        message should include("1 of the 2 records")
-        message should include("could not be parsed")
+        message should include(s"1 of the 2 records of $first could not be parsed")
+        message should include("0.0 (quality.max_rejected_ratio)")
+        message should include("nothing of it was written to Bronze")
+        message should include(s"in quarantine, at ${quarantine(orders).uri}")
       case other => fail(s"the run did not fail: $other")
     }
     val ended = runOf(outcome.run)
@@ -813,12 +916,112 @@ final class IngestionServiceSpec
       rowsRead = Some(2),
       rowsWritten = Some(0),
       rowsRejected = Some(1),
-      bytesRead = Some(Files.size(a))
+      bytesRead = Some(Files.size(a)),
+      writeConflicts = Some(0),
+      commitContention = Some(0)
     )
-    batchesOf(orders) shouldBe Seq(1L -> "PLANNED")
-    tableIsThere(orders) shouldBe false
-    takenOf(orders) shouldBe empty
     holderOf(orders) shouldBe None
+
+    // The rejected record is where whoever owns the source finds it, and nothing else is
+    // anywhere: no row in Bronze, no file taken, no state moved, and the batch still planned.
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    tableIsThere(orders) shouldBe false
+    delta.lastVersion(bronze(orders), first.app) shouldBe None
+    takenOf(orders) shouldBe empty
+    stateOf(orders) shouldBe None
+    batchOf(first).status shouldBe BatchStatus.Planned
+    batchOf(first).outputs shouldBe None
+  }
+
+  test("the share that a source allows is allowed whole, and one record more is too many") {
+    // One record of two: half of the batch.
+    val half = fileSource(rejected = Some("0.5"))
+    drop(half, "a.csv", "id,amount\n1,2\n3\n")
+    ingested(launch(half)).counts.rowsRejected shouldBe Some(1)
+    rowsOf(half) shouldBe Seq(("1", 1L, "a.csv"))
+
+    val less = fileSource(rejected = Some("0.49"))
+    drop(less, "a.csv", "id,amount\n1,2\n3\n")
+    launch(less) match {
+      case Outcome.Failed(_, failure, message) =>
+        failure shouldBe FailureClass.Data
+        message should include("0.49 (quality.max_rejected_ratio)")
+      case other => fail(s"the run did not fail: $other")
+    }
+    tableIsThere(less) shouldBe false
+    quarantinedOf(less) shouldBe Seq((1L, "a.csv", "3"))
+  }
+
+  test("a batch whose records were all rejected, as its source allows, writes no data") {
+    val events = fileSource(format = "json", rejected = Some("1"))
+    val a = drop(events, "a.json", "not json\n{\"id\": 1\n")
+    val points = mutable.Buffer.empty[FaultPoint]
+    val recording: FaultHooks = (point, _) => { points += point; () }
+
+    val done = ingested(launch(events, service(recording)))
+
+    // Its quarantine is all that it wrote; its files are taken, as those of any batch.
+    done.outputs shouldBe Seq(BatchOutput(quarantineTable(events), 0))
+    done.counts shouldBe RunCounts(
+      rowsRead = Some(2),
+      rowsWritten = Some(0),
+      rowsRejected = Some(2),
+      bytesRead = Some(Files.size(a)),
+      writeConflicts = Some(0),
+      commitContention = Some(0)
+    )
+    quarantinedOf(events) shouldBe Seq((1L, "a.json", "not json"), (1L, "a.json", "{\"id\": 1"))
+    tableIsThere(events) shouldBe false
+    takenOf(events) shouldBe Seq(("a.json", Files.size(a), 1L))
+    batchOf(done.batch).status shouldBe BatchStatus.Committed
+    points.toSeq shouldBe Seq(
+      FaultPoint.AfterPlan,
+      FaultPoint.AfterRead,
+      FaultPoint.AfterQuarantineWrite,
+      FaultPoint.BeforeStateCommit
+    )
+  }
+
+  test("a quarantine grows with the batches that reject, and the others leave it as it was") {
+    val orders = fileSource(rejected = Some("0.5"))
+    drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    ingested(launch(orders)).outputs.map(_.version) shouldBe Seq(0L, 0L)
+
+    // A batch with nothing rejected writes its data alone.
+    drop(orders, "b.csv", "id,amount\n4,5\n")
+    ingested(launch(orders)).outputs shouldBe Seq(BatchOutput(orders.targets.bronze.table, 1))
+    DeltaLog.forTable(spark, quarantine(orders).uri).update().version shouldBe 0L
+    delta.lastVersion(quarantine(orders), batchId(orders, 2).app) shouldBe Some(1L)
+
+    // The next one that rejects is appended, under its own number.
+    drop(orders, "c.csv", "id,amount\n6,7\n8,9,10\n")
+    ingested(launch(orders)).outputs shouldBe Seq(
+      BatchOutput(quarantineTable(orders), 1),
+      BatchOutput(orders.targets.bronze.table, 2)
+    )
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (3L, "c.csv", "8,9,10"))
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("4", 2L, "b.csv"), ("6", 3L, "c.csv"))
+  }
+
+  test("a run that dies between the quarantine and the data leaves a batch to be replayed") {
+    val orders = fileSource(rejected = Some("0.5"))
+    drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    val first = batchId(orders, 1)
+    val dying = service(hookAt(FaultPoint.AfterQuarantineWrite)(_ => throw new Died))
+
+    intercept[Died](launch(orders, dying))
+
+    // The batch is written in part: its quarantine has it, and its data does not.
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    tableIsThere(orders) shouldBe false
+    val left = batchOf(first)
+    left.status shouldBe BatchStatus.Planned
+    takenOf(orders) shouldBe empty
+    val planned = PlannedBatch(left.id, left.plan, left.plannedBy, left.plannedAt)
+    // The table that is asked is the one that a batch writes last, its data: it says "replay",
+    // and the quarantine, which has the batch, would have said that all of it is written.
+    Recovery.of(Some(planned), bronze(orders), delta) shouldBe Recovery.Replay(planned)
+    Recovery.of(Some(planned), quarantine(orders), delta) shouldBe Recovery.RollForward(planned)
   }
 }
 

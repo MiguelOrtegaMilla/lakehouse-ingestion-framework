@@ -60,7 +60,7 @@ Paths are relative: a table to the lake of the profile, a directory of files to 
 | What if rows are deleted in the source? | `deletes` | A full load sees what is gone. An incremental load does not: `key_reconciliation` compares the keys in a run of its own, and `deleted_flag` reads the column in which the source marks a deleted row |
 | What if the source changes its schema? | `schema` | By default a new column is taken, a missing one is null, and a change of type fails the run |
 | Which columns hold personal data? | `columns` | Tag them (`pii: email`), and say how Silver hides them (`silver: { mask: hmac }`) |
-| How many bad rows are too many? | `quality.max_rejected_ratio` | Rows that cannot be read go to quarantine. Above this share, the batch is not committed. By default no row may be rejected |
+| How many bad rows are too many? | `quality.max_rejected_ratio` | Records that cannot be parsed go to the quarantine of the source, a table of the lake at `_quarantine/bronze/<id>`, as they were. Above this share of a batch, nothing of the batch is written to Bronze and the run ends in 5. By default no record may be rejected |
 | How fresh must it be? | `freshness_sla` | How old its data may get before it is late |
 
 ## 3. Point at the secrets, never write them
