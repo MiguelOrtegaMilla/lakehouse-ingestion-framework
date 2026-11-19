@@ -1,45 +1,22 @@
 package lakehouse.ingestion.it.logstore
 
-import java.util.concurrent.ConcurrentLinkedQueue
-
-import scala.jdk.CollectionConverters._
-
+import lakehouse.ingestion.it.support.CapturedLogs
 import lakehouse.ingestion.logstore.{FaultHooks, FaultPoint, PostgresLogStore}
 import org.apache.hadoop.conf.Configuration
-import org.apache.logging.log4j.core.appender.AbstractAppender
-import org.apache.logging.log4j.core.config.Property
-import org.apache.logging.log4j.core.{LogEvent, LoggerContext}
-import org.apache.logging.log4j.{Level, LogManager}
+import org.apache.logging.log4j.Level
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /**
  * A fault hook left on in a configuration cannot go unnoticed: every LogStore says so when it
- * is created. The warnings are read from the logging backend the application runs with, log4j,
- * through an appender of the test's own.
+ * is created. The warnings are read from the logging backend the application runs with, log4j
+ * (`CapturedLogs`).
  */
 final class FaultHookWarningSpec extends AnyFunSuite with Matchers {
 
   /** What `PostgresLogStore` logs while `body` runs: the level and the text of each event. */
-  private def logged(body: => Unit): Seq[(Level, String)] = {
-    val events = new ConcurrentLinkedQueue[(Level, String)]
-    val appender =
-      new AbstractAppender("captured-by-test", null, null, false, Property.EMPTY_ARRAY) {
-        override def append(event: LogEvent): Unit =
-          if (event.getLoggerName == classOf[PostgresLogStore].getName)
-            events.add(event.getLevel -> event.getMessage.getFormattedMessage): Unit
-      }
-    appender.start()
-    val root =
-      LogManager.getContext(false).asInstanceOf[LoggerContext].getConfiguration.getRootLogger
-    root.addAppender(appender, null, null)
-    try body
-    finally {
-      root.removeAppender(appender.getName)
-      appender.stop()
-    }
-    events.asScala.toSeq
-  }
+  private def logged(body: => Unit): Seq[(Level, String)] =
+    CapturedLogs.of(classOf[PostgresLogStore])(body)._2.map(line => line.level -> line.message)
 
   test("a LogStore created with fault hooks configured warns of each: its point and its wait") {
     val conf = new Configuration()
