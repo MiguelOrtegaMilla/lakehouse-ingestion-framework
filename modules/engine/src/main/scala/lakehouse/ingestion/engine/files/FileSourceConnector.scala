@@ -17,7 +17,14 @@ import lakehouse.ingestion.core.config.{
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
 import lakehouse.ingestion.core.files.{FilePlan, FilePlanner}
 import lakehouse.ingestion.engine.RunFailedException
-import lakehouse.ingestion.engine.connector.{PlanContext, ReadContext, ReadResult, SourceConnector}
+import lakehouse.ingestion.engine.connector.{
+  PlanContext,
+  Progress,
+  ReadContext,
+  ReadResult,
+  SourceChangedException,
+  SourceConnector
+}
 import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.functions.{col, lit, udf}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
@@ -76,8 +83,11 @@ import org.slf4j.LoggerFactory
  * only the engine writes, or to read from storage where an object never changes once written
  * (E2).
  *
- * A plan that cannot be read as it was planned fails as permanent (4): a run that reads it again
- * finds the same. The batch stays planned, for the operator (P7).
+ * '''A plan whose files changed is not read''', and the read says so, with each file and what
+ * changed of it (`SourceChangedException`): a run that read the plan again would find the same.
+ * The engine then gives the batch up, if nothing of it was written, and the next run plans the
+ * files as they are by then (ADR-0018). A file that was written again is another file, and is
+ * planned as a new one.
  *
  * @param afterRead what runs once Spark has read the files and before they are confirmed again:
  *   nothing, but in the tests that change a file at that moment
@@ -120,23 +130,8 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       plan: Json,
       context: ReadContext
   ): ReadResult = {
-    val files = FilePlan
-      .fromJson(plan)
-      .fold(
-        problem =>
-          throw RunFailedException.permanent(
-            s"the plan of the batch of ${source.id} is not one that this application reads: it " +
-              problem
-          ),
-        identity
-      )
-    if (files.directory != config.path)
-      throw RunFailedException.permanent(
-        s"the plan of the batch of ${source.id} is of the directory ${files.directory}, and the " +
-          s"source reads ${config.path}: it was planned under another configuration"
-      )
-
-    val before = confirmed(config, files, "since it was planned")(landing.confirm(config, files))
+    val files = planOf(source, config, plan)
+    val before = confirmed(config, "since it was planned")(landing.confirm(config, files))
     val read =
       readable(context.spark, config.format, before.paths, sourceFiles(files, before.paths))
     // What is read is kept by Spark apart from the files, and everything after is made from it.
@@ -152,7 +147,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
           )
       }
     afterRead()
-    confirmed(config, files, "while it was read")(landing.confirmAgain(config, files, before))
+    confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
 
     if (config.format == FileConnectorConfig.Format.Parquet) ReadResult(kept, unparsed = None)
     else
@@ -166,17 +161,46 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       )
   }
 
-  /** What a look at the files of a plan found, if each is still as it was. */
-  private def confirmed[A](config: FileConnectorConfig, plan: FilePlan, when: String)(
-      look: Either[Vector[String], A]
+  /** The files of a plan are what its commit records: each is taken, and never again. */
+  override def progress(source: Source, config: FileConnectorConfig, plan: Json): Progress =
+    Progress(watermark = None, files = Some(planOf(source, config, plan)))
+
+  /** A plan of this source, as this application reads it. */
+  private def planOf(source: Source, config: FileConnectorConfig, plan: Json): FilePlan = {
+    val files = FilePlan
+      .fromJson(plan)
+      .fold(
+        problem =>
+          throw RunFailedException.permanent(
+            s"the plan of the batch of ${source.id} is not one that this application reads: it " +
+              problem
+          ),
+        identity
+      )
+    if (files.directory != config.path)
+      throw RunFailedException.permanent(
+        s"the plan of the batch of ${source.id} is of the directory ${files.directory}, and the " +
+          s"source reads ${config.path}: it was planned under another configuration"
+      )
+    files
+  }
+
+  /**
+   * What a look at the files of a plan found, if each is still as it was.
+   *
+   * @throws SourceChangedException if one is not: the plan is not read
+   */
+  private def confirmed[A](config: FileConnectorConfig, when: String)(
+      look: Either[Vector[Landing.NotAsPlanned], A]
   ): A =
     look match {
       case Right(found) => found
       case Left(problems) =>
-        throw RunFailedException.permanent(
+        throw new SourceChangedException(
           s"the batch of ${config.path} cannot be read as it was planned: " +
             s"${Landing.files(problems.size)} of it changed $when, and nothing of it was " +
-            s"written: ${Landing.some(problems)}"
+            s"written: ${Landing.some(problems.map(_.toString))}",
+          problems.map(problem => SourceChangedException.Changed(problem.name, problem.how))
         )
     }
 

@@ -100,6 +100,18 @@ final class FileSourceConnectorSpec
     failure.getMessage
   }
 
+  /**
+   * What a read says of a plan whose files are not as they were planned: not a failure with a
+   * class, but what the engine gives the batch up by (ADR-0018).
+   */
+  private def changedUnder(body: => Any): SourceChangedException = {
+    val changed = the[SourceChangedException] thrownBy body
+    changed.getMessage shouldBe changed.summary
+    changed.summary should include("cannot be read as it was planned")
+    changed.summary should include("nothing of it was written")
+    changed
+  }
+
   // ---------------------------------------------------------------------------------------------
   // The plan
   // ---------------------------------------------------------------------------------------------
@@ -329,19 +341,20 @@ final class FileSourceConnectorSpec
   // The files that were planned, and no other
   // ---------------------------------------------------------------------------------------------
 
-  test("a file written again after its plan fails the read, and says what changed") {
+  test("a file written again after its plan is not read, and the read says what changed") {
     val root = landingZone()
     val orders = source("csv")
     val a = drop(root, "a.csv", "id\n1\n")
+    drop(root, "b.csv", "id\n2\n")
     val planned = plan(root, orders).value
     Files.write(a, "id\n1\n2\n".getBytes(UTF_8))
 
-    val message = refused(read(root, orders, planned))
-    message should include(
-      "cannot be read as it was planned: 1 file of it changed since it was planned"
-    )
-    message should include("'a.csv' is of 7 bytes, and was of 5")
-    message should include("nothing of it was written")
+    val changed = changedUnder(read(root, orders, planned))
+    changed.summary should include("1 file of it changed since it was planned")
+    changed.summary should include("'a.csv' is of 7 bytes, and was of 5")
+    // Each file that changed, by the name that the plan has it under: the other is not named.
+    changed.changed.map(_.item) shouldBe Seq("a.csv")
+    changed.changed.head.change should startWith("is of 7 bytes, and was of 5, was changed at ")
   }
 
   test("a file that is gone, or a link that leads to another size now, fails the read") {
@@ -360,10 +373,14 @@ final class FileSourceConnectorSpec
     Files.setLastModifiedTime(second, FileTime.from(anHourAgo))
     Files.createSymbolicLink(link, second)
 
-    val message = refused(read(root, orders, planned))
-    message should include("2 files of it changed since it was planned")
-    message should include("'a.csv' is not there any more")
-    message should include("'b.csv' is of 6 bytes, and was of 5")
+    val changed = changedUnder(read(root, orders, planned))
+    changed.summary should include("2 files of it changed since it was planned")
+    changed.summary should include("'a.csv' is not there any more")
+    changed.summary should include("'b.csv' is of 6 bytes, and was of 5")
+    changed.changed shouldBe Seq(
+      SourceChangedException.Changed("a.csv", "is not there any more, or is a directory now"),
+      SourceChangedException.Changed("b.csv", "is of 6 bytes, and was of 5")
+    )
   }
 
   test("a link that leads out of the landing zone after the plan fails the read") {
@@ -380,9 +397,14 @@ final class FileSourceConnectorSpec
     Files.delete(link)
     Files.createSymbolicLink(link, outside)
 
-    refused(read(root, orders, planned)) should include(
-      "'x.csv' leads out of the landing zone"
+    // It changed since it was planned, as a file written again did. A plan made now refuses
+    // the link, as a permanent failure: the listing does not take a file that leads out.
+    val changed = changedUnder(read(root, orders, planned))
+    changed.changed shouldBe Seq(
+      SourceChangedException
+        .Changed("x.csv", "leads out of the landing zone, through a symbolic link")
     )
+    refused(plan(root, orders)) should include("'x.csv' leads out of the landing zone")
   }
 
   test("a file changed while it was read fails the read, after Spark read it") {
@@ -400,9 +422,11 @@ final class FileSourceConnectorSpec
         ()
       }
     )
-    val message = refused(changing.read(orders, configOf(orders), planned, ReadContext(spark)))
+    val changed =
+      changedUnder(changing.read(orders, configOf(orders), planned, ReadContext(spark)))
     read shouldBe true
-    message should include("1 file of it changed while it was read")
+    changed.summary should include("1 file of it changed while it was read")
+    changed.changed.map(_.item) shouldBe Seq("a.csv")
   }
 
   test("a file put in another's place while it was read, of the same size and time, fails it") {
@@ -420,11 +444,13 @@ final class FileSourceConnectorSpec
         ()
       }
     )
-    val message =
-      refused(replacing.read(orders, configOf(orders), planned, ReadContext(spark)))
-    message should include("1 file of it changed while it was read")
-    message should include("'a.csv' is another file of the file system than the one that was read")
-    message should not include "bytes"
+    val changed =
+      changedUnder(replacing.read(orders, configOf(orders), planned, ReadContext(spark)))
+    changed.summary should include("1 file of it changed while it was read")
+    changed.summary should include(
+      "'a.csv' is another file of the file system than the one that was read"
+    )
+    changed.summary should not include "bytes"
   }
 
   test("a link that leads to another file while it was read fails the read") {
@@ -446,7 +472,9 @@ final class FileSourceConnectorSpec
         ()
       }
     )
-    refused(relinking.read(orders, configOf(orders), planned, ReadContext(spark))) should include(
+    changedUnder(
+      relinking.read(orders, configOf(orders), planned, ReadContext(spark))
+    ).summary should include(
       "'a.csv' is another file of the file system than the one that was read"
     )
   }
@@ -503,6 +531,41 @@ final class FileSourceConnectorSpec
       include("is not one that this application reads: it is of version 2")
     refused(
       read(root, orders, planned.mapObject(_.add("directory", Json.fromString("shop/returns"))))
+    ) should include("is of the directory shop/returns, and the source reads shop/orders")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // What the commit of a plan records
+  // ---------------------------------------------------------------------------------------------
+
+  test("what the commit of a plan records is its files, said from the plan alone") {
+    val root = landingZone()
+    val orders = source("csv")
+    drop(root, "a.csv", "id\n1\n")
+    drop(root, "empty.csv", "")
+    val planned = plan(root, orders).value
+    // The files are gone: the plan is all that is read, as for a batch that is rolled forward.
+    Files.delete(root.resolve("shop/orders/a.csv"))
+    Files.delete(root.resolve("shop/orders/empty.csv"))
+
+    val progress = connector(root).progress(orders, configOf(orders), planned)
+
+    progress.watermark shouldBe None
+    progress.files shouldBe Some(FilePlan.fromJson(planned).value)
+    progress.files.value.names.map(_.value) shouldBe Vector("a.csv", "empty.csv")
+    progress.bytes shouldBe Some(5L)
+
+    // A plan that is not this source's has nothing to record, as it has nothing to read.
+    refused(
+      connector(root)
+        .progress(orders, configOf(orders), planned.mapObject(_.add("version", Json.fromInt(2))))
+    ) should include("is not one that this application reads: it is of version 2")
+    refused(
+      connector(root).progress(
+        orders,
+        configOf(orders),
+        planned.mapObject(_.add("directory", Json.fromString("shop/returns")))
+      )
     ) should include("is of the directory shop/returns, and the source reads shop/orders")
   }
 }

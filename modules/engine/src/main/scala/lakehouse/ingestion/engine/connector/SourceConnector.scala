@@ -6,7 +6,7 @@ import scala.reflect.ClassTag
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.{ConnectorConfig, ConnectorKind, RelativePath, Source}
-import lakehouse.ingestion.core.files.LandedFile
+import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
 /**
@@ -29,6 +29,13 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  *  - '''A read of a plan reads that plan, and is the same each time it is replayed''', for as
  *    long as the source still has what the plan names. It has no effect: what was read reaches
  *    nothing but the rows that it gives.
+ *  - '''A source that no longer has what a plan names is said so, and nothing of the plan is
+ *    read as something else''' (`SourceChangedException`, ADR-0018): a file written again, or
+ *    gone. What follows is the engine's: the batch is given up if nothing of it was written,
+ *    and the next run plans anew.
+ *  - '''What the commit of a plan records is a function of the plan alone''' (`progress`):
+ *    where the next batch starts from, and the files that the batch took. A batch whose data a
+ *    run finds written is then committed with nothing read (ADR-0005 §3, step 2).
  *  - '''A connector never writes to the lake, nor to the control plane.''' The state of a
  *    source, the files it took and the record of a run are the engine's, which moves them in
  *    one transaction with the batch (ADR-0005). What a connector needs of them is given to it,
@@ -60,8 +67,19 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
    *
    * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
    *   not one that this connector reads
+   * @throws SourceChangedException if the source no longer has what the plan names, as the plan
+   *   names it. Nothing of the plan was given to be written
    */
   def read(source: Source, config: C, plan: Json, context: ReadContext): ReadResult
+
+  /**
+   * What the commit of a plan records of its source. It reads the plan and nothing else: no
+   * file, no table, no clock.
+   *
+   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   *   not one that this connector reads
+   */
+  def progress(source: Source, config: C, plan: Json): Progress
 
   /**
    * This connector for one source: none if the source is of another kind. The engine holds a
@@ -79,6 +97,9 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
 
     override def read(plan: Json, context: ReadContext): ReadResult =
       SourceConnector.this.read(source, config, plan, context)
+
+    override def progress(plan: Json): Progress =
+      SourceConnector.this.progress(source, config, plan)
   }
 }
 
@@ -90,6 +111,9 @@ abstract class BoundSource private[connector] (val source: Source) {
 
   /** @see [[SourceConnector.read]] */
   def read(plan: Json, context: ReadContext): ReadResult
+
+  /** @see [[SourceConnector.progress]] */
+  def progress(plan: Json): Progress
 }
 
 /**
@@ -136,4 +160,51 @@ object ReadResult {
 
   /** The column of an unparsed record that has its text, as it was in the source. */
   val Record = "_record"
+}
+
+/**
+ * What the commit of a batch records of its source, besides the batch itself: how far the
+ * source has been ingested once the batch is in its tables. The engine writes it, in the
+ * transaction that commits the batch (ADR-0005 §3, step 7); a connector only says what it is.
+ *
+ * @param watermark where the next batch starts from, in the connector's own form; none, for a
+ *   source that has none
+ * @param files the files that the batch took, for a source of files: they are recorded as
+ *   taken, and no batch after it takes them again
+ */
+final case class Progress(watermark: Option[Json], files: Option[FilePlan]) {
+
+  /** The bytes that the batch reads, where its plan says them: the sizes of its files. */
+  def bytes: Option[Long] = files.map(_.bytes)
+}
+
+/**
+ * The source no longer has what a plan names, as the plan names it (ADR-0018): a file that was
+ * written again, or is gone, since it was planned. A read raises it in place of rows, with
+ * nothing of the plan given to be written.
+ *
+ * It is not a failure with a class (`RunFailedException`). It says one thing of a plan, which
+ * a plan made now would not have wrong, and what follows is the engine's to decide: the batch
+ * is given up, if nothing of it is in its tables, and the next run plans anew. So a connector
+ * raises it for that alone. A plan that it cannot read, or a source that is not there, are
+ * failures: no new plan mends them.
+ *
+ * @param summary what happened, for a person: it names what changed, and never a value of a
+ *   row nor where a link leads
+ * @param changed each thing of the plan that is not as it was planned
+ */
+final class SourceChangedException(
+    val summary: String,
+    val changed: Seq[SourceChangedException.Changed]
+) extends RuntimeException(summary) {
+  require(changed.nonEmpty, "a source that changed has something that changed")
+}
+
+object SourceChangedException {
+
+  /**
+   * @param item what the plan names, as the plan names it: a file, by its name
+   * @param change how it is not as it was planned
+   */
+  final case class Changed(item: String, change: String)
 }

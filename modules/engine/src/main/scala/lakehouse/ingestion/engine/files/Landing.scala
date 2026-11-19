@@ -89,7 +89,7 @@ final class Landing(root: RootUri) {
    * the machine or of its container may number the same disk otherwise (`FileIdentity`).
    *
    * @return the files of the plan, in its directory as it is resolved, in the order of the plan;
-   *   or what is not as it was planned, for each name that is not
+   *   or what is not as it was planned, for each name that is not, in that order
    * @throws RunFailedException a permanent failure, for a root or a directory that is not there,
    *   is not a directory, or is outside the root
    * @throws IllegalArgumentException if the plan is of another directory than the source's
@@ -98,7 +98,7 @@ final class Landing(root: RootUri) {
   def confirm(
       config: FileConnectorConfig,
       plan: FilePlan
-  ): Either[Vector[String], Landing.Confirmed] =
+  ): Either[Vector[Landing.NotAsPlanned], Landing.Confirmed] =
     looks(config, plan)((_, _) => None).map(found => new Landing.Confirmed(plan, found))
 
   /**
@@ -113,7 +113,7 @@ final class Landing(root: RootUri) {
       config: FileConnectorConfig,
       plan: FilePlan,
       before: Landing.Confirmed
-  ): Either[Vector[String], Unit] = {
+  ): Either[Vector[Landing.NotAsPlanned], Unit] = {
     require(before.plan == plan, "what was confirmed is of another plan")
     looks(config, plan) { (index, now) =>
       val was = before.identities(index)
@@ -129,7 +129,7 @@ final class Landing(root: RootUri) {
    */
   private def looks(config: FileConnectorConfig, plan: FilePlan)(
       otherwise: (Int, FileIdentity) => Option[String]
-  ): Either[Vector[String], Vector[(Path, FileIdentity)]] = {
+  ): Either[Vector[Landing.NotAsPlanned], Vector[(Path, FileIdentity)]] = {
     require(plan.directory == config.path, s"the plan is of ${plan.directory}, not ${config.path}")
     val (rootReal, directory) = locate(config)
 
@@ -142,7 +142,7 @@ final class Landing(root: RootUri) {
           val problems = otherwise(index, stat.identity).toSeq ++ changes(file, stat)
           if (problems.isEmpty) Right(entry -> stat.identity) else Left(problems.mkString(", "))
         }
-      now.left.map(problem => s"'$name' $problem")
+      now.left.map(Landing.NotAsPlanned(name, _))
     }
     val problems = found.collect { case Left(problem) => problem }
     if (problems.nonEmpty) Left(problems) else Right(found.collect { case Right(file) => file })
@@ -284,6 +284,17 @@ object Landing {
 
     /** Which file of the file system each was, in the plan's order. */
     val identities: Vector[FileIdentity] = found.map(_._2)
+  }
+
+  /**
+   * A file of a plan that a look did not find as it was planned.
+   *
+   * @param name the file, by its name in the directory of its source
+   * @param how what is not as it was planned: its size, its time, which file it is, or that it
+   *   is not there. Never where a link leads
+   */
+  final case class NotAsPlanned(name: String, how: String) {
+    override def toString: String = s"'$name' $how"
   }
 
   final private[files] case class Stat(
