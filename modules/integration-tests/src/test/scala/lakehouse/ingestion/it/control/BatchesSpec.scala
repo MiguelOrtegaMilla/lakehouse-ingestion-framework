@@ -209,6 +209,41 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     refused.getSQLState shouldBe "42501"
   }
 
+  test("the batches of a sequence that were given up are named, in their order") {
+    val orders = newSource()
+    val other = newSource()
+    val delta = new SimulatedDelta
+    def givenUp(of: Source): BatchSeq = {
+      val leased = open(of)
+      val planned = leased.plan(range(0, 10))
+      leased.abandon(planned.id, Reason, None, GivenUp) shouldBe true
+      planned.id.seq
+    }
+    def committed(of: Source): BatchSeq = {
+      val leased = open(of)
+      val planned = leased.plan(range(0, 10))
+      finish(leased, of, delta, planned) shouldBe true
+      planned.id.seq
+    }
+    val app = TxnAppId.of(orders.id, Layer.Bronze)
+    database.run(Batches.abandoned(_, app)) shouldBe empty
+
+    val first = givenUp(orders)
+    committed(orders)
+    val third = givenUp(orders)
+    givenUp(other)
+    // One that is planned is not given up, whatever becomes of it.
+    val last = open(orders)
+    val planned = last.plan(range(10, 20))
+    last.close()
+
+    database.run(Batches.abandoned(_, app)) shouldBe Vector(first, third)
+    database.run(Batches.abandoned(_, app)).map(_.value) shouldBe Vector(1L, 3L)
+    planned.id.seq.value shouldBe 4L
+    database.run(Batches.abandoned(_, TxnAppId.of(other.id, Layer.Bronze))).map(_.value) shouldBe
+      Vector(1L)
+  }
+
   test("the next batch has the next number, and starts from where the state is") {
     val orders = newSource()
     val delta = new SimulatedDelta

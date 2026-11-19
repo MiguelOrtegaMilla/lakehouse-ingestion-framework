@@ -100,6 +100,28 @@ object Batches {
   }
 
   /**
+   * The numbers of the batches of a sequence that were given up, in their order: what a reader
+   * of a table that batches write before their end, as a quarantine, leaves out (ADR-0018).
+   */
+  @throws[SQLException]
+  def abandoned(connection: Connection, app: TxnAppId): Vector[BatchSeq] =
+    Using.resource(
+      connection.prepareStatement(
+        "SELECT batch_seq FROM control.ingestion_batch " +
+          "WHERE txn_app_id = ? AND status = 'ABANDONED' ORDER BY batch_seq"
+      )
+    ) { statement =>
+      statement.setString(1, app.value)
+      Using.resource(statement.executeQuery()) { rows =>
+        Iterator
+          .continually(rows)
+          .takeWhile(_.next())
+          .map(row => known("batch_seq", BatchSeq.of(row.getLong("batch_seq"))))
+          .toVector
+      }
+    }
+
+  /**
    * Marks a planned batch as committed by `run`, with what it wrote.
    *
    * @return false if the batch was not planned: it was committed already, or given up

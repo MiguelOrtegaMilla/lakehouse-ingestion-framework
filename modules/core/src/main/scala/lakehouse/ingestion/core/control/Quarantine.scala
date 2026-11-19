@@ -12,7 +12,12 @@ import lakehouse.ingestion.core.config.{RelativePath, SourceId}
  * records, and who may read them, a matter of one source. A record is kept whole, as text, and
  * it holds whatever the source holds: the personal data of a source is in its quarantine too.
  *
- * A batch writes its quarantine before its data (ADR-0005 §3, step 5), under the same number.
+ * A batch writes its quarantine before its data (ADR-0005 §3, step 5), under the same number,
+ * and whatever becomes of the batch. So the records of a batch that is given up afterwards
+ * (ADR-0018) stay in it, and the batch after it sets the same records apart again under its own
+ * number. A record says its batch (`batch_seq`), and the control plane says how the batch
+ * ended: whoever reads a quarantine leaves out the batches that are `ABANDONED` there, as the
+ * reader of the engine does (`QuarantineReader`).
  */
 object Quarantine {
 
