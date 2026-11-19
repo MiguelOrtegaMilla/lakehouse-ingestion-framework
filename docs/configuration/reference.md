@@ -150,6 +150,13 @@ A record that cannot be made a row is not lost, and does not stop the rest of it
 
 A quarantine holds what its source holds, the personal data of the source among it. No source can name a table under `_quarantine`: a [relative path](#a-relative-path) has no segment that starts with `_`.
 
+**Reading a quarantine.** A batch writes its rejected records before its data, whatever becomes of it. A batch that is then given up, because a file of it changed before it could be finished, leaves its records in the table, and the batch after it sets the same records apart again under its own number. Nothing is deleted for it: the control plane says which batches were given up, and a record says its batch (`batch_seq`). So whoever reads the table leaves out the batches that this gives, as the reader of the engine does (`QuarantineReader`):
+
+```sql
+SELECT batch_seq FROM control.ingestion_batch
+ WHERE txn_app_id = '<id of the source>/bronze' AND status = 'ABANDONED';
+```
+
 ### The `jdbc` connector
 
 A table of a relational database. PostgreSQL, for now. It loads by `full` or by `incremental`.

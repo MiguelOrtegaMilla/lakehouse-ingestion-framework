@@ -28,6 +28,7 @@ import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.engine.delta.{BatchAppend, CommitMetadata, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
+import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
 import lakehouse.ingestion.it.control.ControlPlaneSuite
@@ -1529,6 +1530,52 @@ final class IngestionServiceSpec
     )
     quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (3L, "c.csv", "8,9,10"))
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("4", 2L, "b.csv"), ("6", 3L, "c.csv"))
+  }
+
+  test("the records of a batch that was given up are left out of what the quarantine is read as") {
+    val orders = fileSource(rejected = Some("0.5"))
+    val reader = new QuarantineReader(database, spark, lakeRoot)
+    def read(): Seq[(Long, String, String)] =
+      reader
+        .records(orders.id)
+        .value
+        .select("batch_seq", "source_file", "raw_record")
+        .collect()
+        .map(row => (row.getLong(0), row.getString(1).split('/').last, row.getString(2)))
+        .sorted
+        .toSeq
+    // A source that never rejected a record has no quarantine to read.
+    reader.records(orders.id) shouldBe None
+    reader.table(orders.id) shouldBe quarantine(orders)
+
+    // The first batch sets a record apart, and its run dies before its data is written. One
+    // of its files is then written again, so the run after it gives the batch up.
+    drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    drop(orders, "b.csv", "id,amount\n4,5\n")
+    dies(orders, FaultPoint.AfterQuarantineWrite)
+    drop(orders, "b.csv", "id,amount\n6,7\n8,9\n", at = Now.minusSeconds(1800))
+    launch(orders) shouldBe a[Outcome.GivenUp]
+    reader.abandoned(orders.id).map(_.value) shouldBe Vector(1L)
+    // Its record is in the table, and counts for nothing.
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    read() shouldBe empty
+
+    // The next batch reads the file that did not change again, and sets the same record apart
+    // under its own number: the table has it twice, and whoever reads it as it counts, once.
+    ingested(launch(orders)).batch shouldBe batchId(orders, 2)
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (2L, "a.csv", "3"))
+    read() shouldBe Seq((2L, "a.csv", "3"))
+    reader.records(orders.id).value.columns.toSeq shouldBe Quarantine.Columns
+
+    // The records of a batch that is planned still are kept: of one that is not committed
+    // because too many were rejected, they are what there is to look at.
+    drop(orders, "c.csv", "id,amount\n10\n11\n12,13\n")
+    launch(orders) match {
+      case Outcome.Failed(_, failure, _) => failure shouldBe FailureClass.Data
+      case other => fail(s"the run did not fail: $other")
+    }
+    batchesOf(orders) shouldBe Seq((1L, "ABANDONED"), (2L, "COMMITTED"), (3L, "PLANNED"))
+    read() shouldBe Seq((2L, "a.csv", "3"), (3L, "c.csv", "10"), (3L, "c.csv", "11"))
   }
 
   test("a run that dies between the quarantine and the data leaves a batch to be replayed") {

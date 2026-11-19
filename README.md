@@ -67,7 +67,8 @@ sbt "integration-tests/testOnly *DeltaSetTransactionContractSpec"   # what Delta
 sbt "integration-tests/testOnly *DeltaTableTransactionsSpec"   # which batches a real table has, and at which version (needs Docker)
 sbt "integration-tests/testOnly *BronzeWriterSpec"   # the writer of Bronze: once, with the engine's columns, and what it refuses (needs Docker)
 sbt "integration-tests/testOnly *QuarantineWriterSpec"   # the quarantine of a source: a rejected record kept as it was, once (needs Docker)
-sbt "integration-tests/testOnly *IngestionServiceSpec"   # a run from end to end: files to Bronze once, rejected records in quarantine and their threshold, a batch given up when its files change, a batch with no rows (needs Docker)
+sbt "integration-tests/testOnly *IngestionServiceSpec"   # a run from end to end: files to Bronze once, rejected records in quarantine and their threshold, a batch given up when its files change, a batch with no rows; a run that dies at each fault point and the next that finishes its batch; a run that lost its lease, refused by the LogStore (needs Docker)
+sbt "integration-tests/testOnly *WriterEpochRaceSpec"   # a commit under an epoch against the announcement of the next, in both orders, held in PostgreSQL (needs Docker)
 sbt "integration-tests/testOnly *PostgresLogStoreDeltaSpec"   # Delta on the PostgreSQL-coordinated LogStore (needs Docker)
 sbt "integration-tests/testOnly *PostgresLogStoreEndToEndSpec"   # the operations of an ingestion on it: idempotent append, MERGE, OPTIMIZE, VACUUM, checkpoints (needs Docker)
 sbt "delta-pg-logstore/testOnly * -- -z F14"   # the tests of one fault scenario of ADR-0004, here F14
