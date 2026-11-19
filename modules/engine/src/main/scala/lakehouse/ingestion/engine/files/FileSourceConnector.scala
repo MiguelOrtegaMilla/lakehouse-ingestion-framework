@@ -28,8 +28,7 @@ import org.slf4j.LoggerFactory
  * Files that are left in a directory of the landing zone (`type: file`).
  *
  * '''A plan''' is the files of the directory that are new, complete and of the source
- * (`FilePlanner`), each with which file of the file system it was when the directory was listed
- * (`Landing`).
+ * (`FilePlanner`), each by its name, its size and its time, as `processed_file` records it.
  *
  * '''A read''' reads the files of a plan and no other, as the source wrote them:
  *
@@ -53,23 +52,29 @@ import org.slf4j.LoggerFactory
  *    it.
  *
  * '''The files are the planned ones while they are read.''' A name may be given to another file
- * at any moment. So, just before Spark reads the files, each name must still lead to the file
- * that was planned, of the same size and the same time (`Landing.confirm`); Spark then reads
- * them all, and what it read is kept, by Spark, apart from the files
- * (`Dataset.localCheckpoint`); and just after, each name must still lead to that file. If one
+ * at any moment. So, just before Spark reads the files, each name must still lead to a file of
+ * the size and the time that were planned, and which file of the file system it is, its device
+ * and its inode, is taken then (`Landing.confirm`); Spark then reads them all, and what it read
+ * is kept, by Spark, apart from the files (`Dataset.localCheckpoint`); and just after, each name
+ * must still lead to that same file, of that size and that time (`Landing.confirmAgain`). If one
  * does not, the read fails, before anything of it is written. What is kept is what everything
  * after the read is made from: the data, the records set apart, and their counts, which are
  * then of one read. A copy that Spark loses is not read again from the files: the job that needs
  * it fails, and the batch with it.
  *
- * '''What that leaves open.''' A file that is changed and then put back as it was between the
- * two looks, or changed in its place with its size and its time put back, is read as it was
- * while it was read, and not seen to have changed: telling that needs what the file holds,
- * read twice. It takes a producer that means to do it. The way to close it is to take a file
- * out of the producer's reach before it is read, by moving it where only the engine writes, or
- * to read from storage where an object never changes once written (E2). The device of a file
- * is that of the machine that planned it, so a plan is read on the machine whose landing zone
- * it is (one machine, in the deployments of the MVP).
+ * The device and the inode are not in the plan. A plan outlives its process, and a restart of the
+ * machine or of its container may give the same disk another device number: a plan that named
+ * one would fail, as permanent, a batch whose files never changed, and stop its source.
+ *
+ * '''What that leaves open.''' Between the plan and the look before the read, a file is known by
+ * its size and its time alone: another file put in its place with the same size and time, or the
+ * file changed in its place with them put back, is read, and not seen to have changed. While it
+ * is read, a file put in its place is seen; a file changed in its place with its size and time
+ * put back, or changed and put back as it was between the two looks, is not. Telling those needs
+ * what the file holds, read twice, and it takes a producer that means to hide a change. The way
+ * to close it is to take a file out of the producer's reach before it is read, by moving it where
+ * only the engine writes, or to read from storage where an object never changes once written
+ * (E2).
  *
  * A plan that cannot be read as it was planned fails as permanent (4): a run that reads it again
  * finds the same. The batch stays planned, for the operator (P7).
@@ -102,7 +107,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
         None
       case Right(Planned(plan, waiting, leftOver)) =>
         log.info(
-          s"${source.id}: planned ${plan.planned.size} files of ${config.path}, " +
+          s"${source.id}: planned ${plan.files.size} files of ${config.path}, " +
             s"${plan.bytes} bytes; $waiting not complete yet, $leftOver for the next batch"
         )
         Some(plan.toJson)
@@ -131,8 +136,9 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
           s"source reads ${config.path}: it was planned under another configuration"
       )
 
-    val paths = confirmed(config, files, "since it was planned")
-    val read = readable(context.spark, config.format, paths, sourceFiles(files, paths))
+    val before = confirmed(config, files, "since it was planned")(landing.confirm(config, files))
+    val read =
+      readable(context.spark, config.format, before.paths, sourceFiles(files, before.paths))
     // What is read is kept by Spark apart from the files, and everything after is made from it.
     val kept =
       try read.localCheckpoint(eager = true)
@@ -146,7 +152,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
           )
       }
     afterRead()
-    confirmed(config, files, "while it was read")
+    confirmed(config, files, "while it was read")(landing.confirmAgain(config, files, before))
 
     if (config.format == FileConnectorConfig.Format.Parquet) ReadResult(kept, unparsed = None)
     else
@@ -160,10 +166,12 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       )
   }
 
-  /** The paths of the files of a plan, if each is still the file that was planned. */
-  private def confirmed(config: FileConnectorConfig, plan: FilePlan, when: String): Vector[Path] =
-    landing.confirm(config, plan) match {
-      case Right(paths) => paths
+  /** What a look at the files of a plan found, if each is still as it was. */
+  private def confirmed[A](config: FileConnectorConfig, plan: FilePlan, when: String)(
+      look: Either[Vector[String], A]
+  ): A =
+    look match {
+      case Right(found) => found
       case Left(problems) =>
         throw RunFailedException.permanent(
           s"the batch of ${config.path} cannot be read as it was planned: " +
@@ -284,7 +292,7 @@ object FileSourceConnector {
   /** `_source_file` of each path that is read, by the path as Spark gives it, decoded. */
   private def sourceFiles(plan: FilePlan, paths: Vector[Path]): Map[String, String] =
     paths
-      .zip(plan.planned)
+      .zip(plan.files)
       .map { case (path, file) => path.toString -> s"${plan.directory}/${file.name}" }
       .toMap
 

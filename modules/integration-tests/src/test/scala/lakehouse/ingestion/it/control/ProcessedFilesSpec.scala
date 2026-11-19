@@ -7,15 +7,7 @@ import scala.concurrent.duration._
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
-import lakehouse.ingestion.core.files.{
-  FileIdentity,
-  FileName,
-  FilePlan,
-  FilePlanner,
-  LandedFile,
-  Listed,
-  PlannedFile
-}
+import lakehouse.ingestion.core.files.{FileName, FilePlan, FilePlanner, LandedFile, Listed}
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.funsuite.AnyFunSuite
@@ -54,7 +46,7 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     LeasedRun.open(database, starting(of), versionOf(of), timing).value
 
   private def listed(name: String, size: Long = 10, at: String = "2026-11-18T10:00:00.123Z") =
-    Listed(name, size, Instant.parse(at), FileIdentity(2049, name.hashCode.toLong.abs))
+    Listed(name, size, Instant.parse(at))
 
   /** Steps 2 and 3 of a file source: what is new, from the listing and what was taken. */
   private def plan(leased: LeasedRun, of: Source, listing: Seq[Listed]): FilePlanner.Planning = {
@@ -172,12 +164,7 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     // A caller that says the batch read other files than its plan names.
     val other = FilePlan(
       filePlan.directory,
-      Vector(
-        PlannedFile(
-          LandedFile(FileName.parse("c.csv").value, 1, Instant.parse("2026-11-18T10:00:00Z")),
-          FileIdentity(2049, 3)
-        )
-      )
+      Vector(LandedFile(FileName.parse("c.csv").value, 1, Instant.parse("2026-11-18T10:00:00Z")))
     )
     the[IllegalStateException] thrownBy
       leased.commit(batch.id, None, Nil, files = Some(other)) should have message
@@ -194,7 +181,7 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
 
     // A plan that names it again, as a planner that did not ask what was taken would make.
     val leased = open(returns)
-    val again = FilePlan(firstPlan.directory, firstPlan.planned :+ plannedOf(listed("b.csv")))
+    val again = FilePlan(firstPlan.directory, firstPlan.files :+ landedOf(listed("b.csv")))
     val batch = leased.plan(again.toJson)
     the[IllegalStateException] thrownBy
       leased.commit(batch.id, None, Nil, files = Some(again)) should have message
@@ -250,9 +237,6 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     other.finish(RunEnd.Succeeded(RunCounts.Nothing)) shouldBe true
   }
 
-  private def plannedOf(file: Listed): PlannedFile =
-    PlannedFile(
-      LandedFile(FileName.parse(file.name).value, file.size, file.modifiedAt),
-      file.identity
-    )
+  private def landedOf(file: Listed): LandedFile =
+    LandedFile(FileName.parse(file.name).value, file.size, file.modifiedAt)
 }

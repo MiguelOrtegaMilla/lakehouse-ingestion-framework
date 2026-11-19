@@ -104,17 +104,20 @@ final class FileSourceConnectorSpec
   // The plan
   // ---------------------------------------------------------------------------------------------
 
-  test("a plan is the new, complete files, each with the file it is on the file system") {
+  test("a plan is the new, complete files, by their name, size and time alone") {
     val root = landingZone()
     val orders = source("csv")
-    val a = drop(root, "a.csv", "id\n1\n")
+    drop(root, "a.csv", "id\n1\n")
     drop(root, "b.csv", "id\n2\n")
     drop(root, "fresh.csv", "id\n3\n", at = now)
 
-    val planned = FilePlan.fromJson(plan(root, orders).value).value
+    val json = plan(root, orders).value
+    val planned = FilePlan.fromJson(json).value
     planned.names.map(_.value) shouldBe Vector("a.csv", "b.csv")
-    planned.planned.head.identity.inode shouldBe Files.getAttribute(a, "unix:ino")
-    planned.planned.head.identity.device shouldBe Files.getAttribute(a, "unix:dev")
+    planned.files.head shouldBe LandedFile(planned.names.head, 5, anHourAgo)
+    // Nothing of the file system it was made on, which a restart may number otherwise.
+    json.hcursor.downField("files").downArray.keys.value.toSeq shouldBe
+      Seq("name", "size", "modified_at")
 
     // A file that a batch took is not planned again.
     FilePlan
@@ -341,21 +344,7 @@ final class FileSourceConnectorSpec
     message should include("nothing of it was written")
   }
 
-  test("a file put in another's place, of the same size and time, fails the read") {
-    val root = landingZone()
-    val orders = source("csv")
-    val a = drop(root, "a.csv", "id\n1\n")
-    val planned = plan(root, orders).value
-    // What a producer does that writes a file whole and renames it over the old one.
-    val other = drop(root, ".a.csv.tmp", "id\n9\n")
-    Files.move(other, a, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
-
-    val message = refused(read(root, orders, planned))
-    message should include("'a.csv' is another file of the file system")
-    message should not include "bytes"
-  }
-
-  test("a file that is gone, or a link that leads elsewhere now, fails the read") {
+  test("a file that is gone, or a link that leads to another size now, fails the read") {
     val root = landingZone()
     val orders = source("csv")
     drop(root, "a.csv", "id\n1\n")
@@ -367,14 +356,14 @@ final class FileSourceConnectorSpec
 
     Files.delete(root.resolve("shop/orders/a.csv"))
     Files.delete(link)
-    val second = Files.copy(first, root.resolve("shared/second.csv"))
+    val second = Files.write(root.resolve("shared/second.csv"), "id\n22\n".getBytes(UTF_8))
     Files.setLastModifiedTime(second, FileTime.from(anHourAgo))
     Files.createSymbolicLink(link, second)
 
     val message = refused(read(root, orders, planned))
-    message should include("2 files of it changed")
+    message should include("2 files of it changed since it was planned")
     message should include("'a.csv' is not there any more")
-    message should include("'b.csv' is another file of the file system")
+    message should include("'b.csv' is of 6 bytes, and was of 5")
   }
 
   test("a link that leads out of the landing zone after the plan fails the read") {
@@ -416,6 +405,52 @@ final class FileSourceConnectorSpec
     message should include("1 file of it changed while it was read")
   }
 
+  test("a file put in another's place while it was read, of the same size and time, fails it") {
+    val root = landingZone()
+    val orders = source("csv")
+    val a = drop(root, "a.csv", "id\n1\n")
+    val planned = plan(root, orders).value
+
+    // What a producer does that writes a file whole and renames it over the old one.
+    val replacing = connector(
+      root,
+      afterRead = () => {
+        val other = drop(root, ".a.csv.tmp", "id\n9\n")
+        Files.move(other, a, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        ()
+      }
+    )
+    val message =
+      refused(replacing.read(orders, configOf(orders), planned, ReadContext(spark)))
+    message should include("1 file of it changed while it was read")
+    message should include("'a.csv' is another file of the file system than the one that was read")
+    message should not include "bytes"
+  }
+
+  test("a link that leads to another file while it was read fails the read") {
+    val root = landingZone()
+    val orders = source("csv")
+    val shared = Files.createDirectories(root.resolve("shared"))
+    val first = Files.write(shared.resolve("first.csv"), "id\n1\n".getBytes(UTF_8))
+    Files.setLastModifiedTime(first, FileTime.from(anHourAgo))
+    val link = Files.createSymbolicLink(root.resolve("shop/orders/a.csv"), first)
+    val planned = plan(root, orders).value
+
+    val relinking = connector(
+      root,
+      afterRead = () => {
+        val second = Files.copy(first, shared.resolve("second.csv"))
+        Files.setLastModifiedTime(second, FileTime.from(anHourAgo))
+        Files.delete(link)
+        Files.createSymbolicLink(link, second)
+        ()
+      }
+    )
+    refused(relinking.read(orders, configOf(orders), planned, ReadContext(spark))) should include(
+      "'a.csv' is another file of the file system than the one that was read"
+    )
+  }
+
   test("what was read is what everything after the read is made from, not the files") {
     val root = landingZone()
     val orders = source("csv")
@@ -441,6 +476,19 @@ final class FileSourceConnectorSpec
     rows(read(root, orders, planned).rows.select("id")) shouldBe Seq(Row("9"))
   }
 
+  test("what the checks cannot see: another file put in its place after the plan, alike") {
+    // A plan knows a file by its size and time, as processed_file does: which file of the file
+    // system it is, is taken just before the read, and a plan made then would take this one too.
+    val root = landingZone()
+    val orders = source("csv")
+    val a = drop(root, "a.csv", "id\n1\n")
+    val planned = plan(root, orders).value
+    val other = drop(root, ".a.csv.tmp", "id\n9\n")
+    Files.move(other, a, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+
+    rows(read(root, orders, planned).rows.select("id")) shouldBe Seq(Row("9"))
+  }
+
   // ---------------------------------------------------------------------------------------------
   // Plans that are not this source's
   // ---------------------------------------------------------------------------------------------
@@ -451,8 +499,8 @@ final class FileSourceConnectorSpec
     drop(root, "a.csv", "id\n1\n")
     val planned = plan(root, orders).value
 
-    refused(read(root, orders, planned.mapObject(_.add("version", Json.fromInt(1))))) should
-      include("is not one that this application reads: it is of version 1")
+    refused(read(root, orders, planned.mapObject(_.add("version", Json.fromInt(2))))) should
+      include("is not one that this application reads: it is of version 2")
     refused(
       read(root, orders, planned.mapObject(_.add("directory", Json.fromString("shop/returns"))))
     ) should include("is of the directory shop/returns, and the source reads shop/orders")

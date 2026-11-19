@@ -2,7 +2,7 @@ package lakehouse.ingestion.engine.files
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, Path}
+import java.nio.file.{Files, Path, StandardCopyOption}
 import java.time.Instant
 import java.util.Comparator
 
@@ -10,7 +10,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, RootUri}
 import lakehouse.ingestion.core.control.FailureClass
-import lakehouse.ingestion.core.files.{FileIdentity, FilePlanner, Listed}
+import lakehouse.ingestion.core.files.{FileName, FilePlan, FilePlanner, LandedFile, Listed}
 import lakehouse.ingestion.engine.RunFailedException
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -78,6 +78,16 @@ final class LandingSpec
     Files.getAttribute(path, "unix:ino").asInstanceOf[Long]
   )
 
+  /** A plan of the files of the directory of the source, as they are listed now. */
+  private def planOf(names: String*): FilePlan =
+    FilePlan(
+      config().path,
+      names.toVector.map { name =>
+        val file = list().find(_.name == name).get
+        LandedFile(FileName.parse(name).value, file.size, file.modifiedAt)
+      }
+    )
+
   private def refused(body: => Any): RunFailedException = {
     val failure = the[RunFailedException] thrownBy body
     failure.failure shouldBe FailureClass.Permanent
@@ -89,21 +99,16 @@ final class LandingSpec
   // ---------------------------------------------------------------------------------------------
 
   test("the files of the directory, with their size and their time to the millisecond") {
-    val a = write(orders.resolve("a.csv"), bytes = 5)
+    write(orders.resolve("a.csv"), bytes = 5)
     // A file system keeps the time to the nanosecond, and a listing gives it to the millisecond,
     // as Hadoop does and as the control plane records it.
-    val b =
-      write(
-        orders.resolve("b.csv"),
-        bytes = 0,
-        at = Instant.parse("2026-11-19T08:30:15.123456789Z")
-      )
-
-    list().sortBy(_.name) shouldBe Vector(
-      Listed("a.csv", 5, changed, identityOf(a)),
-      Listed("b.csv", 0, changed, identityOf(b))
+    write(
+      orders.resolve("b.csv"),
+      bytes = 0,
+      at = Instant.parse("2026-11-19T08:30:15.123456789Z")
     )
-    identityOf(a) should not be identityOf(b)
+
+    list().sortBy(_.name) shouldBe Vector(Listed("a.csv", 5, changed), Listed("b.csv", 0, changed))
   }
 
   test("not the hidden files, nor those of another pattern, nor what is under a directory") {
@@ -143,17 +148,17 @@ final class LandingSpec
     Files.createSymbolicLink(orders.resolve("today.csv"), elsewhere)
 
     // The file that the link leads to, which is the one a read reads.
-    list() shouldBe Vector(Listed("today.csv", 7, changed, identityOf(elsewhere)))
+    list() shouldBe Vector(Listed("today.csv", 7, changed))
   }
 
   test("a relative link is resolved from where it is") {
-    val shared = write(landing.resolve("shared/a.csv"), bytes = 2)
+    write(landing.resolve("shared/a.csv"), bytes = 2)
     Files.createSymbolicLink(
       orders.resolve("a.csv"),
       orders.relativize(landing.resolve("shared/a.csv"))
     )
 
-    list() shouldBe Vector(Listed("a.csv", 2, changed, identityOf(shared)))
+    list() shouldBe Vector(Listed("a.csv", 2, changed))
   }
 
   test("a source directory that is a link to another directory of the landing zone") {
@@ -337,5 +342,72 @@ final class LandingSpec
     val s3 = RootUri.parse("s3a://landing-bucket/zone").value
 
     refused(new Landing(s3).list(config())).getMessage should include("on file:// alone")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The files of a plan, just before and just after they are read
+  // ---------------------------------------------------------------------------------------------
+
+  test("just before a read, the files of a plan are where they are, and which file each is") {
+    val a = write(orders.resolve("a.csv"), bytes = 5)
+    val shared = write(landing.resolve("shared/b.csv"), bytes = 2)
+    Files.createSymbolicLink(orders.resolve("b.csv"), shared)
+    val plan = planOf("b.csv", "a.csv")
+
+    val confirmed = new Landing(rootAt(landing)).confirm(config(), plan).value
+    // In the plan's order, in the directory as it resolves; a link by its own name.
+    confirmed.paths shouldBe Vector(orders.resolve("b.csv"), orders.resolve("a.csv"))
+    confirmed.identities shouldBe Vector(identityOf(shared), identityOf(a))
+    identityOf(a) should not be identityOf(shared)
+  }
+
+  test("a plan knows a file by its size and time: the look before the read compares no more") {
+    val a = write(orders.resolve("a.csv"), bytes = 5)
+    val plan = planOf("a.csv")
+    val landingZone = new Landing(rootAt(landing))
+
+    // Another file put in its place, of the same size and time, after the plan: it is taken, as
+    // it would be by a plan made now (FileSourceConnector says what that leaves open).
+    val other = write(orders.resolve(".a.csv.tmp"), bytes = 5)
+    Files.move(other, a, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    landingZone.confirm(config(), plan).value.identities shouldBe Vector(identityOf(a))
+
+    write(a, bytes = 6)
+    landingZone.confirm(config(), plan).left.value shouldBe
+      Vector("'a.csv' is of 6 bytes, and was of 5")
+  }
+
+  test(
+    "just after a read, each file must be the one found before it, of the planned size and time"
+  ) {
+    val a = write(orders.resolve("a.csv"), bytes = 5)
+    write(orders.resolve("b.csv"), bytes = 5)
+    val plan = planOf("a.csv", "b.csv")
+    val landingZone = new Landing(rootAt(landing))
+    val before = landingZone.confirm(config(), plan).value
+
+    landingZone.confirmAgain(config(), plan, before) shouldBe Right(())
+
+    // A file put in its place, of the same size and the same time.
+    val was = identityOf(a)
+    val other = write(orders.resolve(".a.csv.tmp"), bytes = 5)
+    Files.move(other, a, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+    Files.delete(orders.resolve("b.csv"))
+
+    landingZone.confirmAgain(config(), plan, before).left.value shouldBe Vector(
+      s"'a.csv' is another file of the file system than the one that was read (${identityOf(a)}, " +
+        s"and was $was)",
+      "'b.csv' is not there any more, or is a directory now"
+    )
+  }
+
+  test("what was found before a read is compared with its own plan alone") {
+    write(orders.resolve("a.csv"))
+    write(orders.resolve("b.csv"))
+    val landingZone = new Landing(rootAt(landing))
+    val before = landingZone.confirm(config(), planOf("a.csv")).value
+
+    an[IllegalArgumentException] should be thrownBy
+      landingZone.confirmAgain(config(), planOf("b.csv"), before)
   }
 }
