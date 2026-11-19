@@ -134,13 +134,21 @@ The example with every section is [`conf/sources/sales.orders.yaml`](../../conf/
 | `schema.renames` | Columns that changed their name, old to new. A rename cannot be told from a column that went and another that came, unless somebody says so | none |
 | `columns.<name>.pii` | What kind of personal data the column holds: a word of the team's own, as `email` or `national_id` | none |
 | `columns.<name>.silver.mask` | How Silver hides the column: `hmac` or `redact` | not masked |
-| `quality.max_rejected_ratio` | The share of the rows of a batch that may be rejected before the batch is not committed. `0` to `1` | `0` |
+| `quality.max_rejected_ratio` | The share of the records of a batch that may be [rejected](#records-that-are-rejected) before the batch is not committed. `0` to `1`; the share itself is allowed | `0` |
 | `targets.bronze.table` | The Bronze table: a [path](#a-relative-path) relative to `lake.uri` | required |
 | `targets.silver.table` | The Silver table. Without it, the source goes to Bronze alone | no Silver |
 | `targets.silver.partition_by` | The columns the Silver table is partitioned by, in their order | not partitioned |
 | `freshness_sla` | How old the data of the source may get before it is late. A [duration](#a-duration), `1s` at least | none |
 
 What each value of the schema policy and of the masks does is decided where it is built (discovery §17, P9 and P10).
+
+### Records that are rejected
+
+A record that cannot be made a row is not lost, and does not stop the rest of its batch by itself. It is kept whole, as the text that it was, in the quarantine of its source: a table of the lake at `_quarantine/bronze/<id of the source>`, with the file that it came from, the batch, the run, and why. Today that is a record that the parser of its format could not parse: a line that is not JSON, a record of CSV with more values or fewer than its header.
+
+`quality.max_rejected_ratio` says how many are too many. It is a share of the records that a batch read, and it is allowed whole: with `0.01`, one record of a hundred is taken, and two are not. When a batch is beyond it, nothing of the batch is written to Bronze, the run ends in 5, and the rejected records are in quarantine to be looked at. The same data gives the same result, so the batch waits until the source allows more, or sends what it meant to. By default no record may be rejected.
+
+A quarantine holds what its source holds, the personal data of the source among it. No source can name a table under `_quarantine`: a [relative path](#a-relative-path) has no segment that starts with `_`.
 
 ### The `jdbc` connector
 

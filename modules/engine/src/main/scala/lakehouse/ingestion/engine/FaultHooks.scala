@@ -28,6 +28,13 @@ object FaultPoint {
   case object AfterRead extends FaultPoint("AfterRead")
 
   /**
+   * The records of the batch that were rejected are in the quarantine of its source, and its
+   * rows are not in Bronze: the batch is written in part. A batch with no such record does not
+   * get here: it has no commit to its quarantine.
+   */
+  case object AfterQuarantineWrite extends FaultPoint("AfterQuarantineWrite")
+
+  /**
    * The rows of the batch are in its table of Bronze, and the control plane does not know. A
    * batch that wrote no row does not get here: it has no commit.
    */
@@ -37,7 +44,8 @@ object FaultPoint {
   case object BeforeStateCommit extends FaultPoint("BeforeStateCommit")
 
   /** In the order a run reaches them. */
-  val All: Seq[FaultPoint] = Seq(AfterPlan, AfterRead, AfterBronzeCommit, BeforeStateCommit)
+  val All: Seq[FaultPoint] =
+    Seq(AfterPlan, AfterRead, AfterQuarantineWrite, AfterBronzeCommit, BeforeStateCommit)
 }
 
 /** What a run does when it reaches a fault point. Outside tests: nothing. */

@@ -195,7 +195,7 @@ object Batches {
       val fields = entry.hcursor
       val output = for {
         table <- fields.get[String]("table").left.map(_ => "have an entry with no table")
-        path <- RelativePath.parse(table).left.map(reason => s"name a table that $reason")
+        path <- RelativePath.stored(table).left.map(reason => s"name a table that $reason")
         version <- fields.get[Long]("version").left.map(_ => "have an entry with no version")
       } yield BatchOutput(path, version)
       output.fold(wrong, identity)

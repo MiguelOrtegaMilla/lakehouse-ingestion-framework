@@ -13,6 +13,10 @@ package lakehouse.ingestion.core.config
  * It also leaves out the names that Spark and Delta treat as hidden, the ones that start with
  * `_` or `.`. A target that ended in `_delta_log` would be the log of another table.
  *
+ * So one directory of a lake can be the engine's own, `_quarantine`: no path that a
+ * configuration gives is under it, and the tables that the engine makes there for a source are
+ * no source's to name (`RelativePath.quarantine`).
+ *
  * There is one way to write a path: no `/` at the end and no empty segment, so that two texts
  * never name one place. What the text cannot tell, a symbolic link that leads out of the root,
  * is checked where the path is used (P5).
@@ -28,6 +32,30 @@ object RelativePath {
 
   val MaxSegmentBytes = 255
   val MaxBytes = 1024
+
+  /**
+   * The directory of a lake that is the engine's own: under it are the tables that the engine
+   * makes for a source and that no source names, the quarantine of each (discovery §13.4). No
+   * path that is written in a configuration is under it, since no segment of one starts with
+   * `_`: a source cannot give the quarantine of another, nor its own, as one of its targets.
+   */
+  val Quarantine = "_quarantine"
+
+  /**
+   * A path under the engine's own directory. It is made by the engine, from a path that is one
+   * by the grammar, and never from what a configuration says.
+   */
+  private[core] def quarantine(under: RelativePath): RelativePath =
+    new RelativePath(s"$Quarantine/${under.value}")
+
+  /**
+   * A path as the control plane stored it, of a table that a batch wrote: one that a
+   * configuration may give, or one of the engine's own. `Left` says what is wrong.
+   */
+  def stored(text: String): Either[String, RelativePath] =
+    if (text.startsWith(s"$Quarantine/"))
+      parse(text.drop(Quarantine.length + 1)).map(quarantine)
+    else parse(text)
 
   private def startsSegment(c: Int): Boolean =
     (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
