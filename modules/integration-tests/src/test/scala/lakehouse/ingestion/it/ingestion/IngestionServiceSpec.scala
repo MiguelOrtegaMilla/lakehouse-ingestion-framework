@@ -3,37 +3,28 @@ package lakehouse.ingestion.it.ingestion
 import java.net.URI
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, Paths}
 import java.sql.Timestamp
 import java.time.temporal.ChronoUnit
 import java.time.{Clock, Instant, ZoneOffset}
 
 import scala.collection.mutable
-import scala.concurrent.duration._
 
 import io.circe.Json
 import io.delta.tables.DeltaTable
-import lakehouse.ingestion.core.config.{
-  PathTableLocator,
-  RelativePath,
-  RootUri,
-  Source,
-  TableLocation
-}
+import lakehouse.ingestion.core.config.Source
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.files.FilePlan
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.control._
-import lakehouse.ingestion.engine.delta.{BatchAppend, CommitMetadata, DeltaTableTransactions, Lake}
+import lakehouse.ingestion.engine.delta.{BatchAppend, CommitMetadata, Lake}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
-import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, LocalSparkSuite}
 import lakehouse.ingestion.logstore.coordination.{CoordinationSettings, WriterEpoch}
 import lakehouse.ingestion.logstore.{CommitContext, WriterEpochs}
 import org.apache.spark.sql.Row
@@ -55,193 +46,9 @@ import org.scalatest.matchers.should.Matchers
  * The clock of the service is the test's own, and so is the time of each file: whether a file
  * is complete does not depend on how long a test takes.
  */
-final class IngestionServiceSpec
-    extends AnyFunSuite
-    with Matchers
-    with ControlPlaneSuite
-    with LocalSparkSuite {
+final class IngestionServiceSpec extends AnyFunSuite with Matchers with IngestionSuite {
 
   import IngestionServiceSpec._
-
-  // The commits of every table go through the LogStore, on the database that `migrate` made.
-  private lazy val coordination =
-    CoordinationStores.settings(pg.jdbcUrl(CoordinationSchema.Database), pg)
-
-  override protected def sparkConf: Map[String, String] =
-    CoordinationStores.sparkSettings(coordination)
-
-  private lazy val lakeRoot =
-    RootUri.parse(Files.createDirectories(workDir.resolve("lake")).toUri.toString).value
-  private lazy val landingDirectory = Files.createDirectories(workDir.resolve("landing"))
-  private lazy val landingRoot = RootUri.parse(landingDirectory.toUri.toString).value
-  private lazy val locator = new PathTableLocator(lakeRoot)
-  private lazy val delta = new DeltaTableTransactions(spark)
-
-  private val timing = LeaseTiming(2.minutes)
-  private val Now = Instant.parse("2026-11-19T12:00:00Z")
-  private val anHourAgo = Now.minusSeconds(3600)
-
-  // ---------------------------------------------------------------------------------------------
-  // A source, its files, and a run of it
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * A source of files of its own, with its directory made in the landing zone.
-   *
-   * @param rejected the share of the records of a batch that it lets be rejected; none, unless
-   *   it says so
-   */
-  private def fileSource(
-      format: String = "csv",
-      options: String = "",
-      rejected: Option[String] = None,
-      id: String = newSourceId().value,
-      table: Option[String] = None
-  ): Source = {
-    val directory = id.replace('.', '_')
-    Files.createDirectories(landingDirectory.resolve(directory))
-    Source
-      .load(
-        s"$id.yaml",
-        s"""id: $id
-           |connector: { type: file, path: $directory, format: $format$options }
-           |load: { mode: new_files }
-           |targets: { bronze: { table: ${table.getOrElse(s"bronze/${id.replace('.', '/')}")} } }
-           |${rejected.fold("")(share => s"quality: { max_rejected_ratio: $share }")}
-           |""".stripMargin
-      )
-      .value
-      .value
-  }
-
-  private def directoryOf(of: Source): Path =
-    landingDirectory.resolve(of.id.value.replace('.', '_'))
-
-  /** A file of the source, last changed an hour ago unless said: complete, for a plan made now. */
-  private def drop(of: Source, name: String, text: String, at: Instant = anHourAgo): Path = {
-    val path = directoryOf(of).resolve(name)
-    Files.write(path, text.getBytes(UTF_8))
-    Files.setLastModifiedTime(path, FileTime.from(at))
-    path
-  }
-
-  /**
-   * The service, as an application puts it together.
-   *
-   * @param at what "now" is for it
-   * @param afterRead what happens once the connector has read the files, before it looks at
-   *   them again
-   */
-  private def service(
-      hooks: FaultHooks = FaultHooks.Off,
-      at: Instant = Now,
-      afterRead: () => Unit = () => ()
-  ): IngestionService =
-    new IngestionService(
-      database,
-      ConnectorRegistry(new FileSourceConnector(new Landing(landingRoot), afterRead)),
-      spark,
-      lakeRoot,
-      timing,
-      Clock.fixed(at, ZoneOffset.UTC),
-      hooks
-    )
-
-  /** One run of a source, by a service that has nothing done to it unless one is given. */
-  private def launch(of: Source, by: IngestionService = service()): Outcome =
-    by.run(of, versionOf(of))
-
-  private def ingested(outcome: Outcome): Outcome.Ingested = outcome match {
-    case done: Outcome.Ingested => done
-    case other => fail(s"no batch was committed: $other")
-  }
-
-  /** Hooks that do one thing, at one point of a run. */
-  private def hookAt(at: FaultPoint)(action: PlannedBatch => Unit): FaultHooks =
-    (point, batch) => if (point == at) action(batch)
-
-  // ---------------------------------------------------------------------------------------------
-  // What a run left: in the lake, and in the control plane
-  // ---------------------------------------------------------------------------------------------
-
-  private def bronze(of: Source): TableLocation = locator.locate(of.targets.bronze.table)
-
-  private def quarantineTable(of: Source): RelativePath = Quarantine.table(of.id, Layer.Bronze)
-  private def quarantine(of: Source): TableLocation = locator.locate(quarantineTable(of))
-
-  private def isThere(table: TableLocation): Boolean =
-    Files.exists(Paths.get(URI.create(table.uri)))
-  private def tableIsThere(of: Source): Boolean = isThere(bronze(of))
-
-  /** The records in the quarantine of a source: the batch, the file and the text of each. */
-  private def quarantinedOf(of: Source): Seq[(Long, String, String)] =
-    spark.read
-      .format("delta")
-      .load(quarantine(of).uri)
-      .select("batch_seq", "source_file", "raw_record")
-      .collect()
-      .map(row => (row.getLong(0), row.getString(1).split('/').last, row.getString(2)))
-      .sorted
-      .toSeq
-
-  private def tableVersion(of: Source): Long =
-    DeltaLog.forTable(spark, bronze(of).uri).update().version
-
-  /** The rows of Bronze, each by its id, the batch that wrote it and the file it came from. */
-  private def rowsOf(of: Source): Seq[(String, Long, String)] =
-    spark.read
-      .format("delta")
-      .load(bronze(of).uri)
-      .select("id", "_batch_seq", "_source_file")
-      .collect()
-      .map(row => (row.getString(0), row.getLong(1), row.getString(2).split('/').last))
-      .sorted
-      .toSeq
-
-  private def runOf(id: RunId): RunRecord = database.run(Runs.find(_, id)).value
-  private def batchOf(id: BatchId): BatchRecord = database.run(Batches.find(_, id)).value
-  private def stateOf(of: Source): Option[SourceState] =
-    database.run(SourceStates.find(_, of.id, Layer.Bronze))
-  private def holderOf(of: Source): Option[RunId] =
-    database.run(Leases.find(_, LeaseKey.of(of.id, Layer.Bronze))).flatMap(_.holder).map(_.run)
-
-  private def batchId(of: Source, seq: Long): BatchId =
-    BatchId(TxnAppId.of(of.id, Layer.Bronze), BatchSeq.of(seq).value)
-
-  /** The batches of a source, each with how it stands. */
-  private def batchesOf(of: Source): Seq[(Long, String)] = asSuperuser { c =>
-    query(
-      c,
-      "SELECT batch_seq::text, status FROM control.ingestion_batch WHERE source_id = ? ORDER BY 1",
-      of.id.value
-    ).map(row => (row(0).toLong, row(1)))
-  }
-
-  /** The files that batches of a source took: the name, the size, and the batch. */
-  private def takenOf(of: Source): Seq[(String, Long, Long)] = asSuperuser { c =>
-    query(
-      c,
-      "SELECT path, size::text, batch_seq::text FROM control.processed_file " +
-        "WHERE source_id = ? ORDER BY path, batch_seq",
-      of.id.value
-    ).map(row => (row(0).split('/').last, row(1).toLong, row(2).toLong))
-  }
-
-  /** The lease of a source runs out in the database, whatever its holder believes of it. */
-  private def expire(of: Source): Unit = asSuperuser { c =>
-    update(
-      c,
-      "UPDATE control.source_lease SET expires_at = now() - interval '1 second' WHERE lease_key = ?",
-      LeaseKey.of(of.id, Layer.Bronze).value
-    ) shouldBe 1: Unit
-  }
-
-  private val NothingCounted = RunCounts(
-    rowsRead = Some(0),
-    rowsWritten = Some(0),
-    rowsRejected = Some(0),
-    bytesRead = Some(0)
-  )
 
   // ---------------------------------------------------------------------------------------------
   // The path where nothing fails
