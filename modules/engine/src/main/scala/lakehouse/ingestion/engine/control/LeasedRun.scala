@@ -152,6 +152,61 @@ final class LeasedRun private (
   }
 
   /**
+   * Gives a planned batch up, when the source no longer has what its plan names and nothing of
+   * the batch is in its tables (ADR-0018): marks the batch abandoned, with who, when and why,
+   * ends the run as failed, and gives the lease up. All of it in one transaction, on condition
+   * that the lease is still this run's under its epoch, or none of it.
+   *
+   * The files of the batch are not recorded as taken, the state of the source does not move,
+   * and the number of the batch is not used again. The next run finds nothing planned, and
+   * plans anew from what the source has by then.
+   *
+   * That nothing of the batch is in its tables is the caller's to ask first, of the table
+   * (`TableTransactions`): a batch whose data is written is rolled forward, and never given up.
+   *
+   * @param reason why, for a person: it is kept with the batch
+   * @param detail what of the plan could not be run, in a form of the engine's own
+   * @param end how the run ends. It did not do what it was asked, so it does not succeed
+   * @return false if the lease is another run's: this process was a zombie, and nothing was
+   *   changed. The batch is the other run's, to finish or to give up
+   * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
+   *   given up: it is not the planned one. Nothing was changed, and the lease is no longer
+   *   renewed
+   * @throws java.lang.IllegalArgumentException if the reason says nothing, or the detail could
+   *   not be stored. Nothing was changed, and the lease is still renewed
+   */
+  @throws[SQLException]
+  def abandon(
+      batch: BatchId,
+      reason: String,
+      detail: Option[Json],
+      end: RunEnd.Failed
+  ): Boolean = {
+    require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
+    // Before the lease stops being renewed, as the watermark of a commit: what cannot be
+    // stored is a mistake of whoever gave it, and no reason to let the lease go.
+    Batches.abandonable(reason, detail)
+    heartbeat.close()
+    database.transaction { connection =>
+      Leases.holds(connection, start.leaseKey, start.id, epoch) && {
+        def must(done: Boolean, what: String): Unit =
+          if (!done) throw new IllegalStateException(s"the batch $batch was not given up: $what")
+
+        must(
+          Batches.abandon(connection, batch, start.id, reason, detail),
+          "it is not a planned batch"
+        )
+        must(Runs.end(connection, start.id, end), s"the run ${start.id} is not running")
+        must(
+          Leases.release(connection, start.leaseKey, start.id, epoch),
+          "its lease could not be given up"
+        )
+        true
+      }
+    }
+  }
+
+  /**
    * Runs `body` in a transaction that has the lease locked, and found it to be this run's. What
    * `body` writes is then written by the holder of the lease, whatever happens next.
    */

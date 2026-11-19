@@ -467,6 +467,153 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     run(idle.start.id).batch shouldBe None
   }
 
+  // Why a batch is given up, as the engine would say it: the source no longer has its plan.
+  private val Reason = "2 files of the batch changed after it was planned"
+  private val Detail = Json.obj(
+    "changed" -> Json.arr(
+      Json.obj("item" -> Json.fromString("a b.csv"), "change" -> Json.fromString("is gone")),
+      Json.obj("item" -> Json.fromString("ñ-😀.csv"), "change" -> Json.fromString("is of 12 bytes"))
+    )
+  )
+  private val GivenUp =
+    RunEnd.Failed(FailureClass.Transient, Reason, RunCounts(bytesRead = Some(0)))
+
+  test(
+    "a batch that is given up says who gave it up, when and why, and its run and its lease end with it"
+  ) {
+    val orders = newSource()
+    val leased = open(orders)
+    val planned = leased.plan(range(0, 10))
+    val before = databaseNow()
+
+    leased.abandon(planned.id, Reason, Some(Detail), GivenUp) shouldBe true
+
+    val abandoned = batch(planned.id)
+    abandoned.status shouldBe BatchStatus.Abandoned
+    val said = abandoned.abandoned.value
+    said.by shouldBe Some(leased.start.id)
+    said.reason shouldBe Reason
+    said.detail shouldBe Some(Detail)
+    said.at should (be >= before and be <= databaseNow())
+    // The plan that was never run is still what the log says was to be read.
+    abandoned.plan shouldBe range(0, 10)
+    abandoned.committedBy shouldBe None
+    abandoned.outputs shouldBe None
+
+    val ended = run(leased.start.id)
+    ended.status shouldBe RunStatus.Failed
+    ended.failure shouldBe Some(RunFailure(FailureClass.Transient, Reason))
+    ended.counts shouldBe RunCounts(bytesRead = Some(0))
+    ended.batch shouldBe Some(BatchSeq.First)
+    // One moment for all of it: the batch and the run ended together.
+    ended.finishedAt shouldBe Some(said.at)
+    lease(orders).holder shouldBe None
+    // Nothing of the batch is accounted for.
+    state(orders) shouldBe None
+
+    // What is given up is given up once, and is not committed after.
+    leased.abandon(planned.id, "again", None, GivenUp) shouldBe false
+    leased.commit(planned.id, None, Nil) shouldBe false
+    batch(planned.id) shouldBe abandoned
+  }
+
+  test("the run after a batch that was given up plans anew, under the next number") {
+    val orders = newSource()
+    val delta = new SimulatedDelta
+    val first = open(orders)
+    finish(first, orders, delta, first.plan(range(0, 10))) shouldBe true
+    val stopped = open(orders)
+    val givenUp = stopped.plan(range(10, 20))
+    stopped.abandon(givenUp.id, Reason, None, GivenUp) shouldBe true
+    batch(givenUp.id).abandoned.value.detail shouldBe None
+
+    // Nothing is planned: there is nothing to recover, and the state is where it was.
+    val next = open(orders)
+    next.tookOver shouldBe None
+    next.planned() shouldBe None
+    Recovery.of(next.planned(), bronze(orders), delta) shouldBe Recovery.NothingPlanned
+    state(orders).value.lastCommitted shouldBe BatchSeq.First
+    val again = next.plan(range(10, 25))
+
+    // The number of the batch that was given up is passed over, and its plan is its own.
+    again.id.seq.value shouldBe 3L
+    batch(givenUp.id).plan shouldBe range(10, 20)
+    finish(next, orders, delta, again) shouldBe true
+
+    // The table and the state go from the first batch to the third.
+    delta.rows(bronze(orders)) shouldBe (0 until 25).map(i => s"row-$i")
+    delta.lastVersion(bronze(orders), again.id.app) shouldBe Some(3L)
+    state(orders).value.lastCommitted.value shouldBe 3L
+    batch(givenUp.id).status shouldBe BatchStatus.Abandoned
+    batch(again.id).status shouldBe BatchStatus.Committed
+  }
+
+  test("a zombie gives no batch up: it is the run that took over's, to finish or to give up") {
+    val orders = newSource()
+    val delta = new SimulatedDelta
+    val zombie = open(orders)
+    val planned = zombie.plan(range(0, 10))
+    dies(zombie)
+    val next = open(orders)
+
+    zombie.abandon(planned.id, Reason, Some(Detail), GivenUp) shouldBe false
+
+    batch(planned.id).status shouldBe BatchStatus.Planned
+    batch(planned.id).abandoned shouldBe None
+    run(zombie.start.id).status shouldBe RunStatus.Abandoned
+    run(zombie.start.id).failure shouldBe None
+    lease(orders).holder.value.run shouldBe next.start.id
+    // The run that took over finds the batch as it was planned, and finishes it.
+    val found = next.planned().value
+    found shouldBe planned
+    finish(next, orders, delta, found) shouldBe true
+    batch(planned.id).status shouldBe BatchStatus.Committed
+  }
+
+  test("what is given up is the planned batch, with a reason, or nothing is changed") {
+    val orders = newSource()
+    val delta = new SimulatedDelta
+    val first = open(orders)
+    val committed = first.plan(range(0, 10))
+    finish(first, orders, delta, committed) shouldBe true
+    val leased = open(orders)
+    val planned = leased.plan(range(10, 20))
+    def unchanged(): Unit = {
+      batch(planned.id).status shouldBe BatchStatus.Planned
+      batch(committed.id).status shouldBe BatchStatus.Committed
+      batch(committed.id).abandoned shouldBe None
+      run(leased.start.id).status shouldBe RunStatus.Running
+      lease(orders).holder.value.run shouldBe leased.start.id: Unit
+    }
+
+    // What could not be stored is refused before the lease is let go: the run goes on.
+    intercept[IllegalArgumentException] {
+      leased.abandon(planned.id, " \n", None, GivenUp)
+    }.getMessage should endWith("a batch is not given up without a reason")
+    intercept[IllegalArgumentException] {
+      leased.abandon(planned.id, Reason, Some(Json.obj(("k" * 2000) -> Json.Null)), GivenUp)
+    }.getMessage should startWith(
+      "the detail of why a batch is given up cannot be stored, since it could not be read back: "
+    )
+    unchanged()
+    leased.verify()
+
+    // A batch that is committed is not given up, nor one that was never planned.
+    Seq(committed.id, BatchId(planned.id.app, planned.id.seq.next)).foreach { other =>
+      val refused = intercept[IllegalStateException] {
+        leased.abandon(other, Reason, Some(Detail), GivenUp)
+      }
+      refused.getMessage shouldBe s"the batch $other was not given up: it is not a planned batch"
+      unchanged()
+    }
+
+    // A reason longer than a person reads is kept by its start.
+    leased.abandon(planned.id, "why " * 1000, None, GivenUp) shouldBe true
+    batch(planned.id).abandoned.value.reason shouldBe ("why " * 1000).trim.take(
+      Runs.MaxMessageLength
+    )
+  }
+
   test("the state of a source only moves forward") {
     val orders = newSource()
     val delta = new SimulatedDelta

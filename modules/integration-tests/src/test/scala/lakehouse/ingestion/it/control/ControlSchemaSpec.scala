@@ -119,6 +119,8 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
   private val Ended = "status = 'SUCCEEDED', finished_at = now()"
   private val Committed =
     """status = 'COMMITTED', committed_at = now(), outputs = '{"bronze/t": 4}'::jsonb"""
+  private val Abandoned =
+    "status = 'ABANDONED', abandoned_at = now(), abandon_reason = 'a file of it was written again'"
 
   test("the names that the database takes are those of the model, no more and no fewer") {
     // A status that the model has and the database refuses fails a run where it ends; one that
@@ -359,6 +361,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       Seq(
         """outputs = '{"bronze/t": 5}'::jsonb""",
         "status = 'ABANDONED', committed_by_run = NULL, committed_at = NULL, outputs = NULL",
+        s"$Abandoned, committed_by_run = NULL, committed_at = NULL, outputs = NULL",
         "status = 'PLANNED', committed_by_run = NULL, committed_at = NULL, outputs = NULL"
       ).foreach { change =>
         withClue(s"$change: ") {
@@ -367,6 +370,92 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
           ) shouldBe CheckViolation
         }
       }
+
+      // And a batch that was given up: who gave it up and why are said once.
+      insertBatch(c, source, 2, run)()
+      update(
+        c,
+        s"UPDATE control.ingestion_batch SET $Abandoned, abandoned_by_run = ? " +
+          "WHERE source_id = ? AND batch_seq = 2 AND status = 'PLANNED'",
+        run.uuid,
+        source
+      ) shouldBe 1
+      Seq(
+        "abandon_reason = 'another reason'",
+        """abandon_detail = '{"changed": []}'::jsonb""",
+        "abandoned_by_run = NULL",
+        "abandoned_at = now()",
+        s"$Committed, committed_by_run = abandoned_by_run, abandoned_by_run = NULL, " +
+          "abandoned_at = NULL, abandon_reason = NULL",
+        "status = 'PLANNED', abandoned_by_run = NULL, abandoned_at = NULL, abandon_reason = NULL"
+      ).foreach { change =>
+        withClue(s"$change: ") {
+          val refused = intercept[SQLException](
+            update(
+              c,
+              s"UPDATE control.ingestion_batch SET $change WHERE source_id = ? AND batch_seq = 2",
+              source
+            )
+          )
+          refused.getSQLState shouldBe CheckViolation
+          refused.getMessage should include("and what ended does not change")
+        }
+      }
+    }
+  }
+
+  test("the engine's role gives a planned batch up, saying who, when and why, and plans the next") {
+    val source = newSource()
+    val run = RunId.generate()
+    as(Engine) { c =>
+      snapshot(c)
+      insertRun(c, source, run)()
+      insertBatch(c, source, 1, run)()
+
+      update(
+        c,
+        s"""UPDATE control.ingestion_batch
+           |   SET $Abandoned, abandoned_by_run = ?,
+           |       abandon_detail = '{"changed": [{"item": "a.csv", "change": "is gone"}]}'::jsonb
+           | WHERE txn_app_id = ? AND batch_seq = 1 AND status = 'PLANNED'""".stripMargin,
+        run.uuid,
+        s"$source/bronze"
+      ) shouldBe 1
+
+      query(
+        c,
+        """SELECT status, abandoned_by_run::text, abandoned_at <= now(), abandon_reason,
+          |       abandon_detail #>> '{changed,0,item}', plan::text, committed_by_run::text, outputs::text
+          |  FROM control.ingestion_batch WHERE source_id = ?""".stripMargin,
+        source
+      ) shouldBe Seq(
+        Seq(
+          "ABANDONED",
+          run.toString,
+          "t",
+          "a file of it was written again",
+          "a.csv",
+          // The plan that was never run is still what the log says was to be read.
+          """{"to": 10, "from": 0}""",
+          null,
+          null
+        )
+      )
+
+      // Its number is not used again, and the sequence goes on from the next.
+      withClue("the number of a batch that was given up: ")(
+        sqlState(insertBatch(c, source, 1, run)()) shouldBe UniqueViolation
+      )
+      insertBatch(c, source, 2, run)()
+
+      // One that no run gave up: an operator's, when there is a command for it (P7).
+      val other = newSource()
+      insertRun(c, other, RunId.generate())()
+      insertBatch(c, other, 1, run)(
+        "status" -> "'ABANDONED'",
+        "abandoned_at" -> "now()",
+        "abandon_reason" -> "'the source was reset'"
+      )
     }
   }
 
@@ -421,6 +510,30 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
           ),
         "planned, with what it wrote" -> Seq("outputs" -> "'{}'::jsonb"),
         "planned, and committed by a run" -> Seq("committed_by_run" -> text(run)),
+        "abandoned, at no time" ->
+          Seq("status" -> "'ABANDONED'", "abandon_reason" -> "'a file was written again'"),
+        "abandoned, for no reason" -> Seq("status" -> "'ABANDONED'", "abandoned_at" -> "now()"),
+        "abandoned, for a reason that says nothing" ->
+          Seq("status" -> "'ABANDONED'", "abandoned_at" -> "now()", "abandon_reason" -> "' \n'"),
+        "abandoned, with what it wrote" ->
+          Seq(
+            "status" -> "'ABANDONED'",
+            "abandoned_at" -> "now()",
+            "abandon_reason" -> "'a file was written again'",
+            "outputs" -> "'{}'::jsonb"
+          ),
+        "planned, and given up by a run" -> Seq("abandoned_by_run" -> text(run)),
+        "planned, and given up at a time" -> Seq("abandoned_at" -> "now()"),
+        "planned, with a reason to give it up" -> Seq("abandon_reason" -> "'why'"),
+        "planned, with the detail of why it was given up" ->
+          Seq("abandon_detail" -> "'{}'::jsonb"),
+        "committed, with a reason to give it up" ->
+          Seq(
+            "status" -> "'COMMITTED'",
+            "committed_by_run" -> text(run),
+            "committed_at" -> "now()",
+            "abandon_reason" -> "'why'"
+          ),
         "a status that is none" -> Seq("status" -> "'RUNNING'"),
         "a number before the first" -> Seq("batch_seq" -> "0")
       )
@@ -434,6 +547,16 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
           insertBatch(c, source, 1, run)("planned_by_run" -> text(RunId.generate()))
         ) shouldBe
           ForeignKeyViolation
+      }
+      withClue("given up by a run that is none: ") {
+        sqlState(
+          insertBatch(c, source, 1, run)(
+            "status" -> "'ABANDONED'",
+            "abandoned_at" -> "now()",
+            "abandon_reason" -> "'why'",
+            "abandoned_by_run" -> text(RunId.generate())
+          )
+        ) shouldBe ForeignKeyViolation
       }
     }
   }

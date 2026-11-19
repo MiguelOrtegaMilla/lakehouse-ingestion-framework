@@ -230,7 +230,7 @@ final class ControlDatabaseSpec
       val failure = ControlDatabase.open(control, secrets).left.value
       failure shouldBe a[DatabaseFailure.Refused]
       failure.message should include(
-        "is at version 3, and this application was built for version 2"
+        "is at version 4, and this application was built for version 3"
       )
     } finally setVersion(ControlSchema.Version)
     opened()(one(_, "SELECT 1") shouldBe "1")

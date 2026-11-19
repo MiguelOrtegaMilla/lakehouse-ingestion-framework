@@ -9,6 +9,8 @@ import scala.util.Using
 
 import lakehouse.ingestion.cli.Main
 import lakehouse.ingestion.core.config.{ConfigLoader, Loaded, Profile}
+import lakehouse.ingestion.engine.control.ControlSchema
+import org.flywaydb.core.Flyway
 
 /**
  * The schemas of a deployment, applied the way a deployment applies them: by the command
@@ -104,6 +106,24 @@ object ControlPlaneSchema {
       "--password",
       s"env:$PasswordVariable"
     )
+
+  /**
+   * Brings the schema `control` of `pg` to version `upTo` and no further: a deployment that is
+   * not upgraded yet. By Flyway itself, as the migrator: the command only goes to the last.
+   *
+   * @return how many migrations were applied
+   */
+  def migrateUpTo(pg: BootstrappedPostgres, upTo: String): Int =
+    Flyway
+      .configure()
+      .dataSource(pg.jdbcUrl(Database), Migrator, pg.password(Migrator))
+      .locations(ControlSchema.Migrations)
+      .defaultSchema(ControlSchema.Name)
+      .createSchemas(false)
+      .target(upTo)
+      .load()
+      .migrate()
+      .migrationsExecuted
 
   /** Runs a command line with an environment of the test's own. */
   def command(environment: Map[String, String])(args: String*): Ran = {
