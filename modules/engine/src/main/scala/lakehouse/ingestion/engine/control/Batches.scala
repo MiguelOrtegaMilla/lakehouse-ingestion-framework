@@ -7,7 +7,7 @@ import java.util.UUID
 import scala.util.Using
 
 import io.circe.Json
-import lakehouse.ingestion.core.config.{RelativePath, SourceId}
+import lakehouse.ingestion.core.config.{RelativePath, SourceId, TableLocation}
 import lakehouse.ingestion.core.control._
 
 /**
@@ -27,7 +27,8 @@ object Batches {
   private val Columns =
     """txn_app_id, batch_seq, source_id, layer, run_kind, plan::text AS plan, status,
       |planned_by_run, planned_at, committed_by_run, committed_at, outputs::text AS outputs,
-      |abandoned_by_run, abandoned_at, abandon_reason, abandon_detail::text AS abandon_detail""".stripMargin
+      |abandoned_by_run, abandoned_at, abandon_reason, abandon_detail::text AS abandon_detail,
+      |target_table""".stripMargin
 
   /**
    * The batch of a sequence that is planned and not committed. There is one at most: the next
@@ -43,7 +44,7 @@ object Batches {
       statement.setString(1, app.value)
       Using.resource(statement.executeQuery()) { row =>
         Option.when(row.next())(record(row)).map { batch =>
-          PlannedBatch(batch.id, batch.plan, batch.plannedBy, batch.plannedAt)
+          PlannedBatch(batch.id, batch.plan, batch.plannedBy, batch.plannedAt, batch.target)
         }
       }
     }
@@ -52,18 +53,26 @@ object Batches {
    * Writes a plan down, as the next batch of the sequence of `start`: the number after the
    * last one the sequence has, whatever became of that one. A number belongs to one plan.
    *
+   * @param target the table that the batch is to write its data to. It is written down with the
+   *   plan, and as little changed afterwards: it is the table that is asked whether it has the
+   *   batch, by whichever run finishes it
    * @throws java.lang.IllegalArgumentException if the plan could not be read back (`StoredJson`):
    *   it is not written, since a plan that cannot be read is a source that cannot be recovered
    * @throws java.sql.SQLException with state 23505 if the sequence has a planned batch already
    */
   @throws[SQLException]
-  def plan(connection: Connection, start: RunStart, plan: Json): PlannedBatch = {
+  def plan(
+      connection: Connection,
+      start: RunStart,
+      plan: Json,
+      target: TableLocation
+  ): PlannedBatch = {
     readable("plan", plan)
     Using.resource(
       connection.prepareStatement(
         """INSERT INTO control.ingestion_batch
-          |  (txn_app_id, batch_seq, source_id, layer, run_kind, plan, planned_by_run)
-          |SELECT ?, COALESCE(max(batch_seq), 0) + 1, ?, ?, ?, ?::jsonb, ?
+          |  (txn_app_id, batch_seq, source_id, layer, run_kind, plan, planned_by_run, target_table)
+          |SELECT ?, COALESCE(max(batch_seq), 0) + 1, ?, ?, ?, ?::jsonb, ?, ?
           |  FROM control.ingestion_batch WHERE txn_app_id = ?
           |RETURNING batch_seq, planned_at""".stripMargin
       )
@@ -74,7 +83,8 @@ object Batches {
       statement.setString(4, start.kind.name)
       statement.setString(5, plan.noSpaces)
       statement.setObject(6, start.id.uuid)
-      statement.setString(7, start.txnAppId.value)
+      statement.setString(7, target.uri)
+      statement.setString(8, start.txnAppId.value)
       Using.resource(statement.executeQuery()) { row =>
         if (!row.next())
           throw new IllegalStateException(s"no batch was written for ${start.txnAppId}")
@@ -82,7 +92,8 @@ object Batches {
           BatchId(start.txnAppId, known("batch_seq", BatchSeq.of(row.getLong("batch_seq")))),
           plan,
           start.id,
-          row.getObject("planned_at", classOf[OffsetDateTime]).toInstant
+          row.getObject("planned_at", classOf[OffsetDateTime]).toInstant,
+          Some(target.uri)
         )
       }
     }
@@ -178,11 +189,12 @@ object Batches {
     }
 
   // What a batch wrote, as a list of tables and not as a mapping by table: a path is longer than
-  // a key that is read back may be, and a list can be asked which batch wrote a version.
+  // a key that is read back may be, and a list can be asked which batch wrote a version. A
+  // version that is not known is written as null, and not left out: the table was written.
   private def written(outputs: Seq[BatchOutput]): Json = Json.fromValues(outputs.map { output =>
     Json.obj(
       "table" -> Json.fromString(output.table.value),
-      "version" -> Json.fromLong(output.version)
+      "version" -> output.version.fold(Json.Null)(Json.fromLong)
     )
   })
 
@@ -196,7 +208,14 @@ object Batches {
       val output = for {
         table <- fields.get[String]("table").left.map(_ => "have an entry with no table")
         path <- RelativePath.stored(table).left.map(reason => s"name a table that $reason")
-        version <- fields.get[Long]("version").left.map(_ => "have an entry with no version")
+        // The field is there for every table; what it has is a version, or null for one that
+        // was not known when the batch was committed.
+        version <- fields
+          .downField("version")
+          .success
+          .toRight("have an entry with no version")
+          .flatMap(_.as[Option[Long]].left.map(_ => "have an entry whose version is no number"))
+        _ <- Either.cond(version.forall(_ >= 0), (), "have an entry with a version below 0")
       } yield BatchOutput(path, version)
       output.fold(wrong, identity)
     }
@@ -229,6 +248,7 @@ object Batches {
       layer = known("layer", Layer.parse(row.getString("layer"))),
       kind = known("run_kind", RunKind.parse(row.getString("run_kind"))),
       plan = stored(id, "plan", row.getString("plan")),
+      target = Option(row.getString("target_table")),
       status = known("status", BatchStatus.parse(row.getString("status"))),
       plannedBy = run("planned_by_run").get,
       plannedAt = instant("planned_at").get,

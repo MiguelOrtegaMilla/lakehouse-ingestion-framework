@@ -679,6 +679,8 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "UPDATE control.ingestion_batch SET batch_seq = 9",
       "UPDATE control.ingestion_batch SET planned_by_run = gen_random_uuid()",
       "UPDATE control.ingestion_batch SET planned_at = now()",
+      // Nor is where it was planned to write: it is the table that recovery asks (V4).
+      "UPDATE control.ingestion_batch SET target_table = 'file:///lake/elsewhere'",
       // What a run was told is written once.
       "UPDATE control.config_snapshot SET content = '{}'::jsonb",
       // That a file was taken, and by which batch, is written once: taking it again is an
@@ -698,6 +700,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       // Nothing outside its own tables: not the migration history, not the commit coordination.
       "SELECT * FROM control.flyway_schema_history",
       "SELECT * FROM delta_coordination.commit_entry",
+      "SELECT * FROM delta_coordination.writer_epoch",
       "INSERT INTO delta_coordination.table_taint (table_uri, reason) VALUES ('t', 'r')"
     )
 

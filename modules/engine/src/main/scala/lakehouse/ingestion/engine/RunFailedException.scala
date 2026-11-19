@@ -20,6 +20,10 @@ final class RunFailedException(
 
 object RunFailedException {
 
+  /** What may pass by itself: something that the run needs did not answer. */
+  def transient(message: String, cause: Throwable = null): RunFailedException =
+    new RunFailedException(FailureClass.Transient, message, cause)
+
   /** What running again does not mend, until somebody has changed something. */
   def permanent(message: String, cause: Throwable = null): RunFailedException =
     new RunFailedException(FailureClass.Permanent, message, cause)

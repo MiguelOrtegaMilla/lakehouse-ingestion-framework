@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.attribute.FileTime
 import java.nio.file.{Files, Path, Paths}
 import java.sql.Timestamp
+import java.time.temporal.ChronoUnit
 import java.time.{Clock, Instant, ZoneOffset}
 
 import scala.collection.mutable
@@ -32,9 +33,10 @@ import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, LocalSparkSuite}
-import lakehouse.ingestion.logstore.CommitContext
+import lakehouse.ingestion.logstore.coordination.{CoordinationSettings, WriterEpoch}
+import lakehouse.ingestion.logstore.{CommitContext, WriterEpochs}
 import org.apache.spark.sql.Row
-import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -45,7 +47,9 @@ import org.scalatest.matchers.should.Matchers
  *
  * What goes wrong is made to go wrong for real: a file is written again on disk, or removed,
  * at a fault point of the engine; a batch is written to its table by another writer; a lease is
- * taken over in the database.
+ * taken over in the database; a run dies at a fault point, and the run after it finishes its
+ * batch (P5.10); a run that lost its lease goes on, and the LogStore refuses its commits
+ * (ADR-0019).
  *
  * The clock of the service is the test's own, and so is the time of each file: whether a file
  * is complete does not depend on how long a test takes.
@@ -89,9 +93,10 @@ final class IngestionServiceSpec
   private def fileSource(
       format: String = "csv",
       options: String = "",
-      rejected: Option[String] = None
+      rejected: Option[String] = None,
+      id: String = newSourceId().value,
+      table: Option[String] = None
   ): Source = {
-    val id = newSourceId().value
     val directory = id.replace('.', '_')
     Files.createDirectories(landingDirectory.resolve(directory))
     Source
@@ -100,7 +105,7 @@ final class IngestionServiceSpec
         s"""id: $id
            |connector: { type: file, path: $directory, format: $format$options }
            |load: { mode: new_files }
-           |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
+           |targets: { bronze: { table: ${table.getOrElse(s"bronze/${id.replace('.', '/')}")} } }
            |${rejected.fold("")(share => s"quality: { max_rejected_ratio: $share }")}
            |""".stripMargin
       )
@@ -495,22 +500,545 @@ final class IngestionServiceSpec
     runOf(left.plannedBy).status shouldBe RunStatus.Running
     holderOf(orders) shouldBe Some(left.plannedBy)
 
-    // The run that takes the lease over says what the dead one could not. Finishing its batch
-    // is recovery, which is not built yet (P5.10): the run fails, and says so.
+    // While the lease is held, the source is its holder's: a run is skipped, and touches nothing.
+    launch(orders) shouldBe a[Outcome.Skipped]
+    batchOf(first).status shouldBe BatchStatus.Planned
+
+    // The run that takes the lease over says what the dead one could not, of itself and of
+    // its batch.
     expire(orders)
     val next = launch(orders)
-    next match {
-      case Outcome.Failed(_, failure, message) =>
-        failure shouldBe FailureClass.Permanent
-        message should include(s"the batch $first was planned by the run ${left.plannedBy}")
-        message should include("(P5.10)")
-      case other => fail(s"the run did not fail: $other")
-    }
+    next shouldBe a[Outcome.RolledForward]
     runOf(left.plannedBy).status shouldBe RunStatus.Abandoned
-    runOf(next.run).status shouldBe RunStatus.Failed
-    batchOf(first).status shouldBe BatchStatus.Planned
+    runOf(next.run).status shouldBe RunStatus.Succeeded
+    batchOf(first).status shouldBe BatchStatus.Committed
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
     holderOf(orders) shouldBe None
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A batch that a run left planned is finished by the next, as its table says (P5.10)
+  // ---------------------------------------------------------------------------------------------
+
+  /** A run of the source that dies at `point`, and whose lease then runs out. */
+  private def dies(of: Source, at: FaultPoint): RunId = {
+    intercept[Died](launch(of, service(hookAt(at)(_ => throw new Died))))
+    val dead = holderOf(of).value
+    expire(of)
+    dead
+  }
+
+  test("a batch whose data is written is rolled forward: nothing is read, nothing written again") {
+    val orders = fileSource()
+    val file = drop(orders, "a.csv", "id\n1\n2\n")
+    val size = Files.size(file)
+    val first = batchId(orders, 1)
+    val dead = dies(orders, FaultPoint.AfterBronzeCommit)
+    batchOf(first).target shouldBe Some(bronze(orders).uri)
+    // The file of the plan is gone by now: what a roll-forward records is said by the plan.
+    Files.delete(file)
+
+    val outcome = launch(orders)
+
+    outcome shouldBe Outcome.RolledForward(
+      outcome.run,
+      first,
+      Seq(BatchOutput(orders.targets.bronze.table, 0)),
+      // It read nothing, which it knows; what the batch wrote was the dead run's to count.
+      RunCounts(rowsRead = Some(0), bytesRead = Some(0))
+    )
+    // The table is as the dead run left it: the same rows, written by that run, at one version.
+    tableVersion(orders) shouldBe 0L
+    spark.read
+      .format("delta")
+      .load(bronze(orders).uri)
+      .select("id", "_run_id", "_batch_seq")
+      .collect()
+      .map(row => (row.getString(0), row.getString(1), row.getLong(2)))
+      .sorted
+      .toSeq shouldBe Seq(("1", dead.toString, 1L), ("2", dead.toString, 1L))
+
+    // And the control plane says what the dead run could not.
+    val committed = batchOf(first)
+    committed.status shouldBe BatchStatus.Committed
+    committed.plannedBy shouldBe dead
+    committed.committedBy shouldBe Some(outcome.run)
+    committed.outputs shouldBe Some(Vector(BatchOutput(orders.targets.bronze.table, 0)))
+    takenOf(orders) shouldBe Seq(("a.csv", size, 1L))
+    val state = stateOf(orders).value
+    state.lastCommitted shouldBe first.seq
+    state.updatedBy shouldBe outcome.run
+    runOf(dead).status shouldBe RunStatus.Abandoned
+    val ended = runOf(outcome.run)
+    ended.status shouldBe RunStatus.Succeeded
+    ended.batch shouldBe Some(first.seq)
+    ended.counts shouldBe RunCounts(rowsRead = Some(0), bytesRead = Some(0))
+    holderOf(orders) shouldBe None
+
+    // The source goes on from there: nothing new now, and a new file is the next batch.
+    launch(orders) shouldBe a[Outcome.NothingNew]
+    drop(orders, "b.csv", "id\n3\n")
+    ingested(launch(orders)).batch shouldBe batchId(orders, 2)
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("2", 1L, "a.csv"), ("3", 2L, "b.csv"))
+  }
+
+  test("a batch whose data is not written is run again as it was planned, under its number") {
+    Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead).foreach { point =>
+      withClue(s"a run that died at $point: ") {
+        val orders = fileSource()
+        val a = drop(orders, "a.csv", "id\n1\n2\n")
+        val first = batchId(orders, 1)
+        val dead = dies(orders, point)
+        tableIsThere(orders) shouldBe false
+        // A file that came since is not of the plan: it is the next batch's.
+        drop(orders, "b.csv", "id\n3\n")
+
+        val done = ingested(launch(orders))
+
+        done.batch shouldBe first
+        done.outputs shouldBe Seq(BatchOutput(orders.targets.bronze.table, 0))
+        done.counts shouldBe RunCounts(
+          rowsRead = Some(2),
+          rowsWritten = Some(2),
+          rowsRejected = Some(0),
+          bytesRead = Some(Files.size(a)),
+          writeConflicts = Some(0),
+          commitContention = Some(0)
+        )
+        // The rows are those of the plan, written by the run that ran it again.
+        spark.read
+          .format("delta")
+          .load(bronze(orders).uri)
+          .select("id", "_run_id", "_batch_seq")
+          .collect()
+          .map(row => (row.getString(0), row.getString(1), row.getLong(2)))
+          .sorted
+          .toSeq shouldBe Seq(("1", done.run.toString, 1L), ("2", done.run.toString, 1L))
+        val committed = batchOf(first)
+        committed.status shouldBe BatchStatus.Committed
+        committed.plannedBy shouldBe dead
+        committed.committedBy shouldBe Some(done.run)
+        takenOf(orders) shouldBe Seq(("a.csv", Files.size(a), 1L))
+        runOf(dead).status shouldBe RunStatus.Abandoned
+        runOf(done.run).batch shouldBe Some(first.seq)
+        batchesOf(orders) shouldBe Seq((1L, "COMMITTED"))
+
+        ingested(launch(orders)).batch shouldBe batchId(orders, 2)
+        rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("2", 1L, "a.csv"), ("3", 2L, "b.csv"))
+      }
+    }
+  }
+
+  test("a batch whose quarantine is written and whose data is not: the rest of it is written") {
+    val orders = fileSource(rejected = Some("0.5"))
+    val a = drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    val first = batchId(orders, 1)
+    val dead = dies(orders, FaultPoint.AfterQuarantineWrite)
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    tableIsThere(orders) shouldBe false
+
+    val done = ingested(launch(orders))
+
+    // The data table says "run it again", and the quarantine, which has the batch, takes its
+    // records once: Delta skips them, and the batch records where they are.
+    done.batch shouldBe first
+    done.outputs shouldBe Seq(
+      BatchOutput(quarantineTable(orders), 0),
+      BatchOutput(orders.targets.bronze.table, 0)
+    )
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    DeltaLog.forTable(spark, quarantine(orders).uri).update().version shouldBe 0L
+    spark.read
+      .format("delta")
+      .load(quarantine(orders).uri)
+      .select("run_id")
+      .collect()
+      .map(_.getString(0))
+      .toSeq shouldBe Seq(dead.toString)
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
+    done.counts shouldBe RunCounts(
+      rowsRead = Some(2),
+      rowsWritten = Some(1),
+      rowsRejected = Some(1),
+      bytesRead = Some(Files.size(a)),
+      writeConflicts = Some(0),
+      commitContention = Some(0)
+    )
+    batchOf(first).outputs shouldBe Some(done.outputs.toVector)
+  }
+
+  test("a batch that is rolled forward records its quarantine too, each table at its version") {
+    val orders = fileSource(rejected = Some("0.5"))
+    drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+    drop(orders, "b.csv", "id,amount\n4,5\n6\n")
+    val second = batchId(orders, 2)
+    dies(orders, FaultPoint.BeforeStateCommit)
+
+    val outcome = launch(orders)
+
+    val outputs = Seq(
+      BatchOutput(quarantineTable(orders), 1),
+      BatchOutput(orders.targets.bronze.table, 1)
+    )
+    outcome shouldBe Outcome.RolledForward(
+      outcome.run,
+      second,
+      outputs,
+      RunCounts(rowsRead = Some(0), bytesRead = Some(0))
+    )
+    batchOf(second).outputs shouldBe Some(outputs.toVector)
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (2L, "b.csv", "6"))
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("4", 2L, "b.csv"))
+  }
+
+  test("a batch with no rows that a run left is run again, to the same nothing") {
+    val orders = fileSource()
+    val blank = drop(orders, "empty.csv", "")
+    val first = batchId(orders, 1)
+    dies(orders, FaultPoint.BeforeStateCommit)
+    // It is in no table, so no table says that it is written.
+    tableIsThere(orders) shouldBe false
+
+    val done = ingested(launch(orders))
+
+    done.batch shouldBe first
+    done.outputs shouldBe empty
+    tableIsThere(orders) shouldBe false
+    takenOf(orders) shouldBe Seq(("empty.csv", Files.size(blank), 1L))
+    batchOf(first).status shouldBe BatchStatus.Committed
+  }
+
+  test("a file that changed since a run left its batch gives the batch up, and the next plans") {
+    val orders = fileSource()
+    val a = drop(orders, "a.csv", "id\n1\n")
+    drop(orders, "b.csv", "id\n2\n")
+    val first = batchId(orders, 1)
+    val dead = dies(orders, FaultPoint.AfterRead)
+    // The producer writes one of the files again, after the run that planned them died.
+    drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800))
+
+    val outcome = launch(orders)
+
+    outcome match {
+      case Outcome.GivenUp(_, batch, why) =>
+        batch shouldBe first
+        why should include("'a.csv' is of 9 bytes, and was of 5")
+      case other => fail(s"the batch was not given up: $other")
+    }
+    val abandoned = batchOf(first)
+    abandoned.status shouldBe BatchStatus.Abandoned
+    abandoned.plannedBy shouldBe dead
+    abandoned.abandoned.value.by shouldBe Some(outcome.run)
+    tableIsThere(orders) shouldBe false
+    takenOf(orders) shouldBe empty
+    holderOf(orders) shouldBe None
+
+    // The next run plans anew: the file that changed as a new file, and the other again.
+    val next = ingested(launch(orders))
+    next.batch shouldBe batchId(orders, 2)
+    rowsOf(orders) shouldBe Seq(("10", 2L, "a.csv"), ("11", 2L, "a.csv"), ("2", 2L, "b.csv"))
+    takenOf(orders) shouldBe Seq(("a.csv", Files.size(a), 2L), ("b.csv", 5L, 2L))
+  }
+
+  test("a batch is finished in the table that it was planned for, and in no other") {
+    val id = newSourceId().value
+    val orders = fileSource(id = id)
+    drop(orders, "a.csv", "id\n1\n")
+    val first = batchId(orders, 1)
+    dies(orders, FaultPoint.AfterBronzeCommit)
+    // The source is given another table before the run that finishes the batch.
+    val moved = fileSource(id = id, table = Some(s"bronze/moved/${id.replace('.', '/')}"))
+
+    val outcome = launch(moved)
+
+    outcome match {
+      case Outcome.Failed(_, failure, message) =>
+        failure shouldBe FailureClass.Permanent
+        message should include(s"the batch $first was planned by the run")
+        message should include(s"to be written to ${bronze(orders).uri}")
+        message should include(s"has its table at ${bronze(moved).uri} now")
+        message should include("Nothing was read or written")
+      case other => fail(s"the run did not fail: $other")
+    }
+    // The other table would have said that the batch is not written, and been given its rows:
+    // it is not made, the batch stays planned, and nothing is accounted for.
+    isThere(bronze(moved)) shouldBe false
+    batchOf(first).status shouldBe BatchStatus.Planned
+    takenOf(orders) shouldBe empty
+    stateOf(orders) shouldBe None
+    runOf(outcome.run).status shouldBe RunStatus.Failed
+    holderOf(orders) shouldBe None
+
+    // With the table that it had, the batch is found written, and rolled forward.
+    launch(orders) shouldBe a[Outcome.RolledForward]
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
+    // And from then on the source writes where its configuration says: the next batch is
+    // planned for the new table.
+    drop(orders, "b.csv", "id\n2\n")
+    ingested(launch(moved)).batch shouldBe batchId(orders, 2)
+    batchOf(batchId(orders, 2)).target shouldBe Some(bronze(moved).uri)
+  }
+
+  test("a batch that was planned before a batch said its table is finished where the source says") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val first = batchId(orders, 1)
+    dies(orders, FaultPoint.AfterBronzeCommit)
+    // As a batch that was planned under version 3 of the schema is, after the migration.
+    asSuperuser { c =>
+      update(
+        c,
+        "UPDATE control.ingestion_batch SET target_table = NULL WHERE txn_app_id = ?",
+        first.app.value
+      ) shouldBe 1
+    }
+    batchOf(first).target shouldBe None
+
+    launch(orders) shouldBe a[Outcome.RolledForward]
+    batchOf(first).status shouldBe BatchStatus.Committed
+  }
+
+  test("a batch whose commit the log no longer keeps is rolled forward at a version not known") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val first = batchId(orders, 1)
+    dies(orders, FaultPoint.AfterBronzeCommit)
+    // The source is not run for forty days, in which its table is written by others: an
+    // operator, here. Delta keeps a commit for thirty, and cleans its log up when it writes a
+    // checkpoint.
+    val deltaLog = DeltaLog.forTable(spark, bronze(orders).uri)
+    deltaLog.startTransaction(None).commit(Nil, DeltaOperations.ManualUpdate) shouldBe 1L
+    val commitOfTheBatch =
+      Paths.get(URI.create(bronze(orders).uri)).resolve("_delta_log").resolve(f"${0L}%020d.json")
+    Files.setLastModifiedTime(
+      commitOfTheBatch,
+      FileTime.from(Instant.now().minus(40, ChronoUnit.DAYS))
+    )
+    deltaLog.checkpoint(deltaLog.update())
+    Files.exists(commitOfTheBatch) shouldBe false
+    // A run that starts remembers nothing of the table: its state comes from the checkpoint.
+    DeltaLog.clearCache()
+
+    val outcome = launch(orders)
+
+    // The table knows the batch, since its transactions are in the checkpoint, and no longer
+    // at which version: that is said, and no version is made up.
+    val unknown = Seq(BatchOutput(orders.targets.bronze.table, None))
+    outcome shouldBe Outcome.RolledForward(
+      outcome.run,
+      first,
+      unknown,
+      RunCounts(rowsRead = Some(0), bytesRead = Some(0))
+    )
+    batchOf(first).outputs shouldBe Some(unknown.toVector)
+    asSuperuser { c =>
+      query(
+        c,
+        "SELECT outputs::text FROM control.ingestion_batch WHERE txn_app_id = ?",
+        first.app.value
+      ) shouldBe Seq(
+        Seq(s"""[{"table": "${orders.targets.bronze.table.value}", "version": null}]""")
+      )
+    }
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
+    takenOf(orders).map(_._1) shouldBe Seq("a.csv")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A run that lost its lease, and goes on (ADR-0019)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * A run that is taken over between its read and its writes: at that point its lease runs out,
+   * `meanwhile` happens, and another run of the source is made, whose outcome is kept. Then the
+   * first goes on, with what it read in its hands and a lease that is another's.
+   */
+  private def takenOver(of: Source, by: => IngestionService = service())(
+      meanwhile: => Unit
+  ): (IngestionService, () => Outcome) = {
+    var successor = Option.empty[Outcome]
+    val zombie = service(hookAt(FaultPoint.AfterRead) { _ =>
+      expire(of)
+      meanwhile
+      successor = Some(launch(of, by))
+    })
+    (zombie, () => successor.value)
+  }
+
+  private def lostItsLease(outcome: Outcome, of: Source): String = outcome match {
+    case Outcome.Failed(_, failure, message) =>
+      failure shouldBe FailureClass.Transient
+      message should include(s"lost the lease of ${LeaseKey.of(of.id, Layer.Bronze)}")
+      message
+    case other => fail(s"the run did not lose its lease: $other")
+  }
+
+  test("a run that lost its lease writes nothing of a batch that was given up meanwhile") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    drop(orders, "b.csv", "id\n2\n")
+    val first = batchId(orders, 1)
+    // The run has read both files when its lease is taken. One of them is written again, and
+    // the run that took the lease gives the batch up: no table has it, and none is there.
+    val (zombie, successor) = takenOver(orders) {
+      drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800)): Unit
+    }
+
+    val outcome = launch(orders, zombie)
+
+    successor() shouldBe a[Outcome.GivenUp]
+    batchOf(first).status shouldBe BatchStatus.Abandoned
+    // The first run goes on to write the rows that it read, to a table that is not there yet,
+    // and its commit is refused for its epoch: it is told that its lease is lost, and stops.
+    val message = lostItsLease(outcome, orders)
+    message should include("the writer commits under epoch 1 of")
+    message should include("the epoch in force is 2")
+    // What it leaves is what any write that fails leaves: files that no commit names. There is
+    // no commit, so there is no table, and no batch in it.
+    DeltaLog.forTable(spark, bronze(orders).uri).update().version shouldBe -1L
+    delta.lastVersion(bronze(orders), first.app) shouldBe None
+    runOf(outcome.run).status shouldBe RunStatus.Abandoned
+    takenOf(orders) shouldBe empty
+
+    // So the next batch has the rows of the files once: those that did not change are not in
+    // Bronze twice, under the number of a batch that was given up and under its own.
+    val next = ingested(launch(orders))
+    next.batch shouldBe batchId(orders, 2)
+    rowsOf(orders) shouldBe Seq(("10", 2L, "a.csv"), ("11", 2L, "a.csv"), ("2", 2L, "b.csv"))
+    tableVersion(orders) shouldBe 0L
+  }
+
+  test("a run that lost its lease adds nothing to a table that is there, nor to its quarantine") {
+    val orders = fileSource(rejected = Some("0.5"))
+    drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+    ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+    drop(orders, "b.csv", "id,amount\n4,5\n6\n")
+    val second = batchId(orders, 2)
+    val (zombie, successor) = takenOver(orders) {
+      drop(orders, "b.csv", "id,amount\n7,8\n9,9\n0\n", at = Now.minusSeconds(1800)): Unit
+    }
+
+    val outcome = launch(orders, zombie)
+
+    successor() shouldBe a[Outcome.GivenUp]
+    lostItsLease(outcome, orders)
+    // The first of its writes is the quarantine's: neither table has anything of the batch.
+    batchOf(second).status shouldBe BatchStatus.Abandoned
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
+    delta.lastVersion(bronze(orders), second.app) shouldBe Some(1L)
+    delta.lastVersion(quarantine(orders), second.app) shouldBe Some(1L)
+
+    ingested(launch(orders)).batch shouldBe batchId(orders, 3)
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("7", 3L, "b.csv"), ("9", 3L, "b.csv"))
+    quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (3L, "b.csv", "0"))
+  }
+
+  test("a run that lost its lease finds its batch written by the run that took over, once") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val first = batchId(orders, 1)
+    // Nothing changes in the source: the run that took the lease runs the plan again.
+    val (zombie, successor) = takenOver(orders)(())
+
+    val outcome = launch(orders, zombie)
+
+    val winner = successor() match {
+      case done: Outcome.Ingested => done
+      case other => fail(s"the run that took over did not finish the batch: $other")
+    }
+    winner.batch shouldBe first
+    // The first run goes on: its table has the batch by now, so it writes nothing, and its
+    // commit of the state is refused, since the lease is another's.
+    lostItsLease(outcome, orders)
+    spark.read
+      .format("delta")
+      .load(bronze(orders).uri)
+      .select("id", "_run_id")
+      .collect()
+      .map(row => (row.getString(0), row.getString(1)))
+      .toSeq shouldBe Seq(("1", winner.run.toString))
+    tableVersion(orders) shouldBe 0L
+    batchOf(first).committedBy shouldBe Some(winner.run)
+    runOf(outcome.run).status shouldBe RunStatus.Abandoned
+  }
+
+  test("a run that is taken over after its data is written: the other rolls its batch forward") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val first = batchId(orders, 1)
+    var successor = Option.empty[Outcome]
+    // Its rows are in the table when its lease is taken: the run that takes it asks the table,
+    // which says so, and commits the batch. This one then finds its commit refused.
+    val zombie = service(hookAt(FaultPoint.AfterBronzeCommit) { _ =>
+      expire(orders)
+      successor = Some(launch(orders))
+    })
+
+    val outcome = launch(orders, zombie)
+
+    successor.value shouldBe a[Outcome.RolledForward]
+    lostItsLease(outcome, orders)
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
+    tableVersion(orders) shouldBe 0L
+    val committed = batchOf(first)
+    committed.plannedBy shouldBe outcome.run
+    committed.committedBy shouldBe Some(successor.value.run)
+    takenOf(orders).map(_._1) shouldBe Seq("a.csv")
+  }
+
+  test("a run that cannot announce its epoch reads nothing, and fails in a way that passes") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    // A session whose LogStore has its coordination database where nothing answers: the
+    // control plane is there, and the store that takes the versions of the tables is not.
+    val cutOff = spark.newSession()
+    cutOff.conf.set(CoordinationSettings.JdbcUrl, "jdbc:postgresql://localhost:1/nothing")
+    cutOff.conf.set(CoordinationSettings.ConnectTimeoutMs, "1000")
+    val unannounced = new IngestionService(
+      database,
+      ConnectorRegistry(new FileSourceConnector(new Landing(landingRoot))),
+      cutOff,
+      lakeRoot,
+      timing,
+      Clock.fixed(Now, ZoneOffset.UTC)
+    )
+
+    val outcome = launch(orders, unannounced)
+
+    outcome match {
+      case Outcome.Failed(_, failure, message) =>
+        failure shouldBe FailureClass.Transient
+        message should include(
+          s"the epoch of the lease of ${LeaseKey.of(orders.id, Layer.Bronze)} could not be announced"
+        )
+        message should include("nothing was read or written")
+      case other => fail(s"the run did not fail: $other")
+    }
+    // Nothing was planned, and the lease is given up: the next run starts from nothing.
+    batchesOf(orders) shouldBe empty
+    runOf(outcome.run).status shouldBe RunStatus.Failed
+    holderOf(orders) shouldBe None
+    ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+  }
+
+  test("a run whose epoch is not the one in force stops before it asks a table anything") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val key = LeaseKey.of(orders.id, Layer.Bronze)
+    // Epochs of this key that another control plane announced, and that nobody forgot when
+    // this one was made anew: the lease of the run is at 1, and 7 is in force.
+    WriterEpochs.announce(
+      spark.sessionState.newHadoopConf(),
+      WriterEpoch(key.value, 7L)
+    ) shouldBe 7L
+
+    val outcome = launch(orders)
+
+    lostItsLease(outcome, orders)
+    batchesOf(orders) shouldBe empty
+    tableIsThere(orders) shouldBe false
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -985,7 +1513,7 @@ final class IngestionServiceSpec
   test("a quarantine grows with the batches that reject, and the others leave it as it was") {
     val orders = fileSource(rejected = Some("0.5"))
     drop(orders, "a.csv", "id,amount\n1,2\n3\n")
-    ingested(launch(orders)).outputs.map(_.version) shouldBe Seq(0L, 0L)
+    ingested(launch(orders)).outputs.map(_.version) shouldBe Seq(Some(0L), Some(0L))
 
     // A batch with nothing rejected writes its data alone.
     drop(orders, "b.csv", "id,amount\n4,5\n")

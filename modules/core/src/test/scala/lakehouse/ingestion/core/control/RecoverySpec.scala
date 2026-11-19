@@ -93,10 +93,15 @@ final class RecoverySpec extends AnyFunSuite with Matchers with EitherValues {
     }
   }
 
-  test("what a batch wrote is a table and a version of it") {
-    val output = BatchOutput(RelativePath.parse("bronze/sales/orders").value, 12)
-    output.version shouldBe 12L
-    an[IllegalArgumentException] should be thrownBy
-      BatchOutput(RelativePath.parse("bronze/sales/orders").value, -1)
+  test("what a batch wrote is a table and a version of it, or a version that is not known") {
+    val table = RelativePath.parse("bronze/sales/orders").value
+    val output = BatchOutput(table, 12)
+    output.version shouldBe Some(12L)
+    output shouldBe BatchOutput(table, Some(12L))
+    // A batch that is known to be in a table whose log no longer keeps its commit: said so,
+    // and not given a version that nobody read.
+    BatchOutput(table, None).version shouldBe None
+    an[IllegalArgumentException] should be thrownBy BatchOutput(table, -1)
+    an[IllegalArgumentException] should be thrownBy BatchOutput(table, Some(-1L))
   }
 }
