@@ -5,6 +5,7 @@
 | **Status** | Accepted (P5.8, 2026-11-19) |
 | **Amends** | [ADR-0005](0005-batch-wal-and-idempotent-writes.md) §3: a planned batch had one way out, its commit, and an operator's hand. It gains a second, taken by the run that holds the lease. The rest of ADR-0005 stands: a plan is immutable, and a `batch_seq` maps to one plan for ever. |
 | **Related** | [ADR-0006](0006-source-leases-with-epoch-fencing.md), [ADR-0008](0008-layer-responsibilities.md), [ADR-0010](0010-concurrent-write-conflict-handling.md) |
+| **Superseded in part** | [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md) (P5.10, 2026-11-19) replaces the last consequences below: the known limit of a zombie that writes an abandoned batch, and the tombstone that was to close it. A run that lost its lease commits to no table, so there is no window, and no tombstone. Those passages keep their original text and point to it. |
 
 ## Context
 
@@ -55,6 +56,8 @@ With ADR-0005 alone, that batch stays `PLANNED`. Every run of the source finds i
   - a table that does not exist yet, which an empty commit cannot be made to;
   - whether Delta takes a commit that has a transaction and no data;
   - how recovery tells a tombstone from the data of a batch. A run that died between the tombstone and the abandonment leaves a batch that is `PLANNED` and whose number is in the table: today that reads as "written", and rolling it forward would record its files as taken with none of their rows in Bronze.
+
+  > **Superseded by [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md)** (P5.10, 2026-11-19), with the known limit above. No tombstone is written. A run names the epoch of its lease in every commit, and the LogStore refuses a commit whose epoch is not the one in force: a run that lost its lease writes the batch to no table, whether the table is there or not, and no table ever has the number of a batch without its data.
 - **The replay of a batch that a run inherits gives it up the same way** (P5.10): a file that changed fails the read of whoever replays the plan, and the same question to the table decides.
 
 ## As built (P5.8, 2026-11-19)

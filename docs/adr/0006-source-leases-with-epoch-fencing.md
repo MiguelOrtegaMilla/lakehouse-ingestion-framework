@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Accepted (2026-09-25) |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md) |
+| **Amended by** | [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md) (P5.10, 2026-11-19): the epoch is also what a commit to a table names, and the LogStore refuses a commit whose epoch is not the one in force. The last consequence below keeps its original text and points to it. |
 
 ## Context
 
@@ -62,3 +63,5 @@ A **lease** row per lease key in `control.source_lease`:
 - Exactly one effective executor per (source, layer) across instances, machines and clusters (server clock, shared DB).
 - The TTL must be much longer than the longest pause (GC, network) and shorter than the acceptable takeover delay. Default 2 minutes with a 40-second heartbeat, configurable.
 - Residual zombie *data* writes are neutralised by Delta's idempotent writes (ADR-0005), not by the lease itself.
+
+  > **Amended by [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md)** (P5.10, 2026-11-19): from P5.10 they are refused where a commit is made. The epoch of a lease is announced to the LogStore by the run that takes the lease, and named by every commit of that run; a commit under an earlier epoch takes no version. The fencing token is checked by the control plane for the state, as above, and by the LogStore for the tables.
