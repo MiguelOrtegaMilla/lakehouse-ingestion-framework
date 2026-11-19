@@ -12,6 +12,9 @@ import java.util.UUID
  * @param runId the engine run that commits, when the writer knows it (ADR-0004 §3.7)
  * @param generation the generation of the table's registration that the writer read before it
  *   prepared the commit. The version is given only while the registration is still that one.
+ * @param epoch the epoch that the writer commits under, if it said one (ADR-0019). The version
+ *   is given only while that epoch is the one in force under its key. A claim that names none
+ *   is held to none.
  */
 final case class Claim(
     table: TableUri,
@@ -19,7 +22,8 @@ final case class Claim(
     tempPath: String,
     writerInstance: String,
     runId: Option[UUID],
-    generation: Long
+    generation: Long,
+    epoch: Option[WriterEpoch] = None
 ) {
   require(version >= 0, s"a commit version cannot be negative: $version")
   require(tempPath.nonEmpty, "a claim needs the path of its temporary file")

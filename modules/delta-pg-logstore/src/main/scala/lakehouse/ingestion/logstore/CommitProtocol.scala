@@ -78,6 +78,8 @@ final private[logstore] class CommitProtocol(
    * @throws WriteRefusedException the registry does not allow the write
    * @throws RegistrationChangedException an operator changed the table's registration after
    *   this writer had looked at it
+   * @throws EpochNotInForceException the context names an epoch, and it is not the one in force
+   *   under its key: the writer has lost its turn (ADR-0019). Nothing was committed
    * @throws CommitMissingException the commit before this one is recorded as published, and
    *   its file is not in the log
    * @throws CommitPublicationPendingException the version is this writer's, and its file
@@ -105,7 +107,8 @@ final private[logstore] class CommitProtocol(
       tempPathFor(target),
       writerInstance,
       context.map(_.runId),
-      registration.generation
+      registration.generation,
+      context.flatMap(_.epoch)
     )
     val temp = log.tempFile(claim.tempPath)
     log.storage.writeTemp(temp, lines)
@@ -151,6 +154,18 @@ final private[logstore] class CommitProtocol(
       case TakeResult.RegistrationChanged =>
         discard(log, temp)
         throw new RegistrationChangedException(log.table)
+
+      // An answer, and not a failure of the step: it is not asked again, and no later version
+      // would be given either.
+      case TakeResult.EpochNotInForce(inForce) =>
+        discard(log, temp)
+        // A claim has an epoch only from a context that has one.
+        val epoch = claim.epoch.getOrElse {
+          throw new IllegalStateException(
+            s"a claim that names no epoch was refused for one: $claim"
+          )
+        }
+        throw new EpochNotInForceException(log.table, version, epoch, inForce)
     }
   }
 

@@ -3,6 +3,8 @@ package lakehouse.ingestion.logstore
 import java.util.concurrent.atomic.LongAdder
 import java.util.{Objects, UUID}
 
+import lakehouse.ingestion.logstore.coordination.WriterEpoch
+
 /**
  * The run that a thread's Delta commits are made for (ADR-0004 §3.7).
  *
@@ -26,13 +28,22 @@ import java.util.{Objects, UUID}
  * inside the block does not inherit it: pools outlive the block, and a later commit under the
  * wrong run is worse than a commit under none.
  *
- * '''Best effort.''' Nothing here can fail a commit, and a commit outside any context is as
- * good as one inside: its entry has no run. A commit that a writer took and another process
- * finished keeps the run of the writer that took it.
+ * '''The run is best effort.''' Naming a run cannot fail a commit, and a commit outside any
+ * context is as good as one inside: its entry has no run. A commit that a writer took and
+ * another process finished keeps the run of the writer that took it.
+ *
+ * '''The epoch is not''' (ADR-0019). A context that says under which epoch its run commits
+ * holds every commit made in it to that epoch: one takes its version only while the epoch is
+ * the one in force under its key, and is refused otherwise
+ * (`EpochNotInForceException`). It is how a run that lost its turn at some work, and does not
+ * know it yet, is kept from committing anything more. A context that names no epoch, and a
+ * commit outside any context, are held to none.
  *
  * One context may be entered on several threads at once, and any number of times.
+ *
+ * @param epoch the epoch that the commits of the run are made under, if it has one
  */
-final class CommitContext private (val runId: UUID) {
+final class CommitContext private (val runId: UUID, val epoch: Option[WriterEpoch]) {
 
   private val lostInLog = new LongAdder
   private val lostAtInsert = new LongAdder
@@ -71,7 +82,7 @@ final class CommitContext private (val runId: UUID) {
   private[logstore] def versionLost(atInsert: Boolean): Unit =
     if (atInsert) lostAtInsert.increment() else lostInLog.increment()
 
-  override def toString: String = s"CommitContext($runId)"
+  override def toString: String = s"CommitContext($runId${epoch.fold("")(e => s", $e")})"
 }
 
 object CommitContext {
@@ -81,7 +92,18 @@ object CommitContext {
 
   /** A context for the run, with nothing counted. One per run, kept for all its writes. */
   def forRun(runId: UUID): CommitContext =
-    new CommitContext(Objects.requireNonNull(runId, "a commit context needs its run"))
+    new CommitContext(Objects.requireNonNull(runId, "a commit context needs its run"), None)
+
+  /**
+   * A context for a run that commits under an epoch: its commits are refused once that epoch is
+   * not the one in force under its key. The run announces the epoch before it writes
+   * (`WriterEpochs.announce`).
+   */
+  def forRun(runId: UUID, epoch: WriterEpoch): CommitContext =
+    new CommitContext(
+      Objects.requireNonNull(runId, "a commit context needs its run"),
+      Some(Objects.requireNonNull(epoch, "a commit context under an epoch needs the epoch"))
+    )
 
   /** The context the calling thread is in, if any. */
   private[logstore] def current: Option[CommitContext] = Option(onThisThread.get())

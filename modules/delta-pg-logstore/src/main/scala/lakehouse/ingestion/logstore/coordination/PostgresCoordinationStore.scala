@@ -22,14 +22,22 @@ final class CoordinationSchemaException(message: String, cause: Throwable = null
 /**
  * The `CoordinationStore` in PostgreSQL, on schema `delta_coordination` (ADR-0004 §3.1).
  *
- * '''Every operation is one statement, or an insert that does nothing on conflict followed by a
- * read.''' Each runs in its own transaction, at PostgreSQL's default `READ COMMITTED`. That is
- * enough: an `INSERT … ON CONFLICT DO NOTHING` waits for a concurrent insert of the same key to
- * commit or roll back before it answers, so the primary key linearises the claims, and nothing
- * on this path deletes the row that the following read looks for. No operation needs two rows to
- * change together. Registering a table and taking its first version are two operations: a
- * registered table without entries is a harmless state, and the foreign key rules out the
- * opposite order.
+ * '''Every operation but one is one statement, or an insert that does nothing on conflict
+ * followed by a read.''' Each runs in its own transaction, at PostgreSQL's default
+ * `READ COMMITTED`. That is enough: an `INSERT … ON CONFLICT DO NOTHING` waits for a concurrent
+ * insert of the same key to commit or roll back before it answers, so the primary key
+ * linearises the claims, and nothing on this path deletes the row that the following read looks
+ * for. No operation needs two rows to change together. Registering a table and taking its first
+ * version are two operations: a registered table without entries is a harmless state, and the
+ * foreign key rules out the opposite order.
+ *
+ * '''A claim that names an epoch is the one: a transaction of two statements''' (ADR-0019). It
+ * locks the row of its key, shared, reads the epoch in force there, and inserts its entry only
+ * if that epoch is its own. An announcement updates that row, so the two wait for each other:
+ * an announcement returns once every claim that read the epoch before it has committed its
+ * entry or given up, and a claim that waited for an announcement reads what it announced.
+ * Claims of one key do not wait for each other. A claim that names no epoch locks nothing, and
+ * is the one statement that it was.
  *
  * '''A claim and an operator's change exclude each other in the database.''' An entry refers to
  * its table's registration by generation. The foreign key check of the `INSERT` waits for a
@@ -103,41 +111,51 @@ final class PostgresCoordinationStore(
       query(connection, LatestEntry)(_.setString(1, table.value))(toEntry(table, _))
     }
 
-  override def take(claim: Claim): TakeResult =
-    run(s"take version ${claim.version} of ${claim.table}") { connection =>
-      val inserted =
-        try
-          Some(update(connection, Take) { statement =>
-            statement.setString(1, claim.table.value)
-            statement.setLong(2, claim.version)
-            statement.setString(3, claim.tempPath)
-            statement.setString(4, claim.writerInstance)
-            claim.runId match {
-              case Some(run) => statement.setObject(5, run)
-              case None => statement.setNull(5, Types.OTHER)
+  override def take(claim: Claim): TakeResult = {
+    val action = s"take version ${claim.version} of ${claim.table}"
+    claim.epoch match {
+      case None => run(action)(connection => settled(connection, claim, insert(connection, claim)))
+
+      case Some(epoch) =>
+        // The lock on the epoch and the INSERT are one transaction. An announcement of a later
+        // epoch waits for it to end, and finds the entry there; one that got to the row first
+        // is waited for, and what it announced is what the lock reads.
+        val attempt = transactionUnless[Attempt](action) { connection =>
+          val inForce = query(connection, LockEpoch)(_.setString(1, epoch.key))(_.getLong(1))
+          if (!inForce.contains(epoch.epoch)) Left(OutOfTurn(inForce))
+          else
+            insert(connection, claim) match {
+              // The foreign key ended the transaction: there is nothing to keep.
+              case None => Left(Inserted(None))
+              case rows => Right(Inserted(rows))
             }
-            statement.setLong(6, claim.generation)
-          })
-        catch {
-          // The foreign key to the registration: the database itself refuses the claim. It
-          // waited for an operator's change of the registration, if one was in flight.
-          case e: SQLException if e.getSQLState == ForeignKeyViolation => None
         }
-      inserted match {
-        // No registration of that generation. Which of the two it is only words the refusal.
-        case None =>
-          if (readRegistration(connection, claim.table).isEmpty) TakeResult.NotRegistered
-          else TakeResult.RegistrationChanged
-        case Some(1) => TakeResult.Taken
-        case Some(_) =>
-          val owner = readEntry(connection, claim.table, claim.version).getOrElse {
-            throw new IOException(
-              s"entry ${claim.version} of ${claim.table} was deleted while it was being read"
-            )
-          }
-          // An earlier call of this same claim, whose reply was lost, already took the version.
-          if (owner.tempPath == claim.tempPath) TakeResult.Taken else TakeResult.TakenBy(owner)
-      }
+        attempt match {
+          case Inserted(rows) => run(action)(settled(_, claim, rows))
+          // Unless the version is this claim's already: an earlier call took it while its
+          // epoch was in force, and its reply was lost. The commit exists, and its writer is
+          // told so, whatever was announced since.
+          case OutOfTurn(inForce) =>
+            val owned = run(action)(readEntry(_, claim.table, claim.version))
+              .exists(_.tempPath == claim.tempPath)
+            if (owned) TakeResult.Taken else TakeResult.EpochNotInForce(inForce)
+        }
+    }
+  }
+
+  override def announce(epoch: WriterEpoch): Long =
+    run(s"announce $epoch") { connection =>
+      val announced = query(connection, Announce) { statement =>
+        statement.setString(1, epoch.key)
+        statement.setLong(2, epoch.epoch)
+      }(_.getLong(1))
+      // No row came back: the epoch in force is this one or a later one, and stays.
+      announced
+        .orElse(query(connection, ReadEpoch)(_.setString(1, epoch.key))(_.getLong(1)))
+        .getOrElse {
+          // Only maintenance deletes an epoch, and not while its writers are running.
+          throw new IOException(s"the epoch of ${epoch.key} was deleted while it was announced")
+        }
     }
 
   override def complete(table: TableUri, version: Long, tempPath: String): Boolean =
@@ -234,6 +252,54 @@ final class PostgresCoordinationStore(
       schemaVerified.set(true)
     }
 
+  /**
+   * The INSERT that takes a version.
+   *
+   * @return how many rows it inserted, one or none; nothing at all, if the database refused it
+   *   by the foreign key to the registration. It waited for an operator's change of the
+   *   registration, if one was in flight
+   */
+  private def insert(connection: Connection, claim: Claim): Option[Int] =
+    try
+      Some(update(connection, Take) { statement =>
+        statement.setString(1, claim.table.value)
+        statement.setLong(2, claim.version)
+        statement.setString(3, claim.tempPath)
+        statement.setString(4, claim.writerInstance)
+        claim.runId match {
+          case Some(run) => statement.setObject(5, run)
+          case None => statement.setNull(5, Types.OTHER)
+        }
+        statement.setLong(6, claim.generation)
+        claim.epoch match {
+          case Some(epoch) =>
+            statement.setString(7, epoch.key)
+            statement.setLong(8, epoch.epoch)
+          case None =>
+            statement.setNull(7, Types.VARCHAR)
+            statement.setNull(8, Types.BIGINT)
+        }
+      })
+    catch { case e: SQLException if e.getSQLState == ForeignKeyViolation => None }
+
+  /** What an INSERT that took a version or did not means for its claim. */
+  private def settled(connection: Connection, claim: Claim, inserted: Option[Int]): TakeResult =
+    inserted match {
+      // No registration of that generation. Which of the two it is only words the refusal.
+      case None =>
+        if (readRegistration(connection, claim.table).isEmpty) TakeResult.NotRegistered
+        else TakeResult.RegistrationChanged
+      case Some(1) => TakeResult.Taken
+      case Some(_) =>
+        val owner = readEntry(connection, claim.table, claim.version).getOrElse {
+          throw new IOException(
+            s"entry ${claim.version} of ${claim.table} was deleted while it was being read"
+          )
+        }
+        // An earlier call of this same claim, whose reply was lost, already took the version.
+        if (owner.tempPath == claim.tempPath) TakeResult.Taken else TakeResult.TakenBy(owner)
+    }
+
   private def readRegistration(connection: Connection, table: TableUri): Option[Registration] =
     query(connection, ReadRegistration)(_.setString(1, table.value)) { row =>
       Registration(
@@ -258,8 +324,17 @@ final class PostgresCoordinationStore(
 
 object PostgresCoordinationStore {
 
-  /** The version of schema `delta_coordination` this code works with: its migrations up to V3. */
-  val SchemaVersion = 3
+  /** The version of schema `delta_coordination` this code works with: its migrations up to V4. */
+  val SchemaVersion = 4
+
+  /** How far a claim that names an epoch got, in its transaction. */
+  sealed private trait Attempt
+
+  /** @param rows what the INSERT said: `insert` */
+  final private case class Inserted(rows: Option[Int]) extends Attempt
+
+  /** The epoch of the claim is not the one in force, and nothing was inserted. */
+  final private case class OutOfTurn(inForce: Option[Long]) extends Attempt
 
   /** What a session of this store calls itself in `pg_stat_activity`. */
   val ApplicationName = "delta-pg-logstore"
@@ -305,9 +380,26 @@ object PostgresCoordinationStore {
 
   private val Take =
     """INSERT INTO delta_coordination.commit_entry
-      |  (table_uri, version, temp_path, writer_instance, run_id, generation)
-      |VALUES (?, ?, ?, ?, ?, ?)
+      |  (table_uri, version, temp_path, writer_instance, run_id, generation, epoch_key, epoch)
+      |VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       |ON CONFLICT DO NOTHING""".stripMargin
+
+  // Shared: claims of one key do not wait for each other, and an announcement, which updates
+  // the row, waits for every one of them and is waited for by the ones that come after it.
+  private val LockEpoch =
+    "SELECT epoch FROM delta_coordination.writer_epoch WHERE epoch_key = ? FOR SHARE"
+
+  private val ReadEpoch = "SELECT epoch FROM delta_coordination.writer_epoch WHERE epoch_key = ?"
+
+  // The row is locked whether or not it is updated, so an announcement that changes nothing
+  // has also waited for the claims that were in flight. The time is the database's.
+  private val Announce =
+    """INSERT INTO delta_coordination.writer_epoch AS held (epoch_key, epoch)
+      |VALUES (?, ?)
+      |ON CONFLICT (epoch_key) DO UPDATE
+      |   SET epoch = EXCLUDED.epoch, announced_at = now()
+      | WHERE held.epoch < EXCLUDED.epoch
+      |RETURNING epoch""".stripMargin
 
   // The completion time is the database's, and the first one stays.
   private val Complete =

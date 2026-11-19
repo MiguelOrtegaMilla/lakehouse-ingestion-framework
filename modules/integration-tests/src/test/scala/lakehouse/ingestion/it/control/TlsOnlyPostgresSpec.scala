@@ -81,7 +81,7 @@ final class TlsOnlyPostgresSpec
     withClue(again.err)(again.exit shouldBe Main.Exit.Ok)
     again.lines.map(_.takeWhile(_ != '(').trim) shouldBe Seq(
       "control: version 3, nothing to apply",
-      "delta_coordination: version 3, nothing to apply"
+      "delta_coordination: version 4, nothing to apply"
     )
 
     // The example profile as it is: TLS off, for a database on the machine.

@@ -60,6 +60,8 @@ final class FaultyCoordinationStore(underlying: CoordinationStore) extends Coord
 
   override def take(claim: Claim): TakeResult = call(Take)(underlying.take(claim))
 
+  override def announce(epoch: WriterEpoch): Long = call(Announce)(underlying.announce(epoch))
+
   override def complete(table: TableUri, version: Long, tempPath: String): Boolean =
     call(Complete)(underlying.complete(table, version, tempPath))
 
@@ -92,6 +94,10 @@ final class FaultyCoordinationStore(underlying: CoordinationStore) extends Coord
       case Some(ReplyLost) =>
         run: Unit
         throw new IOException(s"injected fault: the reply to $operation was lost")
+      case Some(ReplyLostAnd(meanwhile)) =>
+        run: Unit
+        meanwhile()
+        throw new IOException(s"injected fault: the reply to $operation was lost")
       case Some(Preempted(by)) =>
         underlying.take(by): Unit
         throw new IOException(s"injected fault: $operation did not reach the store")
@@ -107,6 +113,7 @@ object FaultyCoordinationStore {
   case object ReadEntry extends Operation
   case object ReadLatestEntry extends Operation
   case object Take extends Operation
+  case object Announce extends Operation
   case object Complete extends Operation
   case object Taint extends Operation
 
@@ -117,6 +124,12 @@ object FaultyCoordinationStore {
 
   /** The call reaches the store and takes effect. The caller only learns that it failed. */
   case object ReplyLost extends Fault
+
+  /**
+   * As `ReplyLost`, and before the caller can ask again another process does `meanwhile`: the
+   * call took effect in a store that has moved on since.
+   */
+  final case class ReplyLostAnd(meanwhile: () => Unit) extends Fault
 
   /**
    * The call does not reach the store, and before the caller can repeat it another writer's

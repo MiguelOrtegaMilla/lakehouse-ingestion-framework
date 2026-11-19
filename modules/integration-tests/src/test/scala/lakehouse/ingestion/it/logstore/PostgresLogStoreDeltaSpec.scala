@@ -9,7 +9,7 @@ import scala.util.Using
 import io.delta.storage.HDFSLogStore
 import io.delta.tables.DeltaTable
 import lakehouse.ingestion.logstore._
-import lakehouse.ingestion.logstore.coordination.Registration
+import lakehouse.ingestion.logstore.coordination.{Registration, WriterEpoch}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
 import org.scalatest.funsuite.AnyFunSuite
@@ -143,6 +143,74 @@ final class PostgresLogStoreDeltaSpec extends AnyFunSuite with Matchers with Coo
     // The other writer's commit was in the log by then: this one was behind, not beside it.
     run.contentionAtInsert shouldBe 0L
     (0L to 2L).map(entry(path, _).runId) shouldBe Seq(None, None, Some(run.runId))
+  }
+
+  test("Delta's commit under an epoch that a later one replaced is refused, and not tried again") {
+    val path = create("out-of-turn")
+    val conf = spark.sessionState.newHadoopConf()
+    val key = s"out-of-turn.${UUID.randomUUID()}/bronze"
+    // A run takes the work, says so, and writes; then another takes it over.
+    val lost = WriterEpoch(key, 1L)
+    WriterEpochs.announce(conf, lost) shouldBe 1L
+    val zombie = CommitContext.forRun(UUID.randomUUID(), lost)
+    def batch(of: CommitContext, number: Long): Unit = of.attribute {
+      rows(number * 10, number * 10 + 10).write
+        .format("delta")
+        .mode("append")
+        .option("txnAppId", key)
+        .option("txnVersion", number)
+        .save(path)
+    }
+    batch(zombie, 1L)
+    WriterEpochs.announce(conf, WriterEpoch(key, 2L)) shouldBe 2L
+    // The run that lost its turn is told so when it asks, too.
+    WriterEpochs.announce(conf, lost) shouldBe 2L
+
+    val failure = intercept[Exception](batch(zombie, 2L))
+
+    val refusal = causesOf(failure).collectFirst { case e: EpochNotInForceException => e }
+    refusal.map(e => (e.epoch, e.inForce)) shouldBe Some((lost, Some(2L)))
+    // Delta neither tried the version again nor moved on to the next: the table is as it was,
+    // and no version was taken for the commit.
+    versionOf(path) shouldBe 1L
+    countOf(path) shouldBe 20L
+    store.latestEntry(keyOf(path)).map(_.version) shouldBe Some(1L)
+    Files.exists(commitFile(path, 2)) shouldBe false
+    DeltaLog.forTable(spark, path).update().transactions.get(key) shouldBe Some(1L)
+    zombie.contention shouldBe 0L
+
+    // The run that has the turn writes the batch that the other could not.
+    batch(CommitContext.forRun(UUID.randomUUID(), WriterEpoch(key, 2L)), 2L)
+    versionOf(path) shouldBe 2L
+    countOf(path) shouldBe 30L
+  }
+
+  test("what no epoch numbers is written as before: maintenance, and a run that names none") {
+    val path = create("unnumbered")
+    val conf = spark.sessionState.newHadoopConf()
+    val key = s"unnumbered.${UUID.randomUUID()}/bronze"
+    WriterEpochs.announce(conf, WriterEpoch(key, 1L)) shouldBe 1L
+    CommitContext.forRun(UUID.randomUUID(), WriterEpoch(key, 1L)).attribute(append(path, 10L, 20L))
+    WriterEpochs.announce(conf, WriterEpoch(key, 2L)) shouldBe 2L
+
+    // An operator's OPTIMIZE and DELETE, outside any context; a MERGE of a run that names no
+    // epoch, as a writer that no lease numbers. None is held to the epochs of the table's
+    // other writers.
+    append(path, 20L, 30L)
+    DeltaTable.forPath(spark, path).optimize().executeCompaction(): Unit
+    DeltaTable.forPath(spark, path).delete("id < 5")
+    CommitContext.forRun(UUID.randomUUID()).attribute {
+      DeltaTable
+        .forPath(spark, path)
+        .as("target")
+        .merge(rows(25L, 35L).as("source"), "target.id = source.id")
+        .whenNotMatched()
+        .insertAll()
+        .execute()
+    }
+
+    versionOf(path) shouldBe 5L
+    countOf(path) shouldBe 30L
   }
 
   test("a checkpoint's pointer is written through the LogStore, and a new reader follows it") {

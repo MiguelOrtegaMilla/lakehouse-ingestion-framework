@@ -2,7 +2,7 @@ package lakehouse.ingestion.logstore
 
 import java.io.IOException
 
-import lakehouse.ingestion.logstore.coordination.TableUri
+import lakehouse.ingestion.logstore.coordination.{TableUri, WriterEpoch}
 
 /**
  * The table's registration does not allow the write (ADR-0004 §3.5, layer 2). Nothing was
@@ -49,6 +49,30 @@ final class RegistrationChangedException(val table: TableUri)
       s"the registration of $table changed while a commit to it was being prepared: an operator " +
         "adopted the table again, or reset its registry. Nothing was written; the transaction " +
         "has to start again from the table as it is now"
+    )
+
+/**
+ * The writer committed under an epoch that is not the one in force under its key (ADR-0019): a
+ * later epoch was announced, so another writer has taken the work over, or none was, and the
+ * writer never announced its own. Nothing was committed, and no version was taken.
+ *
+ * It is not a failure that passes. An epoch only grows, so the same commit is refused however
+ * often it is made: the writer has lost its turn, and is to stop. What it was writing is the
+ * work of whoever holds the turn now.
+ *
+ * @param epoch the epoch that the commit named
+ * @param inForce the epoch in force under its key; none, if none was ever announced
+ */
+final class EpochNotInForceException(
+    val table: TableUri,
+    val version: Long,
+    val epoch: WriterEpoch,
+    val inForce: Option[Long]
+) extends IOException(
+      s"version $version of $table was not committed: the writer commits under $epoch, and " +
+        inForce.fold("no epoch of that key was announced")(now =>
+          s"the epoch in force is $now"
+        ) + ". The writer has lost its turn, and no commit of it will be taken"
     )
 
 /**

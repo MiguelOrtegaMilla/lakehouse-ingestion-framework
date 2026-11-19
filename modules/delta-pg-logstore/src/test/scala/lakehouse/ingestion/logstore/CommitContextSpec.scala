@@ -246,4 +246,25 @@ final class CommitContextSpec extends AnyFunSuite with Matchers with LakeFixture
   test("a context needs its run") {
     a[NullPointerException] should be thrownBy CommitContext.forRun(null)
   }
+
+  test("a context says the epoch of its run, if it was given one") {
+    val run = UUID.randomUUID()
+    val turn = WriterEpoch("sales.orders/bronze", 3L)
+
+    CommitContext.forRun(run).epoch shouldBe None
+    CommitContext.forRun(run, turn).epoch shouldBe Some(turn)
+    CommitContext.forRun(run, turn).toString shouldBe
+      s"CommitContext($run, epoch 3 of sales.orders/bronze)"
+    a[NullPointerException] should be thrownBy CommitContext.forRun(run, null)
+  }
+
+  test("a commit under an epoch is refused for its epoch alone: it is no contention") {
+    val lake = new Lake().withCommits(last = 0)
+    lake.memory.announce(WriterEpoch("sales.orders/bronze", 2L)) shouldBe 2L
+    val late = CommitContext.forRun(UUID.randomUUID(), WriterEpoch("sales.orders/bronze", 1L))
+
+    an[EpochNotInForceException] should be thrownBy late.attribute(lake.commit(1)(append(1)))
+
+    late.contention shouldBe 0L
+  }
 }

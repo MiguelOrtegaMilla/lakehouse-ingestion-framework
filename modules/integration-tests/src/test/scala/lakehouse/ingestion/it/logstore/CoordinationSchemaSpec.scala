@@ -50,11 +50,11 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     """INSERT INTO delta_coordination.table_taint (table_uri, reason) VALUES (?, ?)
       |ON CONFLICT DO NOTHING""".stripMargin
 
-  test("the migrations build version 3 of the schema, and applying them again changes nothing") {
+  test("the migrations build version 4 of the schema, and applying them again changes nothing") {
     CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 0
 
     as(CommitPath) { c =>
-      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("3"))
+      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("4"))
     }
     Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
       val owners = query(
@@ -67,7 +67,8 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
         "coordinated_table",
         "flyway_schema_history",
         "schema_version",
-        "table_taint"
+        "table_taint",
+        "writer_epoch"
       ).map(Seq(_, CoordinationSchema.Migrator))
     }
   }
@@ -242,6 +243,64 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     }
   }
 
+  test("the commit path announces an epoch, which only grows, and locks it to take a version") {
+    val key = "sales.epochs/bronze"
+    val announce =
+      """INSERT INTO delta_coordination.writer_epoch AS held (epoch_key, epoch) VALUES (?, ?)
+        |ON CONFLICT (epoch_key) DO UPDATE SET epoch = EXCLUDED.epoch, announced_at = now()
+        | WHERE held.epoch < EXCLUDED.epoch""".stripMargin
+    val inForce =
+      "SELECT epoch, announced_at IS NULL FROM delta_coordination.writer_epoch WHERE epoch_key = ?"
+    as(CommitPath) { c =>
+      update(c, announce, key, Long.box(2)) shouldBe 1
+      // The time of an announcement is the database's.
+      query(c, inForce, key) shouldBe Seq(Seq("2", "f"))
+      update(c, announce, key, Long.box(5)) shouldBe 1
+      update(c, announce, key, Long.box(3)) shouldBe 0
+      query(c, inForce, key) shouldBe Seq(Seq("5", "f"))
+      // The lock that the claim of a version takes on the epoch of its key.
+      query(c, s"$inForce FOR SHARE", key) shouldBe Seq(Seq("5", "f"))
+
+      // An earlier epoch is refused by the database, whatever statement asks for it.
+      sqlState(
+        update(c, "UPDATE delta_coordination.writer_epoch SET epoch = 4 WHERE epoch_key = ?", key)
+      ) shouldBe CheckViolation
+      query(c, inForce, key) shouldBe Seq(Seq("5", "f"))
+      // An epoch is 1 or more, and is of a key that says something.
+      sqlState(update(c, announce, "sales.none/bronze", Long.box(0))) shouldBe CheckViolation
+      sqlState(update(c, announce, " ", Long.box(1))) shouldBe CheckViolation
+    }
+  }
+
+  test("an entry says the epoch that it was taken under whole, or says none") {
+    val table = "file:/lake/epochs"
+    val withEpoch =
+      """INSERT INTO delta_coordination.commit_entry
+        |  (table_uri, version, temp_path, writer_instance, generation, epoch_key, epoch)
+        |VALUES (?, ?, ?, 'host:1:app', ?, ?, ?)""".stripMargin
+    as(CommitPath) { c =>
+      update(c, Register, table, Long.box(-1))
+      val generation = generationOf(c, table)
+      update(
+        c,
+        withEpoch,
+        table,
+        Long.box(0),
+        ".tmp/0",
+        generation,
+        "sales.x/bronze",
+        Long.box(3)
+      ) shouldBe 1
+      update(c, withEpoch, table, Long.box(1), ".tmp/1", generation, null, null) shouldBe 1
+      sqlState(
+        update(c, withEpoch, table, Long.box(2), ".tmp/2", generation, "sales.x/bronze", null)
+      ) shouldBe CheckViolation
+      sqlState(
+        update(c, withEpoch, table, Long.box(2), ".tmp/2", generation, null, Long.box(3))
+      ) shouldBe CheckViolation
+    }
+  }
+
   test("the commit path cannot delete, rewrite, define, or read outside its tables") {
     val denied = Seq(
       // No deletes: a defect on the commit path cannot erase a commit, a registration or a taint.
@@ -255,6 +314,14 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       "UPDATE delta_coordination.commit_entry SET writer_instance = 'other'",
       "UPDATE delta_coordination.coordinated_table SET registered_version = 9",
       "UPDATE delta_coordination.table_taint SET reason = 'nothing happened'",
+      // The epoch that a commit was taken under is part of its entry, and an epoch that is in
+      // force is not forgotten, nor moved to another key.
+      "UPDATE delta_coordination.commit_entry SET epoch = 9",
+      "UPDATE delta_coordination.commit_entry SET epoch_key = 'other'",
+      "DELETE FROM delta_coordination.writer_epoch",
+      "TRUNCATE delta_coordination.writer_epoch",
+      "UPDATE delta_coordination.writer_epoch SET epoch_key = 'other'",
+      "SELECT delta_coordination.refuse_earlier_epoch()",
       // A registration's generation is an operator's to change, and its row an operator's to
       // hold: the commit path waits on it through the foreign key of its entries, and no more.
       "UPDATE delta_coordination.coordinated_table SET generation = DEFAULT",
@@ -304,6 +371,14 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       update(c, "DELETE FROM delta_coordination.commit_entry WHERE table_uri = ?", table) shouldBe 1
       update(c, registration, table) shouldBe 1
 
+      // Since V4: the epochs of a key are forgotten, when whoever numbers its writers starts
+      // its numbers again.
+      update(
+        c,
+        "DELETE FROM delta_coordination.writer_epoch WHERE epoch_key = ?",
+        "sales.epochs/bronze"
+      ) shouldBe 1
+
       // Since V2: adopting a table registers it, and adopting it again moves its version.
       // Since V3: and gives it a new generation.
       update(c, Register, table, Long.box(41)) shouldBe 1
@@ -325,6 +400,9 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
           "VALUES ('file:/lake/reset', 'by hand')",
         "UPDATE delta_coordination.commit_entry SET complete = true, completed_at = now()",
         "UPDATE delta_coordination.schema_version SET version = 4",
+        // An epoch is announced by the writers that it numbers, and by nobody else.
+        "INSERT INTO delta_coordination.writer_epoch (epoch_key, epoch) VALUES ('by.hand/bronze', 1)",
+        "UPDATE delta_coordination.writer_epoch SET epoch = 99",
         "TRUNCATE delta_coordination.commit_entry",
         "CREATE TABLE delta_coordination.scratch (id int)",
         "SELECT * FROM control.run"
