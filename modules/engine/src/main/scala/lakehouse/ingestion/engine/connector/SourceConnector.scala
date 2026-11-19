@@ -120,8 +120,20 @@ trait FileRegistry {
 final case class ReadContext(spark: SparkSession)
 
 /**
- * The rows of a read, as the source gave them, with the columns that are a read's to add
- * (`_source_file`, `_rescued_data`: `EngineColumns`). The columns of the engine are the
- * writer's to add, and a read never has them.
+ * What a read gives: the rows, and the records that could not be parsed into rows, each from
+ * the same read, so that both say the same thing of the source.
+ *
+ * @param rows as the source gave them, with the columns that are a read's to add
+ *   (`_source_file`, `_rescued_data`: `EngineColumns`). The columns of the engine are the
+ *   writer's to add, and a read never has them
+ * @param unparsed the records that could not be parsed, as they were written in the source:
+ *   `_source_file` and `_record`, both text. None for a source whose records are never text to
+ *   parse, as a table of a database or a file of Parquet
  */
-final case class ReadResult(rows: DataFrame)
+final case class ReadResult(rows: DataFrame, unparsed: Option[DataFrame])
+
+object ReadResult {
+
+  /** The column of an unparsed record that has its text, as it was in the source. */
+  val Record = "_record"
+}

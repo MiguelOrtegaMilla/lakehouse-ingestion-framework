@@ -9,12 +9,25 @@ import io.circe.{ACursor, Json}
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, Unwritten}
 
 /**
+ * Which file of a file system a name led to: the device that holds it, and its number there
+ * (its inode). A name may be given to another file at any moment, by a rename over it or by a
+ * link that is changed; the file that it was keeps these two.
+ *
+ * They say which file it is on one machine, for as long as the file system stays mounted as it
+ * is: another machine, or the same disk mounted again, may number the device otherwise.
+ */
+final case class FileIdentity(device: Long, inode: Long) {
+  override def toString: String = s"inode $inode of device $device"
+}
+
+/**
  * A file as the listing of a directory gives it: its name in the directory, its size in bytes,
- * and when it was last changed. Nothing has been judged of it yet.
+ * when it was last changed, and which file of the file system the name led to. Nothing has been
+ * judged of it yet.
  *
  * @param modifiedAt to the millisecond, as file systems report it to Hadoop
  */
-final case class Listed(name: String, size: Long, modifiedAt: Instant) {
+final case class Listed(name: String, size: Long, modifiedAt: Instant, identity: FileIdentity) {
   require(size >= 0, s"a file has no size $size")
   require(LandedFile.toTheMillisecond(modifiedAt), s"$modifiedAt is not to the millisecond")
 }
@@ -94,6 +107,16 @@ final case class LandedFile(name: FileName, size: Long, modifiedAt: Instant) {
   require(LandedFile.toTheMillisecond(modifiedAt), s"$modifiedAt is not to the millisecond")
 }
 
+/**
+ * A file of a plan: the file that the batch takes, and which file of the file system its name
+ * led to when it was planned. A read reads the plan only while each name still leads to that
+ * file, of that size and that time (P5.7): a file that was written again, or put in another's
+ * place, after its batch was planned, is not what the plan names.
+ */
+final case class PlannedFile(file: LandedFile, identity: FileIdentity) {
+  def name: FileName = file.name
+}
+
 object LandedFile {
 
   /** What a file system reports, and what is written down: a finer time would not read back. */
@@ -109,7 +132,10 @@ object LandedFile {
  *
  * @param directory relative to the landing root of the profile
  */
-final case class FilePlan private (directory: RelativePath, files: Vector[LandedFile]) {
+final case class FilePlan private (directory: RelativePath, planned: Vector[PlannedFile]) {
+
+  /** The files that it takes, as they are recorded once the batch is committed. */
+  def files: Vector[LandedFile] = planned.map(_.file)
 
   /** The files that it takes, by their names: how they are found among those processed. */
   def names: Vector[FileName] = files.map(_.name)
@@ -120,11 +146,13 @@ final case class FilePlan private (directory: RelativePath, files: Vector[Landed
   def toJson: Json = Json.obj(
     "version" -> Json.fromInt(FilePlan.Version),
     "directory" -> Json.fromString(directory.value),
-    "files" -> Json.fromValues(files.map { file =>
+    "files" -> Json.fromValues(planned.map { case PlannedFile(file, identity) =>
       Json.obj(
         "name" -> Json.fromString(file.name.value),
         "size" -> Json.fromLong(file.size),
-        "modified_at" -> Json.fromString(file.modifiedAt.toString)
+        "modified_at" -> Json.fromString(file.modifiedAt.toString),
+        "device" -> Json.fromLong(identity.device),
+        "inode" -> Json.fromLong(identity.inode)
       )
     })
   )
@@ -135,14 +163,17 @@ object FilePlan {
   /**
    * The form of the JSON. A plan outlives the process that wrote it, by a crash, and may be
    * replayed by another version of the application: one that reads another form refuses it.
+   *
+   * Version 2 has the device and the inode of each file. No plan of version 1 was written
+   * outside the tests: the engine plans no batch of files before the command `run` (P5.12).
    */
-  val Version = 1
+  val Version = 2
 
   /** @throws IllegalArgumentException if it has no file, or a name twice */
-  def apply(directory: RelativePath, files: Vector[LandedFile]): FilePlan = {
-    require(files.nonEmpty, "a plan has a file at least")
-    require(files.map(_.name).distinct.size == files.size, "a plan has each name once")
-    new FilePlan(directory, files)
+  def apply(directory: RelativePath, planned: Vector[PlannedFile]): FilePlan = {
+    require(planned.nonEmpty, "a plan has a file at least")
+    require(planned.map(_.name).distinct.size == planned.size, "a plan has each name once")
+    new FilePlan(directory, planned)
   }
 
   /**
@@ -170,12 +201,13 @@ object FilePlan {
     } yield plan
   }
 
-  private def file(entry: Json, index: Int): Either[String, LandedFile] = {
+  private def file(entry: Json, index: Int): Either[String, PlannedFile] = {
     val at = entry.hcursor
     def field[A](name: String, problem: String)(read: ACursor => Either[Any, A]) =
       read(at.downField(name)).leftMap(_ => s"files[$index].$name $problem")
     for {
-      _ <- exactly(at, "name", "size", "modified_at").leftMap(problem => s"files[$index] $problem")
+      _ <- exactly(at, "name", "size", "modified_at", "device", "inode")
+        .leftMap(problem => s"files[$index] $problem")
       text <- field("name", "is not text")(_.as[String])
       name <- FileName.parse(text).leftMap(problem => s"files[$index].name $problem")
       size <- whole(at.downField("size"))
@@ -187,7 +219,9 @@ object FilePlan {
         LandedFile.toTheMillisecond,
         s"files[$index].modified_at is not to the millisecond"
       )
-    } yield LandedFile(name, size, modifiedAt)
+      device <- whole(at.downField("device")).toRight(s"files[$index].device is not a number")
+      inode <- whole(at.downField("inode")).toRight(s"files[$index].inode is not a number")
+    } yield PlannedFile(LandedFile(name, size, modifiedAt), FileIdentity(device, inode))
   }
 
   /**
@@ -262,7 +296,7 @@ object FilePlanner {
     val named = ofTheSource.zipWithIndex.traverse { case (file, index) =>
       FileName
         .parse(file.name)
-        .map(LandedFile(_, file.size, file.modifiedAt))
+        .map(name => PlannedFile(LandedFile(name, file.size, file.modifiedAt), file.identity))
         .leftMap { problem =>
           s"the file of ${config.path} that is number ${index + 1} of those it would take, " +
             s"oldest first (of ${file.size} bytes, changed at ${file.modifiedAt}), has a name " +
@@ -273,9 +307,9 @@ object FilePlanner {
 
     // Every name that is in the way, and not the first alone.
     named.toEither.map { files =>
-      val fresh = files.filterNot(processed)
+      val fresh = files.filterNot(planned => processed(planned.file))
       val oldEnough = now.minusMillis(config.minFileAge.toMillis)
-      val complete = fresh.filterNot(_.modifiedAt.isAfter(oldEnough))
+      val complete = fresh.filterNot(_.file.modifiedAt.isAfter(oldEnough))
       val waiting = fresh.size - complete.size
       val taken = complete.take(config.maxFilesPerBatch).toVector
 

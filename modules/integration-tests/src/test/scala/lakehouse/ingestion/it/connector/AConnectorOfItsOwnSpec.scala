@@ -145,7 +145,7 @@ object AConnectorOfItsOwnSpec {
       val (from, to) = range.getOrElse(
         throw RunFailedException.permanent(s"the plan of ${source.id} is not of version 1")
       )
-      ReadResult(context.spark.range(from, to).toDF("id"))
+      ReadResult(context.spark.range(from, to).toDF("id"), unparsed = None)
     }
   }
 }

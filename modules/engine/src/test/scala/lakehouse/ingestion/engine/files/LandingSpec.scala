@@ -10,7 +10,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, RootUri}
 import lakehouse.ingestion.core.control.FailureClass
-import lakehouse.ingestion.core.files.{FilePlanner, Listed}
+import lakehouse.ingestion.core.files.{FileIdentity, FilePlanner, Listed}
 import lakehouse.ingestion.engine.RunFailedException
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -72,6 +72,12 @@ final class LandingSpec
 
   private def orders: Path = landing.resolve("shop/orders")
 
+  /** Which file of the file system `path` is, as the JDK says it. */
+  private def identityOf(path: Path): FileIdentity = FileIdentity(
+    Files.getAttribute(path, "unix:dev").asInstanceOf[Long],
+    Files.getAttribute(path, "unix:ino").asInstanceOf[Long]
+  )
+
   private def refused(body: => Any): RunFailedException = {
     val failure = the[RunFailedException] thrownBy body
     failure.failure shouldBe FailureClass.Permanent
@@ -83,15 +89,21 @@ final class LandingSpec
   // ---------------------------------------------------------------------------------------------
 
   test("the files of the directory, with their size and their time to the millisecond") {
-    write(orders.resolve("a.csv"), bytes = 5)
+    val a = write(orders.resolve("a.csv"), bytes = 5)
     // A file system keeps the time to the nanosecond, and a listing gives it to the millisecond,
     // as Hadoop does and as the control plane records it.
-    write(orders.resolve("b.csv"), bytes = 0, at = Instant.parse("2026-11-19T08:30:15.123456789Z"))
+    val b =
+      write(
+        orders.resolve("b.csv"),
+        bytes = 0,
+        at = Instant.parse("2026-11-19T08:30:15.123456789Z")
+      )
 
     list().sortBy(_.name) shouldBe Vector(
-      Listed("a.csv", 5, changed),
-      Listed("b.csv", 0, changed)
+      Listed("a.csv", 5, changed, identityOf(a)),
+      Listed("b.csv", 0, changed, identityOf(b))
     )
+    identityOf(a) should not be identityOf(b)
   }
 
   test("not the hidden files, nor those of another pattern, nor what is under a directory") {
@@ -130,17 +142,18 @@ final class LandingSpec
     val elsewhere = write(landing.resolve("shared/2026-11-19.csv"), bytes = 7)
     Files.createSymbolicLink(orders.resolve("today.csv"), elsewhere)
 
-    list() shouldBe Vector(Listed("today.csv", 7, changed))
+    // The file that the link leads to, which is the one a read reads.
+    list() shouldBe Vector(Listed("today.csv", 7, changed, identityOf(elsewhere)))
   }
 
   test("a relative link is resolved from where it is") {
-    write(landing.resolve("shared/a.csv"), bytes = 2)
+    val shared = write(landing.resolve("shared/a.csv"), bytes = 2)
     Files.createSymbolicLink(
       orders.resolve("a.csv"),
       orders.relativize(landing.resolve("shared/a.csv"))
     )
 
-    list() shouldBe Vector(Listed("a.csv", 2, changed))
+    list() shouldBe Vector(Listed("a.csv", 2, changed, identityOf(shared)))
   }
 
   test("a source directory that is a link to another directory of the landing zone") {

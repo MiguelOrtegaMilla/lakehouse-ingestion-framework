@@ -2,7 +2,7 @@ package lakehouse.ingestion.engine.files
 
 import java.io.IOException
 import java.net.URI
-import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 import java.nio.file.{Files, FileSystemException, LinkOption, NoSuchFileException, Path, Paths}
 import java.time.Instant
 
@@ -10,7 +10,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.Using
 
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RootUri}
-import lakehouse.ingestion.core.files.{FileName, Listed}
+import lakehouse.ingestion.core.files.{FileIdentity, FileName, FilePlan, Listed, PlannedFile}
 import lakehouse.ingestion.engine.RunFailedException
 
 /**
@@ -28,12 +28,13 @@ import lakehouse.ingestion.engine.RunFailedException
  * where the link leads that files must be under. A link inside the landing zone to another place
  * inside it is let be, and the file is read through it.
  *
- * '''What is not checked here.''' A link that is changed between the listing and the read leads
- * the read wherever it leads by then: Spark opens a file by its name, and no check made before
- * can hold for the moment it opens it. The read of a plan resolves its files again (P5.7),
- * which leaves the time between that and Spark's open. A hard link is a file like any other,
- * and Linux lets a process make one only to a file that it owns or may write
- * (`fs.protected_hardlinks`).
+ * A name may lead to another file at any moment: a producer that writes a file again, renames
+ * another over it, or changes a link. So each file is listed with which file of the file system
+ * it is (`FileIdentity`), its size and its time, all from one look at it, and the plan keeps
+ * them. A read of the plan confirms them just before Spark reads the files and again just after
+ * (`confirm`, P5.7). What that leaves open is said where the read is (`FileSourceConnector`).
+ * A hard link is a file like any other, and Linux lets a process make one only to a file that
+ * it owns or may write (`fs.protected_hardlinks`).
  *
  * The root is `file://`. A landing zone on object storage has no links, and is read with the
  * deployment that has one (E2).
@@ -72,11 +73,54 @@ final class Landing(root: RootUri) {
     val problems = looked.collect { case (name, Left(problem)) => s"'$name' $problem" }
     if (problems.nonEmpty)
       throw RunFailedException.permanent(
-        s"the directory ${config.path} of the landing zone has ${problems.size} " +
-          s"${if (problems.size == 1) "file" else "files"} that no run may read, and nothing " +
-          s"was planned: ${Landing.some(problems.sorted)}"
+        s"the directory ${config.path} of the landing zone has ${Landing.files(problems.size)} " +
+          s"that no run may read, and nothing was planned: ${Landing.some(problems.sorted)}"
       )
     looked.collect { case (_, Right(listed)) => listed }
+  }
+
+  /**
+   * Where the files of a plan are, if each of its names still leads to the file that was planned:
+   * the same file of the file system, of the same size and the same time, under the root.
+   *
+   * @return the path of each file of the plan, in its directory as it is resolved, in the order
+   *   of the plan; or what is not as it was planned, for each name that is not
+   * @throws RunFailedException a permanent failure, for a root or a directory that is not there,
+   *   is not a directory, or is outside the root
+   * @throws IllegalArgumentException if the plan is of another directory than the source's
+   */
+  @throws[IOException]
+  def confirm(config: FileConnectorConfig, plan: FilePlan): Either[Vector[String], Vector[Path]] = {
+    require(plan.directory == config.path, s"the plan is of ${plan.directory}, not ${config.path}")
+    val (rootReal, directory) = locate(config)
+
+    val found = plan.planned.map { planned =>
+      val name = planned.name.value
+      val entry = directory.resolve(name)
+      val now = look(entry, name, rootReal)
+        .getOrElse(Left("is not there any more, or is a directory now"))
+        .flatMap(listed => changes(planned, listed).toLeft(entry))
+      now.left.map(problem => s"'$name' $problem")
+    }
+    val problems = found.collect { case Left(problem) => problem }
+    if (problems.nonEmpty) Left(problems) else Right(found.collect { case Right(path) => path })
+  }
+
+  /** How a file is not the one that was planned, if it is not. */
+  private def changes(planned: PlannedFile, now: Listed): Option[String] = {
+    val was = planned.file
+    Seq(
+      Option.when(now.identity != planned.identity)(
+        s"is another file of the file system (${now.identity}, and was ${planned.identity})"
+      ),
+      Option.when(now.size != was.size)(s"is of ${now.size} bytes, and was of ${was.size}"),
+      Option.when(now.modifiedAt != was.modifiedAt)(
+        s"was changed at ${now.modifiedAt}, and was of ${was.modifiedAt}"
+      )
+    ).flatten match {
+      case Seq() => None
+      case some => Some(some.mkString(", "))
+    }
   }
 
   /** The real root, and the real directory of the source, which is under it. */
@@ -120,37 +164,32 @@ final class Landing(root: RootUri) {
    * @return none for a directory, a link to one, and an entry that is gone since it was listed:
    *   its producer took it back, and it is not the source's any more
    */
-  private def look(entry: Path, name: String, rootReal: Path): Option[Either[String, Listed]] = {
-    val own = attributes(entry, LinkOption.NOFOLLOW_LINKS)
-    own.flatMap { attrs =>
-      if (attrs.isDirectory) None
-      else if (FileName.parse(name).isLeft) Some(Right(listed(name, attrs)))
-      else if (!attrs.isSymbolicLink) Some(file(name, attrs))
+  private def look(entry: Path, name: String, rootReal: Path): Option[Either[String, Listed]] =
+    stat(entry, LinkOption.NOFOLLOW_LINKS).flatMap { own =>
+      if (own.isDirectory) None
+      else if (FileName.parse(name).isLeft) Some(Right(own.listed(name)))
+      else if (!own.isSymbolicLink) Some(file(name, own))
       else
         real(entry, missing = "is a symbolic link to nothing") match {
           case Left(problem) => Some(Left(problem))
           case Right(target) =>
-            attributes(target).flatMap { targetAttrs =>
-              if (targetAttrs.isDirectory) None
+            stat(target).flatMap { theirs =>
+              if (theirs.isDirectory) None
               else if (!target.startsWith(rootReal))
                 Some(Left("leads out of the landing zone, through a symbolic link"))
-              else Some(file(name, targetAttrs))
+              else Some(file(name, theirs))
             }
         }
     }
-  }
 
   /** What is read under a name: a file, and nothing else. */
-  private def file(name: String, attrs: BasicFileAttributes): Either[String, Listed] =
-    if (attrs.isRegularFile) Right(listed(name, attrs))
+  private def file(name: String, stat: Landing.Stat): Either[String, Listed] =
+    if (stat.isRegularFile) Right(stat.listed(name))
     else
       Left(
         "is not a file but a pipe, a socket or a device: a read of it could wait for ever, or " +
           "never end"
       )
-
-  private def listed(name: String, attrs: BasicFileAttributes): Listed =
-    Listed(name, attrs.size, Instant.ofEpochMilli(attrs.lastModifiedTime.toMillis))
 
   /**
    * The path with every link in it resolved, or why it leads nowhere: to what is not there, or
@@ -166,17 +205,53 @@ final class Landing(root: RootUri) {
         Left(s"is a symbolic link that cannot be followed: ${e.getReason}")
     }
 
-  private def attributes(path: Path, options: LinkOption*): Option[BasicFileAttributes] =
-    try Some(Files.readAttributes(path, classOf[BasicFileAttributes], options: _*))
-    catch { case _: NoSuchFileException => None }
+  /**
+   * What the file system says of a path, all of it from one `stat`, so that the size, the time
+   * and the identity are of one moment: three looks could each see another file.
+   */
+  private def stat(path: Path, options: LinkOption*): Option[Landing.Stat] =
+    try {
+      val attrs = Files.readAttributes(path, Landing.Attributes, options: _*)
+      Some(
+        Landing.Stat(
+          isDirectory = attrs.get("isDirectory").asInstanceOf[Boolean],
+          isRegularFile = attrs.get("isRegularFile").asInstanceOf[Boolean],
+          isSymbolicLink = attrs.get("isSymbolicLink").asInstanceOf[Boolean],
+          size = attrs.get("size").asInstanceOf[Long],
+          modifiedAt = attrs.get("lastModifiedTime").asInstanceOf[FileTime].toMillis,
+          identity = FileIdentity(
+            attrs.get("dev").asInstanceOf[Long],
+            attrs.get("ino").asInstanceOf[Long]
+          )
+        )
+      )
+    } catch { case _: NoSuchFileException => None }
 }
 
 object Landing {
 
+  final private[files] case class Stat(
+      isDirectory: Boolean,
+      isRegularFile: Boolean,
+      isSymbolicLink: Boolean,
+      size: Long,
+      modifiedAt: Long,
+      identity: FileIdentity
+  ) {
+    def listed(name: String): Listed =
+      Listed(name, size, Instant.ofEpochMilli(modifiedAt), identity)
+  }
+
+  /** The attributes of the `unix` view that a look reads, which Linux and macOS have. */
+  private val Attributes =
+    "unix:isDirectory,isRegularFile,isSymbolicLink,size,lastModifiedTime,dev,ino"
+
+  private[files] def files(count: Int): String = if (count == 1) "1 file" else s"$count files"
+
   /** How many problems a failure names: a directory may have thousands, and a log one line. */
   val Named = 10
 
-  private def some(problems: Seq[String]): String =
+  private[files] def some(problems: Seq[String]): String =
     if (problems.size <= Named) problems.mkString("; ")
     else s"${problems.take(Named).mkString("; ")}; and ${problems.size - Named} more"
 }
