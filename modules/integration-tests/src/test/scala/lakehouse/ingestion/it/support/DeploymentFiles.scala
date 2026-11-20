@@ -91,19 +91,28 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
   lazy val validProfile: Path = profileFile()
 
   /**
-   * A source of CSV files, written among the sources of the deployment, with its directory made
-   * in the landing zone.
+   * A source of files, written among the sources of the deployment, with its directory made in
+   * the landing zone.
    *
    * @param rejected the share of the records of a batch that it lets be rejected; none, unless
    *   it says so
+   * @param table its table of Bronze, under the lake; one of its own, unless it is given one,
+   *   which another source may be given as well
    */
-  def fileSource(id: SourceId, rejected: Option[String] = None): Source = {
+  def fileSource(
+      id: SourceId,
+      rejected: Option[String] = None,
+      format: String = "csv",
+      table: Option[String] = None
+  ): Source = {
     Files.createDirectories(directoryOf(id))
     val text =
       s"""id: $id
-         |connector: { type: file, path: ${directoryOf(id).getFileName}, format: csv }
+         |connector: { type: file, path: ${directoryOf(id).getFileName}, format: $format }
          |load: { mode: new_files }
-         |targets: { bronze: { table: bronze/${id.value.replace('.', '/')} } }
+         |targets: { bronze: { table: ${table.getOrElse(
+          s"bronze/${id.value.replace('.', '/')}"
+        )} } }
          |${rejected.fold("")(share => s"quality: { max_rejected_ratio: $share }")}
          |""".stripMargin
     Files.write(sources.resolve(s"$id.yaml"), text.getBytes(UTF_8))

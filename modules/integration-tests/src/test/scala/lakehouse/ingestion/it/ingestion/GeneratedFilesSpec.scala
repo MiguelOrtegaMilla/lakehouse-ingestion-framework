@@ -1,11 +1,8 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.nio.charset.StandardCharsets.UTF_8
-
 import lakehouse.ingestion.core.config.{EngineColumns, Source}
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.it.support.FileGenerator._
-import org.apache.spark.sql.functions.col
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -23,43 +20,7 @@ import org.scalatest.matchers.should.Matchers
  * (P9). Until then a batch of JSON has the columns of all its files, and a file that lacks a
  * column of its table is taken, with nothing in it: the deliveries here are those that P5 takes.
  */
-final class GeneratedFilesSpec extends AnyFunSuite with Matchers with IngestionSuite {
-
-  private def leave(of: Source, delivery: Delivery): Unit =
-    delivery.files.foreach(file => drop(of, file.name, file.text): Unit)
-
-  /** A row, or a record: its file, and its value under each of the columns, if it has one. */
-  private type Record = (String, Seq[Option[String]])
-
-  /** What Bronze is to have of some deliveries, under `columns`. */
-  private def expected(columns: Seq[String], deliveries: Delivery*): Seq[Record] =
-    deliveries
-      .flatMap(_.files)
-      .flatMap(file => file.records.map(record => file.name -> columns.map(record.get)))
-      .sortBy(_.toString)
-
-  /** What Bronze has, under `columns`. */
-  private def written(of: Source, columns: Seq[String]): Seq[Record] =
-    spark.read
-      .format("delta")
-      .load(bronze(of).uri)
-      .select(col(EngineColumns.SourceFile) +: columns.map(col): _*)
-      .collect()
-      .map { row =>
-        row.getString(0).split('/').last -> columns.indices.map(i => Option(row.getString(i + 1)))
-      }
-      .sortBy(_.toString)
-      .toSeq
-
-  private def columnsOf(of: Source): Set[String] =
-    spark.read.format("delta").load(bronze(of).uri).columns.toSet
-
-  /** The records of some deliveries that cannot be parsed: the batch, the file, the text. */
-  private def setApart(batch: Long, delivery: Delivery): Seq[(Long, String, String)] =
-    delivery.files.flatMap(file => file.corrupt.map(text => (batch, file.name, text))).sorted
-
-  private def bytes(delivery: Delivery): Long =
-    delivery.files.map(_.text.getBytes(UTF_8).length.toLong).sum
+final class GeneratedFilesSpec extends AnyFunSuite with Matchers with GeneratedDeliveries {
 
   /** One run of a delivery that is all new: what it counted is what the delivery has. */
   private def take(of: Source, delivery: Delivery): Outcome.Ingested = {
