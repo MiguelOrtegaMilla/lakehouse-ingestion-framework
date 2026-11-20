@@ -347,6 +347,70 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
       .isRight shouldBe true
   }
 
+  test("a profile sets none of the Spark settings that the engine sets, whatever their case") {
+    def settings(key: String): Seq[String] = errorsOf(Valid + s"  settings:\n    $key: x\n")
+
+    Seq(
+      "spark.sql.extensions",
+      "spark.sql.catalog.spark_catalog",
+      "spark.SQL.Extensions"
+    ).foreach { key =>
+      withClue(key)(
+        settings(key) shouldBe Seq(
+          s"$File: spark.settings.$key is set by the engine: every session of a run has the " +
+            "extension and the catalog of Delta"
+        )
+      )
+    }
+    settings("spark.app.name") shouldBe Seq(
+      s"$File: spark.settings.spark.app.name is set by the engine: a session is named after " +
+        "the source that it runs"
+    )
+    settings("spark.delta.logstore.class") shouldBe Seq(
+      s"$File: spark.settings.spark.delta.logstore.class is set by the engine: which " +
+        "LogStore commits to a table is not a setting of a profile (ADR-0004)"
+    )
+    // Before it is taken for a credential: it is a reference, and the engine's to write.
+    Seq(
+      "spark.hadoop.lakehouse.logstore.jdbc.url",
+      "spark.hadoop.lakehouse.logstore.jdbc.passwordRef",
+      "spark.hadoop.lakehouse.logstore.fault.afterInsert.delayMs"
+    ).foreach { key =>
+      withClue(key)(
+        settings(key) shouldBe Seq(
+          s"$File: spark.settings.$key is set by the engine, from databases.coordination: how " +
+            "the LogStore reaches its database is said there, and its fault hooks are for " +
+            "tests alone (ADR-0004)"
+        )
+      )
+    }
+    settings("spark.Master") shouldBe
+      Seq(s"$File: spark.settings.spark.Master is set by the field master of this profile")
+  }
+
+  test("a profile does not give new tables a retention of their transactions") {
+    Seq(
+      "spark.databricks.delta.properties.defaults.setTransactionRetentionDuration",
+      "spark.databricks.delta.properties.defaults.settransactionretentionduration"
+    ).foreach { key =>
+      withClue(key)(
+        errorsOf(Valid + s"  settings:\n    $key: \"interval 30 days\"\n") shouldBe Seq(
+          s"$File: spark.settings.$key would give every table that Delta makes the property " +
+            "delta.setTransactionRetentionDuration. Delta would then forget the batches " +
+            "written to a table before that time, and a replay would write such a batch " +
+            "again: no table of the engine may have it"
+        )
+      )
+    }
+    // Other defaults of the properties of a table are a profile's to give.
+    Profile
+      .load(
+        File,
+        Valid + "  settings:\n    spark.databricks.delta.properties.defaults.logRetentionDuration: \"interval 60 days\"\n"
+      )
+      .isRight shouldBe true
+  }
+
   test("a profile whose databases cannot be reached is validated all the same, and at once") {
     // Nothing is connected to and no name is looked up: `.invalid` never resolves (RFC 6761).
     val unreachable = Valid.replace("localhost:5432", "db.unreachable.invalid:5432")
