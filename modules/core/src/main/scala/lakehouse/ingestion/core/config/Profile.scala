@@ -199,20 +199,98 @@ object Profile {
     val lower = key.toLowerCase(java.util.Locale.ROOT)
     if (!key.startsWith("spark."))
       value.fail("is not a Spark setting: its key must start with spark.")
-    else if (key == "spark.master") value.fail("is set by the field master of this profile")
-    else if (key.startsWith("spark.delta.logStore."))
-      value.fail(
-        "is set by the engine: which LogStore commits to a table is not a setting of a profile (ADR-0004)"
-      )
-    else if (CredentialWords.exists(lower.contains))
+    else if (lower == "spark.master") value.fail("is set by the field master of this profile")
+    else
+      refusedSparkSetting(key) match {
+        case Some(reason) => value.fail(reason)
+        case None => credentialOrValue(key, lower, value)
+      }
+  }
+
+  private def credentialOrValue(key: String, lower: String, value: Node): Result[(String, String)] =
+    if (CredentialWords.exists(lower.contains))
       value.fail(
         "is a credential, and no credential is written in a profile: object storage takes its " +
           "own from the environment or from a Hadoop credential provider (ADR-0011)"
       )
     else value.scalarText.map(key -> _)
-  }
 
   private val CredentialWords = Seq("password", "secret", "token", "access.key")
+
+  /**
+   * The Spark settings that the engine gives the session of every run, whatever its profile
+   * says (the command `run`). A profile may set none of them: its value would be overridden
+   * without a word, or would be the engine's undoing. A test of the command holds every key
+   * that it sets to these.
+   */
+  object EngineSpark {
+
+    /** What a session is called: after the source that it runs. */
+    val AppName = "spark.app.name"
+
+    /** Delta's extension to Spark SQL, which every session of the engine has. */
+    val Extensions = "spark.sql.extensions"
+
+    /** Delta's catalog in place of Spark's own. */
+    val Catalog = "spark.sql.catalog.spark_catalog"
+
+    /** Which LogStore commits to a table, by scheme or for every scheme (ADR-0004). */
+    val LogStorePrefix = "spark.delta.logStore."
+
+    /**
+     * The settings of the LogStore, made from `databases.coordination` (ADR-0004 §3.9), its
+     * fault hooks among them, which are for tests alone. Under `spark.hadoop.`, which Spark
+     * copies into the Hadoop configuration that Delta hands a LogStore.
+     */
+    val LogStoreSettingsPrefix = "spark.hadoop.lakehouse.logstore."
+  }
+
+  /**
+   * What gives every table that Delta makes `delta.setTransactionRetentionDuration`
+   * (`DeltaConfigs`: `spark.databricks.delta.properties.defaults.` and the key of the property
+   * without `delta.`). Delta then forgets the transaction of a batch that is older than that,
+   * and a replay of the batch writes it again: no table of the engine may have the property
+   * (P5.4, P5.5).
+   */
+  val TransactionRetentionDefault =
+    "spark.databricks.delta.properties.defaults.setTransactionRetentionDuration"
+
+  /**
+   * Why a Spark setting is not a profile's to set, if it is not: one that the engine sets, or
+   * one that would break what the engine stands on. Keys are compared with case aside: one
+   * under another case is no setting of Spark's, and is a mistake, or a way round this rule.
+   *
+   * `spark.master` is not here: it is a field of the profile, said in its own way.
+   */
+  def refusedSparkSetting(key: String): Option[String] = {
+    val lower = key.toLowerCase(java.util.Locale.ROOT)
+    def is(engine: String): Boolean = lower == engine.toLowerCase(java.util.Locale.ROOT)
+    def under(prefix: String): Boolean =
+      lower.startsWith(prefix.toLowerCase(java.util.Locale.ROOT))
+
+    if (under(EngineSpark.LogStorePrefix))
+      Some(
+        "is set by the engine: which LogStore commits to a table is not a setting of a profile (ADR-0004)"
+      )
+    else if (under(EngineSpark.LogStoreSettingsPrefix))
+      Some(
+        "is set by the engine, from databases.coordination: how the LogStore reaches its " +
+          "database is said there, and its fault hooks are for tests alone (ADR-0004)"
+      )
+    else if (is(EngineSpark.Extensions) || is(EngineSpark.Catalog))
+      Some(
+        "is set by the engine: every session of a run has the extension and the catalog of Delta"
+      )
+    else if (is(EngineSpark.AppName))
+      Some("is set by the engine: a session is named after the source that it runs")
+    else if (is(TransactionRetentionDefault))
+      Some(
+        "would give every table that Delta makes the property delta.setTransactionRetentionDuration. " +
+          "Delta would then forget the batches written to a table before that time, and a replay " +
+          "would write such a batch again: no table of the engine may have it"
+      )
+    else None
+  }
 
   // -------------------------------------------------------------------------------------------
   // What is about more than one field
