@@ -123,7 +123,7 @@ The example with every section is [`conf/sources/sales.orders.yaml`](../../conf/
 | `connector.type` | The kind of connector: `jdbc` or `file`. The other fields of `connector` are the kind's, below | required |
 | `load.mode` | `full`: everything, every time. `incremental`: what changed, by a watermark. `new_files`: the files not taken yet | required |
 | `load.watermark.column` | The column of a timestamp that only grows, as `updated_at`: a [name](#a-name). [The watermark](#the-watermark) says why a timestamp. Required for `incremental`, and an error for any other mode | — |
-| `load.watermark.lookback` | How far before the last watermark a batch starts again, reading again what the batch before read. A [duration](#a-duration) | `0s` |
+| `load.watermark.lookback` | How far before the last watermark a batch starts again, reading again what the batch before read, and no row at or before `start`. A [duration](#a-duration) | `0s` |
 | `load.watermark.safety_margin` | How far behind the present of the database a batch stops, for transactions that are still open. A [duration](#a-duration) | `0s` |
 | `load.watermark.start` | Where the first batch of the source starts: a [moment](#a-moment). The rows at or before it are not the source's to ingest | the first batch reads the whole table |
 | `load.max_batch_range` | The widest stretch of time that one batch takes, counted from the watermark. A [duration](#a-duration), `1s` at least. `incremental` alone | no limit |
@@ -151,7 +151,10 @@ An incremental load reads, at each batch, the rows whose watermark column is aft
 - **A timestamp, and not a number that grows.** A row gets the time of its column, or the number of a sequence, when its transaction writes it, and is seen when the transaction commits: a row with an earlier time, or a lower number, can appear after a later one was read. A margin of time covers that for a transaction shorter than the margin. No margin can be said in the numbers of a key, so a key that grows is not taken as a watermark. `timestamptz` is the type to have; a `timestamp` without a zone is taken as UTC.
 - **`safety_margin` is what loses nothing; `lookback` reads again.** A row is lost when its transaction committed later than `safety_margin` and `lookback` together after the time it wrote. The margin has a batch wait for such transactions, and reads nothing twice. The lookback reads the last stretch again at every batch, and Bronze keeps every copy for Silver to tell apart. So the margin is the one to set, longer than the longest transaction that writes the table, and `lookback` stays at `0s` unless a source says otherwise.
 - **The first batch.** Without `start` it reads the whole table up to its bound, in one statement, however long the history of the table is. With it, it starts there. `max_batch_range` is counted from the watermark, and the first batch without `start` has none: it is not cut.
-- **`start` is looked at once.** It is where a source with no watermark starts. Changed after the first batch, it changes nothing: history before the watermark is a backfill (discovery §17, P7).
+- **`start` starts a source, once.** It is where a source with no watermark starts. After the first batch it bounds one thing: `lookback` reads no row at or before it, since those are not the source's to ingest. Changed after the first batch, it moves no window forward and skips no row: history before the watermark is a backfill (discovery §17, P7).
+- **The watermark never goes back.** A batch is planned only when its bound is after the watermark. If the clock of the database went back, or `safety_margin` was raised, the source waits until its bound passes the watermark again, and a run meanwhile ends well with nothing read.
+
+The decision, with what was left out and what it costs, is [ADR-0020](../adr/0020-the-watermark-of-an-incremental-load.md).
 
 `validate` warns of a watermark with `safety_margin` and `lookback` both at `0s`, which loses the rows of any transaction that is still open when its window is read, and of `max_batch_range` without `start`, which does not cut the first batch.
 
@@ -338,6 +341,6 @@ A change to a source that what is already ingested cannot follow is a **breaking
 | `connector.table`, the database of `connector.connection.url`, or `connector.type`, for an incremental load | The watermark that is stored is of what was read before: going on from it would skip rows without a word |
 
 - What only says how a database is reached is no breaking change: the role, the reference to the password, TLS, the timeouts.
-- Nor is `load.watermark.start`: it is looked at only while a source has no watermark.
+- Nor is `load.watermark.start`: it starts a source that has no watermark, and after that bounds only what `lookback` reads again.
 - A source that gives Silver up, or goes from a watermark to full loads, breaks nothing that was done. A full load reads from wherever it likes.
 - What lets a breaking change through, a reset of the state or a backfill, comes with the control plane and with recovery (discovery §17, P4 and P7).
