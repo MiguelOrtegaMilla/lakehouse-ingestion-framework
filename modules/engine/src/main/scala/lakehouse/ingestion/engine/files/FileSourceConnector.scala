@@ -28,7 +28,7 @@ import lakehouse.ingestion.engine.connector.{
 import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.functions.{col, lit, udf}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
-import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, SparkSession}
 import org.slf4j.LoggerFactory
 
 /**
@@ -47,9 +47,8 @@ import org.slf4j.LoggerFactory
  *    a value is quoted if it has a comma, a quote or the end of a line in it, a quote inside
  *    it is written twice, and a backslash is a character like any other. A source that writes
  *    another dialect has no way to say so yet (P8). The columns of JSON are those of the
- *    objects of the batch; a
- *    value that is an object or a list is kept as the JSON it was written as. JSON is one object
- *    to a line.
+ *    objects of the batch, each under its name as it was written; a value that is an object or
+ *    a list is kept as the JSON it was written as. JSON is one object to a line.
  *  - '''Parquet with its own types''', and the columns of every file of the batch: a column
  *    that only some files have is null in the rows of the others. Two files with one column
  *    of two types fail the read.
@@ -60,6 +59,22 @@ import org.slf4j.LoggerFactory
  *  - Every row says the file that it was read from (`_source_file`), as `<directory>/<name>`
  *    under the landing root: where the source left it, which is how `processed_file` records
  *    it.
+ *
+ * '''The names of the columns are the source's, and no value is lost for its name.''' Spark
+ * and Delta tell the names of columns apart without their case, and a read that left that to
+ * them would lose what a source sent, without a word:
+ *
+ *  - ''fields of JSON that differ only in their case'', as `id` in one record and `ID` in
+ *    another, would be read as one column, with the values under one of the two names left
+ *    out. They fail the batch, as permanent, naming both: which of the two a column is to be
+ *    is the policy of a schema (P9). So does a record with a field twice, which Spark refuses
+ *    with an error of no class. Inside an object nothing is told apart: it is kept as its text;
+ *  - ''a header of CSV with a name twice, case aside, or with an empty name'' is read by Spark
+ *    under names of its own making, which no file then has: the batch fails, as permanent, and
+ *    says so, as it does for files whose headers differ;
+ *  - ''a column named `_metadata`'' is a column of the source like any other. It is the name
+ *    under which Spark gives the file of a row, which is asked for in the way that a column of
+ *    the source does not hide (`Dataset.metadataColumn`).
  *
  * '''The files are the planned ones while they are read.''' A name may be given to another file
  * at any moment. So, just before Spark reads the files, each name must still lead to a file of
@@ -139,13 +154,15 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       readable(context.spark, config.format, before.paths, sourceFiles(files, before.paths))
     // What is read is kept by Spark apart from the files, and everything after is made from it.
     val kept =
-      try read.localCheckpoint(eager = true)
+      try read.rows.localCheckpoint(eager = true)
       catch {
         case e: Exception if otherHeader(e) =>
           throw RunFailedException.permanent(
-            s"the files of CSV of the batch of ${config.path} do not all have one header: Spark " +
-              "reads a record by the place of its values, and would put them under another " +
-              "column's name. Nothing was written",
+            s"a file of CSV of the batch of ${config.path} does not have the header that the " +
+              "batch is read by. Either the files do not all have one header, or a header has " +
+              "a name twice, case aside, or a name that is empty, which Spark reads under a " +
+              "name of its own making. Spark reads a record by the place of its values, and " +
+              "would put them under another column's name. Nothing was written",
             e
           )
       }
@@ -155,7 +172,9 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
     if (config.format == FileConnectorConfig.Format.Parquet) ReadResult(kept, unparsed = None)
     else
       ReadResult(
-        rows = kept.filter(col(Unparsed).isNull).drop(Unparsed, NoColumn),
+        // The column that stood for the columns of a batch that has none goes with it. A
+        // column of the source is kept, whatever it is named.
+        rows = kept.filter(col(Unparsed).isNull).drop(Unparsed +: read.placeholder.toSeq: _*),
         unparsed = Some(
           kept
             .filter(col(Unparsed).isNotNull)
@@ -216,7 +235,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       format: FileConnectorConfig.Format,
       paths: Vector[Path],
       sourceFileOf: Map[String, String]
-  ): DataFrame = {
+  ): Reading = {
     paths.map(_.toString).find(_.exists(Globbed.contains(_))).foreach { _ =>
       throw RunFailedException.permanent(
         "the directory of the files, with its symbolic links resolved, has a character that " +
@@ -232,7 +251,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       )
     }
 
-    val read = format match {
+    val (read, columns) = format match {
       case FileConnectorConfig.Format.Csv =>
         // The dialect is RFC 4180's: a quote inside a quoted value is the quote twice. Spark's
         // own escape is a backslash, under which such a value keeps every quote it was written
@@ -243,35 +262,84 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
           .option("quote", CsvQuote)
           .option("escape", CsvQuote)
         val columns = refused(header.csv(locations: _*).schema.fieldNames.toSeq)
-        header
+        val csv = header
           .option("enforceSchema", "false")
           .option("mode", "PERMISSIVE")
           .option("columnNameOfCorruptRecord", Unparsed)
           .schema(asText(columns))
           .csv(locations: _*)
+        (csv, columns)
 
       case FileConnectorConfig.Format.Json =>
-        val unparsed = spark.read.option("columnNameOfCorruptRecord", Unparsed)
-        val columns = refused(
-          unparsed
-            .option("primitivesAsString", "true")
-            .json(locations: _*)
-            .schema
-            .fieldNames
-            .toSeq
-            .filterNot(_ == Unparsed)
-        )
-        unparsed.option("mode", "PERMISSIVE").schema(asText(columns)).json(locations: _*)
+        val columns = refused(fieldsOfJson(spark, locations))
+        val json = spark.read
+          .option("columnNameOfCorruptRecord", Unparsed)
+          .option("mode", "PERMISSIVE")
+          .schema(asText(columns))
+          .json(locations: _*)
+        (json, columns)
 
       case FileConnectorConfig.Format.Parquet =>
-        val parquet = spark.read.option("mergeSchema", "true").parquet(locations: _*)
-        refused(parquet.schema.fieldNames.toSeq)
-        parquet
+        val parquet = oneNameEach("a file of Parquet") {
+          spark.read.option("mergeSchema", "true").parquet(locations: _*)
+        }
+        (parquet, refused(parquet.schema.fieldNames.toSeq))
     }
 
-    val withFile = read.select(col("*"), ofItsFile(col("_metadata.file_path")).as(SourceFile))
-    if (format == FileConnectorConfig.Format.Parquet) withFile
-    else withFile.withColumn(EngineColumns.RescuedData, lit(null).cast(StringType))
+    // The file of a row, asked for by what it is and not by its name: a source may have a
+    // column `_metadata` of its own, which a name would find in place of Spark's.
+    val file = read.metadataColumn(FileMetadata).getField("file_path")
+    val withFile = read.select(col("*"), ofItsFile(file).as(SourceFile))
+    val text = format != FileConnectorConfig.Format.Parquet
+    Reading(
+      if (text) withFile.withColumn(EngineColumns.RescuedData, lit(null).cast(StringType))
+      else withFile,
+      placeholder = Option.when(text && columns.isEmpty)(NoColumn)
+    )
+  }
+
+  /**
+   * The fields of the objects of a batch of JSON, each as it was written.
+   *
+   * They are asked with the case of a name counting, in a session of Spark of this question's
+   * own. Asked as the session of a run tells names apart, without their case, two fields that
+   * differ only in it come back as one column, under one of the two names, and the read that
+   * follows finds the values under that name alone: those under the other are left out of the
+   * row, of what is set apart, and of every count. So the two are found here, and refused.
+   *
+   * @throws RunFailedException a permanent failure, for fields that differ only in their case,
+   *   and for a record with a field twice
+   */
+  private def fieldsOfJson(spark: SparkSession, locations: Seq[String]): Seq[String] = {
+    // The settings of the session of the run are not touched: this one is made from it, has
+    // its own, and is left to be collected. The jobs that it starts are the thread's, and so
+    // the run's, to stop.
+    val exact = spark.newSession()
+    exact.conf.set("spark.sql.caseSensitive", "true")
+    val fields = oneNameEach("a record of JSON") {
+      exact.read
+        .option("columnNameOfCorruptRecord", Unparsed)
+        .option("primitivesAsString", "true")
+        .json(locations: _*)
+        .schema
+        .fieldNames
+        .toSeq
+        .filterNot(_ == Unparsed)
+    }
+    val alike = fields
+      .groupBy(_.toLowerCase(Locale.ROOT))
+      .values
+      .collect { case names if names.size > 1 => names.sorted.map(n => s"'$n'").mkString(" and ") }
+      .toSeq
+      .sorted
+    if (alike.nonEmpty)
+      throw RunFailedException.permanent(
+        "the records of JSON of the batch have fields that differ only in their case: " +
+          s"${Landing.some(alike)}. Spark and Delta take such names for one column, and the " +
+          "values under one of them would be left out without a word. Nothing was written: " +
+          "the fields are to have one name before they get here"
+      )
+    fields
   }
 }
 
@@ -299,6 +367,39 @@ object FileSourceConnector {
    * file for the column of what cannot be parsed alone. It is dropped once the files are read.
    */
   private val NoColumn = "_lakehouse_no_column"
+
+  /** Spark's own column of a file source, which has the file of each row. */
+  private val FileMetadata = "_metadata"
+
+  /**
+   * What is read of a batch, before it is kept.
+   *
+   * @param placeholder the column that the read made for a batch whose files have none, to be
+   *   dropped once the files are read; none, if the files have columns, whatever they are named
+   */
+  final private case class Reading(rows: DataFrame, placeholder: Option[String])
+
+  /**
+   * What Spark made of the columns of some files, unless two of them have one name: Spark says
+   * so with an error of no class, which here is a failure of the data, and permanent.
+   */
+  private def oneNameEach[A](what: String)(columns: => A): A =
+    try columns
+    catch {
+      case e: AnalysisException if Option(e.getCondition).contains(SameName) =>
+        throw RunFailedException.permanent(
+          s"$what of the batch has a field twice, or two that differ only in their case: " +
+            s"${firstLine(e.getMessage)} Nothing was written: a field is to have one name, and " +
+            "one field that name, before it gets here",
+          e
+        )
+    }
+
+  /** The condition of Spark's error for two columns of one name. */
+  private val SameName = "COLUMN_ALREADY_EXISTS"
+
+  private def firstLine(message: String): String =
+    Option(message).flatMap(_.linesIterator.map(_.trim).find(_.nonEmpty)).getOrElse("")
 
   /** The columns as text, and the one for what cannot be parsed. */
   private def asText(columns: Seq[String]): StructType = {
