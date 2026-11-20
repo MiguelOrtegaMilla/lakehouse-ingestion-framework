@@ -17,7 +17,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)). |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
 | `engine` | Connectors, Delta writers, control-plane repositories, engine service |
-| `cli` | Entry point, wiring, exit codes. So far: the command `validate`. |
+| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate` and `run`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
 The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`.
@@ -169,13 +169,43 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 ```
 
 ```text
-control: version 3, 3 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
-delta_coordination: version 3, 3 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+control: version 4, 4 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+delta_coordination: version 4, 4 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 
 It can be run again at any time: a schema that is at its version is left as it is. The engine and the LogStore run no DDL. Each checks the version of its schema before it touches a table, and refuses to work on another.
 
 `ControlSchemaSpec` and `CoordinationSchemaSpec` test what the constraints of each schema guarantee whatever the code does, and what each role may and may not do; `MigrateCommandSpec`, the command against a database as the bootstrap leaves it.
+
+## Running a source
+
+`run` runs one source once: the new files of a file source, into its table of Bronze. It is what an orchestrator starts, one process for each source, and its exit code is all it says to it.
+
+```bash
+mkdir -p ~/lakehouse-data/lake ~/lakehouse-data/landing/sales/returns   # once: the engine makes no root
+export INGEST_CONTROL_PASSWORD="$(cat docker/secrets/ingest_control_password)"
+export INGEST_COORDINATION_PASSWORD="$(cat docker/secrets/ingest_coordination_password)"
+printf 'id,amount\n1,10\n2,20\n' > ~/lakehouse-data/landing/sales/returns/returns-1.csv
+sleep 61                                                                # a file is taken once it is a minute old (connector.min_file_age)
+sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source sales.returns"
+```
+
+```text
+The run 019a… of sales.returns committed the batch sales.returns/bronze#1: 2 rows read, 2 written, 0 rejected, into bronze/sales/returns at version 0.
+```
+
+Run it again and it finds nothing new. The whole configuration is validated first, and what can be refused is refused before anything is started: a source that is not there, roots that are not there, a database that does not answer, a Spark setting that the engine sets or that would have Delta forget the batches of a table.
+
+| Code | Meaning |
+|---|---|
+| 0 | A batch committed, nothing new, or a source that is disabled |
+| 2 | Another run holds the lease of the source: nothing was done |
+| 3 | A database did not answer, the run lost its lease, or its files changed under it: run it again later |
+| 4 | Something that running again does not mend: the configuration, a database that refused, a run that failed for good |
+| 5 | More records were rejected than the source allows: nothing was committed, and they are in quarantine |
+| 64 | The command line is not one |
+
+The whole contract is in [discovery §14.1](docs/architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them.
 
 ## License
 
