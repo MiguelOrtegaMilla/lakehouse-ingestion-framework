@@ -103,12 +103,13 @@ object Load {
   /**
    * @param column a column of a timestamp: what a margin can be said in (discovery §17, P6)
    * @param lookback how far before the last watermark a load starts again, for rows that
-   *   arrived late
+   *   arrived late. It reaches no further back than `start`
    * @param safetyMargin how far behind the present a load stops, for transactions that are
    *   still open
    * @param start where the first batch of the source starts: the rows at or before it are not
    *   the source's to ingest. Without it, the first batch reads the whole table. Once the source
-   *   has a watermark, it is not looked at again
+   *   has a watermark, it bounds only how far back `lookback` reads again, and moves no window
+   *   forward (ADR-0020)
    */
   final case class Watermark(
       column: SqlIdentifier,

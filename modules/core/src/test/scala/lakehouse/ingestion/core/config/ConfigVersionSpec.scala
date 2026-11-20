@@ -301,7 +301,7 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     ).foreach(now => breaking(now) shouldBe empty)
   }
 
-  test("a start that moves, or goes, is no breaking change: it is looked at before a watermark") {
+  test("a start that moves, or goes, is no breaking change: no watermark is counted from it") {
     def started(at: String): ConfigVersion =
       version(changed(SourceText, "lookback: 10m", s"lookback: 10m, start: $at"))
     val january = started("2026-01-01T00:00:00Z")

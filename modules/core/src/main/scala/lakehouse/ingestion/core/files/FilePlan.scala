@@ -6,6 +6,7 @@ import java.time.Instant
 import cats.data.NonEmptyChain
 import cats.syntax.all._
 import io.circe.{ACursor, Json}
+import lakehouse.ingestion.core.StoredForm
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, Unwritten}
 
 /**
@@ -153,13 +154,8 @@ object FilePlan {
   def fromJson(json: Json): Either[String, FilePlan] = {
     val top = json.hcursor
     for {
-      _ <- exactly(top, "version", "directory", "files")
-      version <- whole(top.downField("version")).toRight("version is not a whole number")
-      _ <- Either.cond(
-        version == Version,
-        (),
-        s"is of version $version, and this application reads version $Version"
-      )
+      _ <- StoredForm.exactly(top, "version", "directory", "files")
+      _ <- StoredForm.version(top, Version)
       directoryText <- top.get[String]("directory").leftMap(_ => "directory is not text")
       directory <- RelativePath.parse(directoryText).leftMap(problem => s"directory $problem")
       entries <- top.downField("files").values.toRight("files is not a list")
@@ -175,10 +171,13 @@ object FilePlan {
     def field[A](name: String, problem: String)(read: ACursor => Either[Any, A]) =
       read(at.downField(name)).leftMap(_ => s"files[$index].$name $problem")
     for {
-      _ <- exactly(at, "name", "size", "modified_at").leftMap(problem => s"files[$index] $problem")
+      _ <- StoredForm
+        .exactly(at, "name", "size", "modified_at")
+        .leftMap(problem => s"files[$index] $problem")
       text <- field("name", "is not text")(_.as[String])
       name <- FileName.parse(text).leftMap(problem => s"files[$index].name $problem")
-      size <- whole(at.downField("size"))
+      size <- StoredForm
+        .whole(at.downField("size"))
         .filter(_ >= 0)
         .toRight(s"files[$index].size is not a size")
       modifiedAt <- field("modified_at", "is not a time")(_.as[String].flatMap { text =>
@@ -189,26 +188,6 @@ object FilePlan {
       )
     } yield LandedFile(name, size, modifiedAt)
   }
-
-  /**
-   * A whole number written as one. circe's decoders take a number written as text as well, and a
-   * plan is read as it was written, or not at all.
-   */
-  private def whole(at: ACursor): Option[Long] = at.focus.flatMap(_.asNumber).flatMap(_.toLong)
-
-  /** The fields of an object, these and no other: a plan is read as it was written, or not. */
-  private def exactly(at: ACursor, fields: String*): Either[String, Unit] =
-    at.keys.map(_.toSet) match {
-      case None => Left("is not an object")
-      case Some(keys) if keys == fields.toSet => Right(())
-      case Some(keys) =>
-        val missing = fields.filterNot(keys)
-        val more = keys.toSeq.filterNot(fields.contains).sorted
-        Left(
-          (missing.map(name => s"has no $name") ++ more.map(name => s"has a field $name"))
-            .mkString(", ")
-        )
-    }
 }
 
 /**

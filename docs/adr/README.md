@@ -23,6 +23,7 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0017](0017-a-failed-publish-is-reported-not-swallowed.md) | A publish that fails is retried and reported, not swallowed | Accepted |
 | [0018](0018-a-run-gives-up-a-batch-whose-source-changed.md) | A run gives up the batch that its source no longer has as planned | Accepted · its known limit and the tombstone that was to close it superseded by ADR-0019 |
 | [0019](0019-a-commit-names-the-epoch-of-its-lease.md) | A commit names the epoch of its lease, and the LogStore refuses one that is not in force | Accepted |
+| [0020](0020-the-watermark-of-an-incremental-load.md) | The watermark of an incremental load: a window of the source's clock, fixed when the batch is planned | Accepted |
 
 Superseded decisions:
 - *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
