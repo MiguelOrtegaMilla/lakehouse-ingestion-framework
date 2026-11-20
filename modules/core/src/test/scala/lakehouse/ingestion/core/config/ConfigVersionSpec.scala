@@ -105,7 +105,8 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     // because a field was added, with its default, the hash here changes and nothing else: such
     // a field changes every hash when the application is upgraded, and the version of the
     // application that a run records tells that apart (ADR-0007). `leases.ttl` was one (P4.5).
-    version().hash shouldBe "7f109213979a70fbab0a644c327630e1ea1cf2d2f03828831e2c4edb0cb56500"
+    // So is a default that changes: the statement timeout of a source, 10s to 30m (P6.3).
+    version().hash shouldBe "f922234cab5f663e319a77ec0643ced2d0e2af105311b069729e7132ef869eec"
   }
 
   test("two files that say the same have one hash, however they say it") {
@@ -145,6 +146,21 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     version(
       changed(SourceText, "lookback: 10m", "lookback: 10m, safety_margin: 0s")
     ).hash shouldBe version().hash
+    version(
+      changed(
+        SourceText,
+        "tls: { mode: disable }",
+        "tls: { mode: disable }\n    timeouts: { connect: 5s, statement: 30m }"
+      )
+    ).hash shouldBe version().hash
+
+    // A moment is stored in UTC, however its file writes it.
+    def started(at: String): String =
+      changed(SourceText, "lookback: 10m", s"lookback: 10m, start: $at")
+    version(started("\"2026-01-01T01:00:00+01:00\"")).hash shouldBe
+      version(started("2026-01-01T00:00:00Z")).hash
+    version(started("2026-01-01T00:00:00.000000Z")).hash shouldBe
+      version(started("2026-01-01T00:00:00Z")).hash
 
     val profileSpelledOut = changed(
       ProfileText,
@@ -164,6 +180,7 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
       version(changed(SourceText, "keys: [order_id]", "keys: [order_id, line]")),
       version(changed(SourceText, "column: updated_at", "column: modified_at")),
       version(changed(SourceText, "lookback: 10m", "lookback: 11m")),
+      version(changed(SourceText, "lookback: 10m", "lookback: 10m, start: 2026-01-01T00:00:00Z")),
       version(changed(SourceText, "table: public.orders", "table: public.orders_v2")),
       version(changed(SourceText, "env:SALES_RO_PASSWORD", "env:SALES_RO_PASSWORD_2")),
       version(SourceText + "enabled: false\n"),
@@ -180,7 +197,12 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
 
   test("the content is the configuration: read back, it is the same profile and the same source") {
     val v = version(
-      SourceText + "owner: team-sales\ncolumns:\n  email: { pii: email, silver: { mask: hmac } }\ndeletes: { strategy: deleted_flag, column: is_deleted }\nfreshness_sla: 2h\n"
+      changed(
+        SourceText,
+        "lookback: 10m",
+        "lookback: 10m, start: \"2026-01-01T01:00:00.123456+01:00\""
+      ) +
+        "owner: team-sales\ncolumns:\n  email: { pii: email, silver: { mask: hmac } }\ndeletes: { strategy: deleted_flag, column: is_deleted }\nfreshness_sla: 2h\n"
     )
     def part(name: String): String =
       v.content.hcursor.downField(name).focus.map(_.noSpaces).getOrElse(fail(name))
@@ -191,6 +213,7 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     read.columns.toMap shouldBe Map(
       "email" -> ColumnSpec(Some("email"), Some(ColumnSpec.Mask.Hmac))
     )
+    part("source") should include(""""start":"2026-01-01T00:00:00.123456Z"""")
   }
 
   test("every configuration of the repository and of the corpus reads back as itself") {
@@ -256,6 +279,9 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
         SourceText + "owner: team-sales\nenabled: false\nquality: { max_rejected_ratio: 0.05 }\nfreshness_sla: 1h\n"
       ),
       version(changed(SourceText, "lookback: 10m", "lookback: 1h")),
+      // Where a source with no watermark starts: one that has a watermark goes on from it.
+      version(changed(SourceText, "lookback: 10m", "lookback: 10m, start: 2026-01-01T00:00:00Z")),
+      version(changed(SourceText, "lookback: 10m", "lookback: 10m, safety_margin: 5m")),
       // How the database is reached, not which database it is.
       version(changed(SourceText, "env:SALES_RO_PASSWORD", "file:/run/secrets/sales_ro")),
       version(changed(SourceText, "user: sales_ro", "user: sales_reader")),
@@ -273,6 +299,15 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
       version(profile = changed(ProfileText, "local[2]", "local[4]")),
       version(profile = changed(ProfileText, "file:///data/landing", "file:///data/landing2"))
     ).foreach(now => breaking(now) shouldBe empty)
+  }
+
+  test("a start that moves, or goes, is no breaking change: it is looked at before a watermark") {
+    def started(at: String): ConfigVersion =
+      version(changed(SourceText, "lookback: 10m", s"lookback: 10m, start: $at"))
+    val january = started("2026-01-01T00:00:00Z")
+    breaking(started("2025-01-01T00:00:00Z"), last = january) shouldBe empty
+    breaking(started("2027-01-01T00:00:00Z"), last = january) shouldBe empty
+    breaking(version(), last = january) shouldBe empty
   }
 
   test("another key, another watermark column or another table is a breaking change") {

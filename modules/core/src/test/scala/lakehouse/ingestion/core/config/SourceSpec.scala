@@ -2,6 +2,7 @@ package lakehouse.ingestion.core.config
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
+import java.time.Instant
 
 import scala.concurrent.duration._
 
@@ -75,8 +76,16 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
     connector.table.toString shouldBe "public.orders"
     connector.connection.user shouldBe id("sales_ro")
     connector.connection.password shouldBe SecretRef.Env("SALES_RO_PASSWORD")
-    source.load shouldBe
-      Load.Incremental(Load.Watermark(id("updated_at"), 10.minutes, 1.minute), Some(7.days))
+    source.load shouldBe Load.Incremental(
+      Load.Watermark(
+        id("updated_at"),
+        lookback = Duration.Zero,
+        safetyMargin = 1.minute,
+        start = Some(Instant.parse("2026-01-01T00:00:00Z"))
+      ),
+      Some(7.days)
+    )
+    connector.connection.timeouts shouldBe Timeouts(connect = 5.seconds, statement = 30.minutes)
     source.keys shouldBe Vector(id("order_id"))
     source.deletes shouldBe Some(Deletes.KeyReconciliation)
     source.schema shouldBe SchemaPolicy.Default
@@ -178,9 +187,118 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
 
     val watermark = Source.load(File, Incremental).value.value.load
     watermark shouldBe Load.Incremental(
-      Load.Watermark(id("updated_at"), Duration.Zero, Duration.Zero),
+      Load.Watermark(id("updated_at"), Duration.Zero, Duration.Zero, start = None),
       None
     )
+  }
+
+  test("a watermark starts at a moment with its zone, kept to the microsecond, in UTC") {
+    def startOf(text: String): Option[Instant] =
+      Source
+        .load(File, Incremental.replace("column: updated_at", s"column: updated_at, start: $text"))
+        .value
+        .value
+        .load match {
+        case Load.Incremental(watermark, _) => watermark.start
+        case other => fail(s"not incremental: $other")
+      }
+
+    startOf("2026-01-01T00:00:00Z") shouldBe Some(Instant.parse("2026-01-01T00:00:00Z"))
+    // Quoted or not, it is text, and an offset is the moment it says.
+    startOf("\"2026-01-01T01:00:00+01:00\"") shouldBe Some(Instant.parse("2026-01-01T00:00:00Z"))
+    startOf("2026-01-01T00:00:00.123456-03:00") shouldBe
+      Some(Instant.parse("2026-01-01T03:00:00.123456Z"))
+
+    def errorOf(text: String): Seq[String] =
+      errorsOf(Incremental.replace("column: updated_at", s"column: updated_at, start: $text"))
+    errorOf("\"2026-01-01T00:00:00\"") shouldBe Seq(
+      s"$File: load.watermark.start has no zone: write it with Z or an offset, as " +
+        "2026-01-01T00:00:00Z. Without one it would be read in the zone of whichever machine " +
+        "reads it"
+    )
+    errorOf("2026-01-01") shouldBe Seq(
+      s"$File: load.watermark.start is a date alone: write a moment, with its zone, as " +
+        "2026-01-01T00:00:00Z"
+    )
+    errorOf("2026-01-01T00:00:00.1234567Z") shouldBe Seq(
+      s"$File: load.watermark.start has more than six digits after the second: PostgreSQL " +
+        "keeps a timestamp to the microsecond, and rounds the rest"
+    )
+    errorOf("2026") shouldBe Seq(s"$File: load.watermark.start must be text, and is a number")
+  }
+
+  test("a watermark that loses the rows of transactions still open is warned of") {
+    def warningsOf(text: String): Seq[String] =
+      Source.load(File, text).value.warnings.map(_.message)
+    val lost =
+      s"$File: load.watermark has safety_margin and lookback both at 0s: a row whose " +
+        "transaction commits after the window that holds its time was read is never " +
+        "ingested. safety_margin longer than the longest transaction that writes the table " +
+        "loses none"
+
+    warningsOf(Incremental) shouldBe Seq(lost)
+    warningsOf(
+      Incremental.replace(
+        "column: updated_at",
+        "column: updated_at, safety_margin: 0s, lookback: 0s"
+      )
+    ) shouldBe
+      Seq(lost)
+    warningsOf(
+      Incremental.replace("column: updated_at", "column: updated_at, safety_margin: 1m")
+    ) shouldBe
+      empty
+    // A lookback reads the rows again, which loses none of them either.
+    warningsOf(
+      Incremental.replace("column: updated_at", "column: updated_at, lookback: 10m")
+    ) shouldBe
+      empty
+    // A full load has no watermark to lose rows by.
+    warningsOf(Jdbc) shouldBe empty
+  }
+
+  test("a cut of batches that the first batch does not have is warned of") {
+    def warningsOf(watermark: String, range: String): Seq[String] =
+      Source
+        .load(
+          File,
+          Incremental.replace(
+            "watermark: { column: updated_at } }",
+            s"watermark: { column: updated_at, safety_margin: 1m$watermark }$range }"
+          )
+        )
+        .value
+        .warnings
+        .map(_.message)
+
+    warningsOf("", ", max_batch_range: 7d") shouldBe Seq(
+      s"$File: load.max_batch_range is set, and load.watermark.start is not: the first batch " +
+        "reads the whole table up to the present in one statement, however long its history " +
+        "is. max_batch_range cuts the batches after it, counted from the watermark"
+    )
+    warningsOf(", start: 2026-01-01T00:00:00Z", ", max_batch_range: 7d") shouldBe empty
+    warningsOf("", "") shouldBe empty
+    warningsOf(", start: 2026-01-01T00:00:00Z", "") shouldBe empty
+  }
+
+  test("a statement of a source may run 30m, and one of the control plane 10s, unless they say") {
+    def timeoutsOf(text: String): Timeouts =
+      Source.load(File, text).value.value.connector match {
+        case jdbc: JdbcConnectorConfig => jdbc.connection.timeouts
+        case other => fail(s"not jdbc: $other")
+      }
+    def withTimeouts(timeouts: String): String =
+      Jdbc.replace("tls: { mode: disable }", s"tls: { mode: disable }\n    timeouts: $timeouts")
+
+    timeoutsOf(Jdbc) shouldBe Timeouts(connect = 5.seconds, statement = 30.minutes)
+    timeoutsOf(withTimeouts("{ connect: 2s }")) shouldBe
+      Timeouts(connect = 2.seconds, statement = 30.minutes)
+    timeoutsOf(withTimeouts("{ statement: 1h }")) shouldBe
+      Timeouts(connect = 5.seconds, statement = 1.hour)
+    errorsOf(withTimeouts("{ statement: 2h }")) shouldBe Seq(
+      s"$File: connector.connection.timeouts.statement is 2h, and the longest it may be is 1h"
+    )
+    Timeouts.Default shouldBe Timeouts(connect = 5.seconds, statement = 10.seconds)
   }
 
   test("a kind of connector loads in its own ways") {

@@ -99,7 +99,7 @@ object JdbcConnector extends ConnectorKind {
 
   override def read(section: Obj): Result[ConnectorConfig] =
     (
-      section.required("connection")(_.obj(DatabaseConnection.read)),
+      section.required("connection")(_.obj(DatabaseConnection.read(Timeouts.OfASource))),
       section.required("table")(_.text(QualifiedName.parse))
     ).mapN(JdbcConnectorConfig.apply)
 }

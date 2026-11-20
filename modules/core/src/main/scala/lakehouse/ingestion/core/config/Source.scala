@@ -1,5 +1,7 @@
 package lakehouse.ingestion.core.config
 
+import java.time.Instant
+
 import scala.collection.immutable.SortedMap
 import scala.concurrent.duration._
 
@@ -85,7 +87,8 @@ object Load {
   /**
    * What changed since the last time, by a column that only grows.
    *
-   * @param maxBatchRange the widest stretch of the watermark that one batch takes
+   * @param maxBatchRange the widest stretch of the watermark that one batch takes, counted from
+   *   the watermark. The first batch of a source without `start` has no watermark to count from
    */
   final case class Incremental(watermark: Watermark, maxBatchRange: Option[FiniteDuration])
       extends Load {
@@ -98,16 +101,49 @@ object Load {
   }
 
   /**
+   * @param column a column of a timestamp: what a margin can be said in (discovery §17, P6)
    * @param lookback how far before the last watermark a load starts again, for rows that
    *   arrived late
    * @param safetyMargin how far behind the present a load stops, for transactions that are
    *   still open
+   * @param start where the first batch of the source starts: the rows at or before it are not
+   *   the source's to ingest. Without it, the first batch reads the whole table. Once the source
+   *   has a watermark, it is not looked at again
    */
   final case class Watermark(
       column: SqlIdentifier,
       lookback: FiniteDuration,
-      safetyMargin: FiniteDuration
+      safetyMargin: FiniteDuration,
+      start: Option[Instant]
   )
+
+  /**
+   * What is worth a second look in a load that is valid, by the path of the field: a watermark
+   * that loses rows of transactions still open when their window is read, and a cut of batches
+   * that the first batch does not have.
+   */
+  def warnings(load: Load): Seq[Problem] = load match {
+    case Incremental(watermark, range) =>
+      Seq(
+        Option.when(watermark.safetyMargin == Duration.Zero && watermark.lookback == Duration.Zero)(
+          Problem(
+            "load.watermark",
+            "has safety_margin and lookback both at 0s: a row whose transaction commits after " +
+              "the window that holds its time was read is never ingested. safety_margin longer " +
+              "than the longest transaction that writes the table loses none"
+          )
+        ),
+        Option.when(range.nonEmpty && watermark.start.isEmpty)(
+          Problem(
+            "load.max_batch_range",
+            "is set, and load.watermark.start is not: the first batch reads the whole table up " +
+              "to the present in one statement, however long its history is. max_batch_range " +
+              "cuts the batches after it, counted from the watermark"
+          )
+        )
+      ).flatten
+    case _ => Nil
+  }
 }
 
 /** How deletes of the source are found when the load does not find them by itself (ADR-0009). */
@@ -253,10 +289,14 @@ object Source {
         read(json, kinds).toEither.leftMap(_.map(located)).flatMap { case (source, kind) =>
           NonEmptyChain
             .fromChain(rules(source, kind).map(located))
-            .toLeft(Loaded(source, source.connector.warnings.map(located).toVector))
+            .toLeft(Loaded(source, warnings(source).map(located).toVector))
         }
     }
   }
+
+  /** What is worth a second look in a source that is valid: its connector's, and its load's. */
+  def warnings(source: Source): Seq[Problem] =
+    source.connector.warnings ++ Load.warnings(source.load)
 
   // -------------------------------------------------------------------------------------------
   // The file, field by field
@@ -341,7 +381,8 @@ object Source {
       (
         w.required("column")(_.text(SqlIdentifier.parse)),
         w.orElse("lookback", Duration.Zero)(_.duration(Duration.Zero, Durations.Max)),
-        w.orElse("safety_margin", Duration.Zero)(_.duration(Duration.Zero, Durations.Max))
+        w.orElse("safety_margin", Duration.Zero)(_.duration(Duration.Zero, Durations.Max)),
+        w.optional("start")(_.text(Timestamps.parse))
       ).mapN(Load.Watermark.apply)
     })
     val range = fields.optional("max_batch_range")(_.duration(1.second, Durations.Max))

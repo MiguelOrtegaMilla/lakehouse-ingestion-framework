@@ -41,7 +41,7 @@ connector:
   table: public.customers
 load:
   mode: incremental
-  watermark: { column: updated_at, lookback: 10m, safety_margin: 1m }
+  watermark: { column: updated_at, safety_margin: 5m, start: "2026-01-01T00:00:00Z" }
 keys: [customer_id]
 targets:
   bronze: { table: bronze/crm/customers }
@@ -54,7 +54,9 @@ Paths are relative: a table to the lake of the profile, a directory of files to 
 
 | Question | Field | What to know |
 |---|---|---|
-| How is it loaded? | `load.mode` | `full` takes everything every time. `incremental` takes what changed, by a column that only grows (`load.watermark.column`). `new_files` takes the files not taken yet. A table is loaded by one of the first two, files by the third |
+| How is it loaded? | `load.mode` | `full` takes everything every time. `incremental` takes what changed, by a column of a timestamp that only grows (`load.watermark.column`). `new_files` takes the files not taken yet. A table is loaded by one of the first two, files by the third |
+| How long are its transactions? | `load.watermark.safety_margin` | An incremental load stops this far behind the present of the database, and a row whose transaction took longer than that to commit is never read. Longer than the longest transaction that writes the table, then: `validate` warns of a watermark that has no margin and no lookback |
+| From when? | `load.watermark.start` | Where the first batch starts, as `2026-01-01T00:00:00Z`, with its zone. Without it, the first batch reads the whole table, in one statement, and `max_batch_range` does not cut it. After the first batch it is not looked at: history before it is a backfill |
 | When is a file complete? | `connector.min_file_age` | A file is taken once it has gone unchanged this long, a minute by default, so that one that is still being copied is not ingested cut short. Each file source has a directory of its own: two that read one are refused. A file written again under the same name is ingested again, whole, into Bronze, and Silver keeps one of each row by `keys`. One that changes while its batch is ingested costs that run, which ends in 3, and is taken by the next run as a new file: if it happens often, the producer is slower than this, and it is to be raised |
 | What tells one row from another? | `keys` | Silver merges by it, so a source with `targets.silver` needs it. Changing it later is a breaking change |
 | What if rows are deleted in the source? | `deletes` | A full load sees what is gone. An incremental load does not: `key_reconciliation` compares the keys in a run of its own, and `deleted_flag` reads the column in which the source marks a deleted row |
@@ -87,7 +89,7 @@ A configuration that is valid, here the examples of the repository with the exam
 ```text
 The configuration is valid: conf/app/local.example.yaml, and 2 sources.
 The lake is file:///home/CHANGE_ME/lakehouse-data/lake.
-  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  7164d9df522d
+  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  d734e49659f1
   sales.returns  enabled  file  new_files    bronze/sales/returns                      2526a17a25b6
 ```
 
@@ -125,7 +127,7 @@ Some changes to a source cannot be followed by what is already ingested. The app
 - another table in Bronze or in Silver, or another partitioning of the same Silver table;
 - for an incremental load, another table or another database to read from: the watermark that is stored is of the one read before, and going on from it would skip rows without a word.
 
-Anything else can change freely: the owner, the lookback, the schema policy, the password and how the database is reached.
+Anything else can change freely: the owner, the lookback, the margin, the start, the schema policy, the password and how the database is reached.
 
 ## Several sources into one table
 

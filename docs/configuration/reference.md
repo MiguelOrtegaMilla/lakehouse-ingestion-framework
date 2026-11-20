@@ -105,7 +105,7 @@ The same fields for the two databases of a profile and for the database that a J
 | `tls.mode` | `disable`, for a database on the same machine, or `verify-full`: the server proves it is the host that was named | required |
 | `tls.root_certificate` | The absolute path of the certificate of the authority that signed the server's. Required with `verify-full`, and an error with `disable` | — |
 | `timeouts.connect` | How long a connection is waited for, which is how long a call takes to fail when the database is down. `250ms` to `5m` | `5s` |
-| `timeouts.statement` | How long one statement may run. `1s` to `1h` | `10s` |
+| `timeouts.statement` | How long one statement may run. Of a source, which is read with a cursor, how long one fetch of it may take, and not the read whole: it tells a read that hangs. `1s` to `1h` | `10s` for a database of the profile, `30m` for that of a source |
 
 - **A URL takes no parameters, no user and no password.** What a parameter would set is a field here, and in a URL it would win over the field without a word. Some parameters of the driver name a class for it to load (`socketFactory`, CVE-2022-21724).
 - **There are two modes of TLS**, and none in between that encrypts and trusts anyone.
@@ -122,10 +122,11 @@ The example with every section is [`conf/sources/sales.orders.yaml`](../../conf/
 | `owner` | Who answers for the source: up to 100 characters of printable ASCII | none |
 | `connector.type` | The kind of connector: `jdbc` or `file`. The other fields of `connector` are the kind's, below | required |
 | `load.mode` | `full`: everything, every time. `incremental`: what changed, by a watermark. `new_files`: the files not taken yet | required |
-| `load.watermark.column` | The column that only grows, as `updated_at`: a [name](#a-name). Required for `incremental`, and an error for any other mode | — |
-| `load.watermark.lookback` | How far before the last watermark a load starts again, for rows that arrived late. A [duration](#a-duration) | `0s` |
-| `load.watermark.safety_margin` | How far behind the present a load stops, for transactions that are still open | `0s` |
-| `load.max_batch_range` | The widest stretch of the watermark that one batch takes. `incremental` alone | no limit |
+| `load.watermark.column` | The column of a timestamp that only grows, as `updated_at`: a [name](#a-name). [The watermark](#the-watermark) says why a timestamp. Required for `incremental`, and an error for any other mode | — |
+| `load.watermark.lookback` | How far before the last watermark a batch starts again, reading again what the batch before read. A [duration](#a-duration) | `0s` |
+| `load.watermark.safety_margin` | How far behind the present of the database a batch stops, for transactions that are still open. A [duration](#a-duration) | `0s` |
+| `load.watermark.start` | Where the first batch of the source starts: a [moment](#a-moment). The rows at or before it are not the source's to ingest | the first batch reads the whole table |
+| `load.max_batch_range` | The widest stretch of time that one batch takes, counted from the watermark. A [duration](#a-duration), `1s` at least. `incremental` alone | no limit |
 | `keys` | The columns that tell one row from another: what Silver merges by. A list of [names](#a-name), each once | none |
 | `deletes.strategy` | How rows that the source deleted are found, when the load does not find them: `key_reconciliation` or `deleted_flag` | deletes are those the load sees: a full load sees them all |
 | `deletes.column` | The column in which the source marks a deleted row. Required for `deleted_flag`, and an error otherwise | — |
@@ -142,6 +143,17 @@ The example with every section is [`conf/sources/sales.orders.yaml`](../../conf/
 | `freshness_sla` | How old the data of the source may get before it is late. A [duration](#a-duration), `1s` at least | none |
 
 What each value of the schema policy and of the masks does is decided where it is built (discovery §17, P9 and P10).
+
+### The watermark
+
+An incremental load reads, at each batch, the rows whose watermark column is after the watermark of the source and no later than an upper bound, and then moves the watermark to that bound. The bound is what the clock of the database says when the batch is planned, less `safety_margin`, or sooner if `max_batch_range` cuts it. Both bounds are times of the database, and the clock of the machine that runs the engine bounds nothing.
+
+- **A timestamp, and not a number that grows.** A row gets the time of its column, or the number of a sequence, when its transaction writes it, and is seen when the transaction commits: a row with an earlier time, or a lower number, can appear after a later one was read. A margin of time covers that for a transaction shorter than the margin. No margin can be said in the numbers of a key, so a key that grows is not taken as a watermark. `timestamptz` is the type to have; a `timestamp` without a zone is taken as UTC.
+- **`safety_margin` is what loses nothing; `lookback` reads again.** A row is lost when its transaction committed later than `safety_margin` and `lookback` together after the time it wrote. The margin has a batch wait for such transactions, and reads nothing twice. The lookback reads the last stretch again at every batch, and Bronze keeps every copy for Silver to tell apart. So the margin is the one to set, longer than the longest transaction that writes the table, and `lookback` stays at `0s` unless a source says otherwise.
+- **The first batch.** Without `start` it reads the whole table up to its bound, in one statement, however long the history of the table is. With it, it starts there. `max_batch_range` is counted from the watermark, and the first batch without `start` has none: it is not cut.
+- **`start` is looked at once.** It is where a source with no watermark starts. Changed after the first batch, it changes nothing: history before the watermark is a backfill (discovery §17, P7).
+
+`validate` warns of a watermark with `safety_margin` and `lookback` both at `0s`, which loses the rows of any transaction that is still open when its window is read, and of `max_batch_range` without `start`, which does not cut the first batch.
 
 ### Records that are rejected
 
@@ -237,6 +249,15 @@ A whole number and a unit: `500ms`, `30s`, `10m`, `2h`, `7d`.
 - The unit is not optional: a bare `30` is refused, since nobody knows what it was meant in.
 - Lower case alone, no sign, no fraction, no space, no zeros in front, and ten years at most.
 
+### A moment
+
+A date, a time of day and a zone, as ISO 8601 writes them: `2026-01-01T00:00:00Z`, or `2026-01-01T01:00:00+01:00` for the same moment.
+
+- The zone is not optional: a moment without one would be read in the zone of whichever machine reads it. A date alone is refused for the same reason.
+- Seconds always, and at most six digits after them: PostgreSQL keeps microseconds, and rounds the rest.
+- From `1900-01-01T00:00:00Z` to `9999-12-31T23:59:59.999999Z`. It is stored in UTC: the two above have one hash.
+- In quotes, or without: it is text either way.
+
 ### A reference to a secret
 
 Where a secret is, never the secret: `env:NAME` for an environment variable of the process, `file:/absolute/path` for a file, such as a mounted Docker secret.
@@ -317,5 +338,6 @@ A change to a source that what is already ingested cannot follow is a **breaking
 | `connector.table`, the database of `connector.connection.url`, or `connector.type`, for an incremental load | The watermark that is stored is of what was read before: going on from it would skip rows without a word |
 
 - What only says how a database is reached is no breaking change: the role, the reference to the password, TLS, the timeouts.
+- Nor is `load.watermark.start`: it is looked at only while a source has no watermark.
 - A source that gives Silver up, or goes from a watermark to full loads, breaks nothing that was done. A full load reads from wherever it likes.
 - What lets a breaking change through, a reset of the state or a backfill, comes with the control plane and with recovery (discovery §17, P4 and P7).

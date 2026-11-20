@@ -1,0 +1,15 @@
+# Midnight of where? Read in the zone of each machine, it would be another moment on each.
+id: crm.customers
+connector:
+  type: jdbc
+  connection:
+    url: "jdbc:postgresql://localhost:5432/crm"
+    user: reader
+    password: { secretRef: "env:READER_PASSWORD" }
+    tls: { mode: disable }
+  table: customers
+load:
+  mode: incremental
+  watermark: { column: updated_at, safety_margin: 5m, start: "2026-01-01T00:00:00" }
+targets:
+  bronze: { table: bronze/crm/customers }
