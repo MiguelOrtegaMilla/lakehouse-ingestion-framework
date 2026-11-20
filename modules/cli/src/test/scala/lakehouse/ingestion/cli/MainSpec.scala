@@ -4,12 +4,33 @@ import java.io.{ByteArrayOutputStream, PrintStream}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path, Paths}
 
-import org.scalatest.BeforeAndAfterAll
+import java.io.IOException
+import java.sql.SQLException
+import java.time.Instant
+
+import lakehouse.ingestion.core.config.{ConfigLoader, Profile, SourceId}
+import lakehouse.ingestion.core.control._
+import lakehouse.ingestion.engine.IngestionService.Outcome
+import lakehouse.ingestion.logstore.coordination.CoordinationSettings
+import lakehouse.ingestion.logstore.{
+  FaultHooks,
+  FaultPoint,
+  PostgresLogStore,
+  StartupGuard,
+  StartupRefusedException
+}
+import org.apache.spark.sql.SparkSession
+import org.scalatest.{BeforeAndAfterAll, EitherValues, OptionValues}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /** The command line: what `validate` prints, and the code each way of ending gives the process. */
-final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
+final class MainSpec
+    extends AnyFunSuite
+    with Matchers
+    with EitherValues
+    with OptionValues
+    with BeforeAndAfterAll {
 
   import MainSpec.Ran
 
@@ -178,16 +199,19 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
   }
 
   test("the usage says which code is which") {
-    Main.Usage should include("exit codes: 0 the configuration is valid, or the schemas are at")
-    Main.Usage should include("3 a database could not be reached, and running again may do;")
-    Main.Usage should include("4 the configuration is not valid, or a database refused;")
+    Main.Usage should include("exit codes: 0 the configuration is valid, the schemas are at")
+    Main.Usage should include("2 another run holds the lease of the source")
+    Main.Usage should include("3 a database could not be reached, the run lost its lease")
+    Main.Usage should include("4 the configuration is not valid, a database refused")
+    Main.Usage should include("5 more records were rejected than the source allows")
     Main.Usage should include("64 the command line is not one")
   }
 
   test("a command line that is not one ends in 64, with what is wrong and how it is written") {
     val wrong = Seq(
       Seq.empty[String] -> "error: no command",
-      Seq("run") -> "error: 'run' is not a command",
+      Seq("ingest") -> "error: 'ingest' is not a command",
+      Seq("run") -> "error: --profile, --source and --sources must be given",
       Seq("validate") -> "error: --profile and --sources must be given",
       Seq("validate", "--profile", exampleProfile) -> "error: --sources must be given",
       Seq("validate", "--profile") -> "error: --profile has no value after it",
@@ -309,6 +333,223 @@ final class MainSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
       "error: --password cannot read the secret file:/run/secrets/none: "
     )
     noFile.out shouldBe empty
+  }
+
+  // What `run` does is tested against a database and a lake (RunCommandSpec, in the integration
+  // tests). Here is what it refuses, or ends, before it opens a connection or a session.
+
+  /** A profile whose roots are under `work`, made unless said, and whose databases are nowhere. */
+  private def runProfile(name: String, makeRoots: Boolean = true): Path = {
+    val lake = work.resolve(s"$name/lake")
+    val landing = work.resolve(s"$name/landing")
+    if (makeRoots) Seq(lake, landing).foreach(Files.createDirectories(_))
+    write(
+      work.resolve(s"$name/profile.yaml"),
+      example("conf/app/local.example.yaml")
+        .replace("file:///home/CHANGE_ME/lakehouse-data/lake", lake.toUri.toString)
+        .replace("file:///home/CHANGE_ME/lakehouse-data/landing", landing.toUri.toString)
+        // `.invalid` never resolves (RFC 6761): a command that connected would end in 3.
+        .replace("localhost:5432", "db.unreachable.invalid:5432")
+    )
+  }
+
+  /** The example sources, with what a test changes in the text of one of them. */
+  private def runSources(name: String, change: (String, String => String)*): Path = {
+    val directory = work.resolve(s"$name/sources")
+    Seq("sales.orders", "sales.returns").foreach { id =>
+      val text = change.foldLeft(example(s"conf/sources/$id.yaml")) {
+        case (text, (`id`, edit)) => edit(text)
+        case (text, _) => text
+      }
+      write(directory.resolve(s"$id.yaml"), text)
+    }
+    directory
+  }
+
+  /**
+   * `run`, with the warnings of the profile left out of what it said: its lake is under /tmp and
+   * its databases on another machine without TLS, which is warned of and valid.
+   */
+  private def runOf(profile: Path, sources: Path, source: String): Ran = {
+    val ran =
+      run("run", "--profile", profile.toString, "--sources", sources.toString, "--source", source)
+    ran.copy(err = ran.errors.filterNot(_.startsWith("warning: ")).map(_ + "\n").mkString)
+  }
+
+  test("run: a command line that is not one ends in 64, before anything is read") {
+    val noSource = run("run", "--profile", "p.yaml", "--sources", "conf/sources")
+    noSource.exit shouldBe Main.Exit.Usage
+    noSource.errors.head shouldBe "error: --source must be given"
+
+    val notAnId =
+      run("run", "--profile", "p.yaml", "--sources", "conf/sources", "--source", "Sales.Orders")
+    notAnId.exit shouldBe Main.Exit.Usage
+    notAnId.errors.head shouldBe "error: --source must be words of lower-case letters, digits " +
+      "and underscores, each starting with a letter and joined by dots, as sales.orders"
+    notAnId.out shouldBe empty
+  }
+
+  test("run: a configuration that is not valid ends in 4, and nothing is run") {
+    val sources =
+      runSources("invalid", "sales.returns" -> (_.replace("format: csv", "format: xls")))
+
+    val ran = runOf(runProfile("invalid"), sources, "sales.returns")
+
+    ran.exit shouldBe Main.Exit.Permanent
+    ran.errors.head should include("connector.format")
+    ran.errors.last shouldBe "The configuration is not valid, and nothing was run."
+    ran.out shouldBe empty
+  }
+
+  test("run: a source that is not in the configuration ends in 4, and says which are") {
+    val sources = runSources("unknown")
+
+    val ran = runOf(runProfile("unknown"), sources, "sales.refunds")
+
+    ran.exit shouldBe Main.Exit.Permanent
+    ran.errors shouldBe Seq(
+      s"error: there is no source sales.refunds in $sources, and nothing was run. The sources " +
+        "are: sales.orders, sales.returns"
+    )
+  }
+
+  test("run: a source that is disabled ends well, and nothing is opened") {
+    val sources = runSources(
+      "disabled",
+      "sales.returns" -> (_.replace("id: sales.returns\n", "id: sales.returns\nenabled: false\n"))
+    )
+    // Its roots are not there and its databases are nowhere: a pause needs none of them.
+    val ran = runOf(runProfile("disabled", makeRoots = false), sources, "sales.returns")
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    ran.err shouldBe empty
+    ran.out.trim shouldBe "The source sales.returns is disabled (enabled: false), and was not " +
+      "run: nothing was opened, read or recorded. Set enabled to true to run it again."
+    SparkSession.getDefaultSession shouldBe empty
+  }
+
+  test("run: a source that this version has no connector for ends in 4, before any database") {
+    val ran = runOf(runProfile("jdbc"), runSources("jdbc"), "sales.orders")
+
+    ran.exit shouldBe Main.Exit.Permanent
+    ran.errors shouldBe Seq(
+      "error: the source sales.orders is of kind 'jdbc', and this version of the application " +
+        "has no connector for it: it has 'file'",
+      "Nothing was run."
+    )
+  }
+
+  test("run: roots that are not there end in 4, each said, before any database") {
+    val profile = runProfile("roots", makeRoots = false)
+    val ran = runOf(profile, runSources("roots"), "sales.returns")
+
+    ran.exit shouldBe Main.Exit.Permanent
+    ran.errors should have size 3
+    ran.errors.head should startWith(
+      s"error: the root of lake.uri, ${work.resolve("roots/lake").toUri.toString.stripSuffix("/")}, is not a directory"
+    )
+    ran.errors(1) should startWith("error: the root of landing.root, ")
+    ran.errors(1) should endWith(
+      "The engine does not make it, since a root that is missing is more often a disk that is " +
+        "not mounted: make it once, by hand"
+    )
+    ran.errors.last shouldBe "Nothing was run."
+
+    // A file where a root is to be is not a root either.
+    Files.createDirectories(work.resolve("roots/landing"))
+    write(work.resolve("roots/lake"), "not a directory")
+    val file = runOf(profile, runSources("roots"), "sales.returns")
+    file.exit shouldBe Main.Exit.Permanent
+    file.errors should have size 2
+    file.errors.head should include("roots/lake, is not a directory")
+  }
+
+  test("run: each way a run ends has its code") {
+    val run = RunId.generate()
+    val batch =
+      BatchId(TxnAppId.of(SourceId.parse("sales.returns").value, Layer.Bronze), BatchSeq.First)
+    def failed(failure: FailureClass): Outcome = Outcome.Failed(run, failure, "why")
+
+    RunCommand.exitOf(Outcome.NothingNew(run)) shouldBe 0
+    RunCommand.exitOf(Outcome.Ingested(run, batch, Nil, RunCounts.Nothing)) shouldBe 0
+    RunCommand.exitOf(Outcome.RolledForward(run, batch, Nil, RunCounts.Nothing)) shouldBe 0
+    RunCommand.exitOf(Outcome.Skipped(run, RunId.generate(), Instant.EPOCH)) shouldBe 2
+    RunCommand.exitOf(Outcome.GivenUp(run, batch, "a file changed")) shouldBe 3
+    RunCommand.exitOf(failed(FailureClass.Transient)) shouldBe 3
+    // A conflict that outlasted the attempts of the write (discovery §14).
+    RunCommand.exitOf(failed(FailureClass.Conflict)) shouldBe 3
+    RunCommand.exitOf(failed(FailureClass.Permanent)) shouldBe 4
+    RunCommand.exitOf(failed(FailureClass.Data)) shouldBe 5
+  }
+
+  test(
+    "run: a refusal of the startup guard is transient only for a database that was not reached"
+  ) {
+    def down(state: String): IOException =
+      new IOException("coordination store: cannot read", new SQLException("no", state))
+    val notReached = "the coordination database cannot be used: no"
+
+    RunCommand.exitOfRefusal(
+      new StartupRefusedException(Seq(notReached), Some(down("08001")))
+    ) shouldBe Main.Exit.Transient
+    RunCommand.exitOfRefusal(
+      new StartupRefusedException(Seq(notReached), Some(down("28P01")))
+    ) shouldBe Main.Exit.Permanent
+    // Running again does not mend the other problem, whatever the database does.
+    RunCommand.exitOfRefusal(
+      new StartupRefusedException(
+        Seq("spark.delta.logStore.file.impl is not set", notReached),
+        Some(down("08001"))
+      )
+    ) shouldBe Main.Exit.Permanent
+    RunCommand.exitOfRefusal(
+      new StartupRefusedException(Seq("spark.delta.logStore.file.impl is not set"))
+    ) shouldBe Main.Exit.Permanent
+  }
+
+  test("run: the session has the settings of the engine, and the profile could set none of them") {
+    val profile = ConfigLoader.loadProfile(runProfile("session")).value.value
+    val id = SourceId.parse("sales.returns").value
+    val engine = RunSession.engine(profile, id)
+
+    engine("spark.master") shouldBe "local[2]"
+    engine("spark.app.name") shouldBe "lakehouse-ingestion sales.returns"
+    engine("spark.sql.extensions") shouldBe "io.delta.sql.DeltaSparkSessionExtension"
+    engine("spark.sql.catalog.spark_catalog") shouldBe
+      "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+    engine(StartupGuard.logStoreKey("file")) shouldBe classOf[PostgresLogStore].getName
+    engine(s"spark.hadoop.${CoordinationSettings.User}") shouldBe "ingest_coordination"
+    engine(s"spark.hadoop.${CoordinationSettings.PasswordRef}") shouldBe
+      "env:INGEST_COORDINATION_PASSWORD"
+    // Every key that the engine sets is one that a profile is refused for.
+    (engine.keySet - "spark.master").foreach { key =>
+      withClue(key)(Profile.refusedSparkSetting(key) should not be empty)
+    }
+    // The fault hooks of the LogStore as well, which the engine never sets.
+    Profile.refusedSparkSetting(
+      s"spark.hadoop.${FaultHooks.delayKey(FaultPoint.AfterInsert)}"
+    ) should not be empty
+    // The profile's own are kept, under the engine's.
+    RunSession.settings(profile, id) shouldBe (profile.spark.settings ++ engine)
+    profile.spark.settings should contain("spark.sql.shuffle.partitions" -> "4")
+  }
+
+  test("run: a setting from outside the profile that a profile could not set is found") {
+    val engine = Map("spark.sql.extensions" -> "io.delta.sql.DeltaSparkSessionExtension")
+    val effective = engine ++ Map(
+      "spark.sql.shuffle.partitions" -> "4",
+      "spark.app.id" -> "local-1",
+      Profile.TransactionRetentionDefault -> "interval 30 days",
+      "spark.hadoop.lakehouse.logstore.fault.afterInsert.delayMs" -> "50"
+    )
+
+    RunSession.foreign(effective, engine).map(_._1) shouldBe Seq(
+      "spark.databricks.delta.properties.defaults.setTransactionRetentionDuration",
+      "spark.hadoop.lakehouse.logstore.fault.afterInsert.delayMs"
+    )
+    // A key of the engine's with another value than the engine gave it.
+    RunSession.foreign(Map("spark.sql.extensions" -> "x.Other"), engine).map(_._1) shouldBe
+      Seq("spark.sql.extensions")
   }
 
   test("help is asked for, and is not an error") {
