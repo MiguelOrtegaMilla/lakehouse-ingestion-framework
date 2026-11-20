@@ -1,11 +1,7 @@
 package lakehouse.ingestion.it.cli
 
 import java.net.ServerSocket
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, Path, Paths}
-import java.time.Instant
-import java.util.concurrent.TimeUnit
+import java.nio.file.{Files, Path}
 
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
@@ -17,8 +13,7 @@ import lakehouse.ingestion.core.control.LeaseTiming
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.LocalSparkSuite
-import org.apache.spark.launcher.JavaModuleOptions
+import lakehouse.ingestion.it.support.{CommandProcess, DeploymentFiles}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -38,109 +33,16 @@ import org.scalatest.matchers.should.Matchers
  */
 final class RunCommandSpec extends AnyFunSuite with Matchers with ControlPlaneSuite {
 
-  private lazy val work: Path = Files.createTempDirectory("run-command-")
-  private lazy val lakeDirectory = Files.createDirectories(work.resolve("lake"))
-  private lazy val landingDirectory = Files.createDirectories(work.resolve("landing"))
-  private lazy val sourcesDirectory = Files.createDirectories(work.resolve("sources"))
-  private lazy val secrets = Files.createDirectories(work.resolve("secrets"))
+  private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("run-command-"))
+  import files.{arguments, connection, drop, profileFile, validProfile}
 
   override def afterAll(): Unit =
-    try LocalSparkSuite.deleteRecursively(work)
+    try files.close()
     finally super.afterAll()
 
-  /** A file of the secrets of the test: a deployment has them mounted as files. */
-  private def secret(name: String, value: String): String = {
-    val file = secrets.resolve(name)
-    Files.write(file, value.getBytes(UTF_8))
-    s"file:$file"
-  }
-
-  private def connection(
-      role: String,
-      password: String,
-      url: String = pg.jdbcUrl(Database),
-      connect: String = "5s"
-  ): String =
-    s"""    url: "$url"
-       |    user: $role
-       |    password: { secretRef: "${secret(s"$role-${password.hashCode}", password)}" }
-       |    tls: { mode: disable }
-       |    timeouts: { connect: $connect, statement: 10s }
-       |""".stripMargin
-
-  /**
-   * The profile of the suite, in a file: its lake and landing zone, and both databases in the
-   * PostgreSQL of the suite, each reached as its own role with its password in a file.
-   *
-   * @param control the connection to the control plane, as it is written under it
-   * @param coordination that to the coordination database
-   */
-  private def profileFile(
-      control: String = connection(Engine, pg.password(Engine)),
-      coordination: String = connection("ingest_coordination", pg.password("ingest_coordination")),
-      lake: Path = lakeDirectory
-  ): Path = {
-    val file = Files.createTempFile(work, "profile-", ".yaml")
-    Files.write(
-      file,
-      s"""lake: { uri: "${lake.toUri}", deployment: single-machine }
-         |landing: { root: "${landingDirectory.toUri}" }
-         |databases:
-         |  control:
-         |$control  coordination:
-         |$coordination
-         |spark:
-         |  master: "local[2]"
-         |  settings:
-         |    spark.ui.enabled: false
-         |    spark.sql.shuffle.partitions: 2
-         |    spark.default.parallelism: 2
-         |    spark.databricks.delta.snapshotPartitions: 2
-         |    spark.sql.session.timeZone: UTC
-         |    spark.driver.host: 127.0.0.1
-         |    spark.driver.bindAddress: 127.0.0.1
-         |    spark.sql.warehouse.dir: "${work.resolve("warehouse")}"
-         |""".stripMargin.getBytes(UTF_8)
-    )
-  }
-
-  private lazy val validProfile = profileFile()
-
-  /**
-   * A source of CSV files of its own, in the directory of the sources of the suite, with its
-   * directory in the landing zone.
-   */
-  private def fileSource(rejected: Option[String] = None): Source = {
-    val id = newSourceId().value
-    val directory = id.replace('.', '_')
-    Files.createDirectories(landingDirectory.resolve(directory))
-    val text =
-      s"""id: $id
-         |connector: { type: file, path: $directory, format: csv }
-         |load: { mode: new_files }
-         |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
-         |${rejected.fold("")(share => s"quality: { max_rejected_ratio: $share }")}
-         |""".stripMargin
-    Files.write(sourcesDirectory.resolve(s"$id.yaml"), text.getBytes(UTF_8))
-    Source.load(s"$id.yaml", text).value.value
-  }
-
-  /** A file of the source, last changed an hour ago: complete for a run that starts now. */
-  private def drop(of: Source, name: String, text: String): Unit = {
-    val path = landingDirectory.resolve(of.id.value.replace('.', '_')).resolve(name)
-    Files.write(path, text.getBytes(UTF_8))
-    Files.setLastModifiedTime(path, FileTime.from(Instant.now().minusSeconds(3600))): Unit
-  }
-
-  private def arguments(of: Source, profile: Path): Seq[String] = Seq(
-    "run",
-    "--profile",
-    profile.toString,
-    "--sources",
-    sourcesDirectory.toString,
-    "--source",
-    of.id.value
-  )
+  /** A source of CSV files of its own, among the sources of the deployment. */
+  private def fileSource(rejected: Option[String] = None): Source =
+    files.fileSource(newSourceId(), rejected)
 
   /** One run of a source, in this JVM, with an environment that has nothing in it. */
   private def launch(of: Source, profile: Path = validProfile): Ran = {
@@ -181,7 +83,7 @@ final class RunCommandSpec extends AnyFunSuite with Matchers with ControlPlaneSu
 
   /** The commits in the log of the table of Bronze of a source. */
   private def commitsOf(of: Source): Seq[String] = {
-    val log = lakeDirectory.resolve(s"bronze/${of.id.value.replace('.', '/')}/_delta_log")
+    val log = files.lake.resolve(s"bronze/${of.id.value.replace('.', '/')}/_delta_log")
     if (!Files.isDirectory(log)) Nil
     else
       Using.resource(Files.list(log))(
@@ -357,32 +259,9 @@ final class RunCommandSpec extends AnyFunSuite with Matchers with ControlPlaneSu
     runsOf(rejecting) shouldBe Seq("FAILED" -> Some("data"))
   }
 
-  /**
-   * Runs the command in a JVM of its own, as `cli/run` starts it: with the classpath of this
-   * one, which has Spark, and the options of a JVM that embeds Spark.
-   *
-   * @return its exit code, and what it printed
-   */
+  /** One run of a source in a JVM of its own: its exit code, and the end of what it printed. */
   private def process(of: Source): (Int, String) = {
-    val log = Files.createTempFile(work, "process-", ".log")
-    val command =
-      Seq(Paths.get(sys.props("java.home"), "bin", "java").toString) ++
-        JavaModuleOptions.defaultModuleOptionArray().toSeq ++
-        Seq("-Xmx768m", "-Duser.timezone=UTC", "-cp", sys.props("java.class.path")) ++
-        Seq(Main.getClass.getName.stripSuffix("$")) ++
-        arguments(of, validProfile)
-    val builder = new ProcessBuilder(command.asJava)
-      .redirectErrorStream(true)
-      .redirectOutput(log.toFile)
-    builder.environment().put("SPARK_LOCAL_IP", "127.0.0.1")
-    val started = builder.start()
-    if (!started.waitFor(3, TimeUnit.MINUTES)) {
-      started.destroyForcibly()
-      fail(s"the process did not end in 3 minutes:\n${tail(log)}")
-    }
-    (started.exitValue(), tail(log))
+    val ended = CommandProcess.start(arguments(of), files.newLog()).await()
+    (ended.exit, ended.log)
   }
-
-  private def tail(log: Path): String =
-    Files.readAllLines(log, UTF_8).asScala.takeRight(40).mkString("\n")
 }
