@@ -63,6 +63,13 @@ final class BootstrappedPostgres private (
   /** The secret of `role` in this instance, for code that opens its own connections. */
   def password(role: String): String = passwords(role)
 
+  /**
+   * What the server has logged since it started, its standard output and error together. The
+   * image logs to standard error, with no collector: what a test has the server log (such as
+   * `log_statement`) is here.
+   */
+  def serverLog(): String = container.getLogs()
+
   /** Runs a command inside the container as the container user; returns trimmed stdout. */
   def exec(command: String*): String = container.execInContainer(command: _*).getStdout.trim
 
