@@ -4,7 +4,10 @@
 set -euo pipefail
 
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker/secrets"
-roles=(pg_superuser ingest_migrator ingest_control ingest_coordination ingest_maintenance sales_ro)
+roles=(
+  pg_superuser ingest_migrator ingest_control ingest_coordination ingest_maintenance
+  sales_owner sales_ro
+)
 
 umask 077
 mkdir -p "$dir"

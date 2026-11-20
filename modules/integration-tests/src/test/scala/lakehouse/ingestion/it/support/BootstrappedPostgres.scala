@@ -99,13 +99,17 @@ object BootstrappedPostgres {
 
   val Superuser = "postgres"
 
-  /** The login roles created by `docker/postgres/init` (ADR-0013 §3). */
-  val RuntimeRoles: Seq[String] =
+  /**
+   * The login roles created by `docker/postgres/init` (ADR-0013 §3): those of the application,
+   * and the two of the demo source, its owner and the one that the JDBC connector reads it as.
+   */
+  val LoginRoles: Seq[String] =
     Seq(
       "ingest_migrator",
       "ingest_control",
       "ingest_coordination",
       "ingest_maintenance",
+      "sales_owner",
       "sales_ro"
     )
 
@@ -133,7 +137,7 @@ object BootstrappedPostgres {
    */
   def start(network: Option[Network] = None, tlsOnly: Boolean = false): BootstrappedPostgres = {
     val root = repoRoot()
-    val passwords = (RuntimeRoles :+ Superuser).map(_ -> randomPassword()).toMap
+    val passwords = (LoginRoles :+ Superuser).map(_ -> randomPassword()).toMap
 
     val container = new Container(imageFromCompose(composeFile))
       .withExposedPorts(Int.box(Port))
