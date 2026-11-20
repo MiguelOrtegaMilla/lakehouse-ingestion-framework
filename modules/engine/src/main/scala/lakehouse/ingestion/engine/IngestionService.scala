@@ -114,7 +114,9 @@ import org.slf4j.LoggerFactory
  *
  * '''How a run ends.'''
  *  - A failure that says its class (`RunFailedException`) ends the run as `FAILED` with it, and
- *    gives the lease up. The batch, if one was planned, stays planned.
+ *    gives the lease up. The batch, if one was planned, stays planned. If the control plane
+ *    cannot be told, the run is reported with that class all the same, and is left there as
+ *    a process that died leaves it.
  *  - A run that finds its lease another's, where it asks the control plane, at its commit, or
  *    by a commit to a table that is refused for its epoch, stops there. It is not tried again
  *    and it says nothing to the control plane, where the run that took over has ended it.
@@ -262,10 +264,35 @@ final class IngestionService(
     }
   }
 
-  /** Says how a run failed, and what the process then reports. */
-  private def ended(leased: LeasedRun, end: RunEnd.Failed): Outcome =
-    if (leased.finish(end)) Outcome.Failed(leased.start.id, end.failure, end.message)
-    else fenced(leased.start, "another run ended it")
+  /**
+   * Says how a run failed, and what the process then reports.
+   *
+   * What the run failed with is known by then, and it is what the process reports whether or
+   * not the control plane could be told: a failure to say it is not the failure. A run that
+   * failed for good, or for its data, and whose word did not reach the control plane would
+   * otherwise end as an exception that nothing classified, and whoever started it would not
+   * know that running it again mends nothing. Untold, the run is left as a process that died
+   * leaves it: its lease is no longer renewed, and the run that takes it over marks this one
+   * `ABANDONED`, and finds what this one found.
+   */
+  private def ended(leased: LeasedRun, end: RunEnd.Failed): Outcome = {
+    val start = leased.start
+    val told =
+      try Right(leased.finish(end))
+      catch { case NonFatal(untold) => Left(untold) }
+    told match {
+      case Right(true) => Outcome.Failed(start.id, end.failure, end.message)
+      case Right(false) => fenced(start, "another run ended it")
+      case Left(untold) =>
+        log.warn(
+          s"the control plane could not be told that the run ${start.id} failed " +
+            s"(${end.failure}). It is reported as it failed all the same. Its lease expires, " +
+            "and the run that takes it over ends this one",
+          untold
+        )
+        Outcome.Failed(start.id, end.failure, end.message)
+    }
+  }
 
   /**
    * A run whose lease is another's. What it did is not committed, and its row says `ABANDONED`,
