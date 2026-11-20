@@ -56,6 +56,26 @@ final class DatabaseFailureSpec extends AnyFunSuite with Matchers {
     ) shouldBe false
   }
 
+  test("a pool that timed out is told by what the database said to its attempts") {
+    // HikariCP: no connection in time, with the state of the last attempt and that attempt.
+    def timedOut(attempt: SQLException): SQLTransientConnectionException =
+      new SQLTransientConnectionException(
+        "control-plane - Connection is not available, request timed out after 5000ms",
+        attempt.getSQLState,
+        attempt
+      )
+
+    DatabaseFailure.mayPass(timedOut(sql("08001"))) shouldBe true
+    DatabaseFailure.mayPass(timedOut(sql("28P01"))) shouldBe false
+    DatabaseFailure.mayPass(timedOut(sql("3D000"))) shouldBe false
+    // As the LogStore hands it on: in an IOException of its own.
+    DatabaseFailure.mayPass(
+      new java.io.IOException("coordination store: cannot read", timedOut(sql("28P01")))
+    ) shouldBe false
+    // The innermost state is the database's own, whatever a wrapper says.
+    DatabaseFailure.mayPass(sql("08006", sql("28P01"))) shouldBe false
+  }
+
   test("a certificate that is not trusted is no connection that failed: it will not pass") {
     // The driver reports them all as 08006, a connection failure.
     val untrusted = sql("08006", new SSLHandshakeException("PKIX path building failed"))

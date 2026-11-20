@@ -39,6 +39,12 @@ object DatabaseFailure {
    * A TLS session that could not be agreed is reported by the driver as a connection that
    * failed. It is no such thing: a certificate that this root did not sign, or that is another
    * host's, is as wrong the next time. So what the exception was caused by is looked at first.
+   *
+   * Then the database's own word, which is the SQLState of the innermost failure that has one.
+   * A type that says that a failure is transient is the word of whatever wrapped it, and is
+   * taken only when no state is known: a pool that waits for a connection reports every
+   * attempt that failed as a connection that did not come in time
+   * (`SQLTransientConnectionException`), a password that the database refused among them.
    */
   def mayPass(e: Throwable): Boolean = {
     val causes = Iterator.iterate(e)(_.getCause).takeWhile(_ != null).take(16).toVector
@@ -47,11 +53,10 @@ object DatabaseFailure {
       case sql: SQLException => Option(sql.getMessage).exists(_.contains(HostNotVerified))
       case _ => false
     }
-    !trust && causes.exists {
-      case _: SQLTransientException => true
-      case sql: SQLException => Option(sql.getSQLState).exists(passes)
-      case _ => false
+    val state = causes.reverseIterator.collectFirst {
+      case sql: SQLException if Option(sql.getSQLState).exists(_.nonEmpty) => sql.getSQLState
     }
+    !trust && state.fold(causes.exists(_.isInstanceOf[SQLTransientException]))(passes)
   }
 
   /**
