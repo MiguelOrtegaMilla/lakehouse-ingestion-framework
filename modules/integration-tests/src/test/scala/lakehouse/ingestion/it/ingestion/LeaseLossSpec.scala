@@ -389,6 +389,53 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
     }
   }
 
+  test("a run that failed for a reason of its own says so, though its control plane is not told") {
+    // For good: a column of the engine's in the data, which the read finds.
+    val refused = fileSource()
+    drop(refused, "a.csv", "id,_run_id\n1,x\n")
+    // For its data: more rejected records than the source allows, once they are in quarantine.
+    val rejecting = fileSource()
+    drop(rejecting, "a.csv", "id\n1\n1,2\n")
+
+    Seq(
+      (refused, FaultPoint.AfterPlan, FailureClass.Permanent, "_run_id"),
+      (rejecting, FaultPoint.AfterQuarantineWrite, FailureClass.Data, "could not be parsed")
+    ).foreach { case (source, point, failure, said) =>
+      val first = batchId(source, 1)
+
+      val outcome = throughTheProxy { control =>
+        // The run is cut off from its control plane before it fails, and stays so: what it
+        // has to say of how it ended reaches nobody. Its lease is still good by its count.
+        val cutOff = hookAt(point)(_ => proxied.faulty.disable())
+        launch(source, service(cutOff, on = control))
+      }
+
+      // What the process reports is what the run failed with, and not that nobody was told.
+      withClue(s"$failure: ") {
+        outcome match {
+          case Outcome.Failed(_, reported, message) =>
+            reported shouldBe failure
+            message should include(said)
+          case other => fail(s"the run did not fail with its class: $other")
+        }
+        // The control plane has it as a process that died left it.
+        runOf(outcome.run).status shouldBe RunStatus.Running
+        holderOf(source) shouldBe Some(outcome.run)
+        batchOf(first).status shouldBe BatchStatus.Planned
+
+        // The run that takes its lease, once it expires, ends it and fails as it did: this
+        // time the control plane is told.
+        expire(source)
+        val next = launch(source)
+        runOf(outcome.run).status shouldBe RunStatus.Abandoned
+        runOf(next.run).failure.value.failure shouldBe failure
+        holderOf(source) shouldBe None
+      }
+    }
+    // The records that were rejected are in quarantine once, for the two runs that found them.
+    quarantinedOf(rejecting) shouldBe Seq((1L, "a.csv", "1,2"))
+  }
+
   test(
     "a run whose count ran out with its data written commits its batch, if its lease is its own"
   ) {
