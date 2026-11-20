@@ -43,8 +43,11 @@ import org.slf4j.LoggerFactory
  *    `_rescued_data` is there for what does not fit the columns, which the policy of a
  *    source's schema fills (P9). The columns of CSV are those of the header, which every file
  *    of the batch must have: Spark reads a record by the place of its values, and a file with
- *    other columns would put values under another column's name. Values may span lines when
- *    they are quoted (RFC 4180). The columns of JSON are those of the objects of the batch; a
+ *    other columns would put values under another column's name. The dialect is RFC 4180's:
+ *    a value is quoted if it has a comma, a quote or the end of a line in it, a quote inside
+ *    it is written twice, and a backslash is a character like any other. A source that writes
+ *    another dialect has no way to say so yet (P8). The columns of JSON are those of the
+ *    objects of the batch; a
  *    value that is an object or a list is kept as the JSON it was written as. JSON is one object
  *    to a line.
  *  - '''Parquet with its own types''', and the columns of every file of the batch: a column
@@ -231,7 +234,14 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
 
     val read = format match {
       case FileConnectorConfig.Format.Csv =>
-        val header = spark.read.option("header", "true").option("multiLine", "true")
+        // The dialect is RFC 4180's: a quote inside a quoted value is the quote twice. Spark's
+        // own escape is a backslash, under which such a value keeps every quote it was written
+        // with, and a comma after the doubled quote ends it.
+        val header = spark.read
+          .option("header", "true")
+          .option("multiLine", "true")
+          .option("quote", CsvQuote)
+          .option("escape", CsvQuote)
         val columns = refused(header.csv(locations: _*).schema.fieldNames.toSeq)
         header
           .option("enforceSchema", "false")
@@ -277,6 +287,9 @@ object FileSourceConnector {
    * engine's.
    */
   val Unparsed = "_lakehouse_unparsed"
+
+  /** The quote of CSV, which is its own escape (RFC 4180). */
+  private val CsvQuote = "\""
 
   /** What makes Spark read a path as a pattern. */
   private val Globbed = "*?[]{}\\"

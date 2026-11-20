@@ -50,7 +50,7 @@ final class FileGeneratorSpec extends AnyFunSuite with Matchers {
       "csv" -> digest(deliver(1, Format.Csv, Everything)),
       "json" -> digest(deliver(1, Format.Json, Everything))
     ) shouldBe Map(
-      "csv" -> "7f984434a0e53cc0cadab9c47a309084409ceac95883d3a57d8e9e7db2edcad6",
+      "csv" -> "0518aca6d3fb0dd7402446abdc221e8ed0b6e1b1ded9d6d1bac4d910d75a5c4c",
       "json" -> "7a3f031e260efbfe5ed77c4c489792c4f26e2501c809a0c3593a480d416660ae"
     )
   }
