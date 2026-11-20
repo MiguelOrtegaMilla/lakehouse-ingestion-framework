@@ -472,6 +472,23 @@ final class FileSourceConnectorSpec
       Seq(Row("1", "x"))
   }
 
+  test("a file that cannot be read fails the batch, whatever the session says of such files") {
+    val root = landingZone()
+    val session = spark
+    import session.implicits._
+    dropParquet(root, "a.parquet", Seq((1L, "ann")).toDF("id", "name"))
+    drop(root, "b.parquet", "this is no file of Parquet")
+    val orders = source("parquet")
+    val planned = plan(root, orders).value
+
+    // With this, Spark passes over a file that it cannot read, and says nothing: the file
+    // would be recorded as taken, with none of its rows in Bronze.
+    val setting = "spark.sql.files.ignoreCorruptFiles"
+    spark.conf.set(setting, "true")
+    try an[Exception] should be thrownBy read(root, orders, planned)
+    finally spark.conf.unset(setting)
+  }
+
   // ---------------------------------------------------------------------------------------------
   // The files that were planned, and no other
   // ---------------------------------------------------------------------------------------------
