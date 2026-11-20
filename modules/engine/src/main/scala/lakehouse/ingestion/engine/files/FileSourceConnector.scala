@@ -28,7 +28,7 @@ import lakehouse.ingestion.engine.connector.{
 import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.functions.{col, lit, udf}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
-import org.apache.spark.sql.{AnalysisException, DataFrame, SparkSession}
+import org.apache.spark.sql.{AnalysisException, DataFrame, DataFrameReader, SparkSession}
 import org.slf4j.LoggerFactory
 
 /**
@@ -75,6 +75,12 @@ import org.slf4j.LoggerFactory
  *  - ''a column named `_metadata`'' is a column of the source like any other. It is the name
  *    under which Spark gives the file of a row, which is asked for in the way that a column of
  *    the source does not hide (`Dataset.metadataColumn`).
+ *
+ * '''A file that cannot be read fails its batch, whatever the session is set to.''' With
+ * `spark.sql.files.ignoreCorruptFiles`, Spark passes over a file that it cannot read, or keeps
+ * what it had read of it, and says nothing: the file would be recorded as taken with its rows
+ * not in Bronze. Every read says that no file is passed over, which a setting of a session
+ * does not change. The policy that may skip a file, and says that it did, is P8's.
  *
  * '''The files are the planned ones while they are read.''' A name may be given to another file
  * at any moment. So, just before Spark reads the files, each name must still lead to a file of
@@ -256,7 +262,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
         // The dialect is RFC 4180's: a quote inside a quoted value is the quote twice. Spark's
         // own escape is a backslash, under which such a value keeps every quote it was written
         // with, and a comma after the doubled quote ends it.
-        val header = spark.read
+        val header = everyFile(spark.read)
           .option("header", "true")
           .option("multiLine", "true")
           .option("quote", CsvQuote)
@@ -272,7 +278,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
 
       case FileConnectorConfig.Format.Json =>
         val columns = refused(fieldsOfJson(spark, locations))
-        val json = spark.read
+        val json = everyFile(spark.read)
           .option("columnNameOfCorruptRecord", Unparsed)
           .option("mode", "PERMISSIVE")
           .schema(asText(columns))
@@ -281,7 +287,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
 
       case FileConnectorConfig.Format.Parquet =>
         val parquet = oneNameEach("a file of Parquet") {
-          spark.read.option("mergeSchema", "true").parquet(locations: _*)
+          everyFile(spark.read).option("mergeSchema", "true").parquet(locations: _*)
         }
         (parquet, refused(parquet.schema.fieldNames.toSeq))
     }
@@ -317,7 +323,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
     val exact = spark.newSession()
     exact.conf.set("spark.sql.caseSensitive", "true")
     val fields = oneNameEach("a record of JSON") {
-      exact.read
+      everyFile(exact.read)
         .option("columnNameOfCorruptRecord", Unparsed)
         .option("primitivesAsString", "true")
         .json(locations: _*)
@@ -378,6 +384,15 @@ object FileSourceConnector {
    *   dropped once the files are read; none, if the files have columns, whatever they are named
    */
   final private case class Reading(rows: DataFrame, placeholder: Option[String])
+
+  /**
+   * A reader that passes over no file, whatever its session is set to: one that is corrupt, or
+   * that is gone, fails the read (`spark.sql.files.ignoreCorruptFiles`, `ignoreMissingFiles`).
+   * A file that a read skipped without a word would be recorded as taken, with its rows not
+   * in Bronze. A file that is gone is found by the look after the read as well.
+   */
+  private def everyFile(reader: DataFrameReader): DataFrameReader =
+    reader.option("ignoreCorruptFiles", "false").option("ignoreMissingFiles", "false")
 
   /**
    * What Spark made of the columns of some files, unless two of them have one name: Spark says
