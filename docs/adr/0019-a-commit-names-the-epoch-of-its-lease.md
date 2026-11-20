@@ -86,3 +86,7 @@ What makes the problem tractable here is that this project owns the place where 
     - *An announcement that meets a commit in flight, every time.* The claim of the process that has the turn is held with its version taken and its transaction open, by a trigger of the test's own in the database, and the next epoch is announced then. The announcement waits for the claim, and the process that announced is told of the very batch that was in flight. With the lock taken out of the claim, the run reports one `CommitAfterLaterEpoch` for each of its takeovers.
     - *The takeovers as they come*, at the size of the natural race: each writer is taken over several times while all of them commit.
     - A first form of the hold slept before the `INSERT`, and proved nothing: the claim that was held lost its version to another writer meanwhile, with the lock and without it, and the run was clean either way. It was the run without the lock that showed it.
+
+## Erratum (2026-11-20)
+
+The table of alternatives says of `LeasedRun.verify` that it asks the control plane whether the lease is still held. It does not: `verify` asks nobody. It is the count that a run keeps of its own lease (ADR-0006), with no statement to the database. The row is left as it was written, and its verdict stands for the reason it gives: the check comes before the commit and not with it, so it shortens the time a zombie works and proves nothing. What P5.11 built on it is in the discovery, §17 ("As built, P5.11").
