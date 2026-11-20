@@ -1,0 +1,1 @@
+sources/crm.customers.yaml: load.watermark.start has no zone: write it with Z or an offset, as 2026-01-01T00:00:00Z. Without one it would be read in the zone of whichever machine reads it

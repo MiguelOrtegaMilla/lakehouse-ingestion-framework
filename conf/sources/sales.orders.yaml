@@ -15,9 +15,17 @@ connector:
 
 load:
   mode: incremental
-  # A load starts 10m before the last watermark, for rows that arrived late, and stops 1m
-  # behind the present, for transactions that are still open.
-  watermark: { column: updated_at, lookback: 10m, safety_margin: 1m }
+  watermark:
+    column: updated_at
+    # A batch stops 1m behind the present of the database: a transaction that is still open
+    # then, and shorter than that, has its rows read by the batch after.
+    safety_margin: 1m
+    # Nothing is read twice: the margin, not the lookback, is what loses no row.
+    lookback: 0s
+    # The rows changed before this are not the source's to ingest. Without it the first batch
+    # would read the whole table, in one statement.
+    start: "2026-01-01T00:00:00Z"
+  # A batch takes a week of changes at most, counted from the watermark.
   max_batch_range: 7d
 
 # What tells one order from another: Silver merges by it.

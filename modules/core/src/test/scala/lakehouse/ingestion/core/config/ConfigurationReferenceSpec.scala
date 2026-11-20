@@ -119,11 +119,12 @@ final class ConfigurationReferenceSpec extends AnyFunSuite with Matchers with Ei
       |    user: sales_ro
       |    password: { secretRef: "env:SALES_RO_PASSWORD" }
       |    tls: { mode: verify-full, root_certificate: /etc/ssl/certs/ca.pem }
-      |    timeouts: { connect: 5s, statement: 10s }
+      |    timeouts: { connect: 5s, statement: 30m }
       |  table: public.orders
       |load:
       |  mode: incremental
-      |  watermark: { column: updated_at, lookback: 10m, safety_margin: 1m }
+      |  watermark:
+      |    { column: updated_at, lookback: 10m, safety_margin: 1m, start: "2026-01-01T00:00:00Z" }
       |  max_batch_range: 7d
       |keys: [order_id]
       |deletes: { strategy: deleted_flag, column: is_deleted }

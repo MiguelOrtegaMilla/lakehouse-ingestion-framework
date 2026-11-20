@@ -123,7 +123,8 @@ object ConfigVersion {
           "watermark" -> Json.obj(
             "column" -> text(watermark.column.value),
             "lookback" -> duration(watermark.lookback),
-            "safety_margin" -> duration(watermark.safetyMargin)
+            "safety_margin" -> duration(watermark.safetyMargin),
+            "start" -> some(watermark.start)(start => text(Timestamps.render(start)))
           ),
           "max_batch_range" -> some(range)(duration)
         )

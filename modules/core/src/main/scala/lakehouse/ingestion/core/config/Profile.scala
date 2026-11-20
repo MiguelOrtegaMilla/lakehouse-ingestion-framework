@@ -158,8 +158,8 @@ object Profile {
       ),
       top.required("databases")(_.obj { databases =>
         (
-          databases.required("control")(_.obj(DatabaseConnection.read)),
-          databases.required("coordination")(_.obj(DatabaseConnection.read))
+          databases.required("control")(_.obj(DatabaseConnection.read(Timeouts.Default))),
+          databases.required("coordination")(_.obj(DatabaseConnection.read(Timeouts.Default)))
         ).mapN(Databases)
       }),
       top.orElse("retries", Retries.Default)(_.obj(retries)),
