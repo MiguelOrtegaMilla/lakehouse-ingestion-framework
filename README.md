@@ -4,7 +4,7 @@
 
 A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a source is writing configuration, not code. It takes data from relational databases (JDBC) and file drops into a Bronze/Silver lakehouse. It is built to stay correct when several instances run at the same time and when a run dies halfway.
 
-> **Status: Phases 2, 3 and 4 are built.** Phase 2 is the PostgreSQL-coordinated LogStore: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Over 33 runs on two machines it acknowledged 10,954 commits and lost none. Phase 3 is the configuration: sources and profiles as files, validated whole and without a connection. Phase 4 is the control plane, in PostgreSQL: one run at a time on a source, by a lease with an epoch and a heartbeat; a plan written down before anything is read; and the state of a source, its batch and its run committed together or not at all. With six instances on one source, and runs that die at any step and wake up as zombies, every batch is in its table once. The engine that reads a source and writes a table comes next. The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
+> **Status: Phases 2 to 5 are built.** Phase 2 is the PostgreSQL-coordinated LogStore: its protocol with every fault injected in one JVM (2a), and its proof with several processes, writers that are killed and a PostgreSQL that is killed (2b). Over 33 runs on two machines it acknowledged 10,954 commits and lost none. Phase 3 is the configuration: sources and profiles as files, validated whole and without a connection. Phase 4 is the control plane, in PostgreSQL: one run at a time on a source, by a lease with an epoch and a heartbeat; a plan written down before anything is read; and the state of a source, its batch and its run committed together or not at all. With six instances on one source, and runs that die at any step and wake up as zombies, every batch is in its table once. Phase 5 is the engine and its first connector: the new files of a directory, CSV, JSON or Parquet, into a table of Bronze, once, with the records that cannot be parsed in a quarantine of their source; a batch that a run left halfway finished by the next; a run that loses its lease stopped, and refused by the LogStore if it goes on; and two sources, in two processes, into one table. The command `run` is what an orchestrator starts. The JDBC connector comes next. The architecture is settled: [discovery document](docs/architecture/00-architecture-discovery.md) and [ADRs](docs/adr/README.md). Code is being built phase by phase (discovery §17).
 
 ## Stack
 
@@ -14,9 +14,9 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 
 | Module | Responsibility |
 |---|---|
-| `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)). |
+| `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)); the model of the control plane and the recovery decision; and the plan of a batch of files. |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
-| `engine` | Connectors, Delta writers, control-plane repositories, engine service |
+| `engine` | Connectors, Delta writers, control-plane repositories, engine service. So far: the control plane, the connector contract and the file connector, the writers of Bronze and of the quarantine, and `IngestionService`, one run of one source. |
 | `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate` and `run`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
@@ -65,9 +65,12 @@ sbt "integration-tests/testOnly *DeltaSmokeSpec"   # Spark + Delta smoke test on
 sbt "integration-tests/testOnly *DeltaLogStoreContractSpec"   # what Delta asks of a LogStore (no Docker)
 sbt "integration-tests/testOnly *DeltaSetTransactionContractSpec"   # what Delta records of an idempotent write, and how it is read back (no Docker)
 sbt "integration-tests/testOnly *DeltaTableTransactionsSpec"   # which batches a real table has, and at which version (needs Docker)
+sbt "integration-tests/testOnly *FileSourceConnectorSpec"   # the file connector on real files: CSV, JSON and Parquet as they are read, what is set apart, what is refused, and files that change under a plan (no Docker)
 sbt "integration-tests/testOnly *BronzeWriterSpec"   # the writer of Bronze: once, with the engine's columns, and what it refuses (needs Docker)
 sbt "integration-tests/testOnly *QuarantineWriterSpec"   # the quarantine of a source: a rejected record kept as it was, once (needs Docker)
 sbt "integration-tests/testOnly *IngestionServiceSpec"   # a run from end to end: files to Bronze once, rejected records in quarantine and their threshold, a batch given up when its files change, a batch with no rows; a run that dies at each fault point and the next that finishes its batch; a run that lost its lease, refused by the LogStore (needs Docker)
+sbt "integration-tests/testOnly *LeaseLossSpec"   # a run that loses its lease, with the control plane cut for real: its jobs stopped, no step after it, and how it ends (needs Docker)
+sbt "integration-tests/testOnly *RunCommandSpec"   # the command run as an orchestrator starts it, each outcome with its exit code (needs Docker)
 sbt "integration-tests/testOnly *GeneratedFilesSpec"   # files made from a seed (a column more or less, broken records, empty and repeated files) through a run, compared with what the generator says is in them (needs Docker)
 sbt "integration-tests/testOnly *FanInSpec"   # two sources, in two processes at once, into one table of Bronze: about a minute and a half (needs Docker)
 sbt "integration-tests/testOnly *WriterEpochRaceSpec"   # a commit under an epoch against the announcement of the next, in both orders, held in PostgreSQL (needs Docker)
