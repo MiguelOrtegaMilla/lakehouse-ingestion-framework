@@ -110,6 +110,20 @@ final class DatabaseFailureSpec extends AnyFunSuite with Matchers {
       sql("08006", new SSLHandshakeException("PKIX path building failed"))
     ) shouldBe
       "the driver's words (SQLState 08006): PKIX path building failed"
+    // A pool that timed out: what the database said to its attempt, and not the pool's words.
+    DatabaseFailure.said(
+      new java.io.IOException(
+        "coordination store: cannot read",
+        new SQLTransientConnectionException(
+          "pool - Connection is not available, request timed out after 1000ms",
+          "28P01",
+          new SQLException("FATAL: password authentication failed for user \"x\"", "28P01")
+        )
+      )
+    ) shouldBe "FATAL: password authentication failed for user \"x\" (SQLState 28P01)"
+    DatabaseFailure.said(
+      new SQLTransientConnectionException("pool - Connection is not available")
+    ) shouldBe "pool - Connection is not available"
     DatabaseFailure.said(new IllegalStateException("something else")) shouldBe "something else"
     DatabaseFailure.said(new IllegalStateException()) shouldBe "no message"
   }
