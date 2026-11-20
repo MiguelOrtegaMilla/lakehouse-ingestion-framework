@@ -200,12 +200,9 @@ final class FileSourceConnectorSpec
     result.unparsed.value.count() shouldBe 0
   }
 
-  test("what is open: a quote doubled inside a quoted value is not read as a quote") {
-    // RFC 4180 writes a quote inside a quoted value twice. The read has the dialect of Spark,
-    // whose escape is a backslash: the value is kept with every quote it was written with, and
-    // a comma after the doubled quote ends it, so that the record has a value too many and is
-    // set apart. Nothing is lost, and neither is what the source meant (discovery §20). The
-    // day the read takes the dialect of its source, this test says the opposite.
+  test("CSV is read as RFC 4180 writes it: a quote inside a quoted value is the quote twice") {
+    // Spark's own escape is a backslash: under it the first value would keep every quote it
+    // was written with, and the second would end at its comma, with its record set apart.
     val root = landingZone()
     drop(
       root,
@@ -214,19 +211,27 @@ final class FileSourceConnectorSpec
         "1,\"said \"\"hi\"\"\"\n" +
         "2,\"say \"\"hi\"\", then go\"\n" +
         "3,\"a, b\"\n" +
-        "4,cy\n"
+        "4,\"\"\"all of it\"\"\"\n" +
+        // A backslash is a character like any other, before a quote as well.
+        "5,C:\\temp\\new\n" +
+        "6,\"ends in a backslash\\\"\n" +
+        "7,\"a \\\"\"quote\\\"\" after one\"\n" +
+        "8,cy\n"
     )
 
     val result = ingest(root, source("csv"))
 
     rows(result.rows.select("id", "name")) shouldBe Seq(
-      Row("1", "\"said \"\"hi\"\"\""),
+      Row("1", "said \"hi\""),
+      Row("2", "say \"hi\", then go"),
       Row("3", "a, b"),
-      Row("4", "cy")
+      Row("4", "\"all of it\""),
+      Row("5", "C:\\temp\\new"),
+      Row("6", "ends in a backslash\\"),
+      Row("7", "a \\\"quote\\\" after one"),
+      Row("8", "cy")
     )
-    rows(result.unparsed.value) shouldBe Seq(
-      Row("shop/orders/a.csv", "2,\"say \"\"hi\"\", then go\"")
-    )
+    result.unparsed.value.count() shouldBe 0
   }
 
   test("files of CSV with different headers fail the batch, and nothing is read") {

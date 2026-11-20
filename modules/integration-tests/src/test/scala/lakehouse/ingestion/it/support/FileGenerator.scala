@@ -27,13 +27,9 @@ import io.circe.{Json, JsonNumber}
  * and not with what it reads back from the lake.
  *
  * Values are as a source has them: names with commas, quotes and letters beyond ASCII, a note
- * of two lines. None is empty, and none has a backslash, so that every value is read back as
- * the text that was written whatever the format.
- *
- * '''No value of CSV has a quote''', for now. A file of CSV is written as RFC 4180 has it, with
- * a quote inside a quoted value doubled, and the engine does not read that as a quote yet
- * (discovery §20; `FileSourceConnectorSpec` has what it does). The values with one are JSON's
- * alone until it does.
+ * of two lines. A file of CSV is written as RFC 4180 has it, which is the dialect that the
+ * engine reads: a value is quoted if it must be, with its quotes doubled. No value is empty,
+ * which CSV cannot tell from no value at all.
  */
 object FileGenerator {
 
@@ -211,7 +207,7 @@ object FileGenerator {
       random,
       Vector.fill(parsed)(true) ++ Vector.fill(corrupt)(false)
     ).map { parses =>
-      val record = columns.map(column => column -> value(random, format, column, ids)).toMap
+      val record = columns.map(column => column -> value(random, column, ids)).toMap
       if (parses) Right(record)
       else
         Left(format match {
@@ -263,16 +259,8 @@ object FileGenerator {
   private val Channels = Vector("web", "store", "phone")
   private val Epoch = Instant.parse("2026-01-01T00:00:00Z")
 
-  private def value(
-      random: java.util.Random,
-      format: Format,
-      column: String,
-      ids: Iterator[String]
-  ): String = {
-    def oneOf(values: Vector[String]): String = {
-      val written = if (format == Format.Csv) values.filterNot(_.contains('"')) else values
-      written(random.nextInt(written.size))
-    }
+  private def value(random: java.util.Random, column: String, ids: Iterator[String]): String = {
+    def oneOf(values: Vector[String]): String = values(random.nextInt(values.size))
     column match {
       case "id" => ids.next()
       case "customer" => oneOf(Customers)
