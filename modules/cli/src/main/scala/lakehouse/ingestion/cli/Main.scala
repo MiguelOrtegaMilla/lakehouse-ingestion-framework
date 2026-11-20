@@ -15,7 +15,8 @@ import lakehouse.ingestion.engine.control.DatabaseFailure
  *    data is touched);
  *  - `migrate` brings the schemas of a deployment to the version of this application. It is the
  *    one command that connects as the role that owns them (ADR-0013 §3), and that role's
- *    password is in no profile: the command is told where it is.
+ *    password is in no profile: the command is told where it is;
+ *  - `run` runs one source once into Bronze, as an orchestrator starts it (`RunCommand`).
  */
 object Main {
 
@@ -43,8 +44,9 @@ object Main {
     val Transient = 3
 
     /**
-     * Something that running again does not mend, until somebody changes something: here, a
-     * configuration that is not valid.
+     * Something that running again does not mend, until somebody changes something: a
+     * configuration that is not valid, a database that refused, a source that the run failed
+     * on for good.
      */
     val Permanent = 4
 
@@ -84,22 +86,31 @@ object Main {
   val Usage: String =
     s"""usage: lakehouse-ingestion validate --profile <file> --sources <directory>
        |       lakehouse-ingestion migrate --profile <file> --password <reference> [--user <role>]
+       |       lakehouse-ingestion run --profile <file> --sources <directory> --source <id>
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
        |  migrate     Brings the schemas of the control plane and of the commit coordination to
        |              the version of this application, in the databases of the profile, as the
        |              role that owns them.
+       |  run         Runs one source once: the new files of the source, into its table of
+       |              Bronze. The configuration is validated whole first.
        |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
+       |  --source    the id of the source to run, as sales.returns
        |  --password  where the password of that role is, and never the password itself:
        |              env:NAME or file:/run/secrets/name
        |  --user      the role that owns the schemas; $Migrator unless said
        |
-       |exit codes: 0 the configuration is valid, or the schemas are at their version;
-       |            3 a database could not be reached, and running again may do;
-       |            4 the configuration is not valid, or a database refused;
+       |exit codes: 0 the configuration is valid, the schemas are at their version, or the run
+       |              ended well: a batch committed, nothing new, or a source that is disabled;
+       |            2 another run holds the lease of the source: nothing was done;
+       |            3 a database could not be reached, the run lost its lease, or its batch
+       |              was given up, and running again later may do;
+       |            4 the configuration is not valid, a database refused, or the run failed
+       |              for a reason that running again does not mend;
+       |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one""".stripMargin
 
   def main(args: Array[String]): Unit = sys.exit(run(args.toSeq, System.out, System.err))
@@ -138,6 +149,23 @@ object Main {
           migrate(profile, user, password, SecretResolver(environment), out, err)
         case Left(problem) => usage(problem, err)
       }
+    case "run" :: options =>
+      val asked = for {
+        found <- parse(options, Set("--profile", "--sources", "--source"))
+        source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
+      } yield (found("--profile"), found("--sources"), source)
+      asked match {
+        case Right((profile, sources, source)) =>
+          RunCommand.run(
+            Paths.get(profile),
+            Paths.get(sources),
+            source,
+            SecretResolver(environment),
+            out,
+            err
+          )
+        case Left(problem) => usage(problem, err)
+      }
     case ("--help" | "-h" | "help") :: Nil =>
       out.println(Usage)
       Exit.Ok
@@ -163,7 +191,9 @@ object Main {
         case Nil =>
           (required -- found.keySet).toSeq.sorted match {
             case Seq() => Right(found)
-            case missing => Left(s"${missing.mkString(" and ")} must be given")
+            case Seq(one) => Left(s"$one must be given")
+            case missing =>
+              Left(s"${missing.init.mkString(", ")} and ${missing.last} must be given")
           }
         case name :: _ if !names(name) => Left(s"'${shown(name)}' is not an option of this command")
         case name :: _ if found.contains(name) => Left(s"$name is given twice")

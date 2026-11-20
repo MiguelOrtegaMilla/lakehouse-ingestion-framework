@@ -100,12 +100,21 @@ lazy val cli = module("cli", artifact = "cli")
   .dependsOn(engine)
   .settings(
     rules(forbidden = Nil),
-    libraryDependencies ++= flyway :+ scalatest,
+    // Spark and Delta are `provided`, as in the engine: `run` builds the session of a run.
+    libraryDependencies ++= flyway ++ Seq(sparkSql, deltaSpark, scalatest),
     Compile / mainClass := Some("lakehouse.ingestion.cli.Main"),
     // `sbt "cli/run validate …"`: a process of its own, so that its exit code is the command's
     // and not the end of sbt, started where sbt was, so that paths are those of the repository.
     run / fork := true,
-    run / baseDirectory := (LocalRootProject / baseDirectory).value
+    run / baseDirectory := (LocalRootProject / baseDirectory).value,
+    // `sbt "cli/run run …"` runs Spark in that process (discovery §17, P5): with the classpath
+    // that has what is `provided`, which `spark-submit` would supply, and the options of a JVM
+    // that embeds Spark, as the tests have them (project/SparkTestJvm.scala).
+    Compile / run := Defaults
+      .runTask(Compile / fullClasspath, Compile / run / mainClass, Compile / run / runner)
+      .evaluated,
+    run / javaOptions ++= SparkTestJvm.moduleOptions ++ Seq("-Duser.timezone=UTC"),
+    run / envVars += "SPARK_LOCAL_IP" -> "127.0.0.1"
   )
 
 /**
