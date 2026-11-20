@@ -72,11 +72,17 @@ object DatabaseFailure {
   def of(what: String, e: Throwable, said: String): DatabaseFailure =
     if (mayPass(e)) Unreachable(s"$what: $said") else Refused(s"$what: $said")
 
-  /** What the database itself said, if it said anything, and its SQLState. */
+  /**
+   * What the database itself said, if it said anything, and its SQLState: the innermost failure
+   * that has a state, as `mayPass` decides by it, or else the first failure of SQL. A pool that
+   * timed out says only that it did, around what the database said to its attempt.
+   */
   def said(e: Throwable): String = {
     val causes = Iterator.iterate(e)(_.getCause).takeWhile(_ != null).take(16).toVector
-    val text = causes
-      .collectFirst { case sql: SQLException => sql }
+    val sqls = causes.collect { case sql: SQLException => sql }
+    val text = sqls.reverseIterator
+      .find(sql => Option(sql.getSQLState).exists(_.nonEmpty))
+      .orElse(sqls.headOption)
       .map { sql =>
         val state = Option(sql.getSQLState).map(code => s" (SQLState $code)").getOrElse("")
         s"${firstLine(sql.getMessage)}$state"
