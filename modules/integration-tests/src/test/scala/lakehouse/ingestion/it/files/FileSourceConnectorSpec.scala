@@ -74,6 +74,17 @@ final class FileSourceConnectorSpec
     path
   }
 
+  /** A file of Parquet of the source, written by Spark and left under a name of its own. */
+  private def dropParquet(root: Path, name: String, frame: DataFrame): Path = {
+    val out = workDir.resolve(s"written-$count-$name")
+    frame.coalesce(1).write.parquet(out.toString)
+    val part = Files.list(out).filter(_.toString.endsWith(".parquet")).findFirst().get
+    val target = root.resolve("shop/orders").resolve(name)
+    Files.copy(part, target)
+    Files.setLastModifiedTime(target, FileTime.from(anHourAgo))
+    target
+  }
+
   private def taken(files: Set[LandedFile]): FileRegistry = new FileRegistry {
     override def processed(directory: RelativePath, names: Seq[String]): Set[LandedFile] =
       files.filter(file => names.contains(file.name.value))
@@ -369,6 +380,96 @@ final class FileSourceConnectorSpec
         Row(2L, null, 9.5, "shop/orders/b.parquet")
       )
     result.rows.columns should not contain "_rescued_data"
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // What a source may bring, and the read must not get wrong (the review of P5)
+  // ---------------------------------------------------------------------------------------------
+
+  test("a column of the source named _metadata is a column like any other, in every format") {
+    val csv = landingZone()
+    drop(csv, "a.csv", "id,_metadata\n1,x\n")
+    rows(ingest(csv, source("csv")).rows.select("id", "_metadata", "_source_file")) shouldBe
+      Seq(Row("1", "x", "shop/orders/a.csv"))
+
+    // Spark tells the names of columns apart without their case, and so its own under this one.
+    val cased = landingZone()
+    drop(cased, "a.csv", "id,_METADATA\n1,x\n")
+    rows(ingest(cased, source("csv")).rows.select("id", "_METADATA", "_source_file")) shouldBe
+      Seq(Row("1", "x", "shop/orders/a.csv"))
+
+    val json = landingZone()
+    drop(json, "a.json", """{"id":"1","_metadata":{"etag":"x"}}""" + "\n")
+    rows(ingest(json, source("json")).rows.select("id", "_metadata", "_source_file")) shouldBe
+      Seq(Row("1", """{"etag":"x"}""", "shop/orders/a.json"))
+
+    val parquet = landingZone()
+    val session = spark
+    import session.implicits._
+    dropParquet(parquet, "a.parquet", Seq((1L, "x")).toDF("id", "_metadata"))
+    rows(ingest(parquet, source("parquet")).rows.select("id", "_metadata", "_source_file")) shouldBe
+      Seq(Row(1L, "x", "shop/orders/a.parquet"))
+  }
+
+  test("fields of JSON that differ only in their case fail the batch: no value is lost") {
+    // In two files, or in two records of one: Spark would read them as one column, and leave
+    // the values under one of the two names out, without a word.
+    val files = landingZone()
+    drop(files, "a.json", """{"id":"1"}""" + "\n")
+    drop(files, "b.json", """{"ID":"2"}""" + "\n")
+    val said = refused(ingest(files, source("json")))
+    said should (include("'ID' and 'id'") and include("only in their case"))
+    said should include("Nothing was written")
+
+    val records = landingZone()
+    drop(
+      records,
+      "a.json",
+      """{"id":"1","amount":"5"}""" + "\n" + """{"Id":"2","AMOUNT":"7"}""" + "\n"
+    )
+    refused(ingest(records, source("json"))) should
+      (include("'AMOUNT' and 'amount'") and include("'Id' and 'id'"))
+
+    // In one record: Spark refuses such columns itself, with an error that says no class.
+    val record = landingZone()
+    drop(record, "a.json", """{"id":"1","Id":"2"}""" + "\n")
+    refused(ingest(record, source("json"))) should include("'Id' and 'id'")
+  }
+
+  test("a record of JSON with a field twice fails the batch, as a failure that says its class") {
+    val root = landingZone()
+    drop(root, "a.json", """{"id":"1"}""" + "\n" + """{"id":"5","id":"6"}""" + "\n")
+
+    refused(ingest(root, source("json"))) should
+      (include("a field twice") and include("Nothing was written"))
+  }
+
+  test("fields that differ only in their case inside an object of JSON are kept, as its text") {
+    val root = landingZone()
+    drop(root, "a.json", """{"id":"1","customer":{"name":"Bea","NAME":"B"}}""" + "\n")
+
+    rows(ingest(root, source("json")).rows.select("id", "customer")) shouldBe
+      Seq(Row("1", """{"name":"Bea","NAME":"B"}"""))
+  }
+
+  test("a header of CSV with a name twice, or with an empty name, fails the batch and says so") {
+    // Spark reads such a header under names of its own making, which no file then has.
+    Seq("id,name,name\n1,x,y\n", "id,Name,name\n1,x,y\n", "id,,name\n1,x,y\n").foreach { text =>
+      val root = landingZone()
+      drop(root, "a.csv", text)
+      withClue(text) {
+        refused(ingest(root, source("csv"))) should
+          (include("a name twice") and include("a name that is empty"))
+      }
+    }
+  }
+
+  test("a column of the source is not taken for the one that a batch with no column is read by") {
+    val root = landingZone()
+    drop(root, "a.csv", "id,_lakehouse_no_column\n1,x\n")
+
+    rows(ingest(root, source("csv")).rows.select("id", "_lakehouse_no_column")) shouldBe
+      Seq(Row("1", "x"))
   }
 
   // ---------------------------------------------------------------------------------------------
