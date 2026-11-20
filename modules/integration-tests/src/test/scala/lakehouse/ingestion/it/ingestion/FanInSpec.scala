@@ -2,6 +2,8 @@ package lakehouse.ingestion.it.ingestion
 
 import java.nio.file.Path
 
+import scala.annotation.tailrec
+
 import io.delta.tables.DeltaTable
 import lakehouse.ingestion.cli.Main
 import lakehouse.ingestion.core.config.{RootUri, Source}
@@ -24,8 +26,14 @@ import org.scalatest.matchers.should.Matchers
  * stress runs'. What is asked is what holds however the two interleave: every row of each
  * source is in the table once, the log has a commit for each batch and no other, each batch
  * records the version that the log has under its name, and each source has a quarantine of its
- * own. And that the two runs of a round were running at one time, by the clock of the control
- * plane, so that this does not pass with one run after the other.
+ * own.
+ *
+ * '''The two runs of a round are to have been running at one time''', by the clock of the
+ * control plane: with one run after the other this would show nothing. Two processes that are
+ * started together are not promised to be, on a machine that is busy with something else. So a
+ * round whose runs were not is made again, up to three times, and the test fails only if none
+ * of the three had them at one time. A round that is made again is still held to everything
+ * else: its rows are in the table, once.
  *
  * The files are `FileGenerator`'s, and so is what the table is to have. One source is of CSV and
  * the other of JSON, with the same columns: a column that a table does not have yet is the
@@ -33,19 +41,89 @@ import org.scalatest.matchers.should.Matchers
  */
 final class FanInSpec extends AnyFunSuite with Matchers with GeneratedDeliveries {
 
+  import FanInSpec._
+
   // The lake and the landing zone that the suite reads are those that the processes run on.
   private lazy val files = new DeploymentFiles(pg, workDir)
   override protected lazy val lakeRoot: RootUri = RootUri.parse(files.lake.toUri.toString).value
   override protected lazy val landingDirectory: Path = files.landing
 
-  /** A heap as the writers of the stress runs have: two processes, beside the JVM of the tests. */
-  private val Heap = "512m"
+  /** Two sources of one table, with nothing left for either yet. */
+  private def newFanIn(): FanIn = {
+    val table = Some(s"bronze/fan_in/${newSourceId().value.split('.').last}")
+    val shop = files.fileSource(newSourceId(), Some("0.5"), format = "csv", table = table)
+    val web = files.fileSource(newSourceId(), Some("0.5"), format = "json", table = table)
+    bronze(shop) shouldBe bronze(web)
+    FanIn(shop, web, Vector.empty, Vector.empty)
+  }
 
-  /** One run of each source, all started before any is awaited: how each ended. */
-  private def together(sources: Source*): Seq[CommandProcess.Ended] =
-    sources
+  /**
+   * One round: a delivery is left for each source, and a run of each is started, both before
+   * either is awaited. Both are to end in 0, having committed their batch.
+   *
+   * @return the two sources with what they have by now, and whether the two runs were running
+   *   at one time
+   */
+  private def round(before: FanIn): (FanIn, Boolean) = {
+    val number = before.rounds + 1
+    // The first delivery of each has files with every column: either may be the one that
+    // makes the table.
+    val ofShop =
+      if (number == 1) Mix(files = 3, corrupt = 2, empty = 1, repeated = 1)
+      else Mix(files = 2, corrupt = 1)
+    val ofWeb =
+      if (number == 1) Mix(files = 3, missing = 1, corrupt = 2, empty = 1)
+      else Mix(files = 2, corrupt = 1, repeated = 1)
+    val after = before.copy(
+      ofShop = before.ofShop :+ deliver(41, Format.Csv, ofShop, number),
+      ofWeb = before.ofWeb :+ deliver(42, Format.Json, ofWeb, number)
+    )
+    leave(after.shop, after.ofShop.last)
+    leave(after.web, after.ofWeb.last)
+
+    val ended = Seq(after.shop, after.web)
       .map(of => CommandProcess.start(files.arguments(of), files.newLog(), Heap))
       .map(_.await())
+
+    ended.foreach(process => withClue(process.log)(process.exit shouldBe Main.Exit.Ok))
+    val one = committer(batch(after.shop, number.toLong))
+    val other = committer(batch(after.web, number.toLong))
+    Seq(one, other).foreach(_.status shouldBe RunStatus.Succeeded)
+    val together = one.startedAt.isBefore(other.finishedAt.value) &&
+      other.startedAt.isBefore(one.finishedAt.value)
+    // Said, and not asked: whether the two met at a commit is not this test's to decide.
+    Seq("CSV" -> one, "JSON" -> other).foreach { case (source, run) =>
+      info(
+        s"round $number, the source of $source: ${run.counts.writeConflicts.value} write " +
+          s"conflicts, ${run.counts.commitContention.value} commits that met another" +
+          (if (together) "" else "; the two runs were not running at one time")
+      )
+    }
+    (after, together)
+  }
+
+  /**
+   * A round in which both sources make their table, with the two runs at one time. A table is
+   * made once, so each try is of two sources of their own, and of a table of their own.
+   */
+  @tailrec
+  private def made(tries: Int = Tries): FanIn = {
+    val (fanIn, together) = round(newFanIn())
+    asWritten(fanIn)
+    if (together) fanIn
+    else if (tries > 1) made(tries - 1)
+    else fail(s"in none of $Tries rounds were the two runs that make a table running at one time")
+  }
+
+  /** A round more of two sources whose table is there, with the two runs at one time. */
+  @tailrec
+  private def appended(before: FanIn, tries: Int = Tries): FanIn = {
+    val (after, together) = round(before)
+    if (together) after
+    else if (tries > 1) appended(after, tries - 1)
+    else
+      fail(s"in none of $Tries rounds were the two runs that append to a table running at one time")
+  }
 
   private def batch(of: Source, seq: Long): BatchRecord = batchOf(batchId(of, seq))
 
@@ -64,47 +142,9 @@ final class FanInSpec extends AnyFunSuite with Matchers with GeneratedDeliveries
     ).map(_.head)
   }
 
-  test("two sources, in two processes at once, write one table: every row of each is there once") {
-    val table = s"bronze/fan_in/${newSourceId().value.split('.').last}"
-    val shop = files.fileSource(newSourceId(), Some("0.5"), format = "csv", table = Some(table))
-    val web = files.fileSource(newSourceId(), Some("0.5"), format = "json", table = Some(table))
-    bronze(shop) shouldBe bronze(web)
-
-    val ofShop = Seq(
-      deliver(41, Format.Csv, Mix(files = 3, corrupt = 2, empty = 1, repeated = 1), number = 1),
-      deliver(41, Format.Csv, Mix(files = 2, corrupt = 1), number = 2)
-    )
-    val ofWeb = Seq(
-      deliver(42, Format.Json, Mix(files = 3, missing = 1, corrupt = 2, empty = 1), number = 1),
-      deliver(42, Format.Json, Mix(files = 2, corrupt = 1, repeated = 1), number = 2)
-    )
-
-    // Two rounds: in the first the table is not there, and both runs are to make it; in the
-    // second it is, and both append to it.
-    for (round <- 1 to 2) withClue(s"round $round: ") {
-      leave(shop, ofShop(round - 1))
-      leave(web, ofWeb(round - 1))
-
-      val ended = together(shop, web)
-
-      ended.foreach(process => withClue(process.log)(process.exit shouldBe Main.Exit.Ok))
-      val (one, other) = (committer(batch(shop, round.toLong)), committer(batch(web, round.toLong)))
-      Seq(one, other).foreach(_.status shouldBe RunStatus.Succeeded)
-      // The two runs were running at one time, by the clock of the database.
-      withClue(
-        s"${one.startedAt} to ${one.finishedAt}, ${other.startedAt} to ${other.finishedAt}"
-      ) {
-        one.startedAt.isBefore(other.finishedAt.value) shouldBe true
-        other.startedAt.isBefore(one.finishedAt.value) shouldBe true
-      }
-      // Said, and not asked: whether the two met at a commit is not this test's to decide.
-      Seq("CSV" -> one, "JSON" -> other).foreach { case (source, run) =>
-        info(
-          s"round $round, the source of $source: ${run.counts.writeConflicts.value} write " +
-            s"conflicts, ${run.counts.commitContention.value} commits that met another"
-        )
-      }
-    }
+  /** What holds of two sources of one table after their rounds, however their runs interleaved. */
+  private def asWritten(fanIn: FanIn): Unit = {
+    import fanIn._
 
     // Every row of each source, once, as its files have it; and no other row.
     written(shop, Columns) shouldBe expected(Columns, ofShop: _*)
@@ -115,7 +155,7 @@ final class FanInSpec extends AnyFunSuite with Matchers with GeneratedDeliveries
     // The log has one commit for each batch and no other, and each batch records the version
     // that the log has under its name.
     val batches =
-      for (of <- Seq(shop, web); seq <- Seq(1L, 2L)) yield of -> batch(of, seq)
+      for (of <- Seq(shop, web); seq <- 1L to rounds.toLong) yield of -> batch(of, seq)
     batches.foreach(_._2.status shouldBe BatchStatus.Committed)
     val history = DeltaTable
       .forPath(spark, bronze(shop).uri)
@@ -124,7 +164,7 @@ final class FanInSpec extends AnyFunSuite with Matchers with GeneratedDeliveries
       .collect()
       .map(row => row.getLong(0) -> row.getString(1))
       .toMap
-    history.keySet shouldBe Set(0L, 1L, 2L, 3L)
+    history.keySet shouldBe (0L until 2L * rounds).toSet
     batches.map { case (of, batch) => versionIn(of, batch) }.toSet shouldBe history.keySet
     batches.foreach { case (of, batch) =>
       history(versionIn(of, batch)) shouldBe
@@ -132,12 +172,45 @@ final class FanInSpec extends AnyFunSuite with Matchers with GeneratedDeliveries
     }
 
     // The records that cannot be parsed are in the quarantine of their own source.
+    def setApartOf(deliveries: Vector[Delivery]): Seq[(Long, String, String)] =
+      deliveries.zipWithIndex.flatMap { case (delivery, i) => setApart(i + 1L, delivery) }.sorted
     quarantine(shop) should not be quarantine(web)
-    quarantinedOf(shop) shouldBe (setApart(1, ofShop(0)) ++ setApart(2, ofShop(1))).sorted
-    quarantinedOf(web) shouldBe (setApart(1, ofWeb(0)) ++ setApart(2, ofWeb(1))).sorted
+    quarantinedOf(shop) shouldBe setApartOf(ofShop)
+    quarantinedOf(web) shouldBe setApartOf(ofWeb)
 
-    // And nothing ran but the two runs of each source.
-    runsOf(shop) shouldBe Seq("SUCCEEDED", "SUCCEEDED")
-    runsOf(web) shouldBe Seq("SUCCEEDED", "SUCCEEDED")
+    // And nothing ran but one run of each source in each round.
+    runsOf(shop) shouldBe Seq.fill(rounds)("SUCCEEDED")
+    runsOf(web) shouldBe Seq.fill(rounds)("SUCCEEDED"): Unit
+  }
+
+  test("two sources, in two processes at once, write one table: every row of each is there once") {
+    // In the first round the table is not there, and both runs are to make it; in the second
+    // it is, and both append to it.
+    val both = appended(made())
+
+    both.rounds should be >= 2
+    asWritten(both)
+  }
+}
+
+object FanInSpec {
+
+  /** A heap as the writers of the stress runs have: two processes, beside the JVM of the tests. */
+  private val Heap = "512m"
+
+  /** How many times a round is made before the test says that two runs were never at one time. */
+  private val Tries = 3
+
+  /**
+   * Two sources of one table of Bronze, and the deliveries that each was left, one for each
+   * round.
+   */
+  final private case class FanIn(
+      shop: Source,
+      web: Source,
+      ofShop: Vector[Delivery],
+      ofWeb: Vector[Delivery]
+  ) {
+    def rounds: Int = ofShop.size
   }
 }
