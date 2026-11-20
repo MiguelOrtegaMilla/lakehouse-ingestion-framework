@@ -21,6 +21,7 @@ import lakehouse.ingestion.logstore.storage.{
 }
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.scalatest.OptionValues
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -31,7 +32,11 @@ import org.scalatest.matchers.should.Matchers
  * The lake is a real directory. The coordination database is the in-memory one here; the
  * integration tests ask a real PostgreSQL, with and without its schema.
  */
-final class StartupGuardSpec extends AnyFunSuite with Matchers with ScratchDirectories {
+final class StartupGuardSpec
+    extends AnyFunSuite
+    with Matchers
+    with OptionValues
+    with ScratchDirectories {
 
   import StartupGuardSpec._
 
@@ -157,6 +162,40 @@ final class StartupGuardSpec extends AnyFunSuite with Matchers with ScratchDirec
 
     found should have size 1
     found.head should include("the coordination database cannot be used")
+  }
+
+  test("a process that may not start is told every problem, and what the database failed with") {
+    val lake = newDirectory()
+    val unset = goodConf()
+    unset.unset(StartupGuard.logStoreKey("file"))
+    def refusal(conf: Configuration): StartupRefusedException =
+      intercept[StartupRefusedException](
+        StartupGuard.require(conf, hadoop(lake), _ => store, LogStorage.of)
+      )
+
+    // A configuration that is wrong: nothing that the database said.
+    val misconfigured = refusal(unset)
+    misconfigured.problems should have size 1
+    misconfigured.coordinationFailure shouldBe empty
+    misconfigured.getCause shouldBe null
+
+    // The database that does not answer, as well: what it failed with is kept, for the caller
+    // to tell whether it may pass, and it is the cause.
+    store.down()
+    val both =
+      try refusal(unset)
+      finally store.up()
+    both.problems should have size 2
+    both.problems.last should include("the coordination database cannot be used")
+    both.coordinationFailure.value shouldBe a[IOException]
+    both.getCause shouldBe both.coordinationFailure.value
+
+    noException should be thrownBy StartupGuard.require(
+      goodConf(),
+      hadoop(lake),
+      _ => store,
+      LogStorage.of
+    )
   }
 
   test(

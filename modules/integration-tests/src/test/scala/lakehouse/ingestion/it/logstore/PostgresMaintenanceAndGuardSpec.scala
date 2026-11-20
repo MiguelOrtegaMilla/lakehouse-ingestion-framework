@@ -1,5 +1,6 @@
 package lakehouse.ingestion.it.logstore
 
+import java.net.ServerSocket
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.attribute.FileTime
 import java.nio.file.{Files, Path => LocalPath}
@@ -10,6 +11,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.Using
 
 import io.delta.storage.HDFSLogStore
+import lakehouse.ingestion.engine.control.DatabaseFailure
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CoordinationSchema, CoordinationStores}
 import lakehouse.ingestion.logstore._
 import lakehouse.ingestion.logstore.coordination.{
@@ -21,7 +23,7 @@ import lakehouse.ingestion.logstore.coordination.{
 }
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
-import org.scalatest.BeforeAndAfterAll
+import org.scalatest.{BeforeAndAfterAll, OptionValues}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -35,6 +37,7 @@ final class PostgresMaintenanceAndGuardSpec
     extends AnyFunSuite
     with Matchers
     with BeforeAndAfterAll
+    with OptionValues
     with ScratchDirectories {
 
   import PostgresMaintenanceAndGuardSpec._
@@ -257,6 +260,28 @@ final class PostgresMaintenanceAndGuardSpec
     found should have size 1
     found.head should include("the coordination database cannot be used")
     found.head should not include "not-the-password"
+
+    // The database answered, and said no: running again will not do.
+    val refused =
+      intercept[StartupRefusedException](StartupGuard.require(configured, hadoop(newDirectory())))
+    DatabaseFailure.mayPass(refused.coordinationFailure.value) shouldBe false
+  }
+
+  test("a coordination database that is not there keeps a process from starting, and may pass") {
+    val closed = Using.resource(new ServerSocket(0))(_.getLocalPort)
+    val configured = deployed(commitPath)
+    configured.set(
+      CoordinationSettings.JdbcUrl,
+      s"jdbc:postgresql://127.0.0.1:$closed/${CoordinationSchema.Database}"
+    )
+    configured.setLong(CoordinationSettings.ConnectTimeoutMs, 500L)
+
+    val refused =
+      intercept[StartupRefusedException](StartupGuard.require(configured, hadoop(newDirectory())))
+
+    refused.problems should have size 1
+    refused.problems.head should include("the coordination database cannot be used")
+    DatabaseFailure.mayPass(refused.coordinationFailure.value) shouldBe true
   }
 }
 

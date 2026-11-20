@@ -8,10 +8,20 @@ import lakehouse.ingestion.logstore.storage.{LogStorage, PublishResult}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
 
-/** A process may not start: its configuration would not coordinate the tables it writes. */
-final class StartupRefusedException(val problems: Seq[String])
-    extends IOException(
-      problems.mkString("the LogStore is not set up for this process:\n  - ", "\n  - ", "")
+/**
+ * A process may not start: its configuration would not coordinate the tables it writes.
+ *
+ * @param coordinationFailure what the coordination database failed with, when that is one of
+ *   the problems. It is the cause of the exception as well. This library does not say whether
+ *   a failure may pass: the application that starts it does, by its own rules, and tells a
+ *   database that was not reached from one that answered and said no
+ */
+final class StartupRefusedException(
+    val problems: Seq[String],
+    val coordinationFailure: Option[IOException] = None
+) extends IOException(
+      problems.mkString("the LogStore is not set up for this process:\n  - ", "\n  - ", ""),
+      coordinationFailure.orNull
     )
 
 /**
@@ -50,11 +60,26 @@ object StartupGuard {
   def problems(conf: Configuration, lakeRoot: Path): Seq[String] =
     problems(conf, lakeRoot, PostgresLogStore.sharedCoordination, LogStorage.of)
 
-  /** Throws if `problems` finds any, with all of them. */
+  /**
+   * Throws if `problems` finds any, with all of them, and with what the coordination database
+   * failed with if it is one of them.
+   */
   @throws[StartupRefusedException]
-  def require(conf: Configuration, lakeRoot: Path): Unit = {
-    val found = problems(conf, lakeRoot)
-    if (found.nonEmpty) throw new StartupRefusedException(found)
+  def require(conf: Configuration, lakeRoot: Path): Unit =
+    require(conf, lakeRoot, PostgresLogStore.sharedCoordination, LogStorage.of)
+
+  private[logstore] def require(
+      conf: Configuration,
+      lakeRoot: Path,
+      coordinationOf: Configuration => CoordinationStore,
+      storageOf: FileSystem => LogStorage
+  ): Unit = {
+    val found = findings(conf, lakeRoot, coordinationOf, storageOf)
+    if (found.nonEmpty)
+      throw new StartupRefusedException(
+        found.map(_.problem),
+        found.collectFirst { case Finding(_, Some(failure)) => failure }
+      )
   }
 
   private[logstore] def problems(
@@ -62,21 +87,34 @@ object StartupGuard {
       lakeRoot: Path,
       coordinationOf: Configuration => CoordinationStore,
       storageOf: FileSystem => LogStorage
-  ): Seq[String] =
+  ): Seq[String] = findings(conf, lakeRoot, coordinationOf, storageOf).map(_.problem)
+
+  /** A problem, with what the coordination database failed with, if that is the problem. */
+  final private case class Finding(problem: String, coordinationFailure: Option[IOException])
+
+  private def problem(text: String): Finding = Finding(text, None)
+
+  private def findings(
+      conf: Configuration,
+      lakeRoot: Path,
+      coordinationOf: Configuration => CoordinationStore,
+      storageOf: FileSystem => LogStorage
+  ): Seq[Finding] =
     try {
       val fs = lakeRoot.getFileSystem(conf)
       val storage =
         try Right(storageOf(fs))
         catch { case e: UnsupportedTableLocationException => Left(e.getMessage) }
 
-      logStoreProblem(conf, fs.getUri.getScheme).toSeq ++
+      (logStoreProblem(conf, fs.getUri.getScheme).toSeq ++
         storage.left.toSeq ++
-        storage.toOption.flatMap(lakeRootProblem(_, fs, lakeRoot)) ++
+        storage.toOption.flatMap(lakeRootProblem(_, fs, lakeRoot))).map(problem) ++
         coordinationProblems(conf, coordinationOf, storage.toOption.map(_ => (lakeRoot, fs))) ++
-        faultHookProblem(conf)
+        faultHookProblem(conf).map(problem)
     } catch {
       // The lake root itself cannot be looked at: no file system for it, for instance.
-      case e: IOException => Seq(s"the lake root $lakeRoot cannot be reached: ${e.getMessage}")
+      case e: IOException =>
+        Seq(problem(s"the lake root $lakeRoot cannot be reached: ${e.getMessage}"))
     }
 
   private def logStoreProblem(conf: Configuration, scheme: String): Option[String] = {
@@ -130,9 +168,9 @@ object StartupGuard {
       conf: Configuration,
       coordinationOf: Configuration => CoordinationStore,
       lake: Option[(Path, FileSystem)]
-  ): Seq[String] =
+  ): Seq[Finding] =
     CoordinationSettings.from(conf) match {
-      case Left(problems) => problems
+      case Left(problems) => problems.map(problem)
       case Right(_) =>
         // Any question does: the first one opens the pool and checks the schema version.
         try {
@@ -141,7 +179,8 @@ object StartupGuard {
           }
           Nil
         } catch {
-          case e: IOException => Seq(s"the coordination database cannot be used: ${e.getMessage}")
+          case e: IOException =>
+            Seq(Finding(s"the coordination database cannot be used: ${e.getMessage}", Some(e)))
         }
     }
 
