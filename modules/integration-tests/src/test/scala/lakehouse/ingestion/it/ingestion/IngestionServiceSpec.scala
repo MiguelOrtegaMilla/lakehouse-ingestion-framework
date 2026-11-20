@@ -278,6 +278,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     seen.toSeq shouldBe Seq(
       (FaultPoint.AfterPlan, "PLANNED", None, 0),
       (FaultPoint.AfterRead, "PLANNED", None, 0),
+      (FaultPoint.AfterCounts, "PLANNED", None, 0),
       (FaultPoint.AfterBronzeCommit, "PLANNED", Some(1L), 0),
       (FaultPoint.BeforeStateCommit, "PLANNED", Some(1L), 0)
     )
@@ -391,7 +392,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
   }
 
   test("a batch whose data is not written is run again as it was planned, under its number") {
-    Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead).foreach { point =>
+    Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead, FaultPoint.AfterCounts).foreach { point =>
       withClue(s"a run that died at $point: ") {
         val orders = fileSource()
         val a = drop(orders, "a.csv", "id\n1\n2\n")
@@ -1102,8 +1103,12 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     tableIsThere(orders) shouldBe false
     delta.lastVersion(bronze(orders), nothing.batch.app) shouldBe None
     // It wrote nothing to Bronze, so it never was after a commit there.
-    points.toSeq shouldBe
-      Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead, FaultPoint.BeforeStateCommit)
+    points.toSeq shouldBe Seq(
+      FaultPoint.AfterPlan,
+      FaultPoint.AfterRead,
+      FaultPoint.AfterCounts,
+      FaultPoint.BeforeStateCommit
+    )
     val idle = launch(orders)
     idle shouldBe Outcome.NothingNew(idle.run)
 
@@ -1188,6 +1193,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     seen.toSeq shouldBe Seq(
       (FaultPoint.AfterPlan, None, None),
       (FaultPoint.AfterRead, None, None),
+      (FaultPoint.AfterCounts, None, None),
       (FaultPoint.AfterQuarantineWrite, Some(1L), None),
       (FaultPoint.AfterBronzeCommit, Some(1L), Some(1L)),
       (FaultPoint.BeforeStateCommit, Some(1L), Some(1L))
@@ -1313,6 +1319,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     points.toSeq shouldBe Seq(
       FaultPoint.AfterPlan,
       FaultPoint.AfterRead,
+      FaultPoint.AfterCounts,
       FaultPoint.AfterQuarantineWrite,
       FaultPoint.BeforeStateCommit
     )

@@ -312,41 +312,47 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
     }
   }
 
-  Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead, FaultPoint.AfterQuarantineWrite).foreach {
-    point =>
-      test(s"a run that lost its lease by $point takes no step after it") {
-        val orders = fileSource(rejected = Some("0.5"))
-        drop(orders, "a.csv", "id,amount\n1,2\n3\n")
-        val first = batchId(orders, 1)
-        val taken = new TakenAt(point, orders)
+  Seq(
+    FaultPoint.AfterPlan,
+    FaultPoint.AfterRead,
+    FaultPoint.AfterCounts,
+    FaultPoint.AfterQuarantineWrite
+  ).foreach { point =>
+    test(s"a run that lost its lease by $point takes no step after it") {
+      val orders = fileSource(rejected = Some("0.5"))
+      drop(orders, "a.csv", "id,amount\n1,2\n3\n")
+      val first = batchId(orders, 1)
+      val taken = new TakenAt(point, orders)
 
-        val outcome = anInstance(own => launch(orders, taken.service(own)))
+      val outcome = anInstance(own => launch(orders, taken.service(own)))
 
-        stoppedForItsLease(taken.stoppedWith, orders)
-        lostItsLease(outcome, orders) should include("another run holds it")
-        // The job that was stopped is the last that the run started.
-        jobsOf(outcome.run).last shouldBe Some(false)
-        // And what the steps before it left is all that there is.
-        point match {
-          case FaultPoint.AfterPlan =>
-            taken.reads shouldBe 0
-            isThere(quarantine(orders)) shouldBe false
-          case FaultPoint.AfterRead =>
-            taken.reads shouldBe 1
-            isThere(quarantine(orders)) shouldBe false
-          case _ =>
-            delta.lastVersion(quarantine(orders), first.app) shouldBe Some(1L)
-        }
-        tableIsThere(orders) shouldBe false
-        runOf(outcome.run).status shouldBe RunStatus.Abandoned
-        batchOf(first).status shouldBe BatchStatus.Planned
-
-        // The batch is the next run's, which writes each of its records once.
-        taken.release(first)
-        ingested(launch(orders)).batch shouldBe first
-        rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
-        quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+      stoppedForItsLease(taken.stoppedWith, orders)
+      lostItsLease(outcome, orders) should include("another run holds it")
+      // The job that was stopped is the last that the run started.
+      jobsOf(outcome.run).last shouldBe Some(false)
+      // And what the steps before it left is all that there is.
+      point match {
+        case FaultPoint.AfterPlan =>
+          taken.reads shouldBe 0
+          isThere(quarantine(orders)) shouldBe false
+        // After its read, and after its counts, which are the last jobs before a table is
+        // written: the record that was rejected is counted, and is not in quarantine.
+        case FaultPoint.AfterRead | FaultPoint.AfterCounts =>
+          taken.reads shouldBe 1
+          isThere(quarantine(orders)) shouldBe false
+        case _ =>
+          delta.lastVersion(quarantine(orders), first.app) shouldBe Some(1L)
       }
+      tableIsThere(orders) shouldBe false
+      runOf(outcome.run).status shouldBe RunStatus.Abandoned
+      batchOf(first).status shouldBe BatchStatus.Planned
+
+      // The batch is the next run's, which writes each of its records once.
+      taken.release(first)
+      ingested(launch(orders)).batch shouldBe first
+      rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
+      quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
+    }
   }
 
   test("a run whose lease ran out says that it failed, if the control plane has it still") {

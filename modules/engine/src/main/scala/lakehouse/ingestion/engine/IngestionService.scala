@@ -452,10 +452,12 @@ final class IngestionService(
         rowsRejected = Some(unparsed),
         bytesRead = progress.bytes
       )
+      hooks.at(FaultPoint.AfterCounts, batch)
 
       // The quarantine before the data (ADR-0005 §3, step 5), and whatever becomes of the batch:
       // a record that was rejected is there to be looked at, the more so when there are too many.
       val apart = read.unparsed.filter(_ => unparsed > 0).map { records =>
+        // The counts were jobs of Spark: a run that lost its lease in them writes no table.
         leased.verify()
         val written = this.written(quarantine, batch) {
           new QuarantineWriter(confinement, tables, commits)
