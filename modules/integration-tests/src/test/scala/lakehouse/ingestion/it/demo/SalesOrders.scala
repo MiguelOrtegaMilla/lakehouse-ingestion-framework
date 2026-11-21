@@ -68,10 +68,13 @@ object SalesOrders {
     val filled = windows.zipWithIndex.foldLeft(TableGenerator.Table.Empty) {
       case (before, (window, index)) =>
         // The first week has nothing yet to change.
-        val mix = if (before.rows.size >= Weekly.updates + Weekly.deletes) Weekly else Weekly.copy(
-          updates = 0,
-          deletes = 0
-        )
+        val mix =
+          if (before.rows.size >= Weekly.updates + Weekly.deletes) Weekly
+          else
+            Weekly.copy(
+              updates = 0,
+              deletes = 0
+            )
         write(TableGenerator.round(Seed, index + 1, window, before, mix), before, connect)
     }
     Made(filled.rows.size, windows.size, until)
@@ -86,7 +89,11 @@ object SalesOrders {
     val rows = Using.resource(connect())(TableGenerator.readBack(_, Orders))
     require(rows.nonEmpty, s"$Orders has no rows: make it with --create first")
     val before =
-      TableGenerator.Table(SortedMap.from(rows.map(row => row.orderId -> row)), rows.map(_.orderId).max, Set.empty)
+      TableGenerator.Table(
+        SortedMap.from(rows.map(row => row.orderId -> row)),
+        rows.map(_.orderId).max,
+        Set.empty
+      )
     // The seed is spread over the rows that are there: the changes of one table are one series.
     val round = TableGenerator.round(Seed ^ before.lastKey, 1, window, before, Changes)
     write(round, before, connect)
