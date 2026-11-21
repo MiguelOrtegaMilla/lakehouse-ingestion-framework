@@ -21,7 +21,11 @@ final class DatabaseFailureSpec extends AnyFunSuite with Matchers {
       "57P03" -> "the server is starting",
       "57014" -> "the statement ran past its timeout",
       "40001" -> "the transaction lost to another",
-      "40P01" -> "the database broke a deadlock by ending this transaction"
+      "40P01" -> "the database broke a deadlock by ending this transaction",
+      "53300" -> "the server, or the role, has no connection left to give",
+      "53200" -> "the server is out of memory",
+      "53100" -> "the disk of the server is full",
+      "55P03" -> "a lock was not given in the time that a statement may wait for one"
     )
     passing.foreach { case (state, what) =>
       withClue(s"$state, $what: ")(DatabaseFailure.mayPass(sql(state)) shouldBe true)
@@ -39,7 +43,9 @@ final class DatabaseFailureSpec extends AnyFunSuite with Matchers {
       "3D000" -> "the database does not exist",
       "42501" -> "the role may not",
       "42P01" -> "the table is not there",
-      "23505" -> "a key is taken"
+      "23505" -> "a key is taken",
+      "55000" -> "the object is not in the state that the statement needs",
+      "54000" -> "a limit of the program was exceeded"
     )
     staying.foreach { case (state, what) =>
       withClue(s"$state, $what: ")(DatabaseFailure.mayPass(sql(state)) shouldBe false)

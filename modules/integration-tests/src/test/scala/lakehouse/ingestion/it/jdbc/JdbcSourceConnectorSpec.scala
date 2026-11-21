@@ -957,6 +957,39 @@ final class JdbcSourceConnectorSpec
     unreachable.getMessage should include("(SQLState 08001)")
   }
 
+  test("a server that is busy may pass: no connection left, and a lock not given in time") {
+    val many = source("public.many")
+    def asSuperuser(statements: String*): Unit =
+      Using.resource(pg.connectAsSuperuser("sales"))(c => statements.foreach(execute(c, _)))
+
+    // The role may open no connection more, and the server says so to the one that asks.
+    val full =
+      try {
+        asSuperuser("ALTER ROLE sales_ro CONNECTION LIMIT 0")
+        intercept[RunFailedException](plan(many))
+      } finally asSuperuser("ALTER ROLE sales_ro CONNECTION LIMIT -1")
+    full.failure shouldBe FailureClass.Transient
+    full.getMessage shouldBe
+      s"""${where(many)}: FATAL: too many connections for role "sales_ro" (SQLState 53300)"""
+
+    // The table is being altered, and the role lets a statement wait 300 ms for its lock.
+    val locked =
+      try {
+        asSuperuser("ALTER ROLE sales_ro IN DATABASE sales SET lock_timeout = '300ms'")
+        Using.resource(pg.connect("sales_owner", "sales")) { altering =>
+          altering.setAutoCommit(false)
+          execute(altering, "LOCK TABLE many IN ACCESS EXCLUSIVE MODE")
+          intercept[RunFailedException](plan(many))
+        }
+      } finally asSuperuser("ALTER ROLE sales_ro IN DATABASE sales RESET lock_timeout")
+    locked.failure shouldBe FailureClass.Transient
+    locked.getMessage shouldBe
+      s"${where(many)}: ERROR: canceling statement due to lock timeout (SQLState 55P03)"
+
+    // Nobody changed anything of the source, and the next plan finds it free.
+    plan(many) shouldBe FullLoadPlan(QualifiedName.parse("public.many").value).toJson
+  }
+
   test("a value that the type of its column does not hold fails the read for good") {
     // A bounded numeric is a decimal of Spark, which has no NaN.
     val bounded = source("public.bounded")
