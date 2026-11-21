@@ -243,6 +243,14 @@ object Profile {
      * copies into the Hadoop configuration that Delta hands a LogStore.
      */
     val LogStoreSettingsPrefix = "spark.hadoop.lakehouse.logstore."
+
+    /**
+     * Whether Delta writes in a commit what its write did, the rows that it wrote among it
+     * (`DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED`). It is on in every session of the engine:
+     * what a run says that it wrote is read from the commits of its batch, and for a source
+     * that is read as it is written there is no other count (discovery §15).
+     */
+    val CommitMetrics = "spark.databricks.delta.history.metricsEnabled"
   }
 
   /**
@@ -283,6 +291,11 @@ object Profile {
       )
     else if (is(EngineSpark.AppName))
       Some("is set by the engine: a session is named after the source that it runs")
+    else if (is(EngineSpark.CommitMetrics))
+      Some(
+        "is set by the engine: the rows that a run wrote are read from the commits of its " +
+          "batch, which Delta counts them in only while this is on"
+      )
     else if (is(TransactionRetentionDefault))
       Some(
         "would give every table that Delta makes the property delta.setTransactionRetentionDuration. " +

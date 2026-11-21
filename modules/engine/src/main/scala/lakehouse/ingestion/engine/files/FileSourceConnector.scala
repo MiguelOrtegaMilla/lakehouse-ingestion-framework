@@ -153,7 +153,7 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
       config: FileConnectorConfig,
       plan: Json,
       context: ReadContext
-  ): ReadResult = {
+  ): ReadResult.Kept = {
     val files = planOf(source, config, plan)
     val before = confirmed(config, "since it was planned")(landing.confirm(config, files))
     val read =
@@ -175,9 +175,10 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
     afterRead()
     confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
 
-    if (config.format == FileConnectorConfig.Format.Parquet) ReadResult(kept, unparsed = None)
+    if (config.format == FileConnectorConfig.Format.Parquet)
+      ReadResult.Kept(kept, unparsed = None)
     else
-      ReadResult(
+      ReadResult.Kept(
         // The column that stood for the columns of a batch that has none goes with it. A
         // column of the source is kept, whatever it is named.
         rows = kept.filter(col(Unparsed).isNull).drop(Unparsed +: read.placeholder.toSeq: _*),

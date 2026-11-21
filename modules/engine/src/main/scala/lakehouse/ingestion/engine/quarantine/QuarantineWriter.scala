@@ -4,9 +4,9 @@ import java.sql.Timestamp
 import java.time.Instant
 
 import lakehouse.ingestion.core.config.{EngineColumns, SourceId, TableLocation}
-import lakehouse.ingestion.core.control.{BatchId, Quarantine, RunId, TableTransactions}
+import lakehouse.ingestion.core.control.{BatchId, Quarantine, RunId}
 import lakehouse.ingestion.engine.connector.ReadResult
-import lakehouse.ingestion.engine.delta.{BatchAppend, Lake}
+import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.functions.{col, lit}
@@ -43,7 +43,7 @@ final case class QuarantineBatch(run: RunId, source: SourceId, id: BatchId, quar
  * @param tables what is asked of a table about its batches, before the write and after it
  * @param context the context of the run that every batch given here is written by
  */
-final class QuarantineWriter(lake: Lake, tables: TableTransactions, context: CommitContext) {
+final class QuarantineWriter(lake: Lake, tables: DeltaTableTransactions, context: CommitContext) {
 
   private val appends = new BatchAppend(lake, tables, context)
 

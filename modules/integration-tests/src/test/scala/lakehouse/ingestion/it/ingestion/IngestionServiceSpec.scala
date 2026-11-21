@@ -992,7 +992,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
         bronze(orders),
         BronzeBatch(other, orders.id, batch.id, Now),
         Seq("1").toDF("id")
-      ) shouldBe BatchAppend.Appended(0, conflicts = 0)
+      ) shouldBe BatchAppend.Appended(0, conflicts = 0, rows = Some(1))
       drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800)): Unit
     })
 
