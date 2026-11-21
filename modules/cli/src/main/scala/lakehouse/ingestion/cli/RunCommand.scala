@@ -279,10 +279,18 @@ object RunCommand {
           more match {
             case Some(within) if chain.maxBatches.forall(done < _) =>
               next(within, ran + 1, done, Some(code))
-            case Some(_) =>
+            case Some(within) =>
+              // The plan of the batch says that there is more. After a batch of another
+              // invocation no plan of this one says anything: the next plans anew, and finds
+              // out.
+              val left =
+                if (within.nonEmpty) "and the source has more."
+                else
+                  "after a batch that a run before this invocation left: whether the source " +
+                    "has more is for the next invocation to plan."
               out.println(
                 s"${ofTheInvocation(source, ran + 1, done)}: it stopped at --max-batches " +
-                  s"${chain.maxBatches.getOrElse(done)}, and the source has more."
+                  s"${chain.maxBatches.getOrElse(done)}, $left"
               )
               code
             case None =>
