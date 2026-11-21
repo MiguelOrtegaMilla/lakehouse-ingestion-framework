@@ -11,6 +11,7 @@ import lakehouse.ingestion.core.config.{
   ConnectorKind,
   DatabaseConnection,
   Durations,
+  EngineColumns,
   JdbcConnector,
   JdbcConnectorConfig,
   Load,
@@ -71,8 +72,9 @@ import org.slf4j.LoggerFactory
  * table, and their types (`SourceDatabase.columns`). A table that is not there, or that the
  * role may not read, fails the run before a batch is planned. Two columns whose names differ
  * only in their case are refused, since a table of Delta cannot have both; and so is a column
- * whose name a table of Delta cannot have (`DeltaNames`). Any other name is taken, whatever it
- * holds: it is written quoted wherever the engine writes it (`JdbcSql`).
+ * whose name a table of Delta cannot have (`DeltaNames`), or that is under a name of the
+ * columns that the engine adds to a row (`EngineColumns`). Any other name is taken, whatever
+ * it holds: it is written quoted wherever the engine writes it (`JdbcSql`).
  *
  * '''The types of the source are kept, and no value is changed without a word'''
  * (`BronzeTypes`). A column of a type that Spark reads into one of its own that changes its
@@ -316,6 +318,18 @@ final class JdbcSourceConnector(secrets: SecretResolver)
         s"has columns whose names a table of Delta cannot have, " +
           s"${unfit.map(JdbcSql.quoted).mkString(", ")}: a name may hold no space, tab or line " +
           "break, and none of ,;{}()=. A view of the table can give them other names"
+      )
+    // Before a batch is planned, and not when its rows are written: the writer of Bronze
+    // refuses four of the names then, with the batch planned for every run to fail on, and
+    // takes the two that a read of files gives a row as that read's own.
+    val engines = columns.map(_.name).filter(EngineColumns.reserved(_).nonEmpty)
+    if (engines.nonEmpty)
+      refused(
+        s"has columns under names of the columns that the engine adds to every row of " +
+          s"Bronze, ${engines.map(JdbcSql.quoted).mkString(", ")}: " +
+          s"${EngineColumns.All.mkString(", ")}, whatever their case. A column of the " +
+          "source would be taken there for the engine's own. A view of the table can give " +
+          "them other names"
       )
     val unknown = config.textColumns.map(_.value).filterNot(columns.map(_.name).toSet)
     if (unknown.nonEmpty)
