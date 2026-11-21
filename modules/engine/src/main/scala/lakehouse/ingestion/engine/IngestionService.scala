@@ -495,15 +495,17 @@ final class IngestionService(
       // has lost its lease.
       leased.verify()
       // One row of it is taken. A batch with none writes nothing, and its table is not touched.
-      val some = read.probe.head(1).nonEmpty
+      val some = overItsRows(read.probe.head(1).nonEmpty)
       hooks.at(FaultPoint.AfterCounts, batch)
 
       val data = Option.when(some) {
         leased.verify()
         // The one pass over the rows. Nothing was counted, so the commit is held to nothing.
         val written = this.written(table, batch, counted = None) {
-          new BronzeWriter(confinement, tables, commits)
-            .write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows)
+          overItsRows {
+            new BronzeWriter(confinement, tables, commits)
+              .write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows)
+          }
         }
         hooks.at(FaultPoint.AfterBronzeCommit, batch)
         written
@@ -524,6 +526,23 @@ final class IngestionService(
         data.map(write => BatchOutput(source.targets.bronze.table, write.version)).toVector
       commit(batch, progress, outputs, withWrites(counts, data.toSeq))
     }
+
+    /**
+     * A step that goes over rows that are read from their source as it does. The source may
+     * fail in it, long after the connector answered, and what such a failure is for the run is
+     * the connector's to say (`SourceConnector.failure`): a failure that it does not know for
+     * its source's is let through as it is.
+     *
+     * A failure that has its class already is left alone. One that is said here keeps what it
+     * was as its cause, so that a commit that the LogStore refused for its epoch, or the loss
+     * of the lease, is still found in it by whatever ends the run.
+     */
+    private def overItsRows[T](step: => T): T =
+      try step
+      catch {
+        case classed: RunFailedException => throw classed
+        case NonFatal(failed) => throw bound.failure(failed).getOrElse(failed)
+      }
 
     /** The commit of a batch that is written: step 7. */
     private def commit(
