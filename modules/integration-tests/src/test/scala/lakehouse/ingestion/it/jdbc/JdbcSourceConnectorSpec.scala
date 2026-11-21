@@ -1,10 +1,10 @@
 package lakehouse.ingestion.it.jdbc
 
 import java.net.ServerSocket
-import java.sql.{Connection, Date, Timestamp}
+import java.sql.{Connection, Date, DriverManager, SQLException, Timestamp}
 import java.time.temporal.ChronoUnit
 import java.time.{Instant, OffsetDateTime}
-import java.util.TimeZone
+import java.util.{Properties, TimeZone}
 
 import scala.util.Using
 
@@ -16,6 +16,7 @@ import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
+import lakehouse.ingestion.engine.control.PostgresJdbc
 import lakehouse.ingestion.engine.jdbc.{JdbcSourceConnector, SourceColumn, SourceDatabase}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CapturedLogs, LocalSparkSuite}
 import org.apache.logging.log4j.Level
@@ -312,13 +313,36 @@ final class JdbcSourceConnectorSpec
         "password" -> pg.password("sales_ro"),
         "dbtable" -> SessionSettings
       )
-    ) shouldBe Row("off", "1s", "1s", "UTC")
+    ) shouldBe Row("off", "1s", "1s", "UTC", "off")
     // And what a connection of the connector has, whatever the role has: its own statement
-    // timeout (30 minutes, of a source), a backslash that is a backslash, and no end to a
-    // session that waits in its transaction.
+    // timeout (30 minutes, of a source), a backslash that is a backslash, no end to a session
+    // that waits in its transaction, and transactions that write nothing.
     settings(
       JdbcSourceConnector.options(config.connection, password, SessionSettings, fetch = 1)
-    ) shouldBe Row("on", "0", "30min", "UTC")
+    ) shouldBe Row("on", "0", "30min", "UTC", "on")
+  }
+
+  test("a session of a source writes nothing though its role may, as a guard and not a barrier") {
+    val config = source("public.many").connector.asInstanceOf[JdbcConnectorConfig]
+    val properties = new Properties
+    PostgresJdbc.ofASource(config.connection).foreach { case (name, value) =>
+      properties.setProperty(name, value)
+    }
+    // The owner of the tables of the source, which may write to them and make others.
+    properties.setProperty("user", "sales_owner")
+    properties.setProperty("password", pg.password("sales_owner"))
+
+    Using.resource(DriverManager.getConnection(pg.jdbcUrl("sales"), properties)) { c =>
+      Seq("DELETE FROM many", "CREATE TABLE made_by_a_read (id int)").foreach { sql =>
+        intercept[SQLException](execute(c, sql)).getSQLState shouldBe "25006"
+      }
+      // It is the default of the session, which the session itself may change: it keeps a
+      // statement from writing by mistake. What keeps the engine from writing to a source is
+      // the role that it connects as, which reads alone (sales_ro, ADR-0013).
+      execute(c, "SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE")
+      execute(c, "CREATE TABLE made_by_a_read (id int)")
+      execute(c, "DROP TABLE made_by_a_read")
+    }
   }
 
   test("a read that waits for longer than the role lets a session be idle is not cut") {
@@ -983,7 +1007,8 @@ object JdbcSourceConnectorSpec {
     "(SELECT current_setting('standard_conforming_strings') AS strings, " +
       "current_setting('idle_in_transaction_session_timeout') AS idle, " +
       "current_setting('statement_timeout') AS statement, " +
-      "current_setting('TimeZone') AS zone) AS settings"
+      "current_setting('TimeZone') AS zone, " +
+      "current_setting('default_transaction_read_only') AS read_only) AS settings"
 
   /** The columns of `typed`, each with the type that Bronze keeps it in. */
   private val TypesInBronze: Seq[(String, DataType)] = Seq(
