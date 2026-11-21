@@ -68,13 +68,19 @@ object PostgresJdbc {
    *  - `idle_in_transaction_session_timeout` off: between two fetches a read is idle in its
    *    transaction for as long as the write of its rows takes, and a source that ends such
    *    sessions would cut the batch.
+   *  - `default_transaction_read_only` on: a read writes nothing, and a statement that would is
+   *    refused (`25006`), though the role of the source may write. It is a guard against a
+   *    write by mistake, and not a barrier: a session can set its transaction to write again.
+   *    What keeps the engine from writing to a source is the role it connects as, which is to
+   *    be granted reading alone (ADR-0013).
    */
   def ofASource(connection: DatabaseConnection): Map[String, String] =
     properties(connection) ++ Map(
       "options" -> Seq(
         s"statement_timeout=${connection.timeouts.statement.toMillis}",
         "standard_conforming_strings=on",
-        "idle_in_transaction_session_timeout=0"
+        "idle_in_transaction_session_timeout=0",
+        "default_transaction_read_only=on"
       ).map(setting => s"-c $setting").mkString(" "),
       // A connection that waits for the write of its rows says nothing for a while.
       "tcpKeepAlive" -> "true"

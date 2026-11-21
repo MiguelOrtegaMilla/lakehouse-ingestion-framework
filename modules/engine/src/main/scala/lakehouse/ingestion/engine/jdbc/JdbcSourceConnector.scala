@@ -32,6 +32,7 @@ import lakehouse.ingestion.engine.connector.{
   SourceConnector
 }
 import lakehouse.ingestion.engine.control.PostgresJdbc
+import lakehouse.ingestion.engine.delta.DeltaNames
 import org.apache.spark.sql.functions.{array, col, element_at, lit, raise_error, when}
 import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.slf4j.LoggerFactory
@@ -64,7 +65,9 @@ import org.slf4j.LoggerFactory
  * '''What is asked of the source before a plan, and before a read''': the columns of the
  * table, and their types (`SourceDatabase.columns`). A table that is not there, or that the
  * role may not read, fails the run before a batch is planned. Two columns whose names differ
- * only in their case are refused, since a table of Delta cannot have both.
+ * only in their case are refused, since a table of Delta cannot have both; and so is a column
+ * whose name a table of Delta cannot have (`DeltaNames`). Any other name is taken, whatever it
+ * holds: it is written quoted wherever the engine writes it (`JdbcSql`).
  *
  * '''The types of the source are kept, and no value is changed without a word'''
  * (`BronzeTypes`). A column of a type that Spark reads into one of its own that changes its
@@ -269,6 +272,13 @@ final class JdbcSourceConnector(secrets: SecretResolver)
       refused(
         s"has columns whose names differ only in their case, ${alike.mkString("; ")}, and a " +
           "table of Delta cannot have both"
+      )
+    val unfit = columns.map(_.name).filterNot(DeltaNames.fits)
+    if (unfit.nonEmpty)
+      refused(
+        s"has columns whose names a table of Delta cannot have, " +
+          s"${unfit.map(JdbcSql.quoted).mkString(", ")}: a name may hold no space, tab or line " +
+          "break, and none of ,;{}()=. A view of the table can give them other names"
       )
     val unknown = config.textColumns.map(_.value).filterNot(columns.map(_.name).toSet)
     if (unknown.nonEmpty)

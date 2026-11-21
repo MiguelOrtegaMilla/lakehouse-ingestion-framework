@@ -182,3 +182,10 @@ No new phase: each control lands in the phase that builds the component it prote
 - The strict identifier grammar rejects some legitimate source names that need quoting. This is a documented limitation.
 - The dependency gate ties CI to GitHub, which ADR-0002 already does.
 - Five PostgreSQL roles instead of one. Each is a few lines of setup, and the denial tests document them.
+
+## As built (P6.9, 2026-11-21)
+
+- **No value reaches a statement of a source.** The test above of "a text watermark or key value" has no such value to give: since [ADR-0020](0020-the-watermark-of-an-incremental-load.md) a watermark is a timestamp, and the connector pushes no filter by a key. Values that would be SQL are tested as what a row holds, read whole and by a window (`SqlInjectionSpec`).
+- **What comes from outside to a statement is names**: those of the configuration, which the grammar lets through and which are always quoted (mixed case and keywords of SQL are tested), and those that a source gives its own columns, which can be anything (a quote, a backtick, the marks of a comment) and are quoted wherever the engine or Spark writes them.
+- **`canary` is not what tells.** The test connects as `sales_owner`, which could drop it; but the driver sends one statement at a time, so a value written into one would fail it as a syntax error, and `' OR '1'='1` drops nothing. What tells is that the run ends well, every value is in Bronze as it is, and the server's log of every statement of the role has none of them.
+- **A session of a source writes nothing** (`default_transaction_read_only` on). It is a guard against a write by mistake, and not a barrier: a session may set its transactions to write again. The barrier is §3, the role that the engine connects as.
