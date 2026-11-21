@@ -369,4 +369,6 @@ A change to a source that what is already ingested cannot follow is a **breaking
 - What only says how a database is reached is no breaking change: the role, the reference to the password, TLS, the timeouts.
 - Nor is `load.watermark.start`: it starts a source that has no watermark, and after that bounds only what `lookback` reads again.
 - A source that gives Silver up, or goes from a watermark to full loads, breaks nothing that was done. A full load reads from wherever it likes.
-- What lets a breaking change through, a reset of the state or a backfill, comes with the control plane and with recovery (discovery §17, P4 and P7).
+- **A run of a source with a breaking change is refused**, as a failure that running again does not mend (exit code 4), before anything is planned, read or written. It says each change, and the hash of the configuration that the source last ingested with, whose content is in `control.config_snapshot`: with that configuration the source runs on.
+- **A run into Bronze is refused for what Bronze cannot follow**: `lake.uri`, `targets.bronze.table`, `load.watermark.column` and, for an incremental load, where the rows come from. `keys` and the table of Silver change nothing of what was ingested, and do not stop it.
+- What lets a breaking change through, a reset of the state or a backfill, comes with recovery (discovery §17, P7).

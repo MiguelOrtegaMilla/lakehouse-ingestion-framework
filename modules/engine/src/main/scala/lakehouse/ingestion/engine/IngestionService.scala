@@ -26,6 +26,7 @@ import lakehouse.ingestion.engine.connector.{
 }
 import lakehouse.ingestion.engine.control.{
   Application,
+  ConfigSnapshots,
   ControlDatabase,
   LeasedRun,
   LeaseLostException,
@@ -44,6 +45,9 @@ import org.slf4j.LoggerFactory
  * of a batch and what its table has are never two stories.
  *
  *  1. The lease of the source, and the run under its epoch; or `SKIPPED_LOCKED`.
+ *  1. The configuration of the run, held to the one that the state of the source was last
+ *     advanced with: a change that what was ingested cannot follow ends the run, before
+ *     anything else is asked (ADR-0007).
  *  1. The epoch of the lease, announced to the LogStore before any table is asked anything
  *     (ADR-0019). From then on a run that held the lease before commits to no table, so what
  *     the tables say of its batch is what they will say.
@@ -59,6 +63,24 @@ import org.slf4j.LoggerFactory
  *  1. One transaction in the control plane, on condition of the epoch: the state of the source
  *     moved, the files of the batch recorded as taken, the batch committed with what it wrote,
  *     the run succeeded, the lease given up (`LeasedRun.commit`).
+ *
+ * '''A source whose configuration changed in a way that Bronze cannot follow is not run'''
+ * (ADR-0007, `ConfigVersion.breakingChanges`): another table of Bronze or another lake, whose
+ * state says what was written to the old one; another watermark column; and, for a source
+ * loaded by a watermark, another origin of its rows, whose watermark says how far something
+ * else was read. The run fails for good, with each change and what it would have done, and
+ * the batch that a run left planned, if there is one, stays as it was.
+ *  - ''It is asked before a planned batch is looked for.'' A batch that is rolled forward
+ *    moves the state under the configuration of the run that does it: asked after, the next
+ *    run would be compared with the new configuration, find nothing changed, and go on from a
+ *    watermark of what was read before.
+ *  - ''What is compared with is the configuration of the run that last advanced the state'',
+ *    and not that of the last run, which may be one that was refused for this very change. A
+ *    source that has committed nothing has nothing to break.
+ *  - ''Only what Bronze cannot follow.'' A key, or the table of Silver and its partitioning,
+ *    change nothing of what was ingested: they are for a run into Silver to refuse (P10).
+ *  - ''Nothing lets such a change through yet'': the way on is the configuration that the
+ *    source had, which the control plane keeps. A reset of the state of a source is P7's.
  *
  * '''A batch with no rows writes nothing''': files that are all empty, or that have a header
  * and no record. Its files are recorded as taken by the commit, and no table is made nor given
@@ -197,7 +219,7 @@ final class IngestionService(
         leased.onLost { loss =>
           jobs.stop(s"the run ${start.id} lost the lease of ${start.leaseKey}: ${loss.reason}")
         }
-        try jobs.during(new Attempt(leased, bound).run())
+        try jobs.during(new Attempt(leased, bound, config).run())
         catch {
           // Before anything else: whatever it is wrapped in, it says that the lease is lost.
           case refused: Throwable if outOfTurn(refused).nonEmpty =>
@@ -319,7 +341,7 @@ final class IngestionService(
   }
 
   /** The steps of one run that holds its lease. */
-  final private class Attempt(leased: LeasedRun, bound: BoundSource) {
+  final private class Attempt(leased: LeasedRun, bound: BoundSource, config: ConfigVersion) {
     private val start = leased.start
     private val source = bound.source
     private val table = locator.locate(source.targets.bronze.table)
@@ -336,6 +358,9 @@ final class IngestionService(
     def run(): Outcome = {
       confinement.confine(table)
       confinement.confine(quarantine)
+      // Before a batch is looked for: one that is rolled forward moves the state of the source
+      // under the configuration of this run.
+      heldToWhatWasIngested()
       // Before a table is asked anything: what it then says of a batch is not changed behind
       // this run by one that held the lease before.
       announce()
@@ -344,6 +369,29 @@ final class IngestionService(
         case None => planNext()
       }
     }
+
+    /**
+     * Refuses a configuration that changed in a way that what Bronze has of the source cannot
+     * follow (ADR-0007), against the one that the state of the source was last advanced with.
+     * The lease is this run's, so that state is not moved while it is asked.
+     *
+     * @throws RunFailedException a permanent failure, with each such change and what would go
+     *   wrong if the source simply ran on. Nothing was planned, read or written
+     */
+    private def heldToWhatWasIngested(): Unit =
+      database.run(ConfigSnapshots.ofState(_, source.id, start.layer)).foreach { last =>
+        val broken = ConfigVersion.breakingChanges(last.content, config).filter(_.breaksBronze)
+        if (broken.nonEmpty)
+          throw RunFailedException.permanent(
+            s"the configuration of ${source.id} changed in a way that what was ingested of " +
+              s"it cannot follow: ${broken.map(_.message).mkString("; ")}. Nothing was " +
+              "planned, read or written, and a batch that a run left planned is as it was. " +
+              "The configuration that the state of the source was last advanced with is in " +
+              s"control.config_snapshot, under the hash ${last.hash}: give the source that " +
+              "one, and run it again. To go on under the new one the state of the source " +
+              "has to be reset, which this version of the application does not do yet"
+          )
+      }
 
     /**
      * Says to the LogStore that the epoch of this run is the one in force for its lease

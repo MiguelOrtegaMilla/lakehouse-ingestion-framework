@@ -463,6 +463,53 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
       Seq("profile" -> "lake.uri", "source" -> "keys", "source" -> "load.watermark.column")
   }
 
+  test("a breaking change says whether it is Bronze that cannot follow it") {
+    val everything = changed(
+      changed(
+        changed(
+          changed(
+            changed(
+              changed(SourceText, "keys: [order_id]", "keys: [id]"),
+              "column: updated_at",
+              "column: modified_at"
+            ),
+            "bronze/sales/orders",
+            "bronze/sales/orders_v2"
+          ),
+          "silver/sales/orders",
+          "silver/sales/orders_v2"
+        ),
+        "table: public.orders",
+        "table: public.orders_v2"
+      ),
+      "localhost:5432/sales",
+      "db.internal:5432/sales"
+    )
+    val now = version(everything, changed(ProfileText, "file:///data/lake", "file:///data/lake2"))
+
+    val found = ConfigVersion.breakingChanges(version().content, now)
+
+    // What was ingested: where it was read from and how far, and where it was written.
+    found.filter(_.breaksBronze).map(_.field) shouldBe Seq(
+      "lake.uri",
+      "targets.bronze.table",
+      "load.watermark.column",
+      "connector.connection.url",
+      "connector.table"
+    )
+    // What is made of Bronze afterwards.
+    found.filterNot(_.breaksBronze).map(_.field) shouldBe Seq("targets.silver.table", "keys")
+
+    // The partitioning of a Silver table that stays is Silver's as well.
+    ConfigVersion
+      .breakingChanges(
+        version().content,
+        version(changed(SourceText, "partition_by: [order_day]", "partition_by: [order_month]"))
+      )
+      .map(change => change.field -> change.breaksBronze) shouldBe
+      Seq("targets.silver.partition_by" -> false)
+  }
+
   test("what a source stops doing, or starts doing, breaks nothing that was done") {
     val bronzeOnly = SourceText.replace(
       "  silver: { table: silver/sales/orders, partition_by: [order_day] }\n",
