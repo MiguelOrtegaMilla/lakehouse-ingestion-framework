@@ -87,14 +87,17 @@ object Main {
     s"""usage: lakehouse-ingestion validate --profile <file> --sources <directory>
        |       lakehouse-ingestion migrate --profile <file> --password <reference> [--user <role>]
        |       lakehouse-ingestion run --profile <file> --sources <directory> --source <id>
+       |                               [--max-batches <n>]
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
        |  migrate     Brings the schemas of the control plane and of the commit coordination to
        |              the version of this application, in the databases of the profile, as the
        |              role that owns them.
-       |  run         Runs one source once: the new files of the source, into its table of
-       |              Bronze. The configuration is validated whole first.
+       |  run         Runs one source into its table of Bronze, a batch a run: and again, while
+       |              the source has more than one batch takes, up to where its first plan saw.
+       |              The configuration is validated whole first. SIGTERM or SIGINT lets the
+       |              batch in course finish, and starts no other; a second ends it at once.
        |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
@@ -102,6 +105,7 @@ object Main {
        |  --password  where the password of that role is, and never the password itself:
        |              env:NAME or file:/run/secrets/name
        |  --user      the role that owns the schemas; $Migrator unless said
+       |  --max-batches  the most batches that run commits; no limit unless said
        |
        |exit codes: 0 the configuration is valid, the schemas are at their version, or the run
        |              ended well: a batch committed, nothing new, or a source that is disabled;
@@ -111,9 +115,12 @@ object Main {
        |            4 the configuration is not valid, a database refused, or the run failed
        |              for a reason that running again does not mend;
        |            5 more records were rejected than the source allows: nothing committed;
-       |            64 the command line is not one""".stripMargin
+       |            64 the command line is not one;
+       |            128 + n run was stopped by the signal n before its first run: nothing was
+       |              run. A run stopped after one ends in the code of its last run""".stripMargin
 
-  def main(args: Array[String]): Unit = sys.exit(run(args.toSeq, System.out, System.err))
+  def main(args: Array[String]): Unit =
+    sys.exit(run(args.toSeq, System.out, System.err, sys.env.get, Stop.onSignals(System.err)))
 
   /**
    * Runs a command line, and gives the exit code of the process.
@@ -122,12 +129,14 @@ object Main {
    * @param err errors and warnings, one on each line
    * @param environment how a variable is looked up; the environment of the process, unless a
    *   test says otherwise
+   * @param stop whether the process has been asked to stop: its signals, in `main`
    */
   def run(
       args: Seq[String],
       out: PrintStream,
       err: PrintStream,
-      environment: String => Option[String] = sys.env.get
+      environment: String => Option[String] = sys.env.get,
+      stop: Stop = Stop.Never
   ): Int = args.toList match {
     case "validate" :: options =>
       parse(options, Set("--profile", "--sources")) match {
@@ -151,18 +160,32 @@ object Main {
       }
     case "run" :: options =>
       val asked = for {
-        found <- parse(options, Set("--profile", "--sources", "--source"))
+        found <- parse(
+          options,
+          Set("--profile", "--sources", "--source"),
+          optional = Set("--max-batches")
+        )
         source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
-      } yield (found("--profile"), found("--sources"), source)
+        limit <- found.get("--max-batches") match {
+          case None => Right(None)
+          case Some(text) =>
+            text.toIntOption
+              .filter(n => n >= 1 && text == n.toString)
+              .map(Some(_))
+              .toRight(s"--max-batches '${shown(text)}' is not a number of batches, from 1")
+        }
+      } yield (found("--profile"), found("--sources"), source, limit)
       asked match {
-        case Right((profile, sources, source)) =>
+        case Right((profile, sources, source, limit)) =>
           RunCommand.run(
             Paths.get(profile),
             Paths.get(sources),
             source,
             SecretResolver(environment),
             out,
-            err
+            err,
+            limit,
+            stop
           )
         case Left(problem) => usage(problem, err)
       }

@@ -102,12 +102,13 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
       id: SourceId,
       rejected: Option[String] = None,
       format: String = "csv",
-      table: Option[String] = None
+      table: Option[String] = None,
+      options: String = ""
   ): Source = {
     Files.createDirectories(directoryOf(id))
     val text =
       s"""id: $id
-         |connector: { type: file, path: ${directoryOf(id).getFileName}, format: $format }
+         |connector: { type: file, path: ${directoryOf(id).getFileName}, format: $format$options }
          |load: { mode: new_files }
          |targets: { bronze: { table: ${table.getOrElse(
           s"bronze/${id.value.replace('.', '/')}"

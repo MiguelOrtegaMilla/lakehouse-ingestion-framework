@@ -31,6 +31,15 @@ final class CommandProcess private (process: Process, log: Path) {
     }
     CommandProcess.Ended(process.exitValue(), CommandProcess.tail(log))
   }
+
+  /** Sends the process a signal, by its name as `kill` takes it: TERM, INT. */
+  def signal(name: String): Unit = {
+    val kill = new ProcessBuilder("kill", s"-$name", process.pid().toString).inheritIO().start()
+    if (!kill.waitFor(10, TimeUnit.SECONDS) || kill.exitValue() != 0)
+      Assertions.fail(s"kill -$name of the process did not end well")
+  }
+
+  def isAlive: Boolean = process.isAlive
 }
 
 object CommandProcess {

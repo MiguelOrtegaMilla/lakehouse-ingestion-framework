@@ -204,7 +204,7 @@ sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source s
 The run 019a… of sales.returns committed the batch sales.returns/bronze#1: 2 rows read, 2 written, 0 rejected, into bronze/sales/returns at version 0.
 ```
 
-Run it again and it finds nothing new. The whole configuration is validated first, and what can be refused is refused before anything is started: a source that is not there, roots that are not there, a database that does not answer, a Spark setting that the engine sets or that would have Delta forget the batches of a table.
+Run it again and it finds nothing new. A source with more than one batch takes (`max_files_per_batch`, or a window that `max_batch_range` cuts) is run again in the same process, a batch a run, up to what was there when the invocation started; `--max-batches <n>` stops it sooner. `SIGTERM` or `SIGINT` lets the batch in course finish and starts no other; a second signal ends the process at once. The whole configuration is validated first, and what can be refused is refused before anything is started: a source that is not there, roots that are not there, a database that does not answer, a Spark setting that the engine sets or that would have Delta forget the batches of a table.
 
 | Code | Meaning |
 |---|---|
@@ -213,6 +213,7 @@ Run it again and it finds nothing new. The whole configuration is validated firs
 | 3 | A database did not answer, the run lost its lease, or its files changed under it: run it again later |
 | 4 | Something that running again does not mend: the configuration, a database that refused, a run that failed for good |
 | 5 | More records were rejected than the source allows: nothing was committed, and they are in quarantine |
+| 128 + n | The signal n came before the first run: nothing was run. A run stopped after one ends in the code of its last run |
 | 64 | The command line is not one |
 
 The whole contract is in [discovery §14.1](docs/architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them.

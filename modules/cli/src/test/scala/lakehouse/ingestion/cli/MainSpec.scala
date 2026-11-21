@@ -398,6 +398,38 @@ final class MainSpec
     notAnId.out shouldBe empty
   }
 
+  test("run: --max-batches is a number of batches from 1, given once") {
+    def refused(value: String): Unit = {
+      val ran = run(
+        "run",
+        "--profile",
+        "p.yaml",
+        "--sources",
+        "conf/sources",
+        "--source",
+        "sales.orders",
+        "--max-batches",
+        value
+      )
+      ran.exit shouldBe Main.Exit.Usage
+      ran.errors.head shouldBe s"error: --max-batches '$value' is not a number of batches, from 1": Unit
+    }
+    Seq("0", "-1", "two", "01", "+2", "2147483648").foreach(refused)
+    run(
+      "run",
+      "--profile",
+      "p.yaml",
+      "--sources",
+      "conf/sources",
+      "--source",
+      "sales.orders",
+      "--max-batches",
+      "1",
+      "--max-batches",
+      "2"
+    ).errors.head shouldBe "error: --max-batches is given twice"
+  }
+
   test("run: a configuration that is not valid ends in 4, and nothing is run") {
     val sources =
       runSources("invalid", "sales.returns" -> (_.replace("format: csv", "format: xls")))
