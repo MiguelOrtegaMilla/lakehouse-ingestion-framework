@@ -88,3 +88,9 @@ U = min(H, A + max_batch_range)
 - **`infinity` in the watermark column is in no window**, as a null is in none: no upper bound is after it. `-infinity` is in the first window of a source without `start`, and fails it. Both are in the discovery, §20.
 - **What stands on something else:** a watermark does not name its column nor its table, and a source that comes back under another is refused by the run, against the configuration that its state was last advanced with ([ADR-0007](0007-metadata-format.md), built with this part).
 - **Tests:** `JdbcWindowSpec`, `JdbcSourceConnectorSpec` and `JdbcIngestionSpec`, which the discovery lists (§17, "As built, P6.7b").
+
+## As built (P6.12, 2026-11-21)
+
+- **A window is read again only from a table that still has its column, as a timestamp.** The column is asked of the table when a batch is planned (point 1), and a batch that a run left is read with no plan made: the read asks again, and fails for good if the column is gone or is of another type by then.
+- **A `timestamp` without a zone is warned of at every plan** (point 1). It is taken as UTC, and the bounds of a window are moments of the clock of the source. Stamped by its writers in a zone ahead of UTC, a row is read late, by the difference; in one behind, it is before the watermark already when it is written, and no window after the first holds it. Nothing that can be asked of a source says whose time a column holds, so the column is warned of and not refused, as one that may be null is. A test pins the loss (`JdbcIngestionSpec`).
+- **What the margin covers** (point 3) is the time between the stamp of a row and the moment that the row can be read where the engine reads: how long its transaction lasts and, where the engine reads a replica, how far the replica is behind. The reference says so.
