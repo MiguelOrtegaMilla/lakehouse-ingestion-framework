@@ -251,6 +251,17 @@ final class JdbcSourceConnector(secrets: SecretResolver)
       case Window(bounds) => bounds.next.map(_.toJson)
     }
 
+  /**
+   * A snapshot of a table is the table as it is when it is read: its plan names the table, and
+   * a run that reads it again reads what a plan made anew would. A window is its bounds,
+   * whenever it is read.
+   */
+  override def wholeWhenRead(source: Source, config: JdbcConnectorConfig, plan: Json): Boolean =
+    planOf(source, plan) match {
+      case Whole(_) => true
+      case Window(_) => false
+    }
+
   /** The horizon of a chain, as the plan before this one gave it. */
   private def horizonOf(source: Source, document: Json): WatermarkHorizon =
     WatermarkHorizon

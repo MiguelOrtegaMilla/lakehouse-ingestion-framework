@@ -59,11 +59,17 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
   /**
    * @param held whether the connector says that its rows are held apart from the source, which
    *   they are not
+   * @param whole whether the connector says that a plan of it is its source whole, as it is
+   *   when the plan is read
    */
-  private def numbers(hooks: FaultHooks = FaultHooks.Off, held: Boolean = false) =
+  private def numbers(
+      hooks: FaultHooks = FaultHooks.Off,
+      held: Boolean = false,
+      whole: Boolean = false
+  ) =
     new IngestionService(
       database,
-      ConnectorRegistry(new NumbersConnector(held)),
+      ConnectorRegistry(new NumbersConnector(held, whole)),
       spark,
       lakeRoot,
       timing,
@@ -246,6 +252,54 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     givenAsRows(source) shouldBe 0L
   }
 
+  test("a batch of another invocation that this run read ends the chain, if its plan is whole") {
+    def leftBy(dead: FaultPoint): Source = {
+      val source = numbersSource()
+      dies(source, dead)
+      source
+    }
+
+    // A plan that is its source whole, read by this run: it is what a plan made anew would
+    // read, and nothing comes after it.
+    val whole = leftBy(FaultPoint.AfterCounts)
+    val read = ingested(launch(whole, numbers(whole = true)))
+    read.batch shouldBe batchId(whole, 1)
+    read.next shouldBe Outcome.Next.Ends
+    givenAsRows(whole) shouldBe 5L
+
+    // A plan that is what it was planned as, however late it is read: a plan made anew.
+    val planned = leftBy(FaultPoint.AfterCounts)
+    ingested(launch(planned, numbers())).next shouldBe Outcome.Next.Afresh
+
+    // A plan that is whole, of a batch that another writer of its sequence wrote under this
+    // run: what the table has is not what this run read.
+    val overtaken = leftBy(FaultPoint.AfterPlan)
+    val other = RunId.generate()
+    val under = numbers(
+      hookAt(FaultPoint.AfterCounts) { batch =>
+        new BronzeWriter(
+          new Lake(lakeRoot, spark.sessionState.newHadoopConf()),
+          delta,
+          CommitContext.forRun(other.uuid)
+        ).write(
+          bronze(overtaken),
+          BronzeBatch(other, overtaken.id, batch.id, Now),
+          spark.range(0, 5).toDF("id")
+        ): Unit
+      },
+      whole = true
+    )
+    ingested(launch(overtaken, under)).next shouldBe Outcome.Next.Afresh
+    givenAsRows(overtaken) shouldBe 0L
+
+    // A batch that a dead run wrote is rolled forward, and is as old as that run.
+    val written = leftBy(FaultPoint.AfterBronzeCommit)
+    launch(written, numbers(whole = true)) shouldBe a[Outcome.RolledForward]
+
+    // And a plan of this run's own is followed as it says, whole or not.
+    ingested(launch(numbersSource(), numbers(whole = true))).next shouldBe Outcome.Next.Ends
+  }
+
   test("a commit that does not count its rows leaves the counts of its run not known") {
     val source = numbersSource()
     // The session of a run has Delta count them (`RunSession`); this one is made not to.
@@ -347,8 +401,11 @@ object OnePassIngestionSpec {
    *
    * @param held whether it answers that its rows are held apart from the source
    *   (`ReadResult.Kept`). They are not: it is what a connector that breaks its word does
+   * @param whole what it answers when it is asked whether a plan is its source whole, as it
+   *   is when the plan is read (`wholeWhenRead`)
    */
-  final class NumbersConnector(held: Boolean) extends SourceConnector[Numbers] {
+  final class NumbersConnector(held: Boolean, whole: Boolean = false)
+      extends SourceConnector[Numbers] {
 
     override val kind: ConnectorKind = NumbersKind
 
@@ -394,6 +451,8 @@ object OnePassIngestionSpec {
 
     override def progress(source: Source, config: Numbers, plan: Json): Progress =
       Progress(watermark = Some(Json.fromLong(rangeOf(source, plan)._2)), files = None)
+
+    override def wholeWhenRead(source: Source, config: Numbers, plan: Json): Boolean = whole
 
     private def rangeOf(source: Source, plan: Json): (Long, Long) = {
       val at = plan.hcursor
