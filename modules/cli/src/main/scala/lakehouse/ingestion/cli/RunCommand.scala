@@ -327,9 +327,14 @@ object RunCommand {
       case Outcome.NothingNew(_) =>
         Stream.Out -> s"$run found nothing new, and ended well with no batch."
       case Outcome.Ingested(_, batch, outputs, counts, _) =>
-        Stream.Out -> (s"$run committed the batch $batch: ${counts.rowsRead.getOrElse(0L)} " +
-          s"rows read, ${counts.rowsWritten.getOrElse(0L)} written, " +
-          s"${counts.rowsRejected.getOrElse(0L)} rejected${written(outputs)}.")
+        // A count that the run did not make is not zero: a batch that another writer of its
+        // sequence wrote, or whose commit does not say its rows, has rows that nobody here
+        // counted, and the control plane records the count as not known.
+        def counted(count: Option[Long]): String = count.fold("an unknown number")(_.toString)
+        Stream.Out -> (s"$run committed the batch $batch: " +
+          s"${counts.rowsRead.fold("an unknown number of")(_.toString)} rows read, " +
+          s"${counted(counts.rowsWritten)} written, " +
+          s"${counted(counts.rowsRejected)} rejected${written(outputs)}.")
       case Outcome.RolledForward(_, batch, outputs, _) =>
         Stream.Out -> (s"$run committed the batch $batch, which a run before it had written " +
           s"and not committed: nothing was read${written(outputs)}.")
