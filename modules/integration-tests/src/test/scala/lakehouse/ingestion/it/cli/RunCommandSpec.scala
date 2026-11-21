@@ -1,24 +1,28 @@
 package lakehouse.ingestion.it.cli
 
+import java.io.{ByteArrayOutputStream, PrintStream}
 import java.net.ServerSocket
 import java.nio.file.{Files, Path}
 import java.time.Instant
 import java.util.TimeZone
+import java.util.concurrent.atomic.AtomicInteger
 
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
-import lakehouse.ingestion.cli.{Main, RunSession}
+import lakehouse.ingestion.cli.{Main, RunSession, Stop}
 import lakehouse.ingestion.core.config.{Profile, Source}
-import lakehouse.ingestion.core.control.LeaseTiming
+import lakehouse.ingestion.core.control.{Layer, LeaseKey, LeaseTiming}
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CommandProcess, DeploymentFiles, LocalSparkSuite}
 import org.apache.spark.sql.SparkSession
+import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.{Seconds, Span}
 
 /**
  * The command `run` from end to end, as an orchestrator starts it: a profile and the sources of
@@ -33,7 +37,11 @@ import org.scalatest.matchers.should.Matchers
  * The runs are in this JVM, through `Main.run`, but for the last test: a process of its own,
  * which ends with the code by `sys.exit`, as a deployment sees it.
  */
-final class RunCommandSpec extends AnyFunSuite with Matchers with ControlPlaneSuite {
+final class RunCommandSpec
+    extends AnyFunSuite
+    with Matchers
+    with Eventually
+    with ControlPlaneSuite {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("run-command-"))
   import files.{arguments, connection, drop, profileFile, validProfile}
@@ -318,5 +326,171 @@ final class RunCommandSpec extends AnyFunSuite with Matchers with ControlPlaneSu
   private def process(of: Source): (Int, String) = {
     val ended = CommandProcess.start(arguments(of), files.newLog()).await()
     (ended.exit, ended.log)
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A chain of runs, and what stops it (discovery §17, P6.10)
+  // ---------------------------------------------------------------------------------------------
+
+  /** A source of files of one record each, of which one batch takes one. */
+  private def oneAtATime(count: Int): Source = {
+    val source = files.fileSource(newSourceId(), options = ", max_files_per_batch: 1")
+    (1 to count).foreach(n => drop(source, f"f$n%02d.csv", s"id\n$n\n"))
+    source
+  }
+
+  /** One invocation in this JVM, asked to stop as `stop` says, with options after the source. */
+  private def invoke(of: Source, stop: Stop = Stop.Never, options: Seq[String] = Nil): Ran = {
+    val (out, err) = (new ByteArrayOutputStream, new ByteArrayOutputStream)
+    val exit = Main.run(
+      arguments(of) ++ options,
+      new PrintStream(out, true, "UTF-8"),
+      new PrintStream(err, true, "UTF-8"),
+      Map.empty[String, String].get,
+      stop
+    )
+    Ran(exit, out.toString("UTF-8"), err.toString("UTF-8"))
+  }
+
+  private def committedOf(of: Source): Int = batchesOf(of).count(_._2 == "COMMITTED")
+
+  private def takenFiles(of: Source): Seq[String] = asSuperuser { c =>
+    query(
+      c,
+      "SELECT path FROM control.processed_file WHERE source_id = ? ORDER BY 1",
+      of.id.value
+    ).map(_.head.split('/').last)
+  }
+
+  /** Has the lease of a source run out, if a run holds it. */
+  private def expireLease(of: Source): Unit = asSuperuser { c =>
+    update(
+      c,
+      "UPDATE control.source_lease SET expires_at = now() - interval '1 second' " +
+        "WHERE lease_key = ? AND holder_run_id IS NOT NULL",
+      LeaseKey.of(of.id, Layer.Bronze).value
+    ): Unit
+  }
+
+  test("an invocation runs its source again while the batch it committed says there is more") {
+    val chained = oneAtATime(3)
+    // Before the second run, a producer leaves a file that is complete already: it was not
+    // there at the first plan, which counted three, so it is the next invocation's.
+    val asked = new AtomicInteger
+    val leaving = new Stop {
+      override def requested: Option[Int] = {
+        if (asked.incrementAndGet() == 2) drop(chained, "late.csv", "id\n4\n"): Unit
+        None
+      }
+    }
+
+    val ran = invoke(chained, leaving)
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    ran.lines.count(_.contains("committed the batch")) shouldBe 3
+    ran.lines.last shouldBe
+      s"The invocation of ${chained.id.value} made 3 runs and committed 3 batches."
+    batchesOf(chained) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED", "3" -> "COMMITTED")
+    // Each a run of its own, with its lease given up.
+    runsOf(chained) shouldBe Seq.fill(3)("SUCCEEDED" -> None)
+    takenFiles(chained) should not contain "late.csv"
+
+    val next = invoke(chained)
+    withClue(next.err)(next.exit shouldBe Main.Exit.Ok)
+    takenFiles(chained) should contain("late.csv")
+  }
+
+  test("--max-batches stops the chain where it says, and the next invocation goes on") {
+    val limited = oneAtATime(3)
+
+    val first = invoke(limited, options = Seq("--max-batches", "2"))
+
+    withClue(first.err)(first.exit shouldBe Main.Exit.Ok)
+    first.lines.last shouldBe s"The invocation of ${limited.id.value} made 2 runs and " +
+      "committed 2 batches: it stopped at --max-batches 2, and the source has more."
+    committedOf(limited) shouldBe 2
+
+    val rest = invoke(limited)
+    withClue(rest.err)(rest.exit shouldBe Main.Exit.Ok)
+    committedOf(limited) shouldBe 3
+    takenFiles(limited) shouldBe Seq("f01.csv", "f02.csv", "f03.csv")
+  }
+
+  test("a stop asked during a run lets the run finish, and no other start") {
+    val stopped = oneAtATime(3)
+    val asked = new AtomicInteger
+    // Asked before each run: nothing before the first, SIGTERM before the second.
+    val afterOne = new Stop {
+      override def requested: Option[Int] = Option.when(asked.getAndIncrement() > 0)(15)
+    }
+
+    val ran = invoke(stopped, afterOne)
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    ran.lines.last shouldBe s"The invocation of ${stopped.id.value} made 1 run and committed " +
+      "1 batch: SIGTERM asked it to stop, and no other run was started."
+    batchesOf(stopped) shouldBe Seq("1" -> "COMMITTED")
+  }
+
+  test("a stop asked before the first run ends in 128 + the signal, with nothing run") {
+    val never = oneAtATime(1)
+    val now = new Stop { override def requested: Option[Int] = Some(2) }
+
+    val ran = invoke(never, now)
+
+    ran.exit shouldBe 130
+    said(ran).last shouldBe "error: SIGINT came before the first run. Nothing was run."
+    runsOf(never) shouldBe empty
+  }
+
+  Seq("TERM", "INT").foreach { signal =>
+    test(s"a real SIG$signal lets the batch in course finish, and starts no other") {
+      val source = oneAtATime(8)
+      val process = CommandProcess.start(arguments(source), files.newLog())
+      eventually(timeout(Span(120, Seconds))) {
+        committedOf(source) should be >= 1
+      }
+
+      process.signal(signal)
+      val ended = process.await()
+
+      withClue(ended.log)(ended.exit shouldBe Main.Exit.Ok)
+      ended.log should include(s"SIG$signal received: the batch in course finishes")
+      ended.log should include(s"SIG$signal asked it to stop, and no other run was started")
+      // Every batch that was started is committed, and the source has files left.
+      batchesOf(source).map(_._2).distinct shouldBe Seq("COMMITTED")
+      committedOf(source) should be < 8
+    }
+  }
+
+  test("a second signal ends the process at once, and the next invocation finishes the rest") {
+    val source = oneAtATime(8)
+    val process = CommandProcess.start(arguments(source), files.newLog())
+    eventually(timeout(Span(120, Seconds))) {
+      committedOf(source) should be >= 1
+    }
+
+    process.signal("TERM")
+    process.signal("TERM")
+    val ended = process.await()
+
+    withClue(ended.log)(ended.exit shouldBe 143)
+    // What it left, a batch planned or a lease held, is the next run's to finish.
+    expireLease(source)
+    val rest = invoke(source)
+    withClue(rest.err)(rest.exit shouldBe Main.Exit.Ok)
+    batchesOf(source).map(_._2).distinct shouldBe Seq("COMMITTED")
+    takenFiles(source) shouldBe (1 to 8).map(n => f"f$n%02d.csv")
+  }
+
+  test("a signal before the first run ends the process in 128 + the signal, with nothing run") {
+    val source = oneAtATime(1)
+    val process = CommandProcess.start(arguments(source), files.newLog())
+
+    process.signal("TERM")
+    val ended = process.await()
+
+    ended.exit shouldBe 143
+    runsOf(source) shouldBe empty
   }
 }

@@ -4,6 +4,10 @@ import java.io.PrintStream
 import java.net.URI
 import java.nio.file.{Files, Path, Paths}
 
+import scala.annotation.tailrec
+
+import io.circe.Json
+
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.{FailureClass, LeaseTiming}
 import lakehouse.ingestion.engine.IngestionService
@@ -17,8 +21,8 @@ import org.apache.hadoop.fs.{Path => HadoopPath}
 import org.apache.spark.sql.SparkSession
 
 /**
- * The command `run`: one run of one source into Bronze, as an orchestrator starts it (a process
- * runs one source in P5). What can be refused is refused before anything costly is started,
+ * The command `run`: the runs of one source into Bronze, as an orchestrator starts it (a
+ * process runs one source). What can be refused is refused before anything costly is started,
  * the cheapest first, and each refusal ends in the code that says what to do with it
  * (discovery §14.1):
  *
@@ -34,7 +38,9 @@ import org.apache.spark.sql.SparkSession
  *  1. the session of Spark, with no setting from outside the profile that a profile would be
  *     refused for (4), and the startup guard of the LogStore: a coordination database that is
  *     not reached (3), anything else (4);
- *  1. the run itself, whose outcome is its code (`exitOf`).
+ *  1. the runs: one, and the next while the batch that it committed says that the source has
+ *     more, up to `--max-batches` and until a signal asks it to stop (`runs`). The code is that
+ *     of the last run (`exitOf`).
  *
  * An exception that nothing classified is let through, after the session and the control plane
  * are closed: the process ends with the JVM's 1 until `Main` catches it (P8, 70).
@@ -57,7 +63,9 @@ object RunCommand {
       id: SourceId,
       secrets: SecretResolver,
       out: PrintStream,
-      err: PrintStream
+      err: PrintStream,
+      maxBatches: Option[Int] = None,
+      stop: Stop = Stop.Never
   ): Int =
     ConfigLoader.load(profilePath, sourcesPath) match {
       case Left(errors) =>
@@ -103,18 +111,34 @@ object RunCommand {
                     case _: DatabaseFailure.Refused => Main.Exit.Permanent
                   }
                 case Right(database) =>
-                  try withSession(profile, source, registry, database, out, err)
+                  try
+                    withSession(
+                      profile,
+                      source,
+                      registry,
+                      database,
+                      Chain(maxBatches, stop),
+                      out,
+                      err
+                    )
                   finally database.close()
               }
         }
     }
 
-  /** The run, in a session of its own, which is stopped however the run ends. */
+  /**
+   * How far an invocation goes: no further than `maxBatches` committed, and no run after
+   * `stop` has asked.
+   */
+  final private case class Chain(maxBatches: Option[Int], stop: Stop)
+
+  /** The runs, in a session of their own, which is stopped however they end. */
   private def withSession(
       profile: Profile,
       source: Source,
       registry: ConnectorRegistry,
       database: ControlDatabase,
+      chain: Chain,
       out: PrintStream,
       err: PrintStream
   ): Int = {
@@ -141,10 +165,7 @@ object RunCommand {
             profile.lake.uri,
             LeaseTiming(profile.leases.ttl)
           )
-          val outcome = service.run(source, ConfigVersion.of(profile, source))
-          val (stream, line) = report(source.id, outcome)
-          (if (stream == Stream.Out) out else err).println(line)
-          exitOf(outcome)
+          runs(service, source, ConfigVersion.of(profile, source), chain, out, err)
         }
     } finally RunSession.close(spark)
   }
@@ -205,6 +226,80 @@ object RunCommand {
           "directory. The engine does not make it, since a root that is missing is more often " +
           "a disk that is not mounted: make it once, by hand"
     }
+
+  /**
+   * The runs of an invocation (discovery §17, P6.10): one, and another after it for as long as
+   * the batch that it committed says that the source has more, within the horizon of the first
+   * plan of the invocation. Each is a whole run, with its lease and its batch. The chain stops
+   * at `--max-batches`, and before a run once a signal has asked it to; its code is that of its
+   * last run, or 128 + the signal if it asked before the first.
+   */
+  private def runs(
+      service: IngestionService,
+      source: Source,
+      config: ConfigVersion,
+      chain: Chain,
+      out: PrintStream,
+      err: PrintStream
+  ): Int = {
+    @tailrec
+    def next(horizon: Option[Json], ran: Int, committed: Int, last: Option[Int]): Int =
+      chain.stop.requested match {
+        case Some(signal) =>
+          last match {
+            case Some(code) =>
+              out.println(
+                s"${ofTheInvocation(source, ran, committed)}: ${Stop.name(signal)} asked it to " +
+                  "stop, and no other run was started."
+              )
+              code
+            case None =>
+              err.println(
+                s"error: ${Stop.name(signal)} came before the first run. Nothing was run."
+              )
+              128 + signal
+          }
+        case None =>
+          val outcome = service.run(source, config, horizon)
+          val (stream, line) = report(source.id, outcome)
+          (if (stream == Stream.Out) out else err).println(line)
+          val code = exitOf(outcome)
+          val done = committed + (outcome match {
+            case _: Outcome.Ingested | _: Outcome.RolledForward => 1
+            case _ => 0
+          })
+          // What the next run plans against, if there is one: the horizon of the chain, or
+          // none, for a first plan of the invocation after a batch of another.
+          val more: Option[Option[Json]] = outcome match {
+            case Outcome.Ingested(_, _, _, _, Outcome.Next.Within(within)) => Some(Some(within))
+            case Outcome.Ingested(_, _, _, _, Outcome.Next.Afresh) => Some(None)
+            case _: Outcome.RolledForward => Some(None)
+            case _ => None
+          }
+          more match {
+            case Some(within) if chain.maxBatches.forall(done < _) =>
+              next(within, ran + 1, done, Some(code))
+            case Some(_) =>
+              out.println(
+                s"${ofTheInvocation(source, ran + 1, done)}: it stopped at --max-batches " +
+                  s"${chain.maxBatches.getOrElse(done)}, and the source has more."
+              )
+              code
+            case None =>
+              if (ran > 0)
+                out.println(s"${ofTheInvocation(source, ran + 1, done)}.")
+              code
+          }
+      }
+    next(horizon = None, ran = 0, committed = 0, last = None)
+  }
+
+  private def ofTheInvocation(source: Source, ran: Int, committed: Int): String =
+    s"The invocation of ${source.id.value} made ${counted(ran, "run")} and committed " +
+      counted(committed, "batch", "batches")
+
+  private def counted(count: Int, one: String, many: String = ""): String =
+    if (count == 1) s"1 $one" else s"$count ${if (many.isEmpty) one + "s" else many}"
 
   /** The code of a run, by how it ended (discovery §14.1). */
   def exitOf(outcome: Outcome): Int = outcome match {
