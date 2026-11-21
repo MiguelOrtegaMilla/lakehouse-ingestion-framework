@@ -72,9 +72,10 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
   private def launch(
       of: Source,
       profile: Path = validProfile,
-      environment: Map[String, String] = Map.empty
+      environment: Map[String, String] = Map.empty,
+      options: Seq[String] = Nil
   ): Ran = {
-    val ran = command(environment)(arguments(of, profile): _*)
+    val ran = command(environment)(arguments(of, profile) ++ options: _*)
     // The command leaves the JVM as it found it.
     SparkSession.getDefaultSession shouldBe empty
     ran
@@ -340,5 +341,61 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
     done.out.linesIterator.toSeq should have size 1
     batchesOf(contracts) shouldBe Seq("1" -> "COMMITTED")
     rowsWritten(contracts) shouldBe Seq("2")
+  }
+
+  test(
+    "a window that a run before left is followed by a plan made anew, which --max-batches may stop"
+  ) {
+    val start = Using
+      .resource(ownerOfSales())(SalesOrders.databaseNow)
+      .truncatedTo(ChronoUnit.DAYS)
+      .minus(10, ChronoUnit.DAYS)
+    asOwner(() => ownerOfSales())(
+      "CREATE TABLE leases (id int PRIMARY KEY, ends_on date, updated_at timestamptz NOT NULL)",
+      s"INSERT INTO leases VALUES (1, 'infinity', '${start.plus(1, ChronoUnit.DAYS)}'), " +
+        s"(2, '2027-01-01', '${start.plus(2, ChronoUnit.DAYS)}')"
+    )
+    val load = "{ mode: incremental, watermark: { column: updated_at, safety_margin: 1m, " +
+      s"""start: "$start" } }"""
+    val leases = files.tableSource(newSourceId(), "public.leases", toSales(), load = load)
+    // The window is planned, and its batch waits for the column to be read as text.
+    launch(leases).exit shouldBe Main.Exit.Permanent
+    batchesOf(leases) shouldBe Seq("1" -> "PLANNED")
+    val asText = files.tableSource(
+      leases.id,
+      "public.leases",
+      toSales(),
+      load = load,
+      textColumns = Seq("ends_on")
+    )
+
+    // The window of the run before stops where it was planned to. With one batch allowed,
+    // the invocation stops after it, and does not say that it knows what is after.
+    val limited = launch(asText, options = Seq("--max-batches", "1"))
+    withClue(limited.err)(limited.exit shouldBe Main.Exit.Ok)
+    limited.out.linesIterator.toSeq.last shouldBe
+      s"The invocation of ${leases.id.value} made 1 run and committed 1 batch: it stopped at " +
+      "--max-batches 1, after a batch that a run before this invocation left: whether the " +
+      "source has more is for the next invocation to plan."
+    batchesOf(asText) shouldBe Seq("1" -> "COMMITTED")
+    rowsWritten(asText) shouldBe Seq("2")
+
+    // Without the limit, the same batch is followed by a plan made anew: a window is not
+    // its source whole, however late it is read.
+    asOwner(() => ownerOfSales())("CREATE TABLE leases_too AS SELECT * FROM leases")
+    val too = files.tableSource(newSourceId(), "public.leases_too", toSales(), load = load)
+    launch(too).exit shouldBe Main.Exit.Permanent
+    val tooAsText = files.tableSource(
+      too.id,
+      "public.leases_too",
+      toSales(),
+      load = load,
+      textColumns = Seq("ends_on")
+    )
+    val done = launch(tooAsText)
+    withClue(done.err)(done.exit shouldBe Main.Exit.Ok)
+    // The second run plans as the first of an invocation does. Its horizon is the clock of
+    // the source less the margin, which is past that of the plan that was left by now.
+    runsOf(tooAsText).count(_._1 == "SUCCEEDED") shouldBe 2
   }
 }
