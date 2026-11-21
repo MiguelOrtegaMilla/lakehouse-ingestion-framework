@@ -25,8 +25,8 @@ load:
     # The rows changed before this are not the source's to ingest. Without it the first batch
     # would read the whole table, in one statement.
     start: "2026-01-01T00:00:00Z"
-  # A batch takes a week of changes at most, counted from the watermark.
-  max_batch_range: 7d
+  # A batch takes four weeks of changes at most, counted from the watermark.
+  max_batch_range: 28d
 
 # What tells one order from another: Silver merges by it.
 keys: [order_id]
