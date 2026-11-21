@@ -922,6 +922,41 @@ final class JdbcIngestionSpec
       .toSeq shouldBe Seq(1 -> "2027-01-01", 2 -> "infinity")
   }
 
+  test("a column under a name of the engine's fails its run for good, before a batch is planned") {
+    asOwner { run =>
+      // The two names that a read of files gives a row, which the writer of Bronze takes as
+      // they come; and one that the writer adds, in another case.
+      run("CREATE TABLE of_a_file (id int, name text, _source_file text, _rescued_data int)")
+      run("INSERT INTO of_a_file VALUES (1, 'a', 'the table''s own', 3)")
+      run("""CREATE TABLE numbered (id int, name text, "_Batch_Seq" int)""")
+      run("INSERT INTO numbered VALUES (1, 'a', 7)")
+    }
+    Seq(
+      "of_a_file" -> """"_source_file", "_rescued_data"""",
+      "numbered" -> """"_Batch_Seq""""
+    ).foreach { case (table, names) =>
+      val named = tableSource(s"public.$table")
+
+      val refused = failed(launch(named, reading()))
+
+      refused.failure shouldBe FailureClass.Permanent
+      refused.message should startWith(
+        s"the table public.$table of the source ${named.id} (${pg.jdbcUrl("sales")}, as " +
+          "sales_ro) has columns under names of the columns that the engine adds to every " +
+          s"row of Bronze, $names: _run_id, _batch_seq, _ingested_at, _source_file, " +
+          "_source_id, _rescued_data, whatever their case."
+      )
+      refused.message should endWith(
+        "A view of the table can give them other names. Nothing was read"
+      )
+      // No batch waits for a table that every run would be refused for, and nothing of the
+      // source is in Bronze under a name of the engine's.
+      batchesOf(named) shouldBe empty
+      tableIsThere(named) shouldBe false
+      holderOf(named) shouldBe None
+    }
+  }
+
   test("a table that is not there fails its run for good, before a batch is planned") {
     val nowhere = tableSource("public.never_made")
 
