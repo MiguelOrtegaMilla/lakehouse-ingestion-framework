@@ -28,10 +28,18 @@ object DatabaseFailure {
    * 08), a server that is starting or stopping (57P), a statement that was cancelled for
    * running too long (57014), and a transaction that lost to another, by a conflict (40001) or
    * because the database broke a deadlock by ending it (40P01).
+   *
+   * And a server that is busy, which says so in a state of its own and not as a connection
+   * that failed: one that has no connection left to give, or nothing left to work with (class
+   * 53: too many connections, of the server or of the role, out of memory, a disk that is
+   * full), and a lock that was not given in the time that the database or the role lets a
+   * statement wait for one (55P03, `lock_timeout`), as while a table is being altered.
+   * Nothing of the configuration is wrong in either, and nobody has to change anything for
+   * the next run to find the database free.
    */
   private def passes(state: String): Boolean =
     state.startsWith("08") || state.startsWith("57P") || state == "57014" ||
-      state == "40001" || state == "40P01"
+      state == "40001" || state == "40P01" || state.startsWith("53") || state == "55P03"
 
   /**
    * Whether running again may do, without anybody having changed anything.
