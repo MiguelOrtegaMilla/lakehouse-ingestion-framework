@@ -73,6 +73,7 @@ sbt "integration-tests/testOnly *BreakingChangeSpec"   # a source whose configur
 sbt "integration-tests/testOnly *LeaseLossSpec"   # a run that loses its lease, with the control plane cut for real: its jobs stopped, no step after it, and how it ends (needs Docker)
 sbt "integration-tests/testOnly *RunCommandSpec"   # the command run as an orchestrator starts it, each outcome with its exit code (needs Docker)
 sbt "integration-tests/testOnly *GeneratedFilesSpec"   # files made from a seed (a column more or less, broken records, empty and repeated files) through a run, compared with what the generator says is in them (needs Docker)
+sbt "integration-tests/testOnly *GeneratedTableSpec"   # a table of PostgreSQL changed from a seed (inserts, updates, deletes, ties, transactions left open) and read after each round, by a watermark and whole, compared with what the generator says each batch is to have: about a minute (needs Docker)
 sbt "integration-tests/testOnly *FanInSpec"   # two sources, in two processes at once, into one table of Bronze: about a minute and a half (needs Docker)
 sbt "integration-tests/testOnly *WriterEpochRaceSpec"   # a commit under an epoch against the announcement of the next, in both orders, held in PostgreSQL (needs Docker)
 sbt "integration-tests/testOnly *PostgresLogStoreDeltaSpec"   # Delta on the PostgreSQL-coordinated LogStore (needs Docker)

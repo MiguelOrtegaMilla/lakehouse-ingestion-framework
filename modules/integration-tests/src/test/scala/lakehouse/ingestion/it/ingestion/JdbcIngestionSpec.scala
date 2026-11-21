@@ -547,6 +547,101 @@ final class JdbcIngestionSpec
   }
 
   // ---------------------------------------------------------------------------------------------
+  // A transaction that commits late, against the clock of the source
+  // ---------------------------------------------------------------------------------------------
+
+  /** The safety margin of the sources below, in seconds: a run is planned well within it. */
+  private val Margin = 10L
+
+  /**
+   * A row inserted by a transaction that stamps it as an application does, with the moment that
+   * the transaction began (`CURRENT_TIMESTAMP`), and that is left open while `meanwhile` runs,
+   * to be committed after. `meanwhile` is given the moment of the row.
+   */
+  private def lateRow[T](table: String, id: Int)(meanwhile: Instant => T): (Instant, T) =
+    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+      c.setAutoCommit(false)
+      val at = Using.resource(c.createStatement()) { statement =>
+        val rows = statement.executeQuery(
+          s"INSERT INTO $table (id, name, updated_at) VALUES ($id, 'late', CURRENT_TIMESTAMP) " +
+            "RETURNING updated_at"
+        )
+        rows.next()
+        rows.getObject(1, classOf[OffsetDateTime]).toInstant
+      }
+      val result = meanwhile(at)
+      c.commit()
+      at -> result
+    }
+
+  /** Asks the server until its clock, less the margin, is past `moment`. */
+  private def marginPast(moment: Instant): Unit =
+    eventually(timeout(Span(3 * Margin, Seconds))) {
+      clockOfTheSource().minusSeconds(Margin).isAfter(moment) shouldBe true
+    }: Unit
+
+  private def rowsAtTheSource(table: String): Int =
+    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+      Using.resource(c.createStatement()) { statement =>
+        val rows = statement.executeQuery(s"SELECT count(*) FROM $table")
+        rows.next()
+        rows.getInt(1)
+      }
+    }
+
+  test("a row of a transaction shorter than the margin is read by the batch after its commit") {
+    changesTable("late_within")
+    val late = watermarkSource("public.late_within", watermark = s"safety_margin: ${Margin}s")
+
+    // The transaction is open while the first batch is planned and read.
+    val (at, first) = lateRow("late_within", 1)(_ => ingested(launch(late, reading())))
+
+    // The window ends a margin behind the clock of the source, so before the moment of the row:
+    // the transaction had not run for as long as the margin.
+    withClue(
+      "the first window reached the moment of a row whose transaction was open: it did not end " +
+        "a margin behind the clock of the source, or it was planned more than the margin after " +
+        "the transaction began: "
+    ) {
+      windowOf(first.batch).upper.isBefore(at) shouldBe true
+    }
+    first.outputs shouldBe empty
+    marginPast(at)
+
+    val second = ingested(launch(late, reading()))
+
+    // The next window starts where that one ended, and the row, committed by then, is in it.
+    windowOf(second.batch).lower shouldBe Some(windowOf(first.batch).upper)
+    snapshots(late) shouldBe Seq((1, "late", 2L))
+  }
+
+  test("a row of a transaction longer than the margin is lost, and no later batch reads it") {
+    changesTable("late_beyond")
+    val late = watermarkSource("public.late_beyond", watermark = s"safety_margin: ${Margin}s")
+
+    // The transaction is still open once the clock of the source is a margin past its row.
+    val (at, first) = lateRow("late_beyond", 1) { at =>
+      marginPast(at)
+      ingested(launch(late, reading()))
+    }
+
+    // The window that holds the moment of the row was read while the row was not committed.
+    val window = windowOf(first.batch)
+    window.upper.isAfter(at) shouldBe true
+    first.outputs shouldBe empty
+    watermarkOf(late) shouldBe Some(window.upper)
+    marginPast(window.upper)
+
+    val second = ingested(launch(late, reading()))
+
+    // The source has the row, behind the watermark, and no window reaches back to it. It is the
+    // known limit of a load by a column, which CDC is for (ADR-0020), pinned here.
+    windowOf(second.batch).lower shouldBe Some(window.upper)
+    rowsAtTheSource("late_beyond") shouldBe 1
+    tableIsThere(late) shouldBe false
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // A run of a window that dies
   // ---------------------------------------------------------------------------------------------
 
