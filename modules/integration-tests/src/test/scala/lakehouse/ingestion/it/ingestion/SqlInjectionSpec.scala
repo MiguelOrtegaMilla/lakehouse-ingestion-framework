@@ -1,17 +1,14 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.sql.{Connection, PreparedStatement}
-import java.time.{Clock, Instant, OffsetDateTime, ZoneOffset}
+import java.sql.PreparedStatement
+import java.time.{Instant, OffsetDateTime, ZoneOffset}
 
 import scala.util.{Try, Using}
 
-import lakehouse.ingestion.core.config.{SecretResolver, Source}
+import lakehouse.ingestion.core.config.Source
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.engine.IngestionService.Outcome
-import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.delta.DeltaNames
-import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
-import lakehouse.ingestion.engine.{FaultHooks, IngestionService}
 import org.apache.spark.sql.{Row => SparkRow}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -34,7 +31,7 @@ import org.scalatest.matchers.should.Matchers
  * each run ends well, with every value in Bronze as it is at the source, and that the server,
  * which logs every statement of `sales_owner`, was sent none of them.
  */
-final class SqlInjectionSpec extends AnyFunSuite with Matchers with IngestionSuite {
+final class SqlInjectionSpec extends AnyFunSuite with Matchers with JdbcIngestionSuite {
 
   import SqlInjectionSpec._
 
@@ -46,12 +43,6 @@ final class SqlInjectionSpec extends AnyFunSuite with Matchers with IngestionSui
     }
     asOwner(execute(_, "CREATE TABLE canary (id int)"))
   }
-
-  private def execute(c: Connection, sql: String): Unit =
-    Using.resource(c.createStatement())(_.execute(sql): Unit)
-
-  private def asOwner[T](body: Connection => T): T =
-    Using.resource(pg.connect("sales_owner", "sales"))(body)
 
   /** A row written with each value bound, and none in the text of the statement. */
   private def insert(table: String, columns: Seq[String], values: Seq[Any]): Unit =
@@ -84,49 +75,15 @@ final class SqlInjectionSpec extends AnyFunSuite with Matchers with IngestionSui
     }
 
   /** A source of a table of `sales`, read as `sales_owner`. */
-  private def ownersSource(table: String, load: String): Source = {
-    val id = newSourceId().value
-    Source
-      .load(
-        s"$id.yaml",
-        s"""id: $id
-           |connector:
-           |  type: jdbc
-           |  connection:
-           |    url: "${pg.jdbcUrl("sales")}"
-           |    user: sales_owner
-           |    password: { secretRef: "env:SALES_OWNER_PASSWORD" }
-           |    tls: { mode: disable }
-           |  table: $table
-           |$load
-           |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
-           |""".stripMargin
-      )
-      .value
-      .value
-  }
+  private def ownersSource(table: String, load: String): Source =
+    jdbcSource(table, load, role = "sales_owner")
 
-  private val Whole = "load: { mode: full }"
+  private val Whole = FullLoad
 
   private def byWindow(column: String): String =
     s"""load:
        |  mode: incremental
        |  watermark: { column: $column, safety_margin: 1m, start: "2026-01-01T00:00:00Z" }""".stripMargin
-
-  private def reading: IngestionService =
-    new IngestionService(
-      database,
-      ConnectorRegistry(
-        new JdbcSourceConnector(
-          SecretResolver(Map("SALES_OWNER_PASSWORD" -> pg.password("sales_owner")).get)
-        )
-      ),
-      spark,
-      lakeRoot,
-      timing,
-      Clock.fixed(Now, ZoneOffset.UTC),
-      FaultHooks.Off
-    )
 
   /** The rows of Bronze, each as the values of `columns` as text, by the first of them. */
   private def bronzeRows(of: Source, columns: Seq[String]): Seq[Seq[String]] =
@@ -143,7 +100,6 @@ final class SqlInjectionSpec extends AnyFunSuite with Matchers with IngestionSui
     case other => String.valueOf(other)
   }
 
-  private def logMark(): Int = pg.serverLog().length
   private def loggedSince(mark: Int): String = pg.serverLog().substring(mark)
 
   /** Whether the server was sent `text`, said without the whole of what it was sent. */
@@ -159,8 +115,8 @@ final class SqlInjectionSpec extends AnyFunSuite with Matchers with IngestionSui
     val mark = logMark()
     val whole = ownersSource(table, Whole)
     val window = ownersSource(table, byWindow(column))
-    ingested(launch(whole, reading))
-    ingested(launch(window, reading))
+    ingested(launch(whole, reading()))
+    ingested(launch(window, reading()))
     (whole, window, loggedSince(mark))
   }
 
@@ -259,7 +215,7 @@ final class SqlInjectionSpec extends AnyFunSuite with Matchers with IngestionSui
     val mark = logMark()
     val unfit = ownersSource("public.unfit", Whole)
 
-    val outcome = launch(unfit, reading)
+    val outcome = launch(unfit, reading())
 
     outcome match {
       case Outcome.Failed(_, failure, message) =>

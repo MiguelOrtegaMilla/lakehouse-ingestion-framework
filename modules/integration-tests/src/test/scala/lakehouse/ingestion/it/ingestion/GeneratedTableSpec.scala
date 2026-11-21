@@ -1,18 +1,13 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.sql.{Connection, Timestamp}
+import java.sql.Timestamp
 import java.time.temporal.ChronoUnit
-import java.time.{Clock, Instant, ZoneOffset}
+import java.time.Instant
 
-import scala.util.Using
-
-import lakehouse.ingestion.core.config.{EngineColumns, SecretResolver, Source}
+import lakehouse.ingestion.core.config.{EngineColumns, Source}
 import lakehouse.ingestion.core.control._
-import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
+import lakehouse.ingestion.core.watermark.WatermarkPlan
 import lakehouse.ingestion.engine.IngestionService.Outcome
-import lakehouse.ingestion.engine.connector.ConnectorRegistry
-import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
-import lakehouse.ingestion.engine.{FaultHooks, IngestionService}
 import lakehouse.ingestion.it.support.TableGenerator
 import lakehouse.ingestion.it.support.TableGenerator._
 import org.apache.spark.sql.functions.col
@@ -36,7 +31,7 @@ import org.scalatest.matchers.should.Matchers
  * generator's. What the margin of a load does against the clock of a source is in
  * `JdbcIngestionSpec`.
  */
-final class GeneratedTableSpec extends AnyFunSuite with Matchers with IngestionSuite {
+final class GeneratedTableSpec extends AnyFunSuite with Matchers with JdbcIngestionSuite {
 
   private val Start = Instant.parse("2026-01-01T00:00:00Z")
 
@@ -49,8 +44,6 @@ final class GeneratedTableSpec extends AnyFunSuite with Matchers with IngestionS
        |  mode: incremental
        |  watermark: { column: updated_at, safety_margin: 1m, start: "$Start" }
        |  max_batch_range: 1d""".stripMargin
-
-  private val FullLoad = "load: { mode: full }"
 
   private val Everything =
     Mix(
@@ -71,51 +64,13 @@ final class GeneratedTableSpec extends AnyFunSuite with Matchers with IngestionS
   // The source, and what a run left
   // ---------------------------------------------------------------------------------------------
 
-  private def asOwner[T](body: Connection => T): T =
-    Using.resource(pg.connect("sales_owner", "sales"))(body)
-
-  private def ownersConnection: () => Connection = () => pg.connect("sales_owner", "sales")
-
-  private def ordersSource(table: String, load: String): Source = {
-    val id = newSourceId().value
-    Source
-      .load(
-        s"$id.yaml",
-        s"""id: $id
-           |connector:
-           |  type: jdbc
-           |  connection:
-           |    url: "${pg.jdbcUrl("sales")}"
-           |    user: sales_ro
-           |    password: { secretRef: "env:SALES_RO_PASSWORD" }
-           |    tls: { mode: disable }
-           |  table: public.$table
-           |$load
-           |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
-           |""".stripMargin
-      )
-      .value
-      .value
-  }
-
-  private def reading: IngestionService =
-    new IngestionService(
-      database,
-      ConnectorRegistry(
-        new JdbcSourceConnector(
-          SecretResolver(Map("SALES_RO_PASSWORD" -> pg.password("sales_ro")).get)
-        )
-      ),
-      spark,
-      lakeRoot,
-      timing,
-      Clock.fixed(Now, ZoneOffset.UTC),
-      FaultHooks.Off
-    )
+  /** A source of a table of orders, as the generator makes one, read as `sales_ro`. */
+  private def ordersSource(table: String, load: String): Source =
+    jdbcSource(s"public.$table", load)
 
   /** A run that commits a batch of `expected` rows, and the count of the batch as it said. */
   private def readBy(of: Source, expected: Vector[Row]): Outcome.Ingested = {
-    val done = ingested(launch(of, reading))
+    val done = ingested(launch(of, reading()))
     val count = Some(expected.size.toLong)
     (done.counts.rowsRead, done.counts.rowsWritten, done.counts.rowsRejected) shouldBe
       ((count, count, Some(0L)))
@@ -123,9 +78,6 @@ final class GeneratedTableSpec extends AnyFunSuite with Matchers with IngestionS
     done.outputs.isEmpty shouldBe expected.isEmpty
     done
   }
-
-  private def watermarkOf(of: Source): Option[Instant] =
-    stateOf(of).flatMap(_.watermark).map(StoredWatermark.fromJson(_).value.value)
 
   /** Each row of Bronze, as the source had it, with the batch that wrote it. */
   private def images(of: Source): Vector[(Long, Row)] =

@@ -1,21 +1,19 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.sql.{Connection, Timestamp}
+import java.sql.Timestamp
 import java.time.temporal.ChronoUnit
-import java.time.{Clock, Instant, OffsetDateTime, ZoneOffset}
+import java.time.{Instant, OffsetDateTime, ZoneOffset}
 
 import scala.util.Using
 
 import eu.rekawek.toxiproxy.model.ToxicDirection
 import io.circe.Json
-import lakehouse.ingestion.core.config.{QualifiedName, SecretResolver, Source}
+import lakehouse.ingestion.core.config.{QualifiedName, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
-import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
+import lakehouse.ingestion.core.watermark.WatermarkPlan
 import lakehouse.ingestion.engine.IngestionService.Outcome
-import lakehouse.ingestion.engine.connector.ConnectorRegistry
-import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
-import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
+import lakehouse.ingestion.engine.FaultPoint
 import lakehouse.ingestion.it.support.ProxiedPostgres
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
@@ -42,7 +40,7 @@ final class JdbcIngestionSpec
     extends AnyFunSuite
     with Matchers
     with Eventually
-    with IngestionSuite {
+    with JdbcIngestionSuite {
 
   import JdbcIngestionSpec._
 
@@ -69,23 +67,18 @@ final class JdbcIngestionSpec
     try behindAProxy.foreach(_.stop())
     finally super.stopServers()
 
-  private def asOwner(body: (String => Unit) => Unit): Unit =
-    Using.resource(pg.connect("sales_owner", "sales"))(c => body(execute(c, _)))
-
-  private def execute(c: Connection, sql: String): Unit =
-    Using.resource(c.createStatement())(_.execute(sql): Unit)
-
   // ---------------------------------------------------------------------------------------------
   // A source of a table, and a run of it
   // ---------------------------------------------------------------------------------------------
 
-  private def secrets: SecretResolver = SecretResolver(
-    (Map("SALES_RO_PASSWORD" -> pg.password("sales_ro")) ++
-      behindAProxy.map(server => "PROXIED_PASSWORD" -> server.postgres.password("sales_ro"))).get
-  )
+  /** With the password of the server behind the proxy, once a test has started it. */
+  override protected def passwords: Map[String, String] =
+    super.passwords ++
+      behindAProxy.map(server => "PROXIED_PASSWORD" -> server.postgres.password("sales_ro"))
 
   /**
-   * A source that reads `table` of `sales`, under an id of its own unless it is given one.
+   * A source that reads `table` of `sales` whole, under an id of its own unless it is given
+   * one.
    *
    * @param statement the longest that a statement of it may run; that of a source, unless said
    */
@@ -97,36 +90,13 @@ final class JdbcIngestionSpec
       password: String = "env:SALES_RO_PASSWORD",
       textColumns: Seq[String] = Nil
   ): Source =
-    Source
-      .load(
-        s"$id.yaml",
-        s"""id: $id
-           |connector:
-           |  type: jdbc
-           |  connection:
-           |    url: "$url"
-           |    user: sales_ro
-           |    password: { secretRef: "$password" }
-           |    tls: { mode: disable }
-           |    ${statement.fold("")(longest => s"timeouts: { statement: $longest }")}
-           |  table: $table
-           |  text_columns: [${textColumns.mkString(", ")}]
-           |load: { mode: full }
-           |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
-           |""".stripMargin
-      )
-      .value
-      .value
-
-  private def reading(hooks: FaultHooks = FaultHooks.Off): IngestionService =
-    new IngestionService(
-      database,
-      ConnectorRegistry(new JdbcSourceConnector(secrets)),
-      spark,
-      lakeRoot,
-      timing,
-      Clock.fixed(Now, ZoneOffset.UTC),
-      hooks
+    jdbcSource(
+      table,
+      id = id,
+      url = url,
+      password = Some(password),
+      statement = statement,
+      textColumns = textColumns
     )
 
   /**
@@ -142,37 +112,27 @@ final class JdbcIngestionSpec
       watermark: String = "safety_margin: 1h",
       range: Option[String] = None
   ): Source =
-    Source
-      .load(
-        s"$id.yaml",
-        s"""id: $id
-           |connector:
-           |  type: jdbc
-           |  connection:
-           |    url: "${pg.jdbcUrl("sales")}"
-           |    user: sales_ro
-           |    password: { secretRef: "env:SALES_RO_PASSWORD" }
-           |    tls: { mode: disable }
-           |  table: $table
-           |load:
-           |  mode: incremental
-           |  watermark: { column: $column, $watermark }
-           |  ${range.fold("")(widest => s"max_batch_range: $widest")}
-           |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
-           |""".stripMargin
-      )
-      .value
-      .value
+    jdbcSource(
+      table,
+      load = s"""load:
+                 |  mode: incremental
+                 |  watermark: { column: $column, $watermark }
+                 |  ${range.fold("")(widest => s"max_batch_range: $widest")}""".stripMargin,
+      id = id
+    )
 
   /** A table of changes, as a load by a watermark reads one: each row with when it changed. */
   private def changesTable(name: String): Unit =
     asOwner(
-      _(s"CREATE TABLE $name (id int PRIMARY KEY, name text, updated_at timestamptz NOT NULL)")
+      execute(
+        _,
+        s"CREATE TABLE $name (id int PRIMARY KEY, name text, updated_at timestamptz NOT NULL)"
+      )
     )
 
   /** A row of a table of changes, stamped as the test says and not by the clock of the server. */
   private def stamped(table: String, id: Int, name: String, at: Instant): Unit =
-    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+    asOwner { c =>
       Using.resource(
         c.prepareStatement(
           s"INSERT INTO $table (id, name, updated_at) VALUES (?, ?, ?) " +
@@ -188,7 +148,7 @@ final class JdbcIngestionSpec
 
   /** What the server of the source says the time is. */
   private def clockOfTheSource(): Instant =
-    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+    asOwner { c =>
       Using.resource(c.createStatement()) { statement =>
         val rows = statement.executeQuery("SELECT CURRENT_TIMESTAMP")
         rows.next()
@@ -199,10 +159,6 @@ final class JdbcIngestionSpec
   /** The window that a batch was planned to read, as the write-ahead log has it. */
   private def windowOf(batch: BatchId): WatermarkPlan =
     WatermarkPlan.fromJson(batchOf(batch).plan).value
-
-  /** The watermark of a source, as the control plane has it. */
-  private def watermarkOf(of: Source): Option[Instant] =
-    stateOf(of).flatMap(_.watermark).map(StoredWatermark.fromJson(_).value.value)
 
   /** A bound as Spark writes it into a statement, in UTC. */
   private def literal(bound: Instant): String = Timestamp.from(bound).toString
@@ -232,8 +188,6 @@ final class JdbcIngestionSpec
     expire(of)
   }
 
-  private def logMark(): Int = pg.serverLog().length
-
   /** The statements that asked for rows of `table`, as the server logged them after `mark`. */
   private def rowsAskedSince(mark: Int, table: String): Seq[String] =
     pg.serverLog()
@@ -261,9 +215,13 @@ final class JdbcIngestionSpec
   // ---------------------------------------------------------------------------------------------
 
   test("a full load takes its table to Bronze as one snapshot, and the next run takes another") {
-    asOwner { run =>
-      run("CREATE TABLE items (id int NOT NULL, name text, price numeric(10,2), seen timestamptz)")
-      run(
+    asOwner { c =>
+      execute(
+        c,
+        "CREATE TABLE items (id int NOT NULL, name text, price numeric(10,2), seen timestamptz)"
+      )
+      execute(
+        c,
         "INSERT INTO items VALUES (1, 'a', 1.50, now()), (2, 'b', 2.50, now()), (3, 'c', NULL, NULL)"
       )
     }
@@ -294,10 +252,10 @@ final class JdbcIngestionSpec
     eventually(statementsSince(mark, "items").count(_ == "portal") shouldBe 2)
 
     // The table changes, and the next run takes it as it is then: another snapshot, whole.
-    asOwner { run =>
-      run("DELETE FROM items WHERE id = 1")
-      run("UPDATE items SET name = 'B' WHERE id = 2")
-      run("INSERT INTO items VALUES (4, 'd', 4.50, now())")
+    asOwner { c =>
+      execute(c, "DELETE FROM items WHERE id = 1")
+      execute(c, "UPDATE items SET name = 'B' WHERE id = 2")
+      execute(c, "INSERT INTO items VALUES (4, 'd', 4.50, now())")
     }
     val second = ingested(launch(items, reading()))
 
@@ -315,7 +273,7 @@ final class JdbcIngestionSpec
   }
 
   test("a table with no rows writes nothing, and its batch is committed") {
-    asOwner(_("CREATE TABLE nothing_yet (id int, name text)"))
+    asOwner(execute(_, "CREATE TABLE nothing_yet (id int, name text)"))
     val noRows = tableSource("public.nothing_yet")
 
     val done = ingested(launch(noRows, reading()))
@@ -335,14 +293,14 @@ final class JdbcIngestionSpec
   // ---------------------------------------------------------------------------------------------
 
   test("a batch that a dead run wrote is rolled forward, and the source is asked nothing") {
-    asOwner { run =>
-      run("CREATE TABLE written_once (id int, name text)")
-      run("INSERT INTO written_once VALUES (1, 'a'), (2, 'b')")
+    asOwner { c =>
+      execute(c, "CREATE TABLE written_once (id int, name text)")
+      execute(c, "INSERT INTO written_once VALUES (1, 'a'), (2, 'b')")
     }
     val source = tableSource("public.written_once")
     dies(source, FaultPoint.AfterBronzeCommit)
     // The table changes after the dead run read it: the batch is the snapshot that was written.
-    asOwner(_("INSERT INTO written_once VALUES (3, 'c')"))
+    asOwner(execute(_, "INSERT INTO written_once VALUES (3, 'c')"))
     val mark = logMark()
 
     val outcome = launch(source, reading())
@@ -360,14 +318,14 @@ final class JdbcIngestionSpec
   }
 
   test("a batch that a dead run did not write is read again, as the table is by then") {
-    asOwner { run =>
-      run("CREATE TABLE read_again (id int, name text)")
-      run("INSERT INTO read_again VALUES (1, 'a')")
+    asOwner { c =>
+      execute(c, "CREATE TABLE read_again (id int, name text)")
+      execute(c, "INSERT INTO read_again VALUES (1, 'a')")
     }
     val source = tableSource("public.read_again")
     dies(source, FaultPoint.AfterCounts)
     hasABatch(source) shouldBe false
-    asOwner(_("INSERT INTO read_again VALUES (2, 'b')"))
+    asOwner(execute(_, "INSERT INTO read_again VALUES (2, 'b')"))
 
     val done = ingested(launch(source, reading()))
 
@@ -579,12 +537,16 @@ final class JdbcIngestionSpec
     // it is written. The connector warns of such a column at every plan, and cannot tell
     // whose time is in it.
     asOwner(
-      _("CREATE TABLE local_times (id int PRIMARY KEY, name text, updated_at timestamp NOT NULL)")
+      execute(
+        _,
+        "CREATE TABLE local_times (id int PRIMARY KEY, name text, updated_at timestamp NOT NULL)"
+      )
     )
     // As an application whose session is in New York stamps a row with now().
     def stampedThere(id: Int, name: String): Unit =
       asOwner(
-        _(
+        execute(
+          _,
           s"INSERT INTO local_times VALUES ($id, '$name', now() AT TIME ZONE 'America/New_York')"
         )
       )
@@ -604,7 +566,7 @@ final class JdbcIngestionSpec
     windowOf(second.batch).lower shouldBe Some(reached)
     second.counts.rowsRead shouldBe Some(0)
     snapshots(there) shouldBe Seq((1, "a", 1L))
-    val stamp = Using.resource(pg.connect("sales_owner", "sales")) { c =>
+    val stamp = asOwner { c =>
       Using.resource(c.createStatement()) { statement =>
         val rows = statement.executeQuery("SELECT updated_at FROM local_times WHERE id = 2")
         rows.next()
@@ -642,7 +604,7 @@ final class JdbcIngestionSpec
    * to be committed after. `meanwhile` is given the moment of the row.
    */
   private def lateRow[T](table: String, id: Int)(meanwhile: Instant => T): (Instant, T) =
-    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+    asOwner { c =>
       c.setAutoCommit(false)
       val at = Using.resource(c.createStatement()) { statement =>
         val rows = statement.executeQuery(
@@ -664,7 +626,7 @@ final class JdbcIngestionSpec
     }: Unit
 
   private def rowsAtTheSource(table: String): Int =
-    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+    asOwner { c =>
       Using.resource(c.createStatement()) { statement =>
         val rows = statement.executeQuery(s"SELECT count(*) FROM $table")
         rows.next()
@@ -809,9 +771,9 @@ final class JdbcIngestionSpec
   test("a watermark is not gone on from under another column, nor for another table") {
     changesTable("followed")
     stamped("followed", 1, "a", Day.plus(1, ChronoUnit.HOURS))
-    asOwner { run =>
-      run("ALTER TABLE followed ADD COLUMN seen_at timestamptz NOT NULL DEFAULT now()")
-      run("CREATE TABLE followed_copy AS SELECT * FROM followed")
+    asOwner { c =>
+      execute(c, "ALTER TABLE followed ADD COLUMN seen_at timestamptz NOT NULL DEFAULT now()")
+      execute(c, "CREATE TABLE followed_copy AS SELECT * FROM followed")
     }
     val settings = "safety_margin: 1h, start: \"2026-01-01T00:00:00Z\""
     val followed = watermarkSource("public.followed", watermark = settings, range = Some("1d"))
@@ -856,7 +818,7 @@ final class JdbcIngestionSpec
     dies(altered, FaultPoint.AfterPlan)
 
     def refusedFor(change: String, problem: String): Unit = {
-      asOwner(_(change))
+      asOwner(execute(_, change))
       val refused = failed(launch(altered, reading()))
       refused.failure shouldBe FailureClass.Permanent
       refused.message shouldBe
@@ -876,7 +838,7 @@ final class JdbcIngestionSpec
       "has no column updated_at (load.watermark.column). Its columns are id, name, changed_at"
     )
     // It is there, as text: Spark would compare its values itself, over the whole table.
-    asOwner(_("ALTER TABLE altered RENAME COLUMN changed_at TO updated_at"))
+    asOwner(execute(_, "ALTER TABLE altered RENAME COLUMN changed_at TO updated_at"))
     refusedFor(
       "ALTER TABLE altered ALTER COLUMN updated_at TYPE text",
       "has its column updated_at (load.watermark.column) of type text, and a watermark is " +
@@ -887,7 +849,8 @@ final class JdbcIngestionSpec
 
     // With the column as the batch was planned by, the batch is read.
     asOwner(
-      _(
+      execute(
+        _,
         "ALTER TABLE altered ALTER COLUMN updated_at TYPE timestamptz " +
           "USING updated_at::timestamptz"
       )
@@ -901,14 +864,18 @@ final class JdbcIngestionSpec
   // ---------------------------------------------------------------------------------------------
 
   test("a statement that the source cuts for running too long may pass, and names its setting") {
-    asOwner { run =>
-      run("CREATE TABLE ten AS SELECT g AS id, 'n' || g AS name FROM generate_series(1, 10) g")
+    asOwner { c =>
+      execute(
+        c,
+        "CREATE TABLE ten AS SELECT g AS id, 'n' || g AS name FROM generate_series(1, 10) g"
+      )
       // A function that the server takes 0.3 s to answer, row by row.
-      run(
+      execute(
+        c,
         "CREATE FUNCTION slowly(v int) RETURNS int LANGUAGE sql VOLATILE AS " +
           "$$ SELECT v FROM pg_sleep(0.3) $$"
       )
-      run("CREATE VIEW slow_ten AS SELECT slowly(id) AS id, name FROM ten")
+      execute(c, "CREATE VIEW slow_ten AS SELECT slowly(id) AS id, name FROM ten")
     }
     // The first row comes in time, and the fetch of the ten of them does not.
     val hurried = tableSource("public.slow_ten", statement = Some("1s"))
@@ -974,9 +941,9 @@ final class JdbcIngestionSpec
   }
 
   test("a row that Bronze cannot keep fails its batch for good, and none of its rows is written") {
-    asOwner { run =>
-      run("CREATE TABLE contracts (id int, name text, valid_to date)")
-      run("INSERT INTO contracts VALUES (1, 'a', '2027-01-01'), (2, 'b', 'infinity')")
+    asOwner { c =>
+      execute(c, "CREATE TABLE contracts (id int, name text, valid_to date)")
+      execute(c, "INSERT INTO contracts VALUES (1, 'a', '2027-01-01'), (2, 'b', 'infinity')")
     }
     val contracts = tableSource("public.contracts")
 
@@ -1016,13 +983,13 @@ final class JdbcIngestionSpec
   }
 
   test("a column under a name of the engine's fails its run for good, before a batch is planned") {
-    asOwner { run =>
+    asOwner { c =>
       // The two names that a read of files gives a row, which the writer of Bronze takes as
       // they come; and one that the writer adds, in another case.
-      run("CREATE TABLE of_a_file (id int, name text, _source_file text, _rescued_data int)")
-      run("INSERT INTO of_a_file VALUES (1, 'a', 'the table''s own', 3)")
-      run("""CREATE TABLE numbered (id int, name text, "_Batch_Seq" int)""")
-      run("INSERT INTO numbered VALUES (1, 'a', 7)")
+      execute(c, "CREATE TABLE of_a_file (id int, name text, _source_file text, _rescued_data int)")
+      execute(c, "INSERT INTO of_a_file VALUES (1, 'a', 'the table''s own', 3)")
+      execute(c, """CREATE TABLE numbered (id int, name text, "_Batch_Seq" int)""")
+      execute(c, "INSERT INTO numbered VALUES (1, 'a', 7)")
     }
     Seq(
       "of_a_file" -> """"_source_file", "_rescued_data"""",
