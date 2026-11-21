@@ -39,6 +39,13 @@ trait ConnectorConfig {
    * database is not: two sources may read one table, each for its own purpose.
    */
   def exclusive: Option[(String, String)] = None
+
+  /**
+   * What is wrong in the section that shows only beside the load of its source, by the path of
+   * the field from the top of the file, as `connector.text_columns[1]`. What is wrong in a
+   * field by itself is said when the section is read (`ConnectorKind.read`).
+   */
+  def rules(load: Load): Seq[Problem] = Nil
 }
 
 /**
@@ -75,9 +82,15 @@ object ConnectorKind {
  *
  * @param table the table, or `schema.table`: a validated name, never text that reaches SQL
  *   (ADR-0013 §1)
+ * @param textColumns the columns of the table that are read as text, the value as the source
+ *   writes it, whatever their type: for a column that holds what the type that Spark would
+ *   read it into has not, as `infinity` in a date (discovery §17, P6.6)
  */
-final case class JdbcConnectorConfig(connection: DatabaseConnection, table: QualifiedName)
-    extends ConnectorConfig {
+final case class JdbcConnectorConfig(
+    connection: DatabaseConnection,
+    table: QualifiedName,
+    textColumns: Vector[SqlIdentifier] = Vector.empty
+) extends ConnectorConfig {
 
   override def kind: String = JdbcConnector.name
 
@@ -85,7 +98,42 @@ final case class JdbcConnectorConfig(connection: DatabaseConnection, table: Qual
     DatabaseConnection.warnings("connector.connection", connection).toSeq
 
   override def canonical: Json =
-    Json.obj("connection" -> connection.canonical, "table" -> Json.fromString(table.toString))
+    Json.obj(
+      "connection" -> connection.canonical,
+      "table" -> Json.fromString(table.toString),
+      "text_columns" -> Json.fromValues(textColumns.map(name => Json.fromString(name.value)))
+    )
+
+  /**
+   * A column is named once; it is the source's, and not one that the engine adds to a row; and
+   * it is not the watermark, which is read as the timestamp that it is: its bounds reach the
+   * source as times, and a text has none.
+   */
+  override def rules(load: Load): Seq[Problem] =
+    textColumns.zipWithIndex.flatMap { case (name, index) =>
+      val field = s"connector.${JdbcConnector.TextColumns}[$index]"
+      val first = textColumns.indexOf(name)
+      Seq(
+        Option.when(first < index)(
+          Problem(
+            field,
+            s"is $name again: it is connector.${JdbcConnector.TextColumns}[$first] already"
+          )
+        ),
+        EngineColumns.refused(field, name.value),
+        load match {
+          case Load.Incremental(watermark, _) if watermark.column == name =>
+            Some(
+              Problem(
+                field,
+                s"is $name, which is load.watermark.column: a watermark is read as the " +
+                  "timestamp that it is, and the bounds of a batch reach the source as times"
+              )
+            )
+          case _ => None
+        }
+      ).flatten
+    }
 
   /** The database and the table. The role, the password, TLS and the timeouts are how it is reached. */
   override def origin: Seq[String] = Seq("connection.url", "table")
@@ -97,10 +145,16 @@ object JdbcConnector extends ConnectorKind {
 
   override val loads: Set[Load.Mode] = Set(Load.Mode.Full, Load.Mode.Incremental)
 
+  /** The field of the columns that are read as text. */
+  val TextColumns = "text_columns"
+
   override def read(section: Obj): Result[ConnectorConfig] =
     (
       section.required("connection")(_.obj(DatabaseConnection.read(Timeouts.OfASource))),
-      section.required("table")(_.text(QualifiedName.parse))
+      section.required("table")(_.text(QualifiedName.parse)),
+      section.orElse(TextColumns, Vector.empty[SqlIdentifier])(
+        _.list(_.text(SqlIdentifier.parse))
+      )
     ).mapN(JdbcConnectorConfig.apply)
 }
 

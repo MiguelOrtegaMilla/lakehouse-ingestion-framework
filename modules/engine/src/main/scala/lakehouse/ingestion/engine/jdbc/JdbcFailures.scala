@@ -76,7 +76,9 @@ object JdbcFailures {
         else if (state.contains(OutOfRange))
           RunFailedException.permanent(
             s"$where has a value that does not fit the type that its column is read into, " +
-              s"and nothing of the batch was written: $told",
+              s"and nothing of the batch was written: $told. A value that the type has not, " +
+              "as NaN in a numeric with a bound, is kept if its column is read as text: add " +
+              "the column to connector.text_columns",
             error
           )
         else

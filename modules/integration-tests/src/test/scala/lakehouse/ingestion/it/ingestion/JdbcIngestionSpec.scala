@@ -85,7 +85,8 @@ final class JdbcIngestionSpec
       id: String = newSourceId().value,
       statement: Option[String] = None,
       url: String = pg.jdbcUrl("sales"),
-      password: String = "env:SALES_RO_PASSWORD"
+      password: String = "env:SALES_RO_PASSWORD",
+      textColumns: Seq[String] = Nil
   ): Source =
     Source
       .load(
@@ -100,6 +101,7 @@ final class JdbcIngestionSpec
            |    tls: { mode: disable }
            |    ${statement.fold("")(longest => s"timeouts: { statement: $longest }")}
            |  table: $table
+           |  text_columns: [${textColumns.mkString(", ")}]
            |load: { mode: full }
            |targets: { bronze: { table: bronze/${id.replace('.', '/')} } }
            |""".stripMargin
@@ -372,11 +374,28 @@ final class JdbcIngestionSpec
     batchesOf(contracts) shouldBe Seq((1L, "PLANNED"))
     hasABatch(contracts) shouldBe false
 
-    // The same data gives the same result, until the row is another.
+    refused.message should endWith(
+      "Add valid_to to connector.text_columns, and the column is read as text, each value " +
+        "as the source writes it"
+    )
+
+    // The same data gives the same result, until the configuration says what the failure
+    // said to: the batch that was planned is then read, with the column as text.
     failed(launch(contracts, reading())).failure shouldBe FailureClass.Permanent
-    asOwner(_("UPDATE contracts SET valid_to = '9999-12-31' WHERE id = 2"))
-    ingested(launch(contracts, reading())).batch shouldBe batchId(contracts, 1)
-    snapshots(contracts) shouldBe Seq((1, "a", 1L), (2, "b", 1L))
+    val asText = tableSource(
+      "public.contracts",
+      id = contracts.id.value,
+      textColumns = Seq("valid_to")
+    )
+    ingested(launch(asText, reading())).batch shouldBe batchId(contracts, 1)
+    spark.read
+      .format("delta")
+      .load(bronze(contracts).uri)
+      .select("id", "valid_to")
+      .collect()
+      .map(row => row.getInt(0) -> row.getString(1))
+      .sortBy(_._1)
+      .toSeq shouldBe Seq(1 -> "2027-01-01", 2 -> "infinity")
   }
 
   test("a table that is not there fails its run for good, before a batch is planned") {

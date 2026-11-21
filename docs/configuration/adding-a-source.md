@@ -89,7 +89,7 @@ A configuration that is valid, here the examples of the repository with the exam
 ```text
 The configuration is valid: conf/app/local.example.yaml, and 2 sources.
 The lake is file:///home/CHANGE_ME/lakehouse-data/lake.
-  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  d734e49659f1
+  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  f89a0016da8e
   sales.returns  enabled  file  new_files    bronze/sales/returns                      2526a17a25b6
 ```
 

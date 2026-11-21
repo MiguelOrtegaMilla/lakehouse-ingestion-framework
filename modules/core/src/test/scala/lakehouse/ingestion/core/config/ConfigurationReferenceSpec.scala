@@ -121,6 +121,7 @@ final class ConfigurationReferenceSpec extends AnyFunSuite with Matchers with Ei
       |    tls: { mode: verify-full, root_certificate: /etc/ssl/certs/ca.pem }
       |    timeouts: { connect: 5s, statement: 30m }
       |  table: public.orders
+      |  text_columns: [valid_to]
       |load:
       |  mode: incremental
       |  watermark:

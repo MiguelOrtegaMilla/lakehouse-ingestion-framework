@@ -100,7 +100,8 @@ final class JdbcSourceConnectorSpec
       user: String = "sales_ro",
       tls: String = "{ mode: disable }",
       load: String = "{ mode: full }",
-      password: String = "env:SALES_RO_PASSWORD"
+      password: String = "env:SALES_RO_PASSWORD",
+      textColumns: Seq[String] = Nil
   ): Source =
     Source
       .load(
@@ -114,6 +115,7 @@ final class JdbcSourceConnectorSpec
            |    password: { secretRef: "$password" }
            |    tls: $tls
            |  table: $table
+           |  text_columns: [${textColumns.mkString(", ")}]
            |load: $load
            |targets: { bronze: { table: bronze/test/read } }
            |""".stripMargin
@@ -367,13 +369,83 @@ final class JdbcSourceConnectorSpec
       s"the column valid_to of the table public.validity of ${where(validity)} has infinity " +
       "or -infinity in a row of the batch, which PostgreSQL has for a date and Spark has " +
       "not: it would be written to Bronze as another date, the last day of the year 9999 " +
-      "for infinity. Nothing of the batch was written"
-    // And -infinity, of a timestamp, in a table whose name is no word.
+      "for infinity. Nothing of the batch was written. Add valid_to to " +
+      "connector.text_columns, and the column is read as text, each value as the source " +
+      "writes it"
+    // And -infinity, of a timestamp, in a column whose name the configuration cannot write.
     val past = source("public.long_ago")
-    failureOf(past)(read(past).rows.collect()).getMessage should startWith(
+    val unnamed = failureOf(past)(read(past).rows.collect()).getMessage
+    unnamed should startWith(
       s"the column Seen At of the table public.long_ago of ${where(past)} has infinity or " +
         "-infinity in a row of the batch, which PostgreSQL has for a timestamptz and Spark has not"
     )
+    unnamed should endWith(
+      "connector.text_columns would have the column read as text, each value as the source " +
+        "writes it, and takes a name of letters, digits and underscores, which this one is " +
+        "not: read the table through a view that gives the column such a name"
+    )
+  }
+
+  test("a column that the configuration has read as text holds infinity as the source writes it") {
+    val validity = source("public.validity", textColumns = Seq("valid_to"))
+    val asText = read(validity)
+    val mark = logMark()
+
+    asText.rows.schema.fields.map(f => f.name -> f.dataType).toSeq shouldBe Seq(
+      "id" -> IntegerType,
+      "valid_to" -> StringType,
+      "seen_at" -> TimestampType
+    )
+    asText.rows.collect().toSeq.sortBy(_.getInt(0)).map(_.getString(1)) shouldBe
+      Seq("2026-01-01", "9999-12-31", "infinity")
+    // The source is asked of the dates that are still read as dates, and of no other.
+    eventually {
+      val asked = statementsSince(mark).map(_.sql).loneOrFail
+      asked should include("""CASE WHEN NOT isfinite("_lakehouse_source"."seen_at") THEN 1 END""")
+      asked should not include "valid_to\")"
+    }
+
+    // Every date of the table as text: the table is read by its name, and nothing is asked.
+    val both = read(source("public.validity", textColumns = Seq("seen_at", "valid_to")))
+    val afterIt = logMark()
+    both.rows.collect().toSeq.sortBy(_.getInt(0)).map(_.getString(2)) shouldBe Seq(
+      "2026-01-01 00:00:00+00",
+      "9999-12-31 23:59:59.999+00",
+      "2026-01-01 00:00:00+00"
+    )
+    eventually {
+      statementsSince(afterIt).map(_.sql).loneOrFail shouldBe
+        """SELECT "id","valid_to","seen_at" FROM "public"."validity""""
+    }
+  }
+
+  test("a column of any type is read as text if the configuration says so, and only that one") {
+    val typed =
+      read(source("public.typed", textColumns = Seq("c_numeric_10_2", "c_date", "c_text")))
+    val row = typed.rows.head()
+    def value(column: String): Any = row.get(row.fieldIndex(column))
+
+    value("c_numeric_10_2") shouldBe "12.34"
+    value("c_date") shouldBe "2026-10-25"
+    value("c_text") shouldBe "text"
+    // The others, as their types say.
+    val asText = Set("c_numeric_10_2", "c_date")
+    typed.rows.schema.fields.map(f => f.name -> f.dataType).toSeq shouldBe TypesInBronze.map {
+      case (name, _) if asText(name) => name -> StringType
+      case other => other
+    }
+  }
+
+  test("a column that the configuration names and the table has not is refused before a plan") {
+    val misnamed = source("public.validity", textColumns = Seq("valid_to", "Valid_To", "until"))
+
+    val refused = intercept[RunFailedException](plan(misnamed))
+
+    refused.failure shouldBe FailureClass.Permanent
+    refused.getMessage shouldBe
+      s"the table public.validity of ${where(misnamed)} has no column Valid_To, until, which " +
+      "connector.text_columns names: a column is named as the source writes it, with its " +
+      "case. Its columns are id, valid_to, seen_at. Nothing was read"
   }
 
   test("a table that has a column under the name of the one that is asked for gets another") {
@@ -546,6 +618,12 @@ final class JdbcSourceConnectorSpec
       s"${where(bounded)} has a value that does not fit the type that its column is read into"
     )
     failed.getMessage should include("(SQLState 22003)")
+    failed.getMessage should endWith("add the column to connector.text_columns")
+    // Which is what keeps it.
+    read(source("public.bounded", textColumns = Seq("n"))).rows
+      .collect()
+      .map(_.getString(1))
+      .toSet shouldBe Set("1.50", "NaN")
   }
 
   // ---------------------------------------------------------------------------------------------

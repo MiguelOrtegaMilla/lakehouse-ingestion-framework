@@ -120,6 +120,7 @@ final class JdbcFailuresSpec extends AnyFunSuite with Matchers with EitherValues
       s"$Where has a value that does not fit the type that its column is read into"
     )
     failed.getMessage should include("Bad value for type BigDecimal : NaN (SQLState 22003)")
+    failed.getMessage should endWith("add the column to connector.text_columns")
   }
 
   test("a failure of SQL under one of I/O is not the source's: the LogStore has a database too") {
