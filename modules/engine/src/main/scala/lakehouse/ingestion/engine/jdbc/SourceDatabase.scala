@@ -1,6 +1,7 @@
 package lakehouse.ingestion.engine.jdbc
 
 import java.sql.{Connection, DriverManager, ResultSetMetaData}
+import java.time.{Instant, OffsetDateTime}
 import java.util.Properties
 
 import scala.util.Using
@@ -10,7 +11,7 @@ import lakehouse.ingestion.engine.control.PostgresJdbc
 
 /**
  * A connection to the database of a source, for what the connector asks of it besides its
- * rows: what the columns of a table are. The rows are read by Spark, on connections of its own
+ * rows: what the columns of a table are, and what time it is there. The rows are read by Spark, on connections of its own
  * that are opened the same way (`PostgresJdbc.ofASource`).
  *
  * It is one connection, opened for a question and closed after it: a run asks a source a
@@ -43,6 +44,21 @@ final class SourceDatabase private (jdbc: Connection) extends AutoCloseable {
             nullable = metadata.isNullable(index) != ResultSetMetaData.columnNoNulls
           )
         }
+      }
+    }
+
+  /**
+   * What the source says the time is, to the microsecond, which is what PostgreSQL keeps: the
+   * clock that a batch of a watermark is bounded by (ADR-0020). It is the time at which the
+   * statement started, on a connection that has no transaction open.
+   *
+   * @throws java.sql.SQLException for whatever the source says in place of it
+   */
+  def clock(): Instant =
+    Using.resource(jdbc.createStatement()) { statement =>
+      Using.resource(statement.executeQuery(JdbcSql.Clock)) { rows =>
+        rows.next(): Unit
+        rows.getObject(1, classOf[OffsetDateTime]).toInstant
       }
     }
 

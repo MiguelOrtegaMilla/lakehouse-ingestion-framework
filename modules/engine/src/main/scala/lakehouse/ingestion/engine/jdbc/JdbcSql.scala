@@ -25,6 +25,12 @@ object JdbcSql {
     (name.schema.toSeq :+ name.name).map(part => quoted(part.value)).mkString(".")
 
   /**
+   * What the source says the time is, which the bounds of a batch of a watermark are times of
+   * (ADR-0020). A constant: nothing of a source, and nothing of its configuration, is in it.
+   */
+  val Clock = "SELECT CURRENT_TIMESTAMP"
+
+  /**
    * A statement over a table that gives no row: what its columns are is in its metadata. It is
    * what Spark asks before a read, so the two are told the same.
    */
