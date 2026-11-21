@@ -178,13 +178,18 @@ object ConfigVersion {
    * @param was the value of the last run
    * @param is the value now
    * @param consequence what would go wrong if the source simply ran on
+   * @param breaksBronze whether it is what Bronze has of the source that cannot follow it: the
+   *   state that says how far the source was read and what was taken of it, and the table that
+   *   was written. A run into Bronze is refused for these, and for no other. The rest are of
+   *   what is made of Bronze afterwards, and are for a run into Silver to refuse (P10)
    */
   final case class BreakingChange(
       of: String,
       field: String,
       was: String,
       is: String,
-      consequence: String
+      consequence: String,
+      breaksBronze: Boolean
   ) {
     def message: String = s"$field of the $of was $was and is $is: $consequence"
   }
@@ -201,6 +206,10 @@ object ConfigVersion {
    * and still is: the kind of its connector, and the fields that its connector names as its
    * origin, a database and a table for JDBC.
    *
+   * Each says whether it is Bronze that cannot follow it (`BreakingChange.breaksBronze`): the
+   * lake, the Bronze table, the watermark column and where the rows come from. A key, the
+   * Silver table and its partitioning change nothing of what was ingested.
+   *
    * @param last the content of the snapshot of the last run
    */
   def breakingChanges(last: Json, now: ConfigVersion): Vector[BreakingChange] = {
@@ -210,16 +219,29 @@ object ConfigVersion {
 
     /** A field that both have, with two values that are not the `same`. */
     def differs(
-        same: (Json, Json) => Boolean
+        same: (Json, Json) => Boolean,
+        breaksBronze: Boolean
     )(consequence: String, path: String*): Option[BreakingChange] =
       for {
         was <- at(last, path: _*)
         is <- at(now.content, path: _*)
         if !same(was, is)
-      } yield BreakingChange(path.head, path.tail.mkString("."), shown(was), shown(is), consequence)
+      } yield BreakingChange(
+        path.head,
+        path.tail.mkString("."),
+        shown(was),
+        shown(is),
+        consequence,
+        breaksBronze
+      )
 
-    def changed(consequence: String, path: String*): Option[BreakingChange] =
-      differs(_ == _)(consequence, path: _*)
+    /** A change that what Bronze has of the source cannot follow. */
+    def ofBronze(consequence: String, path: String*): Option[BreakingChange] =
+      differs(_ == _, breaksBronze = true)(consequence, path: _*)
+
+    /** A change that Bronze follows, and that what is made of Bronze afterwards cannot. */
+    def afterBronze(consequence: String, path: String*): Option[BreakingChange] =
+      differs(_ == _, breaksBronze = false)(consequence, path: _*)
 
     /** A key is its columns, in whatever order a file lists them. */
     def sameColumns(was: Json, is: Json): Boolean =
@@ -240,26 +262,26 @@ object ConfigVersion {
     val mergedBefore = at(last, silver: _*).nonEmpty && at(now.content, silver: _*).nonEmpty
 
     Vector(
-      changed(
+      ofBronze(
         "every table of the source is in another place, and its state says what was written to the old one",
         "profile",
         "lake",
         "uri"
       ),
-      changed(
+      ofBronze(
         "the Bronze table is another, and the state of the source says what was written to the old one",
         "source",
         "targets",
         "bronze",
         "table"
       ),
-      changed(
+      afterBronze(
         "the Silver table is another, and what was merged is in the old one",
         silver: _*
       ),
       Option
         .when(sameSilver)(
-          changed(
+          afterBronze(
             "a table is partitioned one way, and this one already is",
             "source",
             "targets",
@@ -270,14 +292,14 @@ object ConfigVersion {
         .flatten,
       Option
         .when(mergedBefore)(
-          differs(sameColumns)(
+          differs(sameColumns, breaksBronze = false)(
             "the rows already in Silver were merged by the old key, and would not be found by the new one",
             "source",
             "keys"
           )
         )
         .flatten,
-      changed(
+      ofBronze(
         "the watermark that is stored is a value of the old column",
         "source",
         "load",
@@ -288,7 +310,7 @@ object ConfigVersion {
       // A watermark says how far one table of one database was read. Of another, it says
       // nothing, and a full load takes everything whatever it is.
       now.origin.filter(_ => byWatermark).flatMap { field =>
-        changed(
+        ofBronze(
           "the watermark that is stored is of what was read before, and going on from it would " +
             "skip rows of what is read now without a word",
           field.split('.').toIndexedSeq: _*

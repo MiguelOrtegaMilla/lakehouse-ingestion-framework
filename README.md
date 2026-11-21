@@ -69,6 +69,7 @@ sbt "integration-tests/testOnly *FileSourceConnectorSpec"   # the file connector
 sbt "integration-tests/testOnly *BronzeWriterSpec"   # the writer of Bronze: once, with the engine's columns, and what it refuses (needs Docker)
 sbt "integration-tests/testOnly *QuarantineWriterSpec"   # the quarantine of a source: a rejected record kept as it was, once (needs Docker)
 sbt "integration-tests/testOnly *IngestionServiceSpec"   # a run from end to end: files to Bronze once, rejected records in quarantine and their threshold, a batch given up when its files change, a batch with no rows; a run that dies at each fault point and the next that finishes its batch; a run that lost its lease, refused by the LogStore (needs Docker)
+sbt "integration-tests/testOnly *BreakingChangeSpec"   # a source whose configuration changed in a way that what was ingested cannot follow: refused before its planned batch is looked for, and run on with the configuration that it had (needs Docker)
 sbt "integration-tests/testOnly *LeaseLossSpec"   # a run that loses its lease, with the control plane cut for real: its jobs stopped, no step after it, and how it ends (needs Docker)
 sbt "integration-tests/testOnly *RunCommandSpec"   # the command run as an orchestrator starts it, each outcome with its exit code (needs Docker)
 sbt "integration-tests/testOnly *GeneratedFilesSpec"   # files made from a seed (a column more or less, broken records, empty and repeated files) through a run, compared with what the generator says is in them (needs Docker)

@@ -582,11 +582,19 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     // With the table that it had, the batch is found written, and rolled forward.
     launch(orders) shouldBe a[Outcome.RolledForward]
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
-    // And from then on the source writes where its configuration says: the next batch is
-    // planned for the new table.
+    // From then on the source has a state, which says what was written to that table: another
+    // table is a change that it cannot follow, and a run with it is refused before it plans
+    // (ADR-0007, `BreakingChangeSpec`).
     drop(orders, "b.csv", "id\n2\n")
-    ingested(launch(moved)).batch shouldBe batchId(orders, 2)
-    batchOf(batchId(orders, 2)).target shouldBe Some(bronze(moved).uri)
+    launch(moved) match {
+      case Outcome.Failed(_, failure, message) =>
+        failure shouldBe FailureClass.Permanent
+        message should include("targets.bronze.table of the source was")
+      case other => fail(s"the run did not fail: $other")
+    }
+    isThere(bronze(moved)) shouldBe false
+    ingested(launch(orders)).batch shouldBe batchId(orders, 2)
+    batchOf(batchId(orders, 2)).target shouldBe Some(bronze(orders).uri)
   }
 
   test("a batch that was planned before a batch said its table is finished where the source says") {
