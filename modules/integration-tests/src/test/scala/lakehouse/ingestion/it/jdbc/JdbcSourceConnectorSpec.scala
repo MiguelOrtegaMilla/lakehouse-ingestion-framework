@@ -485,6 +485,27 @@ final class JdbcSourceConnectorSpec
     }
   }
 
+  test("a row with infinity is refused for its own column, whatever other is read as text") {
+    // A span that is open at both ends. With one of its dates read as text, the source is
+    // asked of the other alone, and it is the other that the failure names.
+    def refusedWith(asText: String): String = {
+      val spans = source("public.spans", textColumns = Seq(asText))
+      failureOf(spans)(read(spans).rows.collect()).getMessage
+    }
+    val table = s"of the table public.spans of ${where(source("public.spans"))}"
+
+    refusedWith("valid_from") should startWith(s"the column valid_to $table has infinity or ")
+    refusedWith("valid_from") should include("Add valid_to to connector.text_columns")
+    refusedWith("valid_to") should startWith(s"the column valid_from $table has infinity or ")
+    refusedWith("valid_to") should include("Add valid_from to connector.text_columns")
+
+    // With both as text, the span is read as the source writes it.
+    read(source("public.spans", textColumns = Seq("valid_from", "valid_to"))).rows
+      .collect()
+      .map(row => row.getString(1) -> row.getString(2))
+      .toSeq shouldBe Seq("-infinity" -> "infinity")
+  }
+
   test("a column of any type is read as text if the configuration says so, and only that one") {
     val typed =
       read(source("public.typed", textColumns = Seq("c_numeric_10_2", "c_date", "c_text")))
@@ -1243,6 +1264,8 @@ object JdbcSourceConnectorSpec {
       |(4, '1582-10-15', '1582-10-15 00:00:00', '1582-10-15 00:00:00+00'),
       |(5, '1500-02-28', '1500-02-28 12:00:00', '1500-02-28 12:00:00+00'),
       |(6, '0001-01-01', '0001-01-01 00:00:00', '0001-01-01 00:00:00+00')""".stripMargin,
+    "CREATE TABLE spans (id int, valid_from date, valid_to date)",
+    "INSERT INTO spans VALUES (1, '-infinity', 'infinity')",
     """CREATE TABLE long_ago (id int, "Seen-At" timestamptz)""",
     """INSERT INTO long_ago VALUES (1, '2026-01-01 00:00:00+00'), (2, '-infinity')""",
     """CREATE TABLE flagged (id int, _lakehouse_infinite text, day date)""",

@@ -138,6 +138,22 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
         )
       )
       .isRight shouldBe true
+    // A name is the source's, with its case: under another it is another column, which a
+    // table may have beside one that is read as text, or beside its watermark.
+    Seq(Jdbc -> "[valid_to, Valid_To]", Incremental -> "[Updated_At]").foreach {
+      case (of, columns) =>
+        withClue(s"$columns: ") {
+          Source
+            .load(
+              File,
+              of.replace(
+                "  table: public.orders\n",
+                s"  table: public.orders\n  text_columns: $columns\n"
+              )
+            )
+            .isRight shouldBe true
+        }
+    }
   }
 
   test("the example of a JDBC source is valid, and is read as it says") {
