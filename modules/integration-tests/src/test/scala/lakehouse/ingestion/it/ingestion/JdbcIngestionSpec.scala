@@ -803,6 +803,57 @@ final class JdbcIngestionSpec
     ingested(launch(followed, reading())).batch shouldBe batchId(followed, 2)
   }
 
+  test("a window that a run left is not read from a table whose column changed since") {
+    changesTable("altered")
+    stamped("altered", 1, "a", Day.plus(1, ChronoUnit.HOURS))
+    val altered = watermarkSource(
+      "public.altered",
+      watermark = "safety_margin: 1h, start: \"2026-01-01T00:00:00Z\"",
+      range = Some("1d")
+    )
+    dies(altered, FaultPoint.AfterPlan)
+
+    def refusedFor(change: String, problem: String): Unit = {
+      asOwner(_(change))
+      val refused = failed(launch(altered, reading()))
+      refused.failure shouldBe FailureClass.Permanent
+      refused.message shouldBe
+        s"the table public.altered of the source ${altered.id} (${pg.jdbcUrl("sales")}, as " +
+        s"sales_ro) $problem. The batch of ${altered.id} was planned as a window of that " +
+        "column, as the table had it then, and nothing was read"
+      // The run ended with its class and gave its lease up; the batch waits as it was.
+      runOf(refused.run).failure.value.failure shouldBe FailureClass.Permanent
+      batchesOf(altered) shouldBe Seq((1L, "PLANNED"))
+      hasABatch(altered) shouldBe false
+      holderOf(altered) shouldBe None: Unit
+    }
+
+    // The column is gone: there is nothing to bound the rows by.
+    refusedFor(
+      "ALTER TABLE altered RENAME COLUMN updated_at TO changed_at",
+      "has no column updated_at (load.watermark.column). Its columns are id, name, changed_at"
+    )
+    // It is there, as text: Spark would compare its values itself, over the whole table.
+    asOwner(_("ALTER TABLE altered RENAME COLUMN changed_at TO updated_at"))
+    refusedFor(
+      "ALTER TABLE altered ALTER COLUMN updated_at TYPE text",
+      "has its column updated_at (load.watermark.column) of type text, and a watermark is " +
+        "a timestamptz, or a timestamp without a zone, which is taken as UTC: a load by a " +
+        "watermark leaves a margin of time behind the clock of its source, and no margin can " +
+        "be said in another type (ADR-0020)"
+    )
+
+    // With the column as the batch was planned by, the batch is read.
+    asOwner(
+      _(
+        "ALTER TABLE altered ALTER COLUMN updated_at TYPE timestamptz " +
+          "USING updated_at::timestamptz"
+      )
+    )
+    ingested(launch(altered, reading())).batch shouldBe batchId(altered, 1)
+    snapshots(altered) shouldBe Seq((1, "a", 1L))
+  }
+
   // ---------------------------------------------------------------------------------------------
   // The failures of a source, as a run ends with them
   // ---------------------------------------------------------------------------------------------
