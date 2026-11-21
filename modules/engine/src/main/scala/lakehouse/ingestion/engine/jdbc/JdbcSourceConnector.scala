@@ -22,7 +22,12 @@ import lakehouse.ingestion.core.config.{
   Timestamps
 }
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
-import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan, WatermarkPlanner}
+import lakehouse.ingestion.core.watermark.{
+  StoredWatermark,
+  WatermarkHorizon,
+  WatermarkPlan,
+  WatermarkPlanner
+}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
@@ -112,9 +117,12 @@ final class JdbcSourceConnector(secrets: SecretResolver)
         columnsOf(source, config): Unit
         Some(FullLoadPlan(config.table).toJson)
       case incremental: Load.Incremental =>
+        // The horizon of the chain that this run is in, after its first: the clock is not
+        // asked again, so that the chain ends though the source goes on writing (ADR-0020, 9).
+        val chain = context.horizon.map(horizonOf(source, _))
         // On one connection: what the table is, and what time it is where the table is.
         val (said, clock) = asked(source, config) { database =>
-          (database.columns(config.table), database.clock())
+          (database.columns(config.table), if (chain.isEmpty) Some(database.clock()) else None)
         }
         val columns = kept(source, config, said)
         val column = incremental.watermark.column.value
@@ -127,7 +135,13 @@ final class JdbcSourceConnector(secrets: SecretResolver)
           case Right(warning) =>
             warning.foreach(text => log.warn(s"${source.id}: in the table ${config.table}, $text"))
         }
-        nextWindow(source, config, incremental, context.watermark, clock)
+        (chain, clock) match {
+          case (Some(horizon), _) =>
+            windowUpTo(source, incremental, context.watermark, horizon.value, clock = None)
+          case (None, Some(said)) =>
+            nextWindow(source, config, incremental, context.watermark, said)
+          case (None, None) => throw new IllegalStateException("the clock was not asked")
+        }
       case other =>
         throw RunFailedException.permanent(
           s"${source.id} has the load ${other.mode.name}, which is no load of a table"
@@ -213,6 +227,26 @@ final class JdbcSourceConnector(secrets: SecretResolver)
       case Whole(_) => Progress(watermark = None, files = None)
       case Window(bounds) => Progress(watermark = Some(bounds.watermark.toJson), files = None)
     }
+
+  /** More while a window ends before its horizon; a snapshot of a table is all there is. */
+  override def more(source: Source, config: JdbcConnectorConfig, plan: Json): Option[Json] =
+    planOf(source, plan) match {
+      case Whole(_) => None
+      case Window(bounds) => bounds.next.map(_.toJson)
+    }
+
+  /** The horizon of a chain, as the plan before this one gave it. */
+  private def horizonOf(source: Source, document: Json): WatermarkHorizon =
+    WatermarkHorizon
+      .fromJson(document)
+      .fold(
+        problem =>
+          throw RunFailedException.permanent(
+            s"the horizon that ${source.id} was given to plan against is not one that this " +
+              s"application wrote, and nothing was planned: it $problem"
+          ),
+        identity
+      )
 
   override def failure(
       source: Source,
@@ -468,17 +502,7 @@ object JdbcSourceConnector {
       stored: Option[Json],
       clock: Instant
   ): Option[Json] = {
-    val watermark = stored.map { document =>
-      StoredWatermark.fromJson(document) match {
-        case Right(reached) => reached
-        case Left(problem) =>
-          throw RunFailedException.permanent(
-            s"the watermark that the control plane has of ${source.id} is not one that this " +
-              s"application wrote, and nothing was planned: it $problem. A batch is not " +
-              "planned from a moment that was guessed"
-          )
-      }
-    }
+    stored.foreach(storedWatermark(source, _))
     val horizon = WatermarkPlanner.horizon(load.watermark, clock) match {
       case Right(moment) => moment
       case Left(problem) =>
@@ -488,16 +512,34 @@ object JdbcSourceConnector {
             s"outside ${Timestamps.Min} to ${Timestamps.Max}"
         )
     }
+    windowUpTo(source, load, stored, horizon, Some(clock))
+  }
 
+  /**
+   * The plan of the next window of a source up to a horizon, or none if the source has been
+   * read up to it.
+   *
+   * @param clock what the clock of the source said, for the first plan of an invocation; none
+   *   for a later one, which plans against the horizon of its chain and asks no clock
+   */
+  private def windowUpTo(
+      source: Source,
+      load: Load.Incremental,
+      stored: Option[Json],
+      horizon: Instant,
+      clock: Option[Instant]
+  ): Option[Json] = {
+    val watermark = stored.map(storedWatermark(source, _))
     WatermarkPlanner.plan(load, watermark, horizon) match {
       case WatermarkPlanner.Planned(plan) => Some(plan.toJson)
       case nothing: WatermarkPlanner.NothingNew =>
         val margin = load.watermark.safetyMargin
         watermark match {
           // Further behind than the margin: it is the clock that is behind the watermark.
-          case Some(reached) if nothing.behind.compareTo(Span.ofMillis(margin.toMillis)) > 0 =>
+          case Some(reached)
+              if clock.nonEmpty && nothing.behind.compareTo(Span.ofMillis(margin.toMillis)) > 0 =>
             log.warn(
-              s"${source.id}: the clock of its source says $clock, which is before the " +
+              s"${source.id}: the clock of its source says ${clock.get}, which is before the " +
                 s"watermark of the source, ${reached.value}. The clock went back, or it is " +
                 "that of another server. No batch is planned until it has passed the " +
                 s"watermark by safety_margin (${Durations.render(margin)}): what the source " +
@@ -516,6 +558,18 @@ object JdbcSourceConnector {
         None
     }
   }
+
+  /** The watermark of a source, as this connector wrote it. */
+  private def storedWatermark(source: Source, document: Json): StoredWatermark =
+    StoredWatermark.fromJson(document) match {
+      case Right(reached) => reached
+      case Left(problem) =>
+        throw RunFailedException.permanent(
+          s"the watermark that the control plane has of ${source.id} is not one that this " +
+            s"application wrote, and nothing was planned: it $problem. A batch is not " +
+            "planned from a moment that was guessed"
+        )
+    }
 
   /** The rows of a window: after its lower bound, if it has one, and no later than its upper. */
   private def within(window: WatermarkPlan): Column = {

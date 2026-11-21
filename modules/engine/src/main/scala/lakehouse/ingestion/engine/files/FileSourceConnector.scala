@@ -15,7 +15,7 @@ import lakehouse.ingestion.core.config.{
   Source
 }
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
-import lakehouse.ingestion.core.files.{FilePlan, FilePlanner}
+import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
@@ -130,7 +130,19 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
   ): Option[Json] = {
     val listed = landing.list(config)
     val taken = context.files.processed(config.path, listed.map(_.name))
-    FilePlanner.plan(config, listed, taken, context.now) match {
+    val horizon = context.horizon.map { document =>
+      FileHorizon
+        .fromJson(document)
+        .fold(
+          problem =>
+            throw RunFailedException.permanent(
+              s"the horizon that ${source.id} was given to plan against is not one that this " +
+                s"application wrote, and nothing was planned: it $problem"
+            ),
+          identity
+        )
+    }
+    FilePlanner.plan(config, listed, taken, context.now, horizon) match {
       case Left(problems) =>
         throw RunFailedException.permanent(
           s"the directory ${config.path} of the landing zone has files whose names no run may " +
@@ -140,9 +152,12 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
         log.info(s"${source.id}: no new file is complete in ${config.path}; $waiting not yet")
         None
       case Right(Planned(plan, waiting, leftOver)) =>
+        val chain = plan.horizon.fold("")(at =>
+          s"; the invocation takes ${at.remaining} more of those changed by ${at.completeBy}"
+        )
         log.info(
           s"${source.id}: planned ${plan.files.size} files of ${config.path}, " +
-            s"${plan.bytes} bytes; $waiting not complete yet, $leftOver for the next batch"
+            s"${plan.bytes} bytes; $waiting not complete yet, $leftOver complete beyond it$chain"
         )
         Some(plan.toJson)
     }
@@ -193,6 +208,10 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
   /** The files of a plan are what its commit records: each is taken, and never again. */
   override def progress(source: Source, config: FileConnectorConfig, plan: Json): Progress =
     Progress(watermark = None, files = Some(planOf(source, config, plan)))
+
+  /** More while the chain has files left of those complete at its first plan; none for a plan of version 1. */
+  override def more(source: Source, config: FileConnectorConfig, plan: Json): Option[Json] =
+    planOf(source, config, plan).next.map(_.toJson)
 
   /** A plan of this source, as this application reads it. */
   private def planOf(source: Source, config: FileConnectorConfig, plan: Json): FilePlan = {

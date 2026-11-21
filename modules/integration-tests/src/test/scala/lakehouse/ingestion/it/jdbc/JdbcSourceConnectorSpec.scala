@@ -13,7 +13,7 @@ import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.LandedFile
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
-import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
+import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkHorizon, WatermarkPlan}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.PostgresJdbc
@@ -662,6 +662,58 @@ final class JdbcSourceConnectorSpec
     // Cut by the range, counted from the watermark: the source is weeks behind its clock.
     planned.upper shouldBe Instant.parse("2026-11-02T10:00:00Z")
     planned.more shouldBe true
+  }
+
+  test("a later run of a chain plans against the horizon that it is given, and asks no clock") {
+    val changes = byWatermark(more = ", max_batch_range: 1d")
+    val reached = Instant.parse("2026-11-01T10:00:00Z")
+    val chain = WatermarkHorizon(Instant.parse("2026-11-02T22:00:00Z"))
+    val context = planContext.copy(
+      watermark = Some(StoredWatermark(reached).toJson),
+      horizon = Some(chain.toJson)
+    )
+    val mark = logMark()
+
+    val first = WatermarkPlan.fromJson(bound(changes).plan(context).value).value
+
+    // Cut by the range, and bounded by the horizon of the chain and not by the clock.
+    (first.lower, first.upper, first.horizon) shouldBe
+      ((Some(reached), Instant.parse("2026-11-02T10:00:00Z"), chain.value))
+    bound(changes).more(first.toJson) shouldBe Some(chain.toJson)
+    eventually {
+      everyStatementSince(mark).filterNot(sql =>
+        sql.contains("pg_catalog.") || sql.startsWith("SET ")
+      ) shouldBe Seq("""SELECT * FROM "public"."changes" WHERE 1=0""")
+    }
+
+    // The next reaches the horizon, and the chain ends with it; and after it, nothing is new.
+    val last = WatermarkPlan
+      .fromJson(
+        bound(changes)
+          .plan(context.copy(watermark = Some(StoredWatermark(first.upper).toJson)))
+          .value
+      )
+      .value
+    last.upper shouldBe chain.value
+    bound(changes).more(last.toJson) shouldBe None
+    bound(changes).plan(
+      context.copy(watermark = Some(StoredWatermark(last.upper).toJson))
+    ) shouldBe None
+    // A snapshot of a table is all there is.
+    val whole = source("public.changes")
+    bound(whole).more(bound(whole).plan(planContext).value) shouldBe None
+  }
+
+  test("a horizon that is not one this application wrote plans nothing") {
+    val changes = byWatermark()
+    val refused =
+      failureOf(changes)(
+        bound(changes).plan(planContext.copy(horizon = Some(Json.fromString("noon"))))
+      )
+    refused.failure shouldBe FailureClass.Permanent
+    refused.getMessage should include(
+      "was given to plan against is not one that this application wrote"
+    )
   }
 
   test("a window is read by its bounds, which reach the source as predicates of its statement") {

@@ -154,6 +154,44 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     stateOf(orders).value.lastCommitted.value shouldBe 2L
   }
 
+  test("a batch says what comes after it: the horizon of its chain while there is more") {
+    val orders = fileSource(options = ", max_files_per_batch: 1")
+    drop(orders, "a.csv", "id\n1\n")
+    drop(orders, "b.csv", "id\n2\n")
+
+    val first = ingested(launch(orders))
+
+    val horizon = first.next match {
+      case Outcome.Next.Within(next) => next
+      case other => fail(s"the first batch of two files, one a batch, says $other")
+    }
+    // The horizon is the plan's, as the write-ahead log has it.
+    horizon shouldBe FilePlan.fromJson(batchOf(first.batch).plan).value.next.value.toJson
+
+    // A file left meanwhile, after the horizon: not the chain's.
+    drop(orders, "c.csv", "id\n3\n", at = Now.minusSeconds(30))
+    val second = ingested(launch(orders, horizon = Some(horizon)))
+
+    second.next shouldBe Outcome.Next.Ends
+    rowsOf(orders).map(_._3) shouldBe Seq("a.csv", "b.csv")
+  }
+
+  test("a batch that a run before it planned is followed by a plan made anew") {
+    val orders = fileSource(options = ", max_files_per_batch: 1")
+    drop(orders, "a.csv", "id\n1\n")
+    drop(orders, "b.csv", "id\n2\n")
+    intercept[RuntimeException](
+      launch(
+        orders,
+        service(hooks = hookAt(FaultPoint.AfterPlan)(_ => throw new RuntimeException("died")))
+      )
+    )
+    expire(orders)
+
+    // The batch of the run that died is run again: its horizon was another invocation's.
+    ingested(launch(orders)).next shouldBe Outcome.Next.Afresh
+  }
+
   test("a run with no new file ends well with no batch, and makes nothing") {
     val orders = fileSource()
 

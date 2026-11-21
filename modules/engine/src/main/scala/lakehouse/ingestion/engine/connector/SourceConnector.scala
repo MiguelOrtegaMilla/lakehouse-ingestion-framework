@@ -40,6 +40,11 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  *  - '''What the commit of a plan records is a function of the plan alone''' (`progress`):
  *    where the next batch starts from, and the files that the batch took. A batch whose data a
  *    run finds written is then committed with nothing read (ADR-0005 §3, step 2).
+ *  - '''Whether there is more after a plan is a function of the plan alone''' (`more`), and is
+ *    said against a horizon that the first plan of an invocation fixed: the next run of the
+ *    chain is given it (`PlanContext.horizon`), and plans against it, so that a chain ends
+ *    though the source goes on changing (discovery §17, P6.10). A connector with no horizon
+ *    says that there is no more, and its source is never chained.
  *  - '''A connector never writes to the lake, nor to the control plane.''' The state of a
  *    source, the files it took and the record of a run are the engine's, which moves them in
  *    one transaction with the batch (ADR-0005). What a connector needs of them is given to it,
@@ -87,6 +92,16 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
   def progress(source: Source, config: C, plan: Json): Progress
 
   /**
+   * Whether the invocation that planned this plan has more to read after it, as the horizon
+   * that the next run of the chain is to plan against; none if the chain ends here. It reads
+   * the plan and nothing else, as `progress` does.
+   *
+   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   *   not one that this connector reads
+   */
+  def more(source: Source, config: C, plan: Json): Option[Json] = None
+
+  /**
    * What a failure that came up while the engine went over the rows of a read of this connector
    * is, if it is one of the source's: its class, and what to do about it. The engine asks it of
    * rows that are read as they are gone over (`ReadResult.OnePass`), whose source fails after
@@ -120,6 +135,9 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
     override def progress(plan: Json): Progress =
       SourceConnector.this.progress(source, config, plan)
 
+    override def more(plan: Json): Option[Json] =
+      SourceConnector.this.more(source, config, plan)
+
     override def failure(error: Throwable): Option[RunFailedException] =
       SourceConnector.this.failure(source, config, error)
   }
@@ -137,6 +155,9 @@ abstract class BoundSource private[connector] (val source: Source) {
   /** @see [[SourceConnector.progress]] */
   def progress(plan: Json): Progress
 
+  /** @see [[SourceConnector.more]] */
+  def more(plan: Json): Option[Json]
+
   /** @see [[SourceConnector.failure]] */
   def failure(error: Throwable): Option[RunFailedException]
 }
@@ -150,8 +171,15 @@ abstract class BoundSource private[connector] (val source: Source) {
  * @param watermark where the last batch of the source left it, as the connector wrote it: none
  *   before the first, and for a source that has none
  * @param files the files that batches of the source have taken
+ * @param horizon how far the invocation reads, as the plan before this one in its chain said
+ *   (`SourceConnector.more`); none for the first plan of an invocation, which fixes it
  */
-final case class PlanContext(now: Instant, watermark: Option[Json], files: FileRegistry)
+final case class PlanContext(
+    now: Instant,
+    watermark: Option[Json],
+    files: FileRegistry,
+    horizon: Option[Json] = None
+)
 
 /**
  * The files that batches of a source took (`processed_file`), to be asked of a listing.

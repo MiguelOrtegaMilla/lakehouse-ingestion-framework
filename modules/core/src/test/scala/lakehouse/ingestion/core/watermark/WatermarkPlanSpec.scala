@@ -490,4 +490,32 @@ final class WatermarkPlanSpec extends AnyFunSuite with Matchers with EitherValue
       written.mapObject(_.add("value", Json.fromString("2026-11-20T11:00:00.000000001Z")))
     ) shouldBe "value is finer than a microsecond (2026-11-20T11:00:00.000000001Z)"
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // The horizon of a chain of runs (P6.10)
+  // ---------------------------------------------------------------------------------------------
+
+  test(
+    "a plan cut short of its horizon gives it to the next run of the chain; one that reaches it, none"
+  ) {
+    val cut = WatermarkPlan(Column, Some(before(3.hours)), before(2.hours), Noon)
+    cut.next shouldBe Some(WatermarkHorizon(Noon))
+    WatermarkPlan(Column, Some(before(1.hour)), Noon, Noon).next shouldBe None
+  }
+
+  test("the horizon of a chain is written in one form, and read back as itself or refused") {
+    val horizon = WatermarkHorizon(at("2026-11-20T11:59:00.000001Z"))
+    horizon.toJson.noSpaces shouldBe """{"version":1,"until":"2026-11-20T11:59:00.000001Z"}"""
+    WatermarkHorizon.fromJson(SafeYaml.parse(horizon.toJson.noSpaces).value).value shouldBe horizon
+
+    def refusal(json: Json): String = WatermarkHorizon.fromJson(json).left.value
+    refusal(horizon.toJson.mapObject(_.add("version", Json.fromInt(2)))) shouldBe
+      "is of version 2, and this application reads version 1"
+    refusal(horizon.toJson.mapObject(_.remove("until"))) shouldBe "has no until"
+    refusal(
+      horizon.toJson.mapObject(_.add("until", Json.fromString("2026-11-20T12:59:00+01:00")))
+    ) shouldBe
+      "until is not written as a moment is, in UTC and in one way: 2026-11-20T11:59:00Z"
+    an[IllegalArgumentException] should be thrownBy WatermarkHorizon(Noon.plusNanos(1))
+  }
 }

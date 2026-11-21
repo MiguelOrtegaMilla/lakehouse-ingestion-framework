@@ -102,6 +102,59 @@ object LandedFile {
 }
 
 /**
+ * How far a chain of runs of a file source reads (discovery §17, P6.10): the files that were
+ * complete when its first run planned, and no more of them than there were then.
+ *
+ * A file is in the chain if it was last changed at `completeBy` or before. A producer may still
+ * leave, after the first plan, a file that was changed long before (a copy that keeps the time
+ * of its original): such a file is in the chain too. So the chain also counts: the first plan
+ * says how many files were new and complete, and each later run takes no more than are left
+ * of that number. The chain ends however many files arrive, and no list of names is kept.
+ *
+ * @param completeBy the first plan's moment, less `min_file_age`
+ * @param remaining the files that the chain may still take, after the plan that says it
+ */
+final case class FileHorizon(completeBy: Instant, remaining: Int) {
+  require(remaining >= 0, s"$remaining files left")
+
+  def toJson: Json = Json.obj(
+    "version" -> Json.fromInt(FileHorizon.Version),
+    "complete_by" -> Json.fromString(completeBy.toString),
+    "remaining" -> Json.fromInt(remaining)
+  )
+}
+
+object FileHorizon {
+
+  val Version = 1
+
+  /** Reads a horizon back as it was written, or says what is wrong with the document. */
+  def fromJson(json: Json): Either[String, FileHorizon] = {
+    val top = json.hcursor
+    for {
+      _ <- StoredForm.exactly(top, "version", "complete_by", "remaining")
+      _ <- StoredForm.version(top, Version)
+      read <- fields(top)
+    } yield FileHorizon(read._1, read._2)
+  }
+
+  /** `complete_by` and `remaining`, as a horizon and a plan of version 2 write them. */
+  private[files] def fields(at: ACursor): Either[String, (Instant, Int)] =
+    for {
+      text <- at.get[String]("complete_by").leftMap(_ => "complete_by is not a moment")
+      completeBy <- Either
+        .catchNonFatal(Instant.parse(text))
+        .leftMap(_ => "complete_by is not a moment")
+        .filterOrElse(_.toString == text, "complete_by is not written as a moment is, in UTC")
+      remaining <- StoredForm
+        .whole(at.downField("remaining"))
+        .filter(n => n >= 0 && n <= Int.MaxValue)
+        .map(_.toInt)
+        .toRight("remaining is not a number of files")
+    } yield (completeBy, remaining)
+}
+
+/**
  * The plan of a batch of files (ADR-0005 §3): the directory, and the files of it that the batch
  * takes, in the order they are read. It is written down before any of them is read, and a run
  * that replays it reads these files and no other.
@@ -109,8 +162,18 @@ object LandedFile {
  * It has a file at least: a run with nothing new plans no batch.
  *
  * @param directory relative to the landing root of the profile
+ * @param horizon how far the chain of runs that planned it reads, and whether it has more: every
+ *   plan that is made has one. A plan of version 1, written before chains, has none, and says
+ *   that there is no more
  */
-final case class FilePlan private (directory: RelativePath, files: Vector[LandedFile]) {
+final case class FilePlan private (
+    directory: RelativePath,
+    files: Vector[LandedFile],
+    horizon: Option[FileHorizon]
+) {
+
+  /** The horizon that the next run of the chain plans against, if there is more. */
+  def next: Option[FileHorizon] = horizon.filter(_.remaining > 0)
 
   /** The files that it takes, by their names: how they are found among those processed. */
   def names: Vector[FileName] = files.map(_.name)
@@ -118,16 +181,23 @@ final case class FilePlan private (directory: RelativePath, files: Vector[Landed
   def bytes: Long = files.map(_.size).sum
 
   /** As the control plane stores it, in the write-ahead log of batches. */
-  def toJson: Json = Json.obj(
-    "version" -> Json.fromInt(FilePlan.Version),
-    "directory" -> Json.fromString(directory.value),
-    "files" -> Json.fromValues(files.map { file =>
-      Json.obj(
-        "name" -> Json.fromString(file.name.value),
-        "size" -> Json.fromLong(file.size),
-        "modified_at" -> Json.fromString(file.modifiedAt.toString)
+  def toJson: Json = Json.fromFields(
+    Seq(
+      "version" -> Json.fromInt(horizon.fold(FilePlan.Unchained)(_ => FilePlan.Version)),
+      "directory" -> Json.fromString(directory.value),
+      "files" -> Json.fromValues(files.map { file =>
+        Json.obj(
+          "name" -> Json.fromString(file.name.value),
+          "size" -> Json.fromLong(file.size),
+          "modified_at" -> Json.fromString(file.modifiedAt.toString)
+        )
+      })
+    ) ++ horizon.toSeq.flatMap { chain =>
+      Seq(
+        "complete_by" -> Json.fromString(chain.completeBy.toString),
+        "remaining" -> Json.fromInt(chain.remaining)
       )
-    })
+    }
   )
 }
 
@@ -137,13 +207,23 @@ object FilePlan {
    * The form of the JSON. A plan outlives the process that wrote it, by a crash, and may be
    * replayed by another version of the application: one that reads another form refuses it.
    */
-  val Version = 1
+  val Version = 2
+
+  /**
+   * The form of a plan written before chains of runs (P6.10), with no horizon: read, and
+   * written again only for a plan that was read in it.
+   */
+  val Unchained = 1
 
   /** @throws IllegalArgumentException if it has no file, or a name twice */
-  def apply(directory: RelativePath, files: Vector[LandedFile]): FilePlan = {
+  def apply(
+      directory: RelativePath,
+      files: Vector[LandedFile],
+      horizon: Option[FileHorizon] = None
+  ): FilePlan = {
     require(files.nonEmpty, "a plan has a file at least")
     require(files.map(_.name).distinct.size == files.size, "a plan has each name once")
-    new FilePlan(directory, files)
+    new FilePlan(directory, files, horizon)
   }
 
   /**
@@ -154,14 +234,26 @@ object FilePlan {
   def fromJson(json: Json): Either[String, FilePlan] = {
     val top = json.hcursor
     for {
-      _ <- StoredForm.exactly(top, "version", "directory", "files")
-      _ <- StoredForm.version(top, Version)
+      _ <- top.keys.toRight("is not an object")
+      chained <- StoredForm.whole(top.downField("version")) match {
+        case Some(v) if v == Version => Right(true)
+        case Some(v) if v == Unchained => Right(false)
+        case Some(v) => Left(s"is of version $v, and this application reads versions 1 and 2")
+        case None => Left("version is not a whole number")
+      }
+      _ <-
+        if (chained)
+          StoredForm.exactly(top, "version", "directory", "files", "complete_by", "remaining")
+        else StoredForm.exactly(top, "version", "directory", "files")
+      horizon <-
+        if (chained) FileHorizon.fields(top).map { case (at, left) => Some(FileHorizon(at, left)) }
+        else Right(None)
       directoryText <- top.get[String]("directory").leftMap(_ => "directory is not text")
       directory <- RelativePath.parse(directoryText).leftMap(problem => s"directory $problem")
       entries <- top.downField("files").values.toRight("files is not a list")
       files <- entries.toVector.zipWithIndex.traverse { case (entry, index) => file(entry, index) }
       plan <- Either
-        .catchOnly[IllegalArgumentException](FilePlan(directory, files))
+        .catchOnly[IllegalArgumentException](FilePlan(directory, files, horizon))
         .leftMap(_.getMessage.stripPrefix("requirement failed: "))
     } yield plan
   }
@@ -218,6 +310,9 @@ object FilePlanner {
    * @param processed the files of the directory that batches have taken. Others may be there
    *   too, and are not looked at
    * @param now when the run plans: a file is complete once it is `min_file_age` older than this
+   * @param horizon that of the chain of runs that this plan is in, after its first; none for the
+   *   first, which fixes it. A file is then complete if it was changed by the horizon, and no
+   *   more files are taken than the horizon has left
    * @return what to do, or the names of files that the source would take and that no run can
    *   read. They are said, by their place in the listing and by the character that is in the
    *   way, and never passed over: a source that would skip a file without a word would lose
@@ -228,7 +323,8 @@ object FilePlanner {
       config: FileConnectorConfig,
       listed: Seq[Listed],
       processed: Set[LandedFile],
-      now: Instant
+      now: Instant,
+      horizon: Option[FileHorizon] = None
   ): Either[NonEmptyChain[String], Planning] = {
     require(listed.map(_.name).distinct.size == listed.size, "a listing has each name once")
 
@@ -253,13 +349,20 @@ object FilePlanner {
     // Every name that is in the way, and not the first alone.
     named.toEither.map { files =>
       val fresh = files.filterNot(processed)
-      val oldEnough = now.minusMillis(config.minFileAge.toMillis)
-      val complete = fresh.filterNot(_.modifiedAt.isAfter(oldEnough))
+      val completeBy = horizon.fold(now.minusMillis(config.minFileAge.toMillis))(_.completeBy)
+      val complete = fresh.filterNot(_.modifiedAt.isAfter(completeBy))
       val waiting = fresh.size - complete.size
-      val taken = complete.take(config.maxFilesPerBatch).toVector
+      // What the chain may still take: as many as were complete at its first plan, at most.
+      val allowed = horizon.fold(complete.size)(chain => chain.remaining min complete.size)
+      val taken = complete.take(config.maxFilesPerBatch min allowed).toVector
 
       if (taken.isEmpty) NothingNew(waiting)
-      else Planned(FilePlan(config.path, taken), waiting, complete.size - taken.size)
+      else
+        Planned(
+          FilePlan(config.path, taken, Some(FileHorizon(completeBy, allowed - taken.size))),
+          waiting,
+          complete.size - taken.size
+        )
     }
   }
 }

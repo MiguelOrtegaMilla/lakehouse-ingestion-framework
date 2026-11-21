@@ -7,6 +7,7 @@ import java.time.{Clock, Instant, OffsetDateTime, ZoneOffset}
 import scala.util.Using
 
 import eu.rekawek.toxiproxy.model.ToxicDirection
+import io.circe.Json
 import lakehouse.ingestion.core.config.{QualifiedName, SecretResolver, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
@@ -508,6 +509,46 @@ final class JdbcIngestionSpec
     snapshots(history) shouldBe Seq((1, "a", 1L), (2, "b", 1L), (3, "c", 2L), (4, "d", 2L))
   }
 
+  test("a chain of runs ends at the horizon of its first plan, though the source goes on writing") {
+    changesTable("chained")
+    // Two days and a bit behind the clock of the source, in windows of a day: three batches.
+    val from = clockOfTheSource().minus(50, ChronoUnit.HOURS).truncatedTo(ChronoUnit.SECONDS)
+    stamped("chained", 1, "a", from.plus(1, ChronoUnit.HOURS))
+    stamped("chained", 2, "b", from.plus(30, ChronoUnit.HOURS))
+    stamped("chained", 3, "c", from.plus(48 * 60 + 30, ChronoUnit.MINUTES))
+    val chained = watermarkSource(
+      "public.chained",
+      watermark = s"""safety_margin: 1h, start: "$from"""",
+      range = Some("1d")
+    )
+
+    // Run by run, as `run` chains them, with a row stamped by the source after each.
+    val windows = Iterator
+      .iterate(Option(Option.empty[Json])) {
+        case Some(horizon) =>
+          val done = ingested(launch(chained, reading(), horizon))
+          stamped("chained", 100 + done.batch.seq.value.toInt, "new", clockOfTheSource())
+          done.next match {
+            case Outcome.Next.Within(next) => Some(Some(next))
+            case Outcome.Next.Ends => None
+            case Outcome.Next.Afresh => fail("a batch of this chain was planned by another")
+          }
+        case None => None
+      }
+      .takeWhile(_.nonEmpty)
+      .take(10)
+      .size
+
+    // Three runs, each of its own batch: the last ends at the horizon of the first plan, and
+    // what the source wrote meanwhile is the next invocation's.
+    windows shouldBe 3
+    val first = windowOf(batchId(chained, 1))
+    windowOf(batchId(chained, 3)).upper shouldBe first.horizon
+    (1 to 3).map(n => windowOf(batchId(chained, n.toLong)).horizon).distinct shouldBe
+      Seq(first.horizon)
+    snapshots(chained) shouldBe Seq((1, "a", 1L), (2, "b", 2L), (3, "c", 3L))
+  }
+
   test("a lookback reads the last stretch again, and Bronze keeps both copies") {
     changesTable("read_twice")
     val from = Instant.parse("2026-01-01T00:00:00Z")
@@ -675,6 +716,8 @@ final class JdbcIngestionSpec
 
       val done = ingested(launch(source, reading()))
 
+      // A plan of another invocation's: the next run plans as the first of its own does.
+      done.next shouldBe Outcome.Next.Afresh
       // The same batch, under the plan that was written down: the window of the first day,
       // and not one that a clock would give now. Its rows are what the window has by then.
       done.batch shouldBe batchId(source, 1)
