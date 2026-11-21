@@ -66,7 +66,8 @@ import org.slf4j.LoggerFactory
  *
  * '''A plan is read under the load that it was planned under.''' A window is not read as a
  * table, nor a table as a window, nor a window of one column under another: the source is
- * given back the load that it had, its batch is finished, and its load is changed then.
+ * given back the load that it had, its batch is finished, and its load is changed then. Nor
+ * is a window read from a table that no longer has its column, as a timestamp.
  *
  * '''What is asked of the source before a plan, and before a read''': the columns of the
  * table, and their types (`SourceDatabase.columns`). A table that is not there, or that the
@@ -173,6 +174,19 @@ final class JdbcSourceConnector(secrets: SecretResolver)
     }
 
     val columns = columnsOf(source, config)
+    // A window that a run left planned is read from a table that may have changed since: by
+    // a column that it still has, of a timestamp. Without the column there is nothing to
+    // bound the rows by; under another type Spark would compare the values itself, over the
+    // whole table.
+    window.foreach { bounds =>
+      WatermarkColumn.check(columns, bounds.column.value).left.foreach { problem =>
+        throw RunFailedException.permanent(
+          s"the table ${config.table} of ${where(source, config)} $problem. The batch of " +
+            s"${source.id} was planned as a window of that column, as the table had it then, " +
+            "and nothing was read"
+        )
+      }
+    }
     // As text: what the configuration says, and what the type of a column says.
     val named = config.textColumns.map(_.value).toSet
     val text = columns.filter { column =>
