@@ -333,6 +333,9 @@ final class JdbcIngestionSpec
     done.batch shouldBe batchId(source, 1)
     done.counts.rowsWritten shouldBe Some(2)
     snapshots(source) shouldBe Seq((1, "a", 1L), (2, "b", 1L))
+    // It is the table as it is now, which is all that a plan made anew would read: the
+    // invocation ends with it, and does not read the table a second time.
+    done.next shouldBe Outcome.Next.Ends
   }
 
   // ---------------------------------------------------------------------------------------------

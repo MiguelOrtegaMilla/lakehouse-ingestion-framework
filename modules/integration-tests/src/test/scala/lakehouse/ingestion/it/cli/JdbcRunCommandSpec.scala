@@ -239,7 +239,7 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
     rowsWritten(unreached).last shouldBe "10"
   }
 
-  test("a source cut while its rows are read ends in 3; the next invocation reads its batch once") {
+  test("a source cut while its rows are read ends in 3; the next invocation reads its table once") {
     val server = proxied
     asOwner(() => server.observe("sales_owner", "sales"))(
       "CREATE TABLE wide AS SELECT g AS id, repeat('x', 200) AS name " +
@@ -262,17 +262,19 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
 
     val done = launch(wide, hurried)
     withClue(done.err)(done.exit shouldBe Main.Exit.Ok)
-    // The batch that was planned is read whole, once; and, being of a run before it, the
-    // invocation then takes a snapshot of its own (P6.10a).
-    batchesOf(wide) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED")
-    rowsWritten(wide) shouldBe Seq("5000", "5000")
+    // The batch that was planned is read whole, once. It is a snapshot of the table as it is
+    // by now, which is what a plan made anew would read: the invocation ends with it, and
+    // the table is not read a second time (P6.12).
+    done.out.linesIterator.toSeq should have size 1
+    batchesOf(wide) shouldBe Seq("1" -> "COMMITTED")
+    rowsWritten(wide) shouldBe Seq("5000")
     bronze(s"bronze/${wide.id.value.replace('.', '/')}")(
       _.groupBy(EngineColumns.BatchSeq)
         .count()
         .collect()
         .map(row => row.getLong(0) -> row.getLong(1))
         .toSet
-    ) shouldBe Set(1L -> 5000L, 2L -> 5000L)
+    ) shouldBe Set(1L -> 5000L)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -333,11 +335,10 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
     )
     val done = launch(asText)
     withClue(done.err)(done.exit shouldBe Main.Exit.Ok)
-    // The batch that was planned is read as it was, and, being of a run before it, the
-    // invocation then takes a snapshot of its own (P6.10a).
-    done.out.linesIterator.toSeq.last shouldBe
-      s"The invocation of ${contracts.id.value} made 2 runs and committed 2 batches."
-    batchesOf(contracts) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED")
-    rowsWritten(contracts) shouldBe Seq("2", "2")
+    // The batch that was planned is read, as a snapshot of the table as it is by now, and the
+    // invocation ends with it.
+    done.out.linesIterator.toSeq should have size 1
+    batchesOf(contracts) shouldBe Seq("1" -> "COMMITTED")
+    rowsWritten(contracts) shouldBe Seq("2")
   }
 }

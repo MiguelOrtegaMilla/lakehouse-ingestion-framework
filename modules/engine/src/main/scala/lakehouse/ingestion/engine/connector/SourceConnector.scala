@@ -45,6 +45,11 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  *    chain is given it (`PlanContext.horizon`), and plans against it, so that a chain ends
  *    though the source goes on changing (discovery §17, P6.10). A connector with no horizon
  *    says that there is no more, and its source is never chained.
+ *  - '''Whether a plan is its source whole, as it is when the plan is read, is a function of
+ *    the plan alone''' (`wholeWhenRead`): a snapshot of a table is, and a window or a list of
+ *    files is what it was planned as, however late it is read. A batch that a run before left,
+ *    and that this run has read, is then all that a plan made anew would read, and the chain
+ *    ends with it.
  *  - '''A connector never writes to the lake, nor to the control plane.''' The state of a
  *    source, the files it took and the record of a run are the engine's, which moves them in
  *    one transaction with the batch (ADR-0005). What a connector needs of them is given to it,
@@ -102,6 +107,23 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
   def more(source: Source, config: C, plan: Json): Option[Json] = None
 
   /**
+   * Whether a read of this plan gives its source whole, as the source is when it is read, and
+   * not as it was when the plan was made: a snapshot of a table, whose plan names the table
+   * and nothing of what is in it. It reads the plan and nothing else, as `progress` does.
+   *
+   * The engine asks it of a batch that a run before left planned, once this run has read it.
+   * Such a batch is followed by a plan made anew, since what another invocation planned stops
+   * short of what there is by now: a window ends where it was planned to, and a list of files
+   * has the files of then. A plan that is its source whole stops short of nothing: read now,
+   * it is what a plan made anew would read, and reading it again is the source read twice.
+   *
+   * @return false unless the connector says otherwise: a plan made anew is never wrong
+   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   *   not one that this connector reads
+   */
+  def wholeWhenRead(source: Source, config: C, plan: Json): Boolean = false
+
+  /**
    * What a failure that came up while the engine went over the rows of a read of this connector
    * is, if it is one of the source's: its class, and what to do about it. The engine asks it of
    * rows that are read as they are gone over (`ReadResult.OnePass`), whose source fails after
@@ -138,6 +160,9 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
     override def more(plan: Json): Option[Json] =
       SourceConnector.this.more(source, config, plan)
 
+    override def wholeWhenRead(plan: Json): Boolean =
+      SourceConnector.this.wholeWhenRead(source, config, plan)
+
     override def failure(error: Throwable): Option[RunFailedException] =
       SourceConnector.this.failure(source, config, error)
   }
@@ -157,6 +182,9 @@ abstract class BoundSource private[connector] (val source: Source) {
 
   /** @see [[SourceConnector.more]] */
   def more(plan: Json): Option[Json]
+
+  /** @see [[SourceConnector.wholeWhenRead]] */
+  def wholeWhenRead(plan: Json): Boolean
 
   /** @see [[SourceConnector.failure]] */
   def failure(error: Throwable): Option[RunFailedException]

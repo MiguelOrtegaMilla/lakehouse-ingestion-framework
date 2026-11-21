@@ -579,7 +579,9 @@ final class IngestionService(
       }
       val outputs =
         data.map(write => BatchOutput(source.targets.bronze.table, write.version)).toVector
-      commit(batch, progress, outputs, withWrites(counts, data.toSeq))
+      // What the table has of the batch is what this run read of its source: its rows, or
+      // none, where the source had no first row. Not so if another writer wrote the batch.
+      commit(batch, progress, outputs, withWrites(counts, data.toSeq), data.forall(_.byThisRun))
     }
 
     /**
@@ -599,21 +601,31 @@ final class IngestionService(
         case NonFatal(failed) => throw bound.failure(failed).getOrElse(failed)
       }
 
-    /** The commit of a batch that is written: step 7. */
+    /**
+     * The commit of a batch that is written: step 7.
+     *
+     * @param readByThisRun whether what the tables have of the batch is what this run read of
+     *   its source, and not what another writer of its sequence did
+     */
     private def commit(
         batch: PlannedBatch,
         progress: Progress,
         outputs: Vector[BatchOutput],
-        counts: RunCounts
+        counts: RunCounts,
+        readByThisRun: Boolean
     ): Outcome = {
       hooks.at(FaultPoint.BeforeStateCommit, batch)
       if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
         log.info(s"the run ${start.id} committed ${batch.id}")
-        // What comes after: what the plan says, for a plan of this run's; for one that a run
-        // before it planned, under a horizon that was not this invocation's, a plan made anew.
+        // What comes after: what the plan says, for a plan of this run's. For one that a run
+        // before it planned, under a horizon that was not this invocation's, a plan made
+        // anew; unless the plan is its source whole and this run has just read it, which is
+        // what a plan made anew would read.
         val next =
-          if (batch.plannedBy != start.id) Outcome.Next.Afresh
-          else bound.more(batch.plan).fold[Outcome.Next](Outcome.Next.Ends)(Outcome.Next.Within)
+          if (batch.plannedBy == start.id)
+            bound.more(batch.plan).fold[Outcome.Next](Outcome.Next.Ends)(Outcome.Next.Within)
+          else if (readByThisRun && bound.wholeWhenRead(batch.plan)) Outcome.Next.Ends
+          else Outcome.Next.Afresh
         Outcome.Ingested(start.id, batch.id, outputs, counts, next)
       } else fenced(start, "another run holds it")
     }
@@ -675,7 +687,7 @@ final class IngestionService(
           counted.copy(rowsWritten = data.fold(Option(0L))(_.rows)),
           apart.toSeq ++ data
         )
-        commit(batch, progress, outputs, counts)
+        commit(batch, progress, outputs, counts, data.forall(_.byThisRun))
       }
     }
 
@@ -811,20 +823,26 @@ object IngestionService {
 
     /**
      * What an invocation is to do after a batch is committed (discovery §17, P6.10). A batch
-     * that a run rolls forward is followed as `Afresh`.
+     * that a run rolls forward is followed as `Afresh`, whatever its plan: what it has is as
+     * old as the run that wrote it.
      */
     sealed trait Next
     object Next {
 
-      /** The plan says that the invocation has read as far as it may. */
+      /**
+       * The invocation has read as far as it may: the plan of the batch says so, for a plan
+       * of this invocation's. Or the batch was planned by a run before it, its plan is its
+       * source whole (`SourceConnector.wholeWhenRead`), and this run has just read it.
+       */
       case object Ends extends Next
 
       /** The plan says that there is more, and the next run plans against this horizon. */
       final case class Within(horizon: Json) extends Next
 
       /**
-       * The batch was planned by a run before this one, of another invocation: the next run
-       * plans as the first of an invocation does, and fixes the horizon.
+       * The batch was planned by a run before this one, of another invocation, and stops
+       * short of what the source has by now: the next run plans as the first of an invocation
+       * does, and fixes the horizon.
        */
       case object Afresh extends Next
     }
