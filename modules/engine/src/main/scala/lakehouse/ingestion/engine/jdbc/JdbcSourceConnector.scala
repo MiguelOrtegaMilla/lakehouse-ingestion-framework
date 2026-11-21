@@ -81,8 +81,9 @@ import org.slf4j.LoggerFactory
  * '''Every connection to a source is opened the same way''' (`PostgresJdbc.ofASource`): TLS as
  * the configuration says, its timeouts, and the settings of a session that a read stands on,
  * whatever the source has them at. The password is resolved when a connection is opened, and
- * goes to the driver alone: it is in no plan of Spark's and in no message (pinned by
- * `SparkJdbcContractSpec`).
+ * goes to the driver alone. Spark is given where it is, and not the password, which a provider
+ * of the engine's reads as it connects (`SecretRefConnectionProvider`): Spark's own logs every
+ * property of a connection at `DEBUG`.
  *
  * '''The engine writes no statement from a value''' (ADR-0013 §1, `JdbcSql`).
  *
@@ -95,6 +96,9 @@ import org.slf4j.LoggerFactory
 final class JdbcSourceConnector(secrets: SecretResolver)
     extends SourceConnector[JdbcConnectorConfig] {
   import JdbcSourceConnector._
+
+  // What the connections that Spark opens read their passwords with (`SecretRefConnectionProvider`).
+  private val resolver = SecretRefConnectionProvider.register(secrets)
 
   override val kind: ConnectorKind = JdbcConnector
 
@@ -161,7 +165,6 @@ final class JdbcSourceConnector(secrets: SecretResolver)
     // A column that is read as text holds infinity as the source writes it.
     val finite = columns.filter(BronzeTypes.mayBeInfinite).filterNot(column => named(column.name))
     val flag = unusedName(columns, Flag)
-    val password = passwordOf(source, config)
     val table =
       if (finite.isEmpty) JdbcSql.table(config.table)
       else JdbcSql.flagged(config.table, finite.map(_.name), flag)
@@ -170,7 +173,7 @@ final class JdbcSourceConnector(secrets: SecretResolver)
     def rows(fetch: Int): DataFrame = {
       val read =
         try
-          load(context.spark, config.connection, password, table, text.map(_.name), fetch)
+          load(context.spark, config.connection, resolver, table, text.map(_.name), fetch)
         catch {
           // Spark asks for the columns when the read is made, on a connection of its own.
           case NonFatal(e) => throw failure(source, config, e).getOrElse(e)
@@ -322,35 +325,37 @@ object JdbcSourceConnector {
 
   /**
    * The options of a read of Spark's JDBC source: how the connection is opened, and how the
-   * rows are fetched.
+   * rows are fetched. The password is not among them: where it is, and what reads it, are
+   * (`SecretRefConnectionProvider`).
    *
+   * @param resolver what reads the password, as `SecretRefConnectionProvider.register` named it
    * @param table what is read, as it is to be written into the statement (`JdbcSql`)
    * @param fetch how many rows a fetch of the cursor brings
    */
   def options(
       connection: DatabaseConnection,
-      password: Secret,
+      resolver: String,
       table: String,
       fetch: Int
   ): Map[String, String] =
-    PostgresJdbc.ofASource(connection) ++ Map(
-      "url" -> connection.url.value,
-      "user" -> connection.user.value,
-      "password" -> password.reveal,
-      "dbtable" -> table,
-      // A cursor: without it the driver reads the whole result before it gives a row.
-      "fetchsize" -> fetch.toString
-    )
+    PostgresJdbc.ofASource(connection) ++
+      SecretRefConnectionProvider.options(connection.password, resolver) ++ Map(
+        "url" -> connection.url.value,
+        "user" -> connection.user.value,
+        "dbtable" -> table,
+        // A cursor: without it the driver reads the whole result before it gives a row.
+        "fetchsize" -> fetch.toString
+      )
 
   private def load(
       spark: SparkSession,
       connection: DatabaseConnection,
-      password: Secret,
+      resolver: String,
       table: String,
       asText: Seq[String],
       fetch: Int
   ): DataFrame = {
-    val reader = spark.read.format("jdbc").options(options(connection, password, table, fetch))
+    val reader = spark.read.format("jdbc").options(options(connection, resolver, table, fetch))
     // The columns that are read as text; every other, as Spark reads its type.
     val typed =
       if (asText.isEmpty) reader
