@@ -231,7 +231,7 @@ object RunCommand {
     outcome match {
       case Outcome.NothingNew(_) =>
         Stream.Out -> s"$run found nothing new, and ended well with no batch."
-      case Outcome.Ingested(_, batch, outputs, counts) =>
+      case Outcome.Ingested(_, batch, outputs, counts, _) =>
         Stream.Out -> (s"$run committed the batch $batch: ${counts.rowsRead.getOrElse(0L)} " +
           s"rows read, ${counts.rowsWritten.getOrElse(0L)} written, " +
           s"${counts.rowsRejected.getOrElse(0L)} rejected${written(outputs)}.")

@@ -125,6 +125,9 @@ final case class WatermarkPlan private (
    */
   def more: Boolean = upper.isBefore(horizon)
 
+  /** The horizon that the next run of the chain plans against, if there is more. */
+  def next: Option[WatermarkHorizon] = Option.when(more)(WatermarkHorizon(horizon))
+
   /** What the commit of this batch records: the next batch counts from its upper bound. */
   def watermark: StoredWatermark = StoredWatermark(upper)
 
@@ -187,6 +190,36 @@ object WatermarkPlan {
         .catchOnly[IllegalArgumentException](WatermarkPlan(column, lower, upper, horizon))
         .leftMap(_.getMessage.stripPrefix("requirement failed: "))
     } yield plan
+  }
+}
+
+/**
+ * The horizon of a chain of runs of a source loaded by a watermark (ADR-0020, point 9): what the
+ * first plan of an invocation fixed, and what each later run of it plans against, without
+ * asking the clock of the source again. It goes from one run to the next in the process, and is
+ * of a form with a version as a plan is, so that a connector reads it back strictly.
+ */
+final case class WatermarkHorizon(value: Instant) {
+  Moment.problem(value).foreach(what => throw new IllegalArgumentException(s"horizon $what"))
+
+  def toJson: Json = Json.obj(
+    "version" -> Json.fromInt(WatermarkHorizon.Version),
+    "until" -> Moment.write(value)
+  )
+}
+
+object WatermarkHorizon {
+
+  val Version = 1
+
+  /** Reads a horizon back as it was written, or says what is wrong with the document. */
+  def fromJson(json: Json): Either[String, WatermarkHorizon] = {
+    val top = json.hcursor
+    for {
+      _ <- StoredForm.exactly(top, "version", "until")
+      _ <- StoredForm.version(top, Version)
+      until <- Moment.read(top, "until")
+    } yield WatermarkHorizon(until)
   }
 }
 

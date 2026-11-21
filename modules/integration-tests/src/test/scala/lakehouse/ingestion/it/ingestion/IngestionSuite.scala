@@ -8,6 +8,7 @@ import java.time.{Clock, Instant, ZoneOffset}
 
 import scala.concurrent.duration._
 
+import io.circe.Json
 import lakehouse.ingestion.core.config.{
   PathTableLocator,
   RelativePath,
@@ -129,9 +130,17 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       hooks
     )
 
-  /** One run of a source, by a service that has nothing done to it unless one is given. */
-  protected def launch(of: Source, by: IngestionService = service()): Outcome =
-    by.run(of, versionOf(of))
+  /**
+   * One run of a source, by a service that has nothing done to it unless one is given.
+   *
+   * @param horizon that of the chain of runs that it is in, after its first
+   */
+  protected def launch(
+      of: Source,
+      by: IngestionService = service(),
+      horizon: Option[Json] = None
+  ): Outcome =
+    by.run(of, versionOf(of), horizon)
 
   protected def ingested(outcome: Outcome): Outcome.Ingested = outcome match {
     case done: Outcome.Ingested => done

@@ -332,8 +332,11 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
     def refusal(json: Json): String = FilePlan.fromJson(json).left.value
 
     refusal(Json.fromString("a plan")) shouldBe "is not an object"
+    refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(3)))) shouldBe
+      "is of version 3, and this application reads versions 1 and 2"
+    // Of version 2 without what a plan of version 2 has.
     refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(2)))) shouldBe
-      "is of version 2, and this application reads version 1"
+      "has no complete_by, has no remaining"
     refusal(without("directory")) shouldBe "has no directory"
     refusal(Written.toJson.mapObject(_.add("extra", Json.True))) shouldBe "has a field extra"
     refusal(Written.toJson.mapObject(_.add("directory", Json.fromString("../x")))) shouldBe
@@ -359,5 +362,131 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
     // A number written as text is not one, though circe's decoders would take it.
     refusal(Written.toJson.mapObject(_.add("version", Json.fromString("1")))) shouldBe
       "version is not a whole number"
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A chain of runs: the horizon of a plan (P6.10)
+  // ---------------------------------------------------------------------------------------------
+
+  private val Chained =
+    FilePlan(
+      Written.directory,
+      Written.files,
+      Some(FileHorizon(Instant.parse("2026-11-18T11:59:00Z"), 3))
+    )
+
+  test("a plan of a chain is written as version 2, with its horizon, and read back as itself") {
+    Chained.toJson.noSpaces shouldBe
+      """{"version":2,"directory":"sales/returns","files":[""" +
+      """{"name":"returns 1.csv","size":0,"modified_at":"2026-11-18T10:00:00Z"},""" +
+      """{"name":"devoluciones-año.csv","size":123456789012,"modified_at":"2026-11-18T10:00:00.123Z"}],""" +
+      """"complete_by":"2026-11-18T11:59:00Z","remaining":3}"""
+    FilePlan.fromJson(SafeYaml.parse(Chained.toJson.noSpaces).value).value shouldBe Chained
+    Chained.next shouldBe Some(FileHorizon(Instant.parse("2026-11-18T11:59:00Z"), 3))
+    // One with nothing left ends its chain.
+    Chained
+      .copy(horizon = Some(FileHorizon(Instant.parse("2026-11-18T11:59:00Z"), 0)))
+      .next shouldBe None
+  }
+
+  test("a plan of version 1, written before chains, is read, and says that there is no more") {
+    val read = FilePlan.fromJson(Written.toJson).value
+    read.horizon shouldBe None
+    read.next shouldBe None
+  }
+
+  test("a plan of version 2 that is not one this application wrote is refused, and says why") {
+    def refusal(json: Json): String = FilePlan.fromJson(json).left.value
+    def changed(field: String, value: Json): Json = Chained.toJson.mapObject(_.add(field, value))
+
+    refusal(Chained.toJson.mapObject(_.remove("remaining"))) shouldBe "has no remaining"
+    refusal(changed("remaining", Json.fromInt(-1))) shouldBe "remaining is not a number of files"
+    refusal(changed("remaining", Json.fromString("3"))) shouldBe
+      "remaining is not a number of files"
+    refusal(changed("complete_by", Json.fromString("yesterday"))) shouldBe
+      "complete_by is not a moment"
+    refusal(changed("complete_by", Json.fromString("2026-11-18T12:59:00+01:00"))) shouldBe
+      "complete_by is not written as a moment is, in UTC"
+    refusal(changed("complete_by", Json.fromString("2026-11-18T11:59:00.000Z"))) shouldBe
+      "complete_by is not written as a moment is, in UTC"
+  }
+
+  test("the horizon of a chain is written in one form, and read back as itself or refused") {
+    val horizon = FileHorizon(Instant.parse("2026-11-18T11:59:00.5Z"), 7)
+    horizon.toJson.noSpaces shouldBe
+      """{"version":1,"complete_by":"2026-11-18T11:59:00.500Z","remaining":7}"""
+    FileHorizon.fromJson(horizon.toJson).value shouldBe horizon
+    FileHorizon
+      .fromJson(horizon.toJson.mapObject(_.add("version", Json.fromInt(2))))
+      .left
+      .value shouldBe
+      "is of version 2, and this application reads version 1"
+    FileHorizon.fromJson(horizon.toJson.mapObject(_.add("files", Json.True))).left.value shouldBe
+      "has a field files"
+  }
+
+  test("the first plan of an invocation fixes its horizon: what is complete now, and how many") {
+    val listing = (1 to 5).map(i => listed(f"f$i.csv", age = i.hours)) :+
+      listed("young.csv", age = 10.seconds)
+
+    val Planned(first, waiting, leftOver) = planned(plan(listing, under = config(maxFiles = 2)))
+
+    first.files should have size 2
+    (waiting, leftOver) shouldBe ((1, 3))
+    first.horizon shouldBe Some(FileHorizon(Now.minusSeconds(60), 3))
+    // All of them in one batch: the chain ends with it.
+    planned(plan(listing)).plan.next shouldBe None
+  }
+
+  test("a later plan of a chain takes what was complete by its horizon, and no more than is left") {
+    val horizon = FileHorizon(Now.minusSeconds(3600), 2)
+    val listing = Seq(
+      listed("a.csv", age = 3.hours),
+      listed("b.csv", age = 2.hours),
+      listed("c.csv", age = 90.minutes),
+      // Complete by now, and changed after the horizon: the next invocation's.
+      listed("late.csv", age = 10.minutes)
+    )
+
+    val Planned(next, waiting, _) =
+      planned(FilePlanner.plan(config(maxFiles = 10), listing, Set.empty, Now, Some(horizon)).value)
+
+    next.names.map(_.value) shouldBe Vector("a.csv", "b.csv")
+    waiting shouldBe 1
+    next.horizon shouldBe Some(FileHorizon(horizon.completeBy, 0))
+    next.next shouldBe None
+    // A horizon with nothing left plans nothing.
+    FilePlanner
+      .plan(config(), listing, Set.empty, Now, Some(horizon.copy(remaining = 0)))
+      .value shouldBe
+      NothingNew(1)
+  }
+
+  test("a chain ends though a producer goes on leaving files changed long before its horizon") {
+    // Five files are new and complete at the first plan; two are taken a batch. After each
+    // batch the producer leaves three more, changed a day before: complete by any horizon.
+    val under = config(maxFiles = 2)
+    var listing = (1 to 5).map(i => listed(f"first-$i.csv", age = i.hours)).toVector
+    var processed = Set.empty[LandedFile]
+    var horizon = Option.empty[FileHorizon]
+    var batches = 0
+    var going = true
+    while (going) {
+      FilePlanner.plan(under, listing, processed, Now, horizon).value match {
+        case Planned(made, _, _) =>
+          batches += 1
+          processed ++= made.files
+          horizon = made.next
+          going = horizon.nonEmpty
+          listing ++= (1 to 3).map(i => listed(f"copy-$batches-$i.csv", age = 1.day))
+        case NothingNew(_) => going = false
+      }
+      batches should be <= 10
+    }
+
+    // Five files, the number that the first plan counted, oldest first whoever left them: what
+    // is left is the next invocation's.
+    processed should have size 5
+    batches shouldBe 3
   }
 }

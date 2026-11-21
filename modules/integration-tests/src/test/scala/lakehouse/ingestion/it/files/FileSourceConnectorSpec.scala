@@ -9,7 +9,7 @@ import java.time.temporal.ChronoUnit
 import io.circe.Json
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.FailureClass
-import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
+import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, LandedFile}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
@@ -46,12 +46,14 @@ final class FileSourceConnectorSpec
     root
   }
 
-  private def source(format: String): Source =
+  private def source(format: String, batch: Option[Int] = None): Source =
     Source
       .load(
         "shop.orders.yaml",
         s"""id: shop.orders
-           |connector: { type: file, path: shop/orders, format: $format }
+           |connector: { type: file, path: shop/orders, format: $format${batch.fold("")(n =>
+            s", max_files_per_batch: $n"
+          )} }
            |load: { mode: new_files }
            |targets:
            |  bronze: { table: bronze/orders }
@@ -93,9 +95,10 @@ final class FileSourceConnectorSpec
   private def plan(
       root: Path,
       of: Source,
-      processed: Set[LandedFile] = Set.empty
+      processed: Set[LandedFile] = Set.empty,
+      horizon: Option[Json] = None
   ): Option[Json] =
-    connector(root).plan(of, configOf(of), PlanContext(now, None, taken(processed)))
+    connector(root).plan(of, configOf(of), PlanContext(now, None, taken(processed), horizon))
 
   private def read(root: Path, of: Source, plan: Json): ReadResult.Kept =
     connector(root).read(of, configOf(of), plan, ReadContext(spark))
@@ -149,6 +152,30 @@ final class FileSourceConnectorSpec
       .names
       .map(_.value) shouldBe Vector("b.csv")
     plan(root, orders, processed = planned.files.toSet) shouldBe None
+  }
+
+  test("a chain takes the files complete at its first plan, and no more of them than there were") {
+    val root = landingZone()
+    val orders = source("csv", batch = Some(2))
+    Seq("a.csv", "b.csv", "c.csv").foreach(name => drop(root, name, "id\n1\n"))
+
+    val first = FilePlan.fromJson(plan(root, orders).value).value
+    first.names.map(_.value) shouldBe Vector("a.csv", "b.csv")
+    val horizon = connector(root).more(orders, configOf(orders), first.toJson).value
+    FileHorizon.fromJson(horizon).value shouldBe
+      FileHorizon(now.minusMillis(configOf(orders).minFileAge.toMillis), 1)
+
+    // Meanwhile a file changed now, after the horizon, and a copy that kept the time of a file
+    // changed two hours ago: both complete by the time of the next plan.
+    drop(root, "now.csv", "id\n2\n", at = now)
+    drop(root, "copy.csv", "id\n3\n", at = anHourAgo.minusSeconds(3600))
+    val next = FilePlan
+      .fromJson(plan(root, orders, processed = first.files.toSet, horizon = Some(horizon)).value)
+      .value
+
+    // One file, the one left of the three: the oldest of those changed by the horizon.
+    next.names.map(_.value) shouldBe Vector("copy.csv")
+    connector(root).more(orders, configOf(orders), next.toJson) shouldBe None
   }
 
   test("a directory with nothing new plans nothing") {
@@ -679,8 +706,8 @@ final class FileSourceConnectorSpec
     drop(root, "a.csv", "id\n1\n")
     val planned = plan(root, orders).value
 
-    refused(read(root, orders, planned.mapObject(_.add("version", Json.fromInt(2))))) should
-      include("is not one that this application reads: it is of version 2")
+    refused(read(root, orders, planned.mapObject(_.add("version", Json.fromInt(3))))) should
+      include("is not one that this application reads: it is of version 3")
     refused(
       read(root, orders, planned.mapObject(_.add("directory", Json.fromString("shop/returns"))))
     ) should include("is of the directory shop/returns, and the source reads shop/orders")
@@ -710,8 +737,8 @@ final class FileSourceConnectorSpec
     // A plan that is not this source's has nothing to record, as it has nothing to read.
     refused(
       connector(root)
-        .progress(orders, configOf(orders), planned.mapObject(_.add("version", Json.fromInt(2))))
-    ) should include("is not one that this application reads: it is of version 2")
+        .progress(orders, configOf(orders), planned.mapObject(_.add("version", Json.fromInt(3))))
+    ) should include("is not one that this application reads: it is of version 3")
     refused(
       connector(root).progress(
         orders,

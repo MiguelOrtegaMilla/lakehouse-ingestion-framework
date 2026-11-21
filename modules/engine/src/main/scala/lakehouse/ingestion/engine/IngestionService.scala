@@ -196,10 +196,12 @@ final class IngestionService(
    *   profile of this process
    * @throws java.lang.IllegalArgumentException if the application has no connector for the
    *   source. Nothing was started
+   * @param horizon how far the invocation reads, as the batch before this run in its chain said
+   *   (`Outcome.Next.Within`); none for the first run of an invocation, whose plan fixes it
    * @throws java.lang.Exception what nothing classified. The run is left as a process that died
    *   leaves it
    */
-  def run(source: Source, config: ConfigVersion): Outcome = {
+  def run(source: Source, config: ConfigVersion, horizon: Option[Json] = None): Outcome = {
     val bound = connectors.bind(source)
     val start = RunStart(
       RunId.generate(),
@@ -219,7 +221,7 @@ final class IngestionService(
         leased.onLost { loss =>
           jobs.stop(s"the run ${start.id} lost the lease of ${start.leaseKey}: ${loss.reason}")
         }
-        try jobs.during(new Attempt(leased, bound, config).run())
+        try jobs.during(new Attempt(leased, bound, config, horizon).run())
         catch {
           // Before anything else: whatever it is wrapped in, it says that the lease is lost.
           case refused: Throwable if outOfTurn(refused).nonEmpty =>
@@ -341,7 +343,12 @@ final class IngestionService(
   }
 
   /** The steps of one run that holds its lease. */
-  final private class Attempt(leased: LeasedRun, bound: BoundSource, config: ConfigVersion) {
+  final private class Attempt(
+      leased: LeasedRun,
+      bound: BoundSource,
+      config: ConfigVersion,
+      horizon: Option[Json]
+  ) {
     private val start = leased.start
     private val source = bound.source
     private val table = locator.locate(source.targets.bronze.table)
@@ -424,7 +431,7 @@ final class IngestionService(
     /** Plans the next batch of the source, and ingests it. */
     private def planNext(): Outcome = {
       val state = database.run(SourceStates.find(_, source.id, start.layer))
-      val context = PlanContext(clock.instant(), state.flatMap(_.watermark), leased)
+      val context = PlanContext(clock.instant(), state.flatMap(_.watermark), leased, horizon)
       bound.plan(context) match {
         case None =>
           log.info(s"the run ${start.id} found nothing new in ${source.id}, and has no batch")
@@ -602,7 +609,12 @@ final class IngestionService(
       hooks.at(FaultPoint.BeforeStateCommit, batch)
       if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
         log.info(s"the run ${start.id} committed ${batch.id}")
-        Outcome.Ingested(start.id, batch.id, outputs, counts)
+        // What comes after: what the plan says, for a plan of this run's; for one that a run
+        // before it planned, under a horizon that was not this invocation's, a plan made anew.
+        val next =
+          if (batch.plannedBy != start.id) Outcome.Next.Afresh
+          else bound.more(batch.plan).fold[Outcome.Next](Outcome.Next.Ends)(Outcome.Next.Within)
+        Outcome.Ingested(start.id, batch.id, outputs, counts, next)
       } else fenced(start, "another run holds it")
     }
 
@@ -793,8 +805,29 @@ object IngestionService {
         run: RunId,
         batch: BatchId,
         outputs: Seq[BatchOutput],
-        counts: RunCounts
+        counts: RunCounts,
+        next: Next = Next.Ends
     ) extends Outcome
+
+    /**
+     * What an invocation is to do after a batch is committed (discovery §17, P6.10). A batch
+     * that a run rolls forward is followed as `Afresh`.
+     */
+    sealed trait Next
+    object Next {
+
+      /** The plan says that the invocation has read as far as it may. */
+      case object Ends extends Next
+
+      /** The plan says that there is more, and the next run plans against this horizon. */
+      final case class Within(horizon: Json) extends Next
+
+      /**
+       * The batch was planned by a run before this one, of another invocation: the next run
+       * plans as the first of an invocation does, and fixes the horizon.
+       */
+      case object Afresh extends Next
+    }
 
     /**
      * A batch that a run before this one wrote, and did not get to commit, was committed (0).
