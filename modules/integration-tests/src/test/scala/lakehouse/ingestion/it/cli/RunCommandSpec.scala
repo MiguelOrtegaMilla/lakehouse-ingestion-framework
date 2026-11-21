@@ -41,7 +41,8 @@ final class RunCommandSpec
     extends AnyFunSuite
     with Matchers
     with Eventually
-    with ControlPlaneSuite {
+    with ControlPlaneSuite
+    with RunCommandQueries {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("run-command-"))
   import files.{arguments, connection, drop, profileFile, validProfile}
@@ -60,35 +61,6 @@ final class RunCommandSpec
     // The command leaves the JVM as it found it.
     SparkSession.getDefaultSession shouldBe empty
     ran
-  }
-
-  /** What the command said, but the warnings of the profile: its lake is under /tmp. */
-  private def said(ran: Ran): Seq[String] = ran.errors.filterNot(_.startsWith("warning: "))
-
-  /** The runs of a source, each with how it ended, in the order they started. */
-  private def runsOf(of: Source): Seq[(String, Option[String])] = asSuperuser { c =>
-    query(
-      c,
-      "SELECT status, error_class FROM control.ingestion_run WHERE source_id = ? ORDER BY started_at",
-      of.id.value
-    ).map(row => (row(0), Option(row(1))))
-  }
-
-  private def batchesOf(of: Source): Seq[(String, String)] = asSuperuser { c =>
-    query(
-      c,
-      "SELECT batch_seq::text, status FROM control.ingestion_batch WHERE source_id = ? ORDER BY 1",
-      of.id.value
-    ).map(row => (row(0), row(1)))
-  }
-
-  private def rowsWritten(of: Source): Seq[String] = asSuperuser { c =>
-    query(
-      c,
-      "SELECT rows_written::text FROM control.ingestion_run WHERE source_id = ? AND " +
-        "status = 'SUCCEEDED' ORDER BY started_at",
-      of.id.value
-    ).map(_.head)
   }
 
   /** The commits in the log of the table of Bronze of a source. */

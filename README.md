@@ -73,6 +73,7 @@ sbt "integration-tests/testOnly *IngestionServiceSpec"   # a run from end to end
 sbt "integration-tests/testOnly *BreakingChangeSpec"   # a source whose configuration changed in a way that what was ingested cannot follow: refused before its planned batch is looked for, and run on with the configuration that it had (needs Docker)
 sbt "integration-tests/testOnly *LeaseLossSpec"   # a run that loses its lease, with the control plane cut for real: its jobs stopped, no step after it, and how it ends (needs Docker)
 sbt "integration-tests/testOnly *RunCommandSpec"   # the command run as an orchestrator starts it, each outcome with its exit code (needs Docker)
+sbt "integration-tests/testOnly *JdbcRunCommandSpec"   # the command with a table of a database: the example source as the README runs it, a chain of windows in a process of its own, the source cut by a proxy (3), and a password, a table or a value that is refused (4): about four minutes (needs Docker)
 sbt "integration-tests/testOnly *GeneratedFilesSpec"   # files made from a seed (a column more or less, broken records, empty and repeated files) through a run, compared with what the generator says is in them (needs Docker)
 sbt "integration-tests/testOnly *GeneratedTableSpec"   # a table of PostgreSQL changed from a seed (inserts, updates, deletes, ties, transactions left open) and read after each round, by a watermark and whole, compared with what the generator says each batch is to have: about a minute (needs Docker)
 sbt "integration-tests/testOnly *SqlInjectionSpec"   # what reaches a source as SQL: values that would be SQL read as data, names in mixed case, keywords and names that a source gives its columns, each quoted; a column that Delta cannot name refused before a plan (needs Docker)
@@ -189,7 +190,7 @@ It can be run again at any time: a schema that is at its version is left as it i
 
 ## Running a source
 
-`run` runs one source once: the new files of a file source, into its table of Bronze. It is what an orchestrator starts, one process for each source, and its exit code is all it says to it.
+`run` runs one source once: the new files of a file source, or what changed in a table of a database, into its table of Bronze. It is what an orchestrator starts, one process for each source, and its exit code is all it says to it.
 
 ```bash
 mkdir -p ~/lakehouse-data/lake ~/lakehouse-data/landing/sales/returns   # once: the engine makes no root
@@ -216,7 +217,37 @@ Run it again and it finds nothing new. A source with more than one batch takes (
 | 128 + n | The signal n came before the first run: nothing was run. A run stopped after one ends in the code of its last run |
 | 64 | The command line is not one |
 
-The whole contract is in [discovery §14.1](docs/architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them.
+The whole contract is in [discovery §14.1](docs/architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them; `JdbcRunCommandSpec`, with a table of a database, cut for real by a proxy.
+
+### A table of a database: `sales.orders`
+
+The example source [`sales.orders`](conf/sources/sales.orders.yaml) reads `public.orders` of the database `sales` by `updated_at`, a week of changes a batch. The table is the source system's, and the engine makes none: a demo makes it and changes it as the source's applications would, as `sales_owner`. It is test code (`it.demo.SalesOrders`, with the generator of the tests), and is in no artifact of the application.
+
+```bash
+export SALES_OWNER_PASSWORD="$(cat docker/secrets/sales_owner_password)"
+sbt "integration-tests/Test/runMain lakehouse.ingestion.it.demo.SalesOrders --create"   # once: orders since 2026-01-01, up to two minutes ago
+
+export INGEST_CONTROL_PASSWORD="$(cat docker/secrets/ingest_control_password)"
+export INGEST_COORDINATION_PASSWORD="$(cat docker/secrets/ingest_coordination_password)"
+export SALES_RO_PASSWORD="$(cat docker/secrets/sales_ro_password)"
+sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source sales.orders"
+```
+
+```text
+The run 019a… of sales.orders committed the batch sales.orders/bronze#1: 48 rows read, 48 written, 0 rejected, into bronze/sales/orders at version 0.
+…
+The invocation of sales.orders made 47 runs and committed 47 batches.
+```
+
+The first invocation reads from `load.watermark.start` up to a minute before the clock of the database, its `safety_margin`: a run a week, each a batch, about a minute and a half in all. Then the demo changes some orders, and the next invocation reads what changed, and only that, once the margin has passed:
+
+```bash
+sbt "integration-tests/Test/runMain lakehouse.ingestion.it.demo.SalesOrders --changes"   # rows inserted, updated and deleted, at moments of the last minute
+sleep 61
+sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source sales.orders"
+```
+
+A deleted order is not seen by a load by a watermark: it stays in Bronze as it was last read, until the reconciliation of keys (P10). The demo needs the role `sales_owner`, which a volume made before it was added lacks: see [Local services](#local-services).
 
 ## License
 

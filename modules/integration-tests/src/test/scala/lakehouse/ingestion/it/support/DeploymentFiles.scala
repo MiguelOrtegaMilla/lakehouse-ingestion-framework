@@ -57,11 +57,14 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
    *
    * @param control the connection to the control plane, as it is written under it
    * @param coordination that to the coordination database
+   * @param retries for how long a step that fails with an error that passes is tried again, as
+   *   `retries.budget` says; for as long as by default, unless it is given
    */
   def profileFile(
       control: String = connection(Engine, pg.password(Engine)),
       coordination: String = connection("ingest_coordination", pg.password("ingest_coordination")),
-      lake: Path = lake
+      lake: Path = lake,
+      retries: Option[String] = None
   ): Path = {
     val file = Files.createTempFile(work, "profile-", ".yaml")
     Files.write(
@@ -72,6 +75,7 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
          |  control:
          |$control  coordination:
          |$coordination
+         |${retries.fold("")(budget => s"retries: { budget: $budget, first_backoff: 200ms, max_backoff: 1s }")}
          |spark:
          |  master: "local[2]"
          |  settings:
@@ -123,14 +127,20 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
     }
   }
 
-  /** The directory of a source in the landing zone. */
   /**
-   * A source that reads a table of a database whole, written among the sources of the
-   * deployment.
+   * A source that reads a table of a database, written among the sources of the deployment.
    *
    * @param connection how its database is reached (`connection`)
+   * @param load how, as it is written under `load`: whole, unless it is given
+   * @param textColumns the columns that it reads as text
    */
-  def tableSource(id: SourceId, table: String, connection: String): Source = {
+  def tableSource(
+      id: SourceId,
+      table: String,
+      connection: String,
+      load: String = "{ mode: full }",
+      textColumns: Seq[String] = Nil
+  ): Source = {
     val text =
       s"""id: $id
          |connector:
@@ -138,7 +148,8 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
          |  connection:
          |${connection.linesIterator.map("  " + _).mkString("\n")}
          |  table: $table
-         |load: { mode: full }
+         |  text_columns: [${textColumns.mkString(", ")}]
+         |load: $load
          |targets: { bronze: { table: bronze/${id.value.replace('.', '/')} } }
          |""".stripMargin
     Files.write(sources.resolve(s"$id.yaml"), text.getBytes(UTF_8))
@@ -149,6 +160,7 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
     }
   }
 
+  /** The directory of a source in the landing zone. */
   def directoryOf(source: SourceId): Path = landing.resolve(source.value.replace('.', '_'))
 
   /** A file of the source, last changed an hour ago: complete for a run that starts now. */
