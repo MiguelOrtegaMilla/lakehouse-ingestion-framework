@@ -135,8 +135,8 @@ final class JdbcSourceConnector(secrets: SecretResolver)
               s"the table ${config.table} of ${where(source, config)} $problem. Nothing was " +
                 "planned"
             )
-          case Right(warning) =>
-            warning.foreach(text => log.warn(s"${source.id}: in the table ${config.table}, $text"))
+          case Right(warnings) =>
+            warnings.foreach(text => log.warn(s"${source.id}: in the table ${config.table}, $text"))
         }
         (chain, clock) match {
           case (Some(horizon), _) =>

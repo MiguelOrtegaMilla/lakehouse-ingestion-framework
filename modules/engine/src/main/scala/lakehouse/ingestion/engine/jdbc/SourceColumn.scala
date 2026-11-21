@@ -112,11 +112,15 @@ object WatermarkColumn {
   /** The types that a watermark is of: a timestamp, and nothing else (ADR-0020, point 1). */
   val Types: Set[String] = Set("timestamptz", "timestamp")
 
+  /** The type that has no zone, and is taken as UTC. */
+  private val WithoutAZone = "timestamp"
+
   /**
-   * @return why the column cannot be a watermark, or a warning of it if there is one: a column
-   *   that may be null
+   * @return why the column cannot be a watermark, or what is to be warned of in one that can:
+   *   a column that may be null, and a timestamp without a zone. Neither is refused: a column
+   *   that may be null need not hold one, and a time without a zone may well be of UTC
    */
-  def check(columns: Seq[SourceColumn], name: String): Either[String, Option[String]] =
+  def check(columns: Seq[SourceColumn], name: String): Either[String, Seq[String]] =
     columns.find(_.name == name) match {
       case None =>
         Left(
@@ -130,14 +134,24 @@ object WatermarkColumn {
             "UTC: a load by a watermark leaves a margin of time behind the clock of its " +
             "source, and no margin can be said in another type (ADR-0020)"
         )
-      case Some(column) if column.nullable =>
+      case Some(column) =>
         Right(
-          Some(
-            s"the column $name (load.watermark.column) may be null, and a row with no value " +
-              "in it is in no batch: it is never ingested. Every writer of the table has to " +
-              "set it, at every change (ADR-0020)"
-          )
+          Seq(
+            Option.when(column.nullable)(
+              s"the column $name (load.watermark.column) may be null, and a row with no value " +
+                "in it is in no batch: it is never ingested. Every writer of the table has to " +
+                "set it, at every change (ADR-0020)"
+            ),
+            // The bounds of a batch are moments of the clock of the source, written in UTC,
+            // and a time without a zone is compared with them as it is written.
+            Option.when(column.typeName == WithoutAZone)(
+              s"the column $name (load.watermark.column) is a timestamp without a zone, and " +
+                "is taken as UTC. If the writers of the table stamp it in another zone, a " +
+                "row is read late where that zone is ahead of UTC, by the difference, and is " +
+                "never ingested where it is behind: its time is before the watermark already " +
+                "when it is written. A timestamptz has no such doubt (ADR-0020)"
+            )
+          ).flatten
         )
-      case Some(_) => Right(None)
     }
 }

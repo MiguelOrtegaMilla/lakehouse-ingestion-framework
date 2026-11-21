@@ -602,6 +602,30 @@ final class JdbcSourceConnectorSpec
     planOf("updated_at") shouldBe empty
   }
 
+  test("a watermark that is a timestamp without a zone is warned of, at every plan") {
+    val changes = source(
+      "public.changes",
+      load = "{ mode: incremental, watermark: { column: touched_at, safety_margin: 1m } }"
+    )
+    def warned(): Seq[String] = {
+      val (planned, logged) = CapturedLogs.of(classOf[JdbcSourceConnector])(plan(changes))
+      // It is warned of, and not refused: the batch is planned.
+      WatermarkPlan.fromJson(planned).value.column.value shouldBe "touched_at"
+      logged.filter(_.level == Level.WARN).map(_.message)
+    }
+
+    val warnings = warned()
+    // The column may be null as well, which is warned of beside it.
+    warnings should have size 2
+    warnings.last shouldBe
+      "test.read: in the table public.changes, the column touched_at (load.watermark.column) " +
+      "is a timestamp without a zone, and is taken as UTC. If the writers of the table stamp " +
+      "it in another zone, a row is read late where that zone is ahead of UTC, by the " +
+      "difference, and is never ingested where it is behind: its time is before the " +
+      "watermark already when it is written. A timestamptz has no such doubt (ADR-0020)"
+    warned() shouldBe warnings
+  }
+
   // ---------------------------------------------------------------------------------------------
   // A load by a watermark: the window of a plan, and what it reads
   // ---------------------------------------------------------------------------------------------
