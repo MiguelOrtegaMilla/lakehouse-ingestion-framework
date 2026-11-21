@@ -276,6 +276,40 @@ final class JdbcSourceConnectorSpec
     value("c_tstz_array") shouldBe "{infinity}"
   }
 
+  test("the ten days of 1582 that the calendar of Java has not are read as ten days later") {
+    // Pinned as it is, and not as it should be (discovery §20). PostgreSQL counts by the
+    // Gregorian calendar from its first day. Its driver gives Spark a date as a
+    // `java.sql.Date`, whose calendar goes from 4 October 1582 to the 15th: a day between the
+    // two is none of its days, and is taken as the one ten days on, which the table may
+    // hold in another row. Any other day, of any year, is the day that the source has.
+    def asRead(rows: DataFrame): Seq[(String, String, String)] =
+      rows
+        .selectExpr("id", "cast(day AS string)", "cast(at AS string)", "cast(at_tz AS string)")
+        .collect()
+        .sortBy(_.getInt(0))
+        .map(row => (row.getString(1), row.getString(2), row.getString(3)))
+        .toSeq
+
+    asRead(read(source("public.calendar")).rows) shouldBe Seq(
+      ("1582-10-04", "1582-10-04 12:00:00", "1582-10-04 12:00:00"),
+      ("1582-10-15", "1582-10-15 12:00:00", "1582-10-15 12:00:00"),
+      ("1582-10-24", "1582-10-24 23:59:59.999999", "1582-10-24 23:59:59.999999"),
+      ("1582-10-15", "1582-10-15 00:00:00", "1582-10-15 00:00:00"),
+      ("1500-02-28", "1500-02-28 12:00:00", "1500-02-28 12:00:00"),
+      ("0001-01-01", "0001-01-01 00:00:00", "0001-01-01 00:00:00")
+    )
+    // As text, which is what keeps them: each day as the source writes it.
+    asRead(read(source("public.calendar", textColumns = Seq("day", "at", "at_tz"))).rows) shouldBe
+      Seq(
+        ("1582-10-04", "1582-10-04 12:00:00", "1582-10-04 12:00:00+00"),
+        ("1582-10-05", "1582-10-05 12:00:00", "1582-10-05 12:00:00+00"),
+        ("1582-10-14", "1582-10-14 23:59:59.999999", "1582-10-14 23:59:59.999999+00"),
+        ("1582-10-15", "1582-10-15 00:00:00", "1582-10-15 00:00:00+00"),
+        ("1500-02-28", "1500-02-28 12:00:00", "1500-02-28 12:00:00+00"),
+        ("0001-01-01", "0001-01-01 00:00:00", "0001-01-01 00:00:00+00")
+      )
+  }
+
   test("a number that is not one, and a number too long for any decimal, are kept as text") {
     val rows = read(source("public.numbers")).rows
 
@@ -1175,6 +1209,16 @@ object JdbcSourceConnectorSpec {
     """INSERT INTO validity VALUES (1, '2026-01-01', '2026-01-01 00:00:00+00'),
       |(2, '9999-12-31', '9999-12-31 23:59:59.999+00'),
       |(3, 'infinity', '2026-01-01 00:00:00+00')""".stripMargin,
+    // The day before the ten that the calendar of Java has not, the first and the last of
+    // them, the day after, and two days long before.
+    "CREATE TABLE calendar (id int, day date, at timestamp, at_tz timestamptz)",
+    """INSERT INTO calendar VALUES
+      |(1, '1582-10-04', '1582-10-04 12:00:00', '1582-10-04 12:00:00+00'),
+      |(2, '1582-10-05', '1582-10-05 12:00:00', '1582-10-05 12:00:00+00'),
+      |(3, '1582-10-14', '1582-10-14 23:59:59.999999', '1582-10-14 23:59:59.999999+00'),
+      |(4, '1582-10-15', '1582-10-15 00:00:00', '1582-10-15 00:00:00+00'),
+      |(5, '1500-02-28', '1500-02-28 12:00:00', '1500-02-28 12:00:00+00'),
+      |(6, '0001-01-01', '0001-01-01 00:00:00', '0001-01-01 00:00:00+00')""".stripMargin,
     """CREATE TABLE long_ago (id int, "Seen-At" timestamptz)""",
     """INSERT INTO long_ago VALUES (1, '2026-01-01 00:00:00+00'), (2, '-infinity')""",
     """CREATE TABLE flagged (id int, _lakehouse_infinite text, day date)""",
