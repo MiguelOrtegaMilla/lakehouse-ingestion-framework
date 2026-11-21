@@ -151,7 +151,7 @@ object AConnectorOfItsOwnSpec {
         context: ReadContext
     ): ReadResult = {
       val (from, to) = rangeOf(source, plan)
-      ReadResult(context.spark.range(from, to).toDF("id"), unparsed = None)
+      ReadResult.Kept(context.spark.range(from, to).toDF("id"), unparsed = None)
     }
 
     /** The next batch counts on from where this one ends. */

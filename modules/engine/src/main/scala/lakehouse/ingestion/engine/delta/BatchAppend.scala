@@ -8,7 +8,7 @@ import io.delta.exceptions.{
   ProtocolChangedException
 }
 import lakehouse.ingestion.core.config.{SourceId, TableLocation}
-import lakehouse.ingestion.core.control.{BatchId, RunId, TableTransactions}
+import lakehouse.ingestion.core.control.{BatchId, RunId}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.{AnalysisException, DataFrame}
@@ -36,7 +36,7 @@ import org.apache.spark.sql.{AnalysisException, DataFrame}
  * @param tables what is asked of a table about its batches, before the write and after it
  * @param context the context of the run that every batch given here is written by
  */
-final class BatchAppend(lake: Lake, tables: TableTransactions, context: CommitContext) {
+final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: CommitContext) {
   import BatchAppend._
 
   /**
@@ -72,12 +72,15 @@ final class BatchAppend(lake: Lake, tables: TableTransactions, context: CommitCo
     else
       attempt(table, batch, rows) match {
         case None =>
-          val version = tables.committedAt(table, batch.id).getOrElse {
+          // The table is asked for the batch after the write: where it is, and how many rows
+          // its commit counted. For rows that are read from their source as they are written,
+          // it is the one count there is.
+          val commit = tables.commit(table, batch.id).getOrElse {
             throw new IllegalStateException(
               s"${batch.id} was written to ${table.uri}, and no commit of its log holds it"
             )
           }
-          Appended(version, conflicts)
+          Appended(commit.version, conflicts, commit.rows)
 
         // Another writer committed under the name of this sequence while the batch was written:
         // a run that lost its lease and went on, or this one, if it is the one that lost it. It
@@ -160,8 +163,10 @@ object BatchAppend {
    *
    * @param version the version of the table at which its rows are
    * @param conflicts how many times the write was made again because the table had changed
+   * @param rows how many rows the commit says that the write put in the table; none, if the
+   *   commit does not say (`DeltaTableTransactions.commit`)
    */
-  final case class Appended(version: Long, conflicts: Int) extends Result
+  final case class Appended(version: Long, conflicts: Int, rows: Option[Long]) extends Result
 
   /**
    * The table was at this batch of its sequence already, or beyond it, and nothing was written.

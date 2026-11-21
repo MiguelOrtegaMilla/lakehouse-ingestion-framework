@@ -97,11 +97,11 @@ final class FileSourceConnectorSpec
   ): Option[Json] =
     connector(root).plan(of, configOf(of), PlanContext(now, None, taken(processed)))
 
-  private def read(root: Path, of: Source, plan: Json): ReadResult =
+  private def read(root: Path, of: Source, plan: Json): ReadResult.Kept =
     connector(root).read(of, configOf(of), plan, ReadContext(spark))
 
   /** Plans the files of the directory, and reads the plan. */
-  private def ingest(root: Path, of: Source): ReadResult = read(root, of, plan(root, of).value)
+  private def ingest(root: Path, of: Source): ReadResult.Kept = read(root, of, plan(root, of).value)
 
   private def rows(frame: DataFrame): Seq[Row] = frame.collect().toSeq.sortBy(_.toString)
 

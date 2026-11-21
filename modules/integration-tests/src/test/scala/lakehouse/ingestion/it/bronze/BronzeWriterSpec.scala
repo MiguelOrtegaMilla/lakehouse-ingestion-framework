@@ -106,7 +106,11 @@ final class BronzeWriterSpec
     val target = table("bronze/shop/written")
     val first = batch(returns, 1)
 
-    write(target, first, rows("1" -> "10.50", "2" -> "7")) shouldBe Appended(0, conflicts = 0)
+    write(target, first, rows("1" -> "10.50", "2" -> "7")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(2)
+    )
 
     val written = read(target)
     written.schema.fields.map(field => field.name -> field.dataType).toSeq shouldBe Seq(
@@ -145,7 +149,7 @@ final class BronzeWriterSpec
     )
       .toDF("id", "_source_file", "_rescued_data")
 
-    write(target, batch(returns, 1), read) shouldBe Appended(0, conflicts = 0)
+    write(target, batch(returns, 1), read) shouldBe Appended(0, conflicts = 0, rows = Some(2))
 
     this.read(target).columns.toSeq shouldBe
       Seq(
@@ -172,7 +176,7 @@ final class BronzeWriterSpec
   test("a batch that is written again adds nothing, whoever writes it and whatever it brings") {
     val target = table("bronze/shop/again")
     val first = batch(returns, 1)
-    write(target, first, rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+    write(target, first, rows("1" -> "10")) shouldBe Appended(0, conflicts = 0, rows = Some(1))
 
     // The run again, and then another run that recovers the batch, with rows that are not
     // those of its plan: nothing of either gets in.
@@ -180,7 +184,11 @@ final class BronzeWriterSpec
     write(target, batch(returns, 1), rows("9" -> "99")) shouldBe AlreadyThere(Some(0))
     versionOf(target.uri) shouldBe 0
 
-    write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(1, conflicts = 0)
+    write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(
+      1,
+      conflicts = 0,
+      rows = Some(1)
+    )
     // A run that should have stopped comes back with the batch before.
     write(target, batch(returns, 1), rows("9" -> "99")) shouldBe AlreadyThere(Some(0))
     idsOf(target) shouldBe Seq("1", "2")
@@ -190,9 +198,21 @@ final class BronzeWriterSpec
   test("two sources of one table have each its batches, under numbers of their own") {
     val target = table("bronze/shop/fan-in")
 
-    write(target, batch(returns, 1), rows("r1" -> "1")) shouldBe Appended(0, conflicts = 0)
-    write(target, batch(orders, 1), rows("o1" -> "1")) shouldBe Appended(1, conflicts = 0)
-    write(target, batch(orders, 2), rows("o2" -> "1")) shouldBe Appended(2, conflicts = 0)
+    write(target, batch(returns, 1), rows("r1" -> "1")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
+    write(target, batch(orders, 1), rows("o1" -> "1")) shouldBe Appended(
+      1,
+      conflicts = 0,
+      rows = Some(1)
+    )
+    write(target, batch(orders, 2), rows("o2" -> "1")) shouldBe Appended(
+      2,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     read(target).groupBy("_source_id", "_batch_seq").count().collect().toSet shouldBe Set(
       Row("shop.returns", 1L, 1L),
@@ -203,10 +223,14 @@ final class BronzeWriterSpec
 
   test("a batch of no rows is committed all the same, and the table has it") {
     val target = table("bronze/shop/no-rows")
-    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     val empty = batch(returns, 2)
-    write(target, empty, rows()) shouldBe Appended(1, conflicts = 0)
+    write(target, empty, rows()) shouldBe Appended(1, conflicts = 0, rows = Some(0))
 
     delta.lastVersion(target, empty.id.app) shouldBe Some(2)
     idsOf(target) shouldBe Seq("1")
@@ -274,7 +298,7 @@ final class BronzeWriterSpec
     Files.createSymbolicLink(bronze.resolve("alias"), real)
 
     write(table("bronze/aliased/alias/orders"), batch(orders, 1), rows("1" -> "10")) shouldBe
-      Appended(0, conflicts = 0)
+      Appended(0, conflicts = 0, rows = Some(1))
     Files.isDirectory(real.resolve("orders/_delta_log")) shouldBe true
 
     // The lake of a profile may be a link itself, as to a disk that is mounted elsewhere.
@@ -288,13 +312,21 @@ final class BronzeWriterSpec
       new Lake(linkedRoot, spark.sessionState.newHadoopConf()),
       delta,
       CommitContext.forRun(second.run.uuid)
-    ).write(throughLink, second, rows("2" -> "20")) shouldBe Appended(1, conflicts = 0)
+    ).write(throughLink, second, rows("2" -> "20")) shouldBe Appended(
+      1,
+      conflicts = 0,
+      rows = Some(1)
+    )
     idsOf(table("bronze/aliased/real/orders")) shouldBe Seq("1", "2")
   }
 
   test("a table that forgets its transactions is not written to until it keeps them again") {
     val target = table("bronze/shop/forgetful")
-    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
     spark.sql(
       s"ALTER TABLE delta.`${target.uri}` SET TBLPROPERTIES " +
         "('delta.setTransactionRetentionDuration' = 'interval 30 days')"
@@ -310,7 +342,11 @@ final class BronzeWriterSpec
     spark.sql(
       s"ALTER TABLE delta.`${target.uri}` UNSET TBLPROPERTIES ('delta.setTransactionRetentionDuration')"
     ): Unit
-    write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(3, conflicts = 0)
+    write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(
+      3,
+      conflicts = 0,
+      rows = Some(1)
+    )
     idsOf(target) shouldBe Seq("1", "2")
   }
 
@@ -318,7 +354,11 @@ final class BronzeWriterSpec
     val target = table("bronze/shop/schema")
     val session = spark
     import session.implicits._
-    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     val autoMerge = "spark.databricks.delta.schema.autoMerge.enabled"
     spark.conf.set(autoMerge, "true")
@@ -338,7 +378,11 @@ final class BronzeWriterSpec
     delta.lastVersion(target, TxnAppId.of(returns, Layer.Bronze)) shouldBe Some(1)
 
     // Rows that lack a column of the table are taken, with nothing in it.
-    write(target, batch(returns, 2), Seq("2").toDF("id")) shouldBe Appended(1, conflicts = 0)
+    write(target, batch(returns, 2), Seq("2").toDF("id")) shouldBe Appended(
+      1,
+      conflicts = 0,
+      rows = Some(1)
+    )
     read(target).select("id", "amount").orderBy("id").collect().toSeq shouldBe
       Seq(Row("1", "10"), Row("2", null))
   }
@@ -390,22 +434,34 @@ final class BronzeWriterSpec
     val target = table("bronze/shop/made-twice")
 
     val loser = whileWriting(target, batch(orders, 1), rows("o1" -> "1")) {
-      write(target, batch(returns, 1), rows("r1" -> "1")) shouldBe Appended(0, conflicts = 0)
+      write(target, batch(returns, 1), rows("r1" -> "1")) shouldBe Appended(
+        0,
+        conflicts = 0,
+        rows = Some(1)
+      )
     }
 
     // The one that lost the making of the table wrote again, on the table that was there.
-    loser.value shouldBe Appended(1, conflicts = 1)
+    loser.value shouldBe Appended(1, conflicts = 1, rows = Some(1))
     idsOf(target) shouldBe Seq("o1", "r1")
     (0L to 1L).map(entry(target.uri, _).complete) shouldBe Seq(true, true)
   }
 
   test("a batch that another writer of its sequence commits first is there, and is there once") {
     val target = table("bronze/shop/zombie")
-    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     // Two runs with batch 2: one that lost its lease and went on, and the one that took it.
     val late = whileWriting(target, batch(returns, 2), rows("2" -> "20")) {
-      write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(1, conflicts = 0)
+      write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(
+        1,
+        conflicts = 0,
+        rows = Some(1)
+      )
     }
 
     late.value shouldBe AlreadyThere(Some(1))
@@ -417,7 +473,11 @@ final class BronzeWriterSpec
     val target = table("bronze/shop/zombie-at-the-start")
 
     val late = whileWriting(target, batch(returns, 1), rows("1" -> "10")) {
-      write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+      write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(
+        0,
+        conflicts = 0,
+        rows = Some(1)
+      )
     }
 
     late.value shouldBe AlreadyThere(Some(0))
@@ -427,12 +487,20 @@ final class BronzeWriterSpec
 
   test("a sequence that another writer moves under a batch, without writing it, fails for good") {
     val target = table("bronze/shop/two-writers")
-    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(0, conflicts = 0)
+    write(target, batch(returns, 1), rows("1" -> "10")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     // Batch 3 is being written when batch 2 of the same sequence is committed: two writers of
     // one sequence, which is what a lease is there to prevent.
     val failed = whileWriting(target, batch(returns, 3), rows("3" -> "30")) {
-      write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(1, conflicts = 0)
+      write(target, batch(returns, 2), rows("2" -> "20")) shouldBe Appended(
+        1,
+        conflicts = 0,
+        rows = Some(1)
+      )
     }
 
     val refused = failed.left.value

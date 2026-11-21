@@ -25,11 +25,12 @@ import lakehouse.ingestion.core.control.{
   TxnAppId
 }
 import lakehouse.ingestion.engine.RunFailedException
-import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions}
+import lakehouse.ingestion.engine.delta.{BatchCommit, CommitMetadata, DeltaTableTransactions}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
 import lakehouse.ingestion.logstore.{LakeFixture, LogStores}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.delta.sources.DeltaSQLConf
 
 /**
  * What a real Delta table says of its batches, read from its log through the coordinated
@@ -186,6 +187,40 @@ final class DeltaTableTransactionsSpec
     // Two: the last two commits, and the other eight in a page of sixteen.
     (1L to 10L).map(seq => two.committedAt(table, batch(returns, seq)).value) shouldBe versions
     (1L to 10L).map(seq => delta.committedAt(table, batch(returns, seq)).value) shouldBe versions
+  }
+
+  test("the commit of a batch says how many rows it wrote, wherever in the log it is") {
+    val table = newTable("counted")
+    val one = new DeltaTableTransactions(spark, firstPage = 1)
+    write(table, returns, batch(returns, 1), Seq("a", "b", "c")).value shouldBe 0
+    write(table, returns, batch(returns, 2), Nil).value shouldBe 1
+    write(table, returns, batch(returns, 3), Seq("d")).value shouldBe 2
+    // A commit of no batch, which counts rows of its own.
+    foreign(table, None) shouldBe 3
+
+    // The last page, and the pages before it.
+    Seq(delta, one).foreach { asked =>
+      asked.commit(table, batch(returns, 1)) shouldBe Some(BatchCommit(0, Some(3)))
+      asked.commit(table, batch(returns, 2)) shouldBe Some(BatchCommit(1, Some(0)))
+      asked.commit(table, batch(returns, 3)) shouldBe Some(BatchCommit(2, Some(1)))
+      // A batch that the table does not have has no commit, as it has no version.
+      asked.commit(table, batch(returns, 4)) shouldBe None
+      asked.commit(table, batch(orders, 1)) shouldBe None
+    }
+    delta.commit(newTable("counted-nowhere"), batch(returns, 1)) shouldBe None
+  }
+
+  test("a commit of a session that records no metrics has its version, and no count") {
+    val table = newTable("uncounted")
+    val metrics = DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key
+    spark.conf.set(metrics, "false")
+    try write(table, returns, batch(returns, 1), Seq("a", "b")).value shouldBe 0
+    finally spark.conf.unset(metrics)
+    write(table, returns, batch(returns, 2), Seq("c")).value shouldBe 1
+
+    delta.commit(table, batch(returns, 1)) shouldBe Some(BatchCommit(0, None))
+    delta.committedAt(table, batch(returns, 1)) shouldBe Some(0)
+    delta.commit(table, batch(returns, 2)) shouldBe Some(BatchCommit(1, Some(1)))
   }
 
   test("a log that ends on the edge of a page is read to its beginning, and no further") {

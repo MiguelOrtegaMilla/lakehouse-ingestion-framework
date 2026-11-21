@@ -8,7 +8,7 @@ import lakehouse.ingestion.engine.RunFailedException
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.{DeltaLog, Snapshot}
-import org.apache.spark.sql.delta.actions.{Action, SetTransaction}
+import org.apache.spark.sql.delta.actions.{Action, CommitInfo, SetTransaction}
 
 /**
  * What a Delta table says of the batches that were written to it, read from its log (ADR-0005
@@ -26,6 +26,13 @@ import org.apache.spark.sql.delta.actions.{Action, SetTransaction}
  * batch, and no other is. Nothing is taken from what a commit says of itself
  * (`CommitMetadata`), which any writer of a table may set as it likes.
  *
+ * '''The rows of a batch are counted by its commit''' (`commit`). Delta writes in a commit how
+ * many rows the write put in the table (`numOutputRows`, of the metrics of its operation),
+ * unless the session says not to, which a session of the engine never does
+ * (`Profile.EngineSpark.CommitMetrics`). It is the count of the write itself, made where the
+ * rows were written: a batch that is read from its source while it is written has no other,
+ * and one that was counted before has a second count to be held against the first.
+ *
  * '''What is used of Delta that is not its API''' (discovery §5, R3). Delta shows neither
  * answer through a public method, so its own classes are asked, in this file and in no other:
  *  - `Snapshot.transactions`, the last transaction of each application, which Delta keeps in
@@ -33,11 +40,12 @@ import org.apache.spark.sql.delta.actions.{Action, SetTransaction}
  *  - `DeltaLog.getChanges`, the commits of a log from a version on, each with its actions, read
  *    one at a time as they are asked for;
  *  - `SetTransaction`, the action itself;
+ *  - `CommitInfo.operationMetrics`, what a commit says of its write, in the same commit;
  *  - `DeltaLog.minSetTransactionRetentionInterval`, whether a table forgets its transactions.
  *
  * What is assumed of them is pinned by tests of Delta alone, with no code of the engine in
- * them (`DeltaSetTransactionContractSpec`): an upgrade of Delta that changes one fails there,
- * by the name of the assumption, or does not compile here.
+ * them (`DeltaSetTransactionContractSpec`, `DeltaAppendContractSpec`): an upgrade of Delta
+ * that changes one fails there, by the name of the assumption, or does not compile here.
  *
  * '''Two things that a table must keep for the answers to hold.'''
  *  - ''Its transactions.'' A table that sets `delta.setTransactionRetentionDuration` has Delta
@@ -80,13 +88,23 @@ final class DeltaTableTransactions(
    * a log to its beginning.
    */
   override def committedAt(table: TableLocation, batch: BatchId): Option[Long] =
+    commit(table, batch).map(_.version)
+
+  /**
+   * The commit of `batch` in `table`: where its rows are, and how many the commit says that it
+   * wrote. It is found as `committedAt` is, which is this without the count.
+   *
+   * @return none, if the batch is not in the table, or its commit is no longer in the log that
+   *   the table keeps
+   */
+  def commit(table: TableLocation, batch: BatchId): Option[BatchCommit] =
     current(table)
       .filter { case (_, snapshot) =>
         snapshot.transactions.get(batch.app.value).exists(_ >= batch.seq.value)
       }
       .flatMap { case (log, snapshot) =>
         @tailrec
-        def search(last: Long, size: Long): Option[Long] = {
+        def search(last: Long, size: Long): Option[BatchCommit] = {
           val first = if (size > last) 0L else last - size + 1
           val page = read(log, first, last, batch)
           // A page that does not start where it was asked from starts at the first commit that
@@ -132,7 +150,10 @@ final class DeltaTableTransactions(
         val (version, actions) = commits.next()
         if (version > last) page
         else {
-          val seen = page.saw(version, holds(actions, batch))
+          val seen = page.saw(
+            version,
+            Option.when(holds(actions, batch))(BatchCommit(version, rows(actions)))
+          )
           // After the last of the page the iterator is let be: asking it whether there is
           // more costs nothing, and taking what follows would read a commit of no use.
           if (version == last) seen else next(seen)
@@ -160,11 +181,13 @@ object DeltaTableTransactions {
    *
    * @param first the oldest version that was read: the one asked from, unless the log does not
    *   keep it any more
-   * @param found the version of the commit that holds the transaction looked for
+   * @param found the commit that holds the transaction looked for
    */
-  final private case class Page(first: Option[Long], found: Option[Long]) {
-    def saw(version: Long, holds: Boolean): Page =
-      Page(first.orElse(Some(version)), if (holds) Some(version) else found)
+  final private case class Page(first: Option[Long], found: Option[BatchCommit]) {
+
+    /** @param holding the commit at `version`, if it holds the transaction */
+    def saw(version: Long, holding: Option[BatchCommit]): Page =
+      Page(first.orElse(Some(version)), holding.orElse(found))
   }
 
   private object Page {
@@ -179,4 +202,28 @@ object DeltaTableTransactions {
     case SetTransaction(app, version, _) => app == batch.app.value && version == batch.seq.value
     case _ => false
   }
+
+  /** The metric of a write that counts the rows it put in the table. */
+  val RowsWritten = "numOutputRows"
+
+  /**
+   * How many rows a commit says that its write put in the table; none, if it does not say: a
+   * commit of a session that records no metrics, or of a writer that goes around Delta. A count
+   * that is no whole number is none as well, and is never read as another.
+   */
+  private def rows(actions: Seq[Action]): Option[Long] =
+    actions
+      .collectFirst { case info: CommitInfo => info.operationMetrics }
+      .flatten
+      .flatMap(_.get(RowsWritten))
+      .flatMap(_.toLongOption)
+      .filter(_ >= 0)
 }
+
+/**
+ * The commit of a batch in a table.
+ *
+ * @param version the version of the table at which the rows of the batch are
+ * @param rows how many rows the commit says that it wrote; none, if it does not say
+ */
+final case class BatchCommit(version: Long, rows: Option[Long])

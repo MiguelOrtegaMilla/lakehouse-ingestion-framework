@@ -29,6 +29,9 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  *  - '''A read of a plan reads that plan, and is the same each time it is replayed''', for as
  *    long as the source still has what the plan names. It has no effect: what was read reaches
  *    nothing but the rows that it gives.
+ *  - '''A read says whether its rows are held apart from the source''' (`ReadResult`). Rows
+ *    that are, the engine counts before it writes one. Rows that are read from the source each
+ *    time they are gone over, the engine goes over once, as it writes them.
  *  - '''A source that no longer has what a plan names is said so, and nothing of the plan is
  *    read as something else''' (`SourceChangedException`, ADR-0018): a file written again, or
  *    gone. What follows is the engine's: the batch is given up if nothing of it was written,
@@ -144,19 +147,58 @@ trait FileRegistry {
 final case class ReadContext(spark: SparkSession)
 
 /**
- * What a read gives: the rows, and the records that could not be parsed into rows, each from
- * the same read, so that both say the same thing of the source.
+ * What a read gives: the rows of a plan, and how they may be gone over.
  *
- * @param rows as the source gave them, with the columns that are a read's to add
- *   (`_source_file`, `_rescued_data`: `EngineColumns`). The columns of the engine are the
- *   writer's to add, and a read never has them
- * @param unparsed the records that could not be parsed, as they were written in the source:
- *   `_source_file` and `_record`, both text. None for a source whose records are never text to
- *   parse, as a table of a database or a file of Parquet
+ * Rows are a query of Spark's, and each time they are gone over, to count them or to write
+ * them, the query is run. What that costs, and whether it gives the same rows, is the
+ * connector's to say, by which of the two it answers with: the engine counts the rows of one
+ * before it writes them, and never goes twice over the rows of the other.
  */
-final case class ReadResult(rows: DataFrame, unparsed: Option[DataFrame])
+sealed trait ReadResult {
+
+  /**
+   * The rows as the source gave them, with the columns that are a read's to add
+   * (`_source_file`, `_rescued_data`: `EngineColumns`). The columns of the engine are the
+   * writer's to add, and a read never has them.
+   */
+  def rows: DataFrame
+}
 
 object ReadResult {
+
+  /**
+   * Rows that Spark holds apart from the source: going over them again asks the source for
+   * nothing, and gives the same rows. With them, the records that could not be parsed into
+   * rows, from the same read, so that both say the same thing of the source.
+   *
+   * The engine counts both before it writes either: the share of the records that were
+   * rejected is known before a row is in Bronze (ADR-0008).
+   *
+   * @param unparsed the records that could not be parsed, as they were written in the source:
+   *   `_source_file` and `_record`, both text. None for a source whose records are never text
+   *   to parse, as a file of Parquet
+   */
+  final case class Kept(rows: DataFrame, unparsed: Option[DataFrame]) extends ReadResult
+
+  /**
+   * Rows that are read from the source each time they are gone over: a table of a database,
+   * which is asked with a statement, answers with what it has by then, and bears the cost. To
+   * hold them apart first would be to hold the batch in Spark, whatever its size.
+   *
+   * The engine goes over them once, as it writes them, and the count of the batch is that of
+   * the commit of its table. It has no records that could not be parsed: what such a source
+   * gives is rows already.
+   *
+   * A batch with no rows writes nothing, so the engine asks for a first row before it writes
+   * (`probe`). The two are two questions to the source, and it may answer the second
+   * otherwise: a batch that had a row and has none when it is written is a commit of no rows,
+   * which is a batch written as any other.
+   *
+   * @param probe the same rows, asked in the way that gives the first of them at the least
+   *   cost to the source: the engine takes one row of it (`head(1)`), and no more. It is
+   *   `rows`, for a connector that has no cheaper way
+   */
+  final case class OnePass(rows: DataFrame, probe: DataFrame) extends ReadResult
 
   /** The column of an unparsed record that has its text, as it was in the source. */
   val Record = "_record"

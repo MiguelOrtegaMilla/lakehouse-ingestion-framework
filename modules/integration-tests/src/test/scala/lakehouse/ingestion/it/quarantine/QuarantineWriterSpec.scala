@@ -81,7 +81,7 @@ final class QuarantineWriterSpec
     write(
       first,
       unparsed("returns/a.csv" -> "3", "returns/b.json" -> """{"id": 7, "broken""")
-    ) shouldBe Appended(0, conflicts = 0)
+    ) shouldBe Appended(0, conflicts = 0, rows = Some(2))
 
     val written = read(table)
     written.schema.fields.map(field => field.name -> field.dataType).toSeq shouldBe Seq(
@@ -117,7 +117,11 @@ final class QuarantineWriterSpec
     val source = newSource()
     val table = quarantineOf(source)
 
-    write(batch(source, 1), unparsed("returns/a.csv" -> "3")) shouldBe Appended(0, conflicts = 0)
+    write(batch(source, 1), unparsed("returns/a.csv" -> "3")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     // A directory whose name starts with `_`, which no source can name as a target, holds a
     // table that Delta writes, reads and lists as any other.
@@ -128,7 +132,11 @@ final class QuarantineWriterSpec
     directory.getParent.getParent shouldBe lakeDirectory.resolve("_quarantine")
     read(table).count() shouldBe 1L
     spark.sql(s"SELECT raw_record FROM delta.`${table.uri}`").head().getString(0) shouldBe "3"
-    write(batch(source, 2), unparsed("returns/b.csv" -> "4")) shouldBe Appended(1, conflicts = 0)
+    write(batch(source, 2), unparsed("returns/b.csv" -> "4")) shouldBe Appended(
+      1,
+      conflicts = 0,
+      rows = Some(1)
+    )
     read(table).count() shouldBe 2L
     DeltaTable.forPath(spark, table.uri).history().count() shouldBe 2L
   }
@@ -137,7 +145,7 @@ final class QuarantineWriterSpec
     val source = newSource()
     val first = batch(source, 1)
     val records = unparsed("returns/a.csv" -> "3")
-    write(first, records) shouldBe Appended(0, conflicts = 0)
+    write(first, records) shouldBe Appended(0, conflicts = 0, rows = Some(1))
 
     // The run that replays the batch, and the one that should have stopped.
     write(batch(source, 1), records) shouldBe AlreadyThere(Some(0))
@@ -180,7 +188,11 @@ final class QuarantineWriterSpec
     val source = newSource()
     val first = batch(source, 1)
     val data = locator.locate(RelativePath.parse(s"bronze/${source.value}").value)
-    write(first, unparsed("returns/a.csv" -> "3")) shouldBe Appended(0, conflicts = 0)
+    write(first, unparsed("returns/a.csv" -> "3")) shouldBe Appended(
+      0,
+      conflicts = 0,
+      rows = Some(1)
+    )
 
     delta.lastVersion(quarantineOf(source), first.id.app) shouldBe Some(1)
     delta.lastVersion(data, first.id.app) shouldBe None
@@ -191,7 +203,7 @@ final class QuarantineWriterSpec
       data,
       BronzeBatch(first.run, source, first.id, setApartAt),
       Seq("1").toDF("id")
-    ) shouldBe Appended(0, conflicts = 0)
+    ) shouldBe Appended(0, conflicts = 0, rows = Some(1))
     delta.lastVersion(data, first.id.app) shouldBe Some(1)
     read(quarantineOf(source)).count() shouldBe 1L
     read(data).count() shouldBe 1L

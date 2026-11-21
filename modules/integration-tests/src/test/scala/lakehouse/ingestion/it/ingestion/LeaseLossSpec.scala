@@ -564,7 +564,7 @@ object LeaseLossSpec {
       val session = context.spark
       import session.implicits._
       val numbers = session.sparkContext.parallelize(from until to, 2).map(Pace.paced(pace, millis))
-      ReadResult(numbers.toDF("id").localCheckpoint(eager = true), unparsed = None)
+      ReadResult.Kept(numbers.toDF("id").localCheckpoint(eager = true), unparsed = None)
     }
 
     override def progress(source: Source, config: Paced, plan: Json): Progress =

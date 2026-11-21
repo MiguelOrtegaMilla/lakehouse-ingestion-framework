@@ -14,6 +14,8 @@ import org.apache.spark.sql.delta.DeltaLog
  *
  *  - the master of the profile, and the session named after its source;
  *  - Delta's extension and catalog;
+ *  - the metrics of a commit recorded by Delta, which is where the engine reads the rows that
+ *    a batch wrote;
  *  - `PostgresLogStore` for the scheme of the lake, so that every commit to a table of the lake
  *    is coordinated (ADR-0004);
  *  - the settings of the LogStore, made from `databases.coordination`, under `spark.hadoop.`:
@@ -37,6 +39,7 @@ object RunSession {
       Profile.EngineSpark.AppName -> appName(source),
       Profile.EngineSpark.Extensions -> "io.delta.sql.DeltaSparkSessionExtension",
       Profile.EngineSpark.Catalog -> "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+      Profile.EngineSpark.CommitMetrics -> "true",
       StartupGuard.logStoreKey(scheme) -> classOf[PostgresLogStore].getName
     ) ++ LogStoreSettings.hadoop(profile.databases.coordination).map { case (key, value) =>
       s"spark.hadoop.$key" -> value

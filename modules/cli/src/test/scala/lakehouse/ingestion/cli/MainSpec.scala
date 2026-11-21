@@ -517,6 +517,7 @@ final class MainSpec
     engine("spark.sql.extensions") shouldBe "io.delta.sql.DeltaSparkSessionExtension"
     engine("spark.sql.catalog.spark_catalog") shouldBe
       "org.apache.spark.sql.delta.catalog.DeltaCatalog"
+    engine("spark.databricks.delta.history.metricsEnabled") shouldBe "true"
     engine(StartupGuard.logStoreKey("file")) shouldBe classOf[PostgresLogStore].getName
     engine(s"spark.hadoop.${CoordinationSettings.User}") shouldBe "ingest_coordination"
     engine(s"spark.hadoop.${CoordinationSettings.PasswordRef}") shouldBe

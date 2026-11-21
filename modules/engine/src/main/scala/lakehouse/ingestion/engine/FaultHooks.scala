@@ -23,14 +23,17 @@ object FaultPoint {
 
   /**
    * The plan was read, and what was read is kept apart from the source. Nothing is written:
-   * what a run that dies here leaves is what one that dies after its plan leaves.
+   * what a run that dies here leaves is what one that dies after its plan leaves. For rows
+   * that are read as they are written (`ReadResult.OnePass`), the query of them is made, and
+   * the source was not asked for a row.
    */
   case object AfterRead extends FaultPoint("AfterRead")
 
   /**
    * What was read is counted: the run knows how many rows the batch has and how many of its
    * records were rejected, and has written none of them. It is the last point before a table is
-   * written, and every batch that was read gets here.
+   * written, and every batch that was read gets here. For rows that are read as they are
+   * written, what the run knows is whether there is one: it has asked for the first.
    */
   case object AfterCounts extends FaultPoint("AfterCounts")
 

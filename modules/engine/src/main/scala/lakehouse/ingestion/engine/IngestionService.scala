@@ -66,6 +66,18 @@ import org.slf4j.LoggerFactory
  * A table made from an empty batch would have the columns of the engine alone, and the next
  * batch could not be appended to it.
  *
+ * '''Rows that are read from their source each time are gone over once'''
+ * (`ReadResult.OnePass`): a table of a database. They are not counted before they are written,
+ * which would be a second statement at the source, and one that may see other rows. The run
+ * asks for a first row, to know whether the batch writes anything, and then writes: the rows
+ * are read by the write, and what the run read and wrote is what the commit of the batch
+ * counted.
+ *
+ * '''What a run wrote is what the commits of its tables say''' (`rows_written`), for every
+ * batch that it writes, and not what it counted before. For rows that the run counted as well,
+ * the two counts were made apart: where they differ, the run says so, and goes on. What is to
+ * come of a batch whose counts differ is not decided here (discovery §20, P11).
+ *
  * '''More rejected records than the source allows, and the batch is not committed'''
  * (`quality.max_rejected_ratio`, ADR-0008). The records are in quarantine by then, where
  * whoever owns the source finds them; nothing is written to Bronze, the run ends as a data
@@ -153,7 +165,7 @@ final class IngestionService(
   // The configuration that Delta hands the LogStore: where its coordination store is.
   private val hadoop = spark.sessionState.newHadoopConf()
   private val confinement = new Lake(lake, hadoop)
-  private val tables: TableTransactions = new DeltaTableTransactions(spark)
+  private val tables = new DeltaTableTransactions(spark)
 
   /**
    * Runs `source` once.
@@ -460,11 +472,78 @@ final class IngestionService(
       val read =
         try Right(bound.read(batch.plan, ReadContext(spark)))
         catch { case changed: SourceChangedException => Left(changed) }
-      read.fold(giveUp(batch, _), finish(batch, progress, _))
+      read match {
+        case Left(changed) => giveUp(batch, changed)
+        case Right(kept: ReadResult.Kept) => finish(batch, progress, kept)
+        case Right(once: ReadResult.OnePass) => finishInOnePass(batch, progress, once)
+      }
     }
 
-    /** Writes what was read of a batch, its quarantine and then its data, and commits it. */
-    private def finish(batch: PlannedBatch, progress: Progress, read: ReadResult): Outcome = {
+    /**
+     * Writes a batch whose rows are read from their source as they are written, and commits
+     * it. The source is asked twice: for a first row, and for the rows.
+     */
+    private def finishInOnePass(
+        batch: PlannedBatch,
+        progress: Progress,
+        read: ReadResult.OnePass
+    ): Outcome = {
+      val readAt = clock.instant()
+      hooks.at(FaultPoint.AfterRead, batch)
+
+      // The probe is a job of Spark, and a statement at the source: neither is for a run that
+      // has lost its lease.
+      leased.verify()
+      // One row of it is taken. A batch with none writes nothing, and its table is not touched.
+      val some = read.probe.head(1).nonEmpty
+      hooks.at(FaultPoint.AfterCounts, batch)
+
+      val data = Option.when(some) {
+        leased.verify()
+        // The one pass over the rows. Nothing was counted, so the commit is held to nothing.
+        val written = this.written(table, batch, counted = None) {
+          new BronzeWriter(confinement, tables, commits)
+            .write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows)
+        }
+        hooks.at(FaultPoint.AfterBronzeCommit, batch)
+        written
+      }
+
+      // Rows of such a source are never records to parse: none of them is rejected.
+      val known = RunCounts(rowsRejected = Some(0L), bytesRead = progress.bytes)
+      val counts = data match {
+        case None => known.copy(rowsRead = Some(0L), rowsWritten = Some(0L))
+        // Read and written are one pass, and one count: that of the commit.
+        case Some(write) if write.byThisRun =>
+          known.copy(rowsRead = write.rows, rowsWritten = write.rows)
+        // Another writer of this sequence wrote the batch, from the same plan: what it read
+        // and wrote was that writer's to count, and this run counted nothing.
+        case Some(_) => known
+      }
+      val outputs =
+        data.map(write => BatchOutput(source.targets.bronze.table, write.version)).toVector
+      commit(batch, progress, outputs, withWrites(counts, data.toSeq))
+    }
+
+    /** The commit of a batch that is written: step 7. */
+    private def commit(
+        batch: PlannedBatch,
+        progress: Progress,
+        outputs: Vector[BatchOutput],
+        counts: RunCounts
+    ): Outcome = {
+      hooks.at(FaultPoint.BeforeStateCommit, batch)
+      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
+        log.info(s"the run ${start.id} committed ${batch.id}")
+        Outcome.Ingested(start.id, batch.id, outputs, counts)
+      } else fenced(start, "another run holds it")
+    }
+
+    /**
+     * Writes what was read of a batch and is held apart from its source, its quarantine and
+     * then its data, and commits it.
+     */
+    private def finish(batch: PlannedBatch, progress: Progress, read: ReadResult.Kept): Outcome = {
       val readAt = clock.instant()
       hooks.at(FaultPoint.AfterRead, batch)
 
@@ -486,7 +565,7 @@ final class IngestionService(
       val apart = read.unparsed.filter(_ => unparsed > 0).map { records =>
         // The counts were jobs of Spark: a run that lost its lease in them writes no table.
         leased.verify()
-        val written = this.written(quarantine, batch) {
+        val written = this.written(quarantine, batch, counted = Some(unparsed)) {
           new QuarantineWriter(confinement, tables, commits)
             .write(quarantine, QuarantineBatch(start.id, source.id, batch.id, readAt), records)
         }
@@ -500,7 +579,7 @@ final class IngestionService(
         // A batch with no rows writes nothing to Bronze, and its table is not touched.
         val data = Option.when(rows > 0) {
           leased.verify()
-          val written = this.written(table, batch) {
+          val written = this.written(table, batch, counted = Some(rows)) {
             new BronzeWriter(confinement, tables, commits)
               .write(table, BronzeBatch(start.id, source.id, batch.id, readAt), read.rows)
           }
@@ -511,28 +590,43 @@ final class IngestionService(
         val outputs = apart.map(write => BatchOutput(quarantineTable, write.version)).toVector ++
           data.map(write => BatchOutput(source.targets.bronze.table, write.version))
         val counts = withWrites(
-          // Another writer of this sequence wrote the batch, from the same plan: its rows are
-          // there once, and this run wrote none of them, nor counted them.
-          counted.copy(rowsWritten =
-            data.fold(Option(0L))(write => Option.when(write.byThisRun)(rows))
-          ),
+          // What the commit of the table counted, and not what the run counted before it. If
+          // another writer of this sequence wrote the batch, from the same plan, its rows are
+          // there once, and this run wrote none of them.
+          counted.copy(rowsWritten = data.fold(Option(0L))(_.rows)),
           apart.toSeq ++ data
         )
-
-        hooks.at(FaultPoint.BeforeStateCommit, batch)
-        if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
-          log.info(s"the run ${start.id} committed ${batch.id}")
-          Outcome.Ingested(start.id, batch.id, outputs, counts)
-        } else fenced(start, "another run holds it")
+        commit(batch, progress, outputs, counts)
       }
     }
 
-    /** What a write of the batch to one of its tables came to. */
-    private def written(to: TableLocation, batch: PlannedBatch)(
+    /**
+     * What a write of the batch to one of its tables came to.
+     *
+     * @param counted how many rows the run counted before it gave them to the write, if it
+     *   did: the commit is held to it, and a difference is said
+     */
+    private def written(to: TableLocation, batch: PlannedBatch, counted: Option[Long])(
         write: => BatchAppend.Result
     ): Written = write match {
-      case BatchAppend.Appended(version, conflicts) =>
-        Written(Some(version), byThisRun = true, conflicts)
+      case BatchAppend.Appended(version, conflicts, rows) =>
+        rows match {
+          case None =>
+            log.warn(
+              s"the commit of ${batch.id} at version $version of ${to.uri} does not say how " +
+                "many rows it wrote, and what the run wrote there is recorded as not known. " +
+                s"A session of the engine has Delta say it (${DeltaTableTransactions.RowsWritten})"
+            )
+          case Some(said) =>
+            counted.filter(_ != said).foreach { before =>
+              log.warn(
+                s"the run counted $before rows of ${batch.id} before it wrote them to " +
+                  s"${to.uri}, and the commit at version $version says that $said were " +
+                  "written. The batch goes on, with both counts as they were made"
+              )
+            }
+        }
+        Written(Some(version), byThisRun = true, conflicts, rows)
       // A run before this one wrote it: the quarantine of a batch that is run again.
       case BatchAppend.AlreadyThere(version) =>
         if (version.isEmpty)
@@ -540,7 +634,7 @@ final class IngestionService(
             s"the table at ${to.uri} has ${batch.id}, and no commit that its log still keeps " +
               "holds it: the batch is recorded with a version that is not known"
           )
-        Written(version, byThisRun = false, conflicts = 0)
+        Written(version, byThisRun = false, conflicts = 0, rows = None)
     }
 
     /**
@@ -674,8 +768,15 @@ object IngestionService {
    *   already, in a commit that its log no longer keeps
    * @param byThisRun whether this write put it there; if not, the table had it already
    * @param conflicts how many times the write was made again because the table had changed
+   * @param rows how many rows this write put there, as its commit says; none, for a batch that
+   *   the table had already, and for a commit that does not say
    */
-  final private case class Written(version: Option[Long], byThisRun: Boolean, conflicts: Int)
+  final private case class Written(
+      version: Option[Long],
+      byThisRun: Boolean,
+      conflicts: Int,
+      rows: Option[Long]
+  )
 
   /**
    * The commit that the LogStore refused for its epoch, if that is what a failure of a run is,
