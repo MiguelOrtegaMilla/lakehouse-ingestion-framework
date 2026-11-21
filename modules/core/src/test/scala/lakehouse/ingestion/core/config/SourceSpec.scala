@@ -64,6 +64,82 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
 
   private def id(name: String): SqlIdentifier = SqlIdentifier.parse(name).value
 
+  test("the columns of a table that are read as text are names, and none unless they are said") {
+    def textColumns(text: String): Vector[SqlIdentifier] =
+      Source.load(File, text).value.value.connector.asInstanceOf[JdbcConnectorConfig].textColumns
+
+    textColumns(Jdbc) shouldBe empty
+    val named = Jdbc.replace(
+      "  table: public.orders\n",
+      "  table: public.orders\n  text_columns: [valid_to, Amount]\n"
+    )
+    textColumns(named) shouldBe Vector(id("valid_to"), id("Amount"))
+    // As they are stored and hashed: in the order they were written, and an empty list.
+    def stored(text: String) =
+      Source
+        .load(File, text)
+        .value
+        .value
+        .connector
+        .canonical
+        .hcursor
+        .downField("text_columns")
+        .focus
+    stored(named).map(_.noSpaces) shouldBe Some("""["valid_to","Amount"]""")
+    stored(Jdbc).map(_.noSpaces) shouldBe Some("[]")
+
+    def withColumns(columns: String): String =
+      Jdbc.replace(
+        "  table: public.orders\n",
+        s"  table: public.orders\n  text_columns: $columns\n"
+      )
+    errorsOf(withColumns("valid_to")) shouldBe
+      Seq(s"$File: connector.text_columns must be a list, and is text")
+    errorsOf(withColumns("""["valid to", "x; DROP TABLE canary"]""")) shouldBe Seq(
+      s"$File: connector.text_columns[0] has U+0020 SPACE at position 6: a name is letters of " +
+        "ASCII, digits and underscores",
+      s"$File: connector.text_columns[1] has ';' (U+003B) at position 2: a name is letters of " +
+        "ASCII, digits and underscores"
+    )
+  }
+
+  test("a column is read as text once, is the source's, and is not the watermark") {
+    def withColumns(of: String, columns: String): Seq[String] =
+      errorsOf(
+        of.replace(
+          "  table: public.orders\n",
+          s"  table: public.orders\n  text_columns: $columns\n"
+        )
+      )
+
+    withColumns(Jdbc, "[valid_to, amount, valid_to]") shouldBe Seq(
+      s"$File: connector.text_columns[2] is valid_to again: it is connector.text_columns[0] already"
+    )
+    withColumns(Jdbc, "[_run_id, _Batch_Seq]") shouldBe Seq(
+      s"$File: connector.text_columns[0] is _run_id, which is _run_id: a column that the " +
+        "engine adds to every row, and not one of the source. A source that has a column of " +
+        "that name renames it (schema.renames)",
+      s"$File: connector.text_columns[1] is _Batch_Seq, which is _batch_seq, case aside: a " +
+        "column that the engine adds to every row, and not one of the source. A source that " +
+        "has a column of that name renames it (schema.renames)"
+    )
+    withColumns(Incremental, "[valid_to, updated_at]") shouldBe Seq(
+      s"$File: connector.text_columns[1] is updated_at, which is load.watermark.column: a " +
+        "watermark is read as the timestamp that it is, and the bounds of a batch reach the " +
+        "source as times"
+    )
+    // Under a full load the same column is one like any other.
+    Source
+      .load(
+        File,
+        Jdbc.replace(
+          "  table: public.orders\n",
+          "  table: public.orders\n  text_columns: [updated_at]\n"
+        )
+      )
+      .isRight shouldBe true
+  }
+
   test("the example of a JDBC source is valid, and is read as it says") {
     val Loaded(source, warnings) = example("sales.orders.yaml")
 

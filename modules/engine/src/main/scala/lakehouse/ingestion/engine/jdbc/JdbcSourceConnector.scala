@@ -13,7 +13,8 @@ import lakehouse.ingestion.core.config.{
   Load,
   Secret,
   SecretResolver,
-  Source
+  Source,
+  SqlIdentifier
 }
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.engine.RunFailedException
@@ -49,7 +50,8 @@ import org.slf4j.LoggerFactory
  * `infinity` cannot be told by its type, so the source says it of each row, in the statement
  * that gives the row (`JdbcSql.flagged`), and such a row fails its batch, with the column
  * named: Spark would write it as the last day of the year 9999, which a row may hold for
- * itself.
+ * itself. A column that is known to hold it is named in the configuration
+ * (`connector.text_columns`), and is read as text as well, whatever its type.
  *
  * '''Every connection to a source is opened the same way''' (`PostgresJdbc.ofASource`): TLS as
  * the configuration says, its timeouts, and the settings of a session that a read stands on,
@@ -124,8 +126,13 @@ final class JdbcSourceConnector(secrets: SecretResolver)
       )
 
     val columns = columnsOf(source, config)
-    val text = columns.filter(column => BronzeTypes.of(column) != BronzeTypes.AsSparkReads)
-    val finite = columns.filter(BronzeTypes.mayBeInfinite)
+    // As text: what the configuration says, and what the type of a column says.
+    val named = config.textColumns.map(_.value).toSet
+    val text = columns.filter { column =>
+      named(column.name) || BronzeTypes.of(column) != BronzeTypes.AsSparkReads
+    }
+    // A column that is read as text holds infinity as the source writes it.
+    val finite = columns.filter(BronzeTypes.mayBeInfinite).filterNot(column => named(column.name))
     val flag = unusedName(columns, Flag)
     val password = passwordOf(source, config)
     val table =
@@ -213,6 +220,13 @@ final class JdbcSourceConnector(secrets: SecretResolver)
       refused(
         s"has columns whose names differ only in their case, ${alike.mkString("; ")}, and a " +
           "table of Delta cannot have both"
+      )
+    val unknown = config.textColumns.map(_.value).filterNot(columns.map(_.name).toSet)
+    if (unknown.nonEmpty)
+      refused(
+        s"has no column ${unknown.mkString(", ")}, which connector.text_columns names: a " +
+          "column is named as the source writes it, with its case. Its columns are " +
+          columns.map(_.name).mkString(", ")
       )
     columns
   }
@@ -302,5 +316,14 @@ object JdbcSourceConnector {
     s"the column ${column.name} of the table ${config.table} of ${where(source, config)} has " +
       s"infinity or -infinity in a row of the batch, which PostgreSQL has for a " +
       s"${column.typeName} and Spark has not: it would be written to Bronze as another " +
-      "date, the last day of the year 9999 for infinity. Nothing of the batch was written"
+      "date, the last day of the year 9999 for infinity. Nothing of the batch was written. " +
+      (SqlIdentifier.parse(column.name) match {
+        case Right(_) =>
+          s"Add ${column.name} to connector.text_columns, and the column is read as text, " +
+            "each value as the source writes it"
+        case Left(_) =>
+          "connector.text_columns would have the column read as text, each value as the " +
+            "source writes it, and takes a name of letters, digits and underscores, which " +
+            "this one is not: read the table through a view that gives the column such a name"
+      })
 }

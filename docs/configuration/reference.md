@@ -182,6 +182,7 @@ A table of a relational database. PostgreSQL, for now. It loads by `full` or by 
 |---|---|---|
 | `connector.connection` | The [connection](#a-connection-to-a-database) to the database | required |
 | `connector.table` | The table: a [name](#a-name), or `schema.name` | required |
+| `connector.text_columns` | Columns of the table that are read as text, whatever their type: a list of [names](#a-name), each as the source writes it | none |
 
 - **A table is read in one statement, with a cursor.** The rows come a thousand at a time, and are written to Bronze as they come: the table is never held whole, and a full load is one snapshot of it. `timeouts.statement` bounds one fetch.
 - **The role needs to read the table, and nothing else.** The table is asked for its columns before a batch is planned: one that is not there, or that the role may not read, fails the run with nothing planned.
@@ -204,8 +205,9 @@ Bronze keeps the types of the source, and changes no value without saying so. A 
 | `uuid`, `json`, `jsonb`, `xml`, `inet`, `interval`, `money`, an enum, the geometric types | Text, as the server writes it; `money` with the symbol of the server's locale |
 | An array | An array of what its values are kept as. Text, if they are kept as text, or are dates or timestamps |
 
-- **`infinity` fails a batch.** PostgreSQL has `infinity` and `-infinity` for a date and for a timestamp, and Spark has not: it would write the last day of the year 9999 in its place. The source is asked of each row, in the statement that reads it, and a row that has one fails its batch for good, with the column named. `9999-12-31` itself is a date like any other.
-- **A bounded `numeric` that holds `NaN` fails its batch as well**: a decimal has none.
+- **`infinity` fails a batch, unless its column is read as text.** PostgreSQL has `infinity` and `-infinity` for a date and for a timestamp, and Spark has not: it would write the last day of the year 9999 in its place. The source is asked of each row, in the statement that reads it, and a row that has one fails its batch for good, with the column named. `9999-12-31` itself is a date like any other. A column that holds `infinity`, as a `valid_to` often does, goes in `connector.text_columns`: Bronze then has the text `infinity`, and the dates as the source writes them.
+- **A bounded `numeric` that holds `NaN` fails its batch as well**: a decimal has none. Its column goes in `connector.text_columns` too.
+- **`connector.text_columns` names columns that the table has**, each once, as the source writes them; a name that the table has not fails the run before a batch is planned. It cannot name `load.watermark.column`, which is read as the timestamp that it is. A column that is in Bronze already under another type is not changed by it: the table refuses rows of another type, and what a table does with a type that changed is its schema policy.
 
 ### The `file` connector
 

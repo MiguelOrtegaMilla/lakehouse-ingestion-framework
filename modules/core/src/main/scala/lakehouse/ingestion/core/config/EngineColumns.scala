@@ -41,4 +41,21 @@ object EngineColumns {
 
   /** The column of the engine that `name` is, case aside, if it is one. */
   def reserved(name: String): Option[String] = lowerCase.get(name.toLowerCase(Locale.ROOT))
+
+  /**
+   * Why a field that names a column of a source cannot name this one, if it is a column of the
+   * engine: a column of the source by one of those names would be two columns of one name in a
+   * table.
+   *
+   * @param field the path of the field, for the problem
+   */
+  def refused(field: String, name: String): Option[Read.Problem] =
+    reserved(name).map { column =>
+      val which = if (column == name) column else s"$column, case aside"
+      Read.Problem(
+        field,
+        s"is $name, which is $which: a column that the engine adds to every row, and not one " +
+          "of the source. A source that has a column of that name renames it (schema.renames)"
+      )
+    }
 }

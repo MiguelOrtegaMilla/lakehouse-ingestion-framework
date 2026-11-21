@@ -106,7 +106,8 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     // a field changes every hash when the application is upgraded, and the version of the
     // application that a run records tells that apart (ADR-0007). `leases.ttl` was one (P4.5).
     // So is a default that changes: the statement timeout of a source, 10s to 30m (P6.3).
-    version().hash shouldBe "f922234cab5f663e319a77ec0643ced2d0e2af105311b069729e7132ef869eec"
+    // And `connector.text_columns` of a JDBC source, which is empty unless it is said (P6.6).
+    version().hash shouldBe "e6c0e5013bcfcff57979f7c307ef0630ab8f9f02834f3bbd8ee40575fe239204"
   }
 
   test("two files that say the same have one hash, however they say it") {

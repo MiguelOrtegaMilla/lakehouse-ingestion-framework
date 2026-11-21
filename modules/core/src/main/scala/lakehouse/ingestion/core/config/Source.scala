@@ -547,7 +547,8 @@ object Source {
             )
         } ++ repeated("keys", source.keys) ++
         silver.toSeq.flatMap(s => repeated("targets.silver.partition_by", s.partitionBy)) ++
-        engineColumns(source)
+        engineColumns(source) ++
+        source.connector.rules(source.load)
     )
   }
 
@@ -563,14 +564,7 @@ object Source {
    */
   private def engineColumns(source: Source): Seq[Problem] = {
     def engines(field: String, name: String): Option[Problem] =
-      EngineColumns.reserved(name).map { column =>
-        val which = if (column == name) column else s"$column, case aside"
-        Problem(
-          field,
-          s"is $name, which is $which: a column that the engine adds to every row, and not one " +
-            "of the source. A source that has a column of that name renames it (schema.renames)"
-        )
-      }
+      EngineColumns.refused(field, name)
 
     def named(field: String, names: Vector[SqlIdentifier]): Seq[Problem] =
       names.zipWithIndex.flatMap { case (name, index) => engines(s"$field[$index]", name.value) }
