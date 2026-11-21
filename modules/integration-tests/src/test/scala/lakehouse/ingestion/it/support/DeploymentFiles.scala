@@ -75,7 +75,9 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
          |  control:
          |$control  coordination:
          |$coordination
-         |${retries.fold("")(budget => s"retries: { budget: $budget, first_backoff: 200ms, max_backoff: 1s }")}
+         |${retries.fold("")(budget =>
+          s"retries: { budget: $budget, first_backoff: 200ms, max_backoff: 1s }"
+        )}
          |spark:
          |  master: "local[2]"
          |  settings:

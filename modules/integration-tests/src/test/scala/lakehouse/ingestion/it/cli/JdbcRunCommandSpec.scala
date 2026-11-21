@@ -112,7 +112,9 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
   // 0: the example of the repository, as the README runs it
   // ---------------------------------------------------------------------------------------------
 
-  test("the example source runs as it is written: every row of the demo's table once, then only what changed") {
+  test(
+    "the example source runs as it is written: every row of the demo's table once, then only what changed"
+  ) {
     val now = Using.resource(ownerOfSales())(SalesOrders.databaseNow)
     val made = SalesOrders.create(() => ownerOfSales(), now.minusSeconds(120))
     val example = exampleSource("sales.orders")
@@ -211,7 +213,9 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
       )
     )
 
-  test("a source that cannot be reached before its batch is planned ends in 3, with nothing planned") {
+  test(
+    "a source that cannot be reached before its batch is planned ends in 3, with nothing planned"
+  ) {
     val server = proxied
     asOwner(() => server.observe("sales_owner", "sales"))(
       "CREATE TABLE unreached AS SELECT g AS id FROM generate_series(1, 10) g"
@@ -263,7 +267,11 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
     batchesOf(wide) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED")
     rowsWritten(wide) shouldBe Seq("5000", "5000")
     bronze(s"bronze/${wide.id.value.replace('.', '/')}")(
-      _.groupBy(EngineColumns.BatchSeq).count().collect().map(row => row.getLong(0) -> row.getLong(1)).toSet
+      _.groupBy(EngineColumns.BatchSeq)
+        .count()
+        .collect()
+        .map(row => row.getLong(0) -> row.getLong(1))
+        .toSet
     ) shouldBe Set(1L -> 5000L, 2L -> 5000L)
   }
 
@@ -274,7 +282,8 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
   test("a password that the source refuses ends in 4, with nothing planned and no password said") {
     asOwner(() => ownerOfSales())("CREATE TABLE guarded (id int)")
     val wrong = "not-the-password-5e2a"
-    val guarded = files.tableSource(newSourceId(), "public.guarded", toSales(password = Some(wrong)))
+    val guarded =
+      files.tableSource(newSourceId(), "public.guarded", toSales(password = Some(wrong)))
 
     val refused = launch(guarded)
 
