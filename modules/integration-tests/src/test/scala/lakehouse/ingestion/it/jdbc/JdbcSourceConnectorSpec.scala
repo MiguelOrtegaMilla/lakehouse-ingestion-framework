@@ -17,7 +17,12 @@ import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.PostgresJdbc
-import lakehouse.ingestion.engine.jdbc.{JdbcSourceConnector, SourceColumn, SourceDatabase}
+import lakehouse.ingestion.engine.jdbc.{
+  JdbcSourceConnector,
+  SecretRefConnectionProvider,
+  SourceColumn,
+  SourceDatabase
+}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CapturedLogs, LocalSparkSuite}
 import org.apache.logging.log4j.Level
 import org.apache.spark.sql.{DataFrame, Row}
@@ -301,7 +306,7 @@ final class JdbcSourceConnectorSpec
 
   test("every connection to a source has the settings of a session that a read stands on") {
     val config = source("public.many").connector.asInstanceOf[JdbcConnectorConfig]
-    val password = secretsOf(pg).resolve(config.connection.password).value
+    val resolver = SecretRefConnectionProvider.register(secretsOf(pg))
     def settings(options: Map[String, String]): Row =
       spark.read.format("jdbc").options(options).load().head()
 
@@ -318,7 +323,7 @@ final class JdbcSourceConnectorSpec
     // timeout (30 minutes, of a source), a backslash that is a backslash, no end to a session
     // that waits in its transaction, and transactions that write nothing.
     settings(
-      JdbcSourceConnector.options(config.connection, password, SessionSettings, fetch = 1)
+      JdbcSourceConnector.options(config.connection, resolver, SessionSettings, fetch = 1)
     ) shouldBe Row("on", "0", "30min", "UTC", "on")
   }
 
@@ -349,10 +354,10 @@ final class JdbcSourceConnectorSpec
     // The role ends a session that is idle in its transaction for a second, and cuts a
     // statement that runs for one: the read waits two between its fetches, and goes on.
     val config = source("public.many").connector.asInstanceOf[JdbcConnectorConfig]
-    val password = secretsOf(pg).resolve(config.connection.password).value
+    val resolver = SecretRefConnectionProvider.register(secretsOf(pg))
     val slow = spark.read
       .format("jdbc")
-      .options(JdbcSourceConnector.options(config.connection, password, "\"public\".\"many\"", 5))
+      .options(JdbcSourceConnector.options(config.connection, resolver, "\"public\".\"many\"", 5))
       .load()
 
     // Five rows a fetch, and each row taken slowly: two seconds between the two fetches.
@@ -942,11 +947,11 @@ final class JdbcSourceConnectorSpec
     untrusted.failure shouldBe FailureClass.Permanent
     // And Spark's own connections are opened the same way, and fail the same way.
     val config = other.connector.asInstanceOf[JdbcConnectorConfig]
-    val password = secretsOf(server).resolve(config.connection.password).value
+    val resolver = SecretRefConnectionProvider.register(secretsOf(server))
     val bySpark = intercept[Exception](
       spark.read
         .format("jdbc")
-        .options(JdbcSourceConnector.options(config.connection, password, "\"many\"", 1))
+        .options(JdbcSourceConnector.options(config.connection, resolver, "\"many\"", 1))
         .load()
     )
     by.failure(other, config, bySpark).value.failure shouldBe FailureClass.Permanent

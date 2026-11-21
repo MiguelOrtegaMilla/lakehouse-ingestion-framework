@@ -50,12 +50,19 @@ object CommandProcess {
    *
    * @param arguments those of the application, the command first
    * @param log the file that takes what the process prints, both streams in one
+   * @param jvm options of the JVM besides those that every process has, as system properties
    */
-  def start(arguments: Seq[String], log: Path, heap: String = Heap): CommandProcess = {
+  def start(
+      arguments: Seq[String],
+      log: Path,
+      heap: String = Heap,
+      jvm: Seq[String] = Nil
+  ): CommandProcess = {
     val command =
       Seq(Paths.get(sys.props("java.home"), "bin", "java").toString) ++
         JavaModuleOptions.defaultModuleOptionArray().toSeq ++
-        Seq(s"-Xmx$heap", "-Duser.timezone=UTC", "-cp", sys.props("java.class.path")) ++
+        Seq(s"-Xmx$heap", "-Duser.timezone=UTC") ++ jvm ++
+        Seq("-cp", sys.props("java.class.path")) ++
         Seq(Main.getClass.getName.stripSuffix("$")) ++
         arguments
     val builder = new ProcessBuilder(command.asJava)
