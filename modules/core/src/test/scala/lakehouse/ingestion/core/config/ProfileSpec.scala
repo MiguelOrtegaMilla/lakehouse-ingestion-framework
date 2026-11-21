@@ -371,6 +371,11 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
         "engine: the rows that a run wrote are read from the commits of its batch, which " +
         "Delta counts them in only while this is on"
     )
+    settings("spark.sql.session.timeZone") shouldBe Seq(
+      s"$File: spark.settings.spark.sql.session.timeZone is set by the engine: every session " +
+        "of a run is in UTC, as its JVM is, so that a time means the same to the engine, to " +
+        "Spark and to a source"
+    )
     settings("spark.delta.logstore.class") shouldBe Seq(
       s"$File: spark.settings.spark.delta.logstore.class is set by the engine: which " +
         "LogStore commits to a table is not a setting of a profile (ADR-0004)"

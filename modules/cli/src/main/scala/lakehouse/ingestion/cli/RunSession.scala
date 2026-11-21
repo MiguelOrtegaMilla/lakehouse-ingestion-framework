@@ -1,6 +1,10 @@
 package lakehouse.ingestion.cli
 
+import java.time.{ZoneId, ZoneOffset}
+import java.util.TimeZone
+
 import scala.collection.immutable.SortedMap
+import scala.util.control.NonFatal
 
 import lakehouse.ingestion.core.config.{Profile, SourceId}
 import lakehouse.ingestion.engine.control.LogStoreSettings
@@ -16,6 +20,7 @@ import org.apache.spark.sql.delta.DeltaLog
  *  - Delta's extension and catalog;
  *  - the metrics of a commit recorded by Delta, which is where the engine reads the rows that
  *    a batch wrote;
+ *  - UTC as the time zone of the session, which is that of the JVM as well (`jvmToUtc`);
  *  - `PostgresLogStore` for the scheme of the lake, so that every commit to a table of the lake
  *    is coordinated (ADR-0004);
  *  - the settings of the LogStore, made from `databases.coordination`, under `spark.hadoop.`:
@@ -23,6 +28,38 @@ import org.apache.spark.sql.delta.DeltaLog
  *    and in the tasks.
  */
 object RunSession {
+
+  /** The time zone that everything of a run is in (discovery §4, §17). */
+  val Zone = "UTC"
+
+  /**
+   * Sets the time zone of the JVM to UTC, before anything of a run is opened: a connection to
+   * a database takes the zone of the JVM when it is made, and Spark writes and reads a time
+   * with no zone in it (pinned by `SparkJdbcContractSpec`). A process that is started in
+   * another zone, as a machine has it, is then in the one zone that a run is correct in.
+   *
+   * It is for the JVM of the command. Where the tasks of Spark run in a JVM of their own, on
+   * another machine, that JVM is whoever starts it's to set (E1).
+   *
+   * @param set what sets the zone of the JVM: `TimeZone.setDefault`, outside tests
+   * @return why the JVM is not in UTC, if it could not be set so
+   */
+  def jvmToUtc(set: TimeZone => Unit = TimeZone.setDefault): Either[String, Unit] = {
+    val refused =
+      try {
+        set(TimeZone.getTimeZone(Zone))
+        None
+      } catch { case NonFatal(failure) => Some(failure) }
+    val now = ZoneId.systemDefault()
+    Either.cond(
+      now.getRules == ZoneOffset.UTC.getRules,
+      (),
+      s"the time zone of the JVM is ${now.getId}, and could not be set to $Zone" +
+        refused.fold("")(failure => s" (${failure.getMessage})") +
+        ". A time with no zone would mean one thing to the engine and another to a source, " +
+        s"and rows would be read twice, or not at all. Start the JVM with -Duser.timezone=$Zone"
+    )
+  }
 
   /** What a session is called: the application, and the source that it runs. */
   def appName(source: SourceId): String = s"lakehouse-ingestion ${source.value}"
@@ -40,6 +77,7 @@ object RunSession {
       Profile.EngineSpark.Extensions -> "io.delta.sql.DeltaSparkSessionExtension",
       Profile.EngineSpark.Catalog -> "org.apache.spark.sql.delta.catalog.DeltaCatalog",
       Profile.EngineSpark.CommitMetrics -> "true",
+      Profile.EngineSpark.SessionTimeZone -> Zone,
       StartupGuard.logStoreKey(scheme) -> classOf[PostgresLogStore].getName
     ) ++ LogStoreSettings.hadoop(profile.databases.coordination).map { case (key, value) =>
       s"spark.hadoop.$key" -> value

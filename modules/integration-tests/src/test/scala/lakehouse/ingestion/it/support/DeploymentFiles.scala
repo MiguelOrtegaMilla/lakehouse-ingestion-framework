@@ -79,7 +79,6 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
          |    spark.sql.shuffle.partitions: 2
          |    spark.default.parallelism: 2
          |    spark.databricks.delta.snapshotPartitions: 2
-         |    spark.sql.session.timeZone: UTC
          |    spark.driver.host: 127.0.0.1
          |    spark.driver.bindAddress: 127.0.0.1
          |    spark.sql.warehouse.dir: "${work.resolve("warehouse")}"
@@ -124,6 +123,31 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
   }
 
   /** The directory of a source in the landing zone. */
+  /**
+   * A source that reads a table of a database whole, written among the sources of the
+   * deployment.
+   *
+   * @param connection how its database is reached (`connection`)
+   */
+  def tableSource(id: SourceId, table: String, connection: String): Source = {
+    val text =
+      s"""id: $id
+         |connector:
+         |  type: jdbc
+         |  connection:
+         |${connection.linesIterator.map("  " + _).mkString("\n")}
+         |  table: $table
+         |load: { mode: full }
+         |targets: { bronze: { table: bronze/${id.value.replace('.', '/')} } }
+         |""".stripMargin
+    Files.write(sources.resolve(s"$id.yaml"), text.getBytes(UTF_8))
+    Source.load(s"$id.yaml", text) match {
+      case Right(Loaded(source, _)) => source
+      case Left(errors) =>
+        throw new IllegalStateException(errors.toChain.toList.map(_.message).mkString("; "))
+    }
+  }
+
   def directoryOf(source: SourceId): Path = landing.resolve(source.value.replace('.', '_'))
 
   /** A file of the source, last changed an hour ago: complete for a run that starts now. */

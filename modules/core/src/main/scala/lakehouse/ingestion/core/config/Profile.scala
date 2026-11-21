@@ -251,6 +251,15 @@ object Profile {
      * that is read as it is written there is no other count (discovery §15).
      */
     val CommitMetrics = "spark.databricks.delta.history.metricsEnabled"
+
+    /**
+     * The time zone of a session, which is UTC in every session of the engine, as the JVM of a
+     * run is (discovery §17, P6). Spark writes a bound of a batch into the statement of a
+     * source as a time with no zone, in the zone of the JVM or of the session, and the source
+     * reads it in the zone of its connection, which the driver sets to the JVM's: written in
+     * one zone and read in another, a bound is off by their difference.
+     */
+    val SessionTimeZone = "spark.sql.session.timeZone"
   }
 
   /**
@@ -291,6 +300,11 @@ object Profile {
       )
     else if (is(EngineSpark.AppName))
       Some("is set by the engine: a session is named after the source that it runs")
+    else if (is(EngineSpark.SessionTimeZone))
+      Some(
+        "is set by the engine: every session of a run is in UTC, as its JVM is, so that a " +
+          "time means the same to the engine, to Spark and to a source"
+      )
     else if (is(EngineSpark.CommitMetrics))
       Some(
         "is set by the engine: the rows that a run wrote are read from the commits of its " +

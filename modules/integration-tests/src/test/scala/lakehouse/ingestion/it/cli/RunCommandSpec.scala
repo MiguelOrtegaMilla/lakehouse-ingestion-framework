@@ -2,18 +2,20 @@ package lakehouse.ingestion.it.cli
 
 import java.net.ServerSocket
 import java.nio.file.{Files, Path}
+import java.time.Instant
+import java.util.TimeZone
 
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
-import lakehouse.ingestion.cli.Main
+import lakehouse.ingestion.cli.{Main, RunSession}
 import lakehouse.ingestion.core.config.{Profile, Source}
 import lakehouse.ingestion.core.control.LeaseTiming
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.{CommandProcess, DeploymentFiles}
+import lakehouse.ingestion.it.support.{CommandProcess, DeploymentFiles, LocalSparkSuite}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -116,6 +118,59 @@ final class RunCommandSpec extends AnyFunSuite with Matchers with ControlPlaneSu
     commitsOf(returns) shouldBe Seq("00000000000000000000.json")
     runsOf(returns) shouldBe Seq("SUCCEEDED" -> None, "SUCCEEDED" -> None)
     rowsWritten(returns) shouldBe Seq("2", "0")
+  }
+
+  test("a run takes a table of a database to Bronze, in UTC whatever zone its JVM started in") {
+    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+      Using.resource(c.createStatement()) { statement =>
+        statement.execute("CREATE TABLE visits (id int, seen timestamp, seen_at timestamptz)")
+        // Half past two of the night that the clocks of Madrid go back: an hour that is twice.
+        statement.execute(
+          "INSERT INTO visits VALUES (1, '2026-10-25 02:30:00', '2026-10-25 02:30:00+02')"
+        ): Unit
+      }
+    }
+    val visits = files.tableSource(
+      newSourceId(),
+      "public.visits",
+      connection("sales_ro", pg.password("sales_ro"), url = pg.jdbcUrl("sales"))
+    )
+    val started = TimeZone.getDefault
+    TimeZone.setDefault(TimeZone.getTimeZone("Europe/Madrid"))
+
+    val (ran, zone) =
+      try {
+        val ran = launch(visits)
+        (ran, TimeZone.getDefault.getID)
+      } finally TimeZone.setDefault(started)
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    ran.out should include(s"of ${visits.id.value} committed the batch")
+    ran.out should include("1 rows read, 1 written, 0 rejected")
+    said(ran) shouldBe empty
+    // The command set the JVM to UTC before it connected to anything.
+    zone shouldBe "UTC"
+    batchesOf(visits) shouldBe Seq("1" -> "COMMITTED")
+    rowsWritten(visits) shouldBe Seq("1")
+
+    // A time without a zone is taken as UTC, and one with its zone is the moment that it is.
+    val read = LocalSparkSuite
+      .baseConf(Files.createTempDirectory("run-command-read-"), "run-command-read")
+      .foldLeft(SparkSession.builder()) { case (builder, (key, value)) =>
+        builder.config(key, value)
+      }
+      .getOrCreate()
+    val row =
+      try
+        read.read
+          .format("delta")
+          .load(files.lake.resolve(s"bronze/${visits.id.value.replace('.', '/')}").toUri.toString)
+          .head()
+      finally RunSession.close(read)
+    row.getTimestamp(row.fieldIndex("seen")).toInstant shouldBe
+      Instant.parse("2026-10-25T02:30:00Z")
+    row.getTimestamp(row.fieldIndex("seen_at")).toInstant shouldBe
+      Instant.parse("2026-10-25T00:30:00Z")
   }
 
   test("a run of a source whose lease another run holds ends in 2, and does nothing") {
