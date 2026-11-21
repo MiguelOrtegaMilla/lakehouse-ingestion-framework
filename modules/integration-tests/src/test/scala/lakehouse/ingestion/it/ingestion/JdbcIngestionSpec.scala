@@ -572,6 +572,48 @@ final class JdbcIngestionSpec
     snapshots(twice) shouldBe Seq((1, "a", 1L), (2, "b", 1L), (2, "b", 2L), (3, "c", 2L))
   }
 
+  test("a time without a zone that is stamped behind UTC is read by the first batch alone") {
+    // Pinned as it is (ADR-0020, point 1): a timestamp without a zone is taken as UTC, and
+    // the bounds of a batch are moments of the clock of the source. A table whose writers
+    // stamp it in a zone behind UTC has every new row hours before the watermark by the time
+    // it is written. The connector warns of such a column at every plan, and cannot tell
+    // whose time is in it.
+    asOwner(
+      _("CREATE TABLE local_times (id int PRIMARY KEY, name text, updated_at timestamp NOT NULL)")
+    )
+    // As an application whose session is in New York stamps a row with now().
+    def stampedThere(id: Int, name: String): Unit =
+      asOwner(
+        _(
+          s"INSERT INTO local_times VALUES ($id, '$name', now() AT TIME ZONE 'America/New_York')"
+        )
+      )
+    stampedThere(1, "a")
+    val there = watermarkSource("public.local_times", watermark = "safety_margin: 1s")
+
+    // The first batch has no lower bound, and the row is hours before its upper one.
+    ingested(launch(there, reading())).batch shouldBe batchId(there, 1)
+    snapshots(there) shouldBe Seq((1, "a", 1L))
+    val reached = watermarkOf(there).value
+
+    stampedThere(2, "b")
+    eventually(clockOfTheSource().isAfter(reached.plusSeconds(2)) shouldBe true)
+    val second = ingested(launch(there, reading()))
+
+    // A window that the source has no row in: the row is behind it, and stays there.
+    windowOf(second.batch).lower shouldBe Some(reached)
+    second.counts.rowsRead shouldBe Some(0)
+    snapshots(there) shouldBe Seq((1, "a", 1L))
+    val stamp = Using.resource(pg.connect("sales_owner", "sales")) { c =>
+      Using.resource(c.createStatement()) { statement =>
+        val rows = statement.executeQuery("SELECT updated_at FROM local_times WHERE id = 2")
+        rows.next()
+        rows.getObject(1, classOf[java.time.LocalDateTime]).toInstant(ZoneOffset.UTC)
+      }
+    }
+    stamp.isBefore(reached) shouldBe true
+  }
+
   test("a source that is to start later has nothing new, and its run ends well") {
     changesTable("not_yet")
     stamped("not_yet", 1, "a", Instant.parse("2026-01-01T00:00:00Z"))

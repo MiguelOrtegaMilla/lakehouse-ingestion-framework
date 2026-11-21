@@ -108,8 +108,8 @@ final class BronzeTypesSpec extends AnyFunSuite with Matchers with EitherValues 
   )
 
   test("a watermark is a timestamp that the table has, under the name that it has it") {
-    WatermarkColumn.check(orders, "updated_at").value shouldBe None
-    WatermarkColumn.check(orders, "created").value shouldBe None
+    WatermarkColumn.check(orders, "updated_at").value shouldBe empty
+    WatermarkColumn.check(orders, "created").isRight shouldBe true
     WatermarkColumn.check(orders, "modified_at").left.value shouldBe
       "has no column modified_at (load.watermark.column). Its columns are id, updated_at, " +
       "created, touched_at, day, Updated_At"
@@ -124,9 +124,24 @@ final class BronzeTypesSpec extends AnyFunSuite with Matchers with EitherValues 
   }
 
   test("a watermark that may be null is warned of, and is not refused") {
-    WatermarkColumn.check(orders, "touched_at").value.value should startWith(
+    val warnings = WatermarkColumn.check(orders, "touched_at").value
+    warnings should have size 1
+    warnings.head should startWith(
       "the column touched_at (load.watermark.column) may be null, and a row with no value " +
         "in it is in no batch"
     )
+  }
+
+  test("a watermark that is a timestamp without a zone is warned of, and is not refused") {
+    WatermarkColumn.check(orders, "created").value shouldBe Seq(
+      "the column created (load.watermark.column) is a timestamp without a zone, and is " +
+        "taken as UTC. If the writers of the table stamp it in another zone, a row is read " +
+        "late where that zone is ahead of UTC, by the difference, and is never ingested " +
+        "where it is behind: its time is before the watermark already when it is written. " +
+        "A timestamptz has no such doubt (ADR-0020)"
+    )
+    // One that may be null as well is warned of for both.
+    val both = orders :+ SourceColumn("seen", "timestamp", 29, 6, nullable = true)
+    WatermarkColumn.check(both, "seen").value should have size 2
   }
 }
