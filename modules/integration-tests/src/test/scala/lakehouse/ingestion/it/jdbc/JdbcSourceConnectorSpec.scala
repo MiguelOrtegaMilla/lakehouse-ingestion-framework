@@ -2,7 +2,9 @@ package lakehouse.ingestion.it.jdbc
 
 import java.net.ServerSocket
 import java.sql.{Connection, Date, Timestamp}
-import java.time.Instant
+import java.time.temporal.ChronoUnit
+import java.time.{Instant, OffsetDateTime}
+import java.util.TimeZone
 
 import scala.util.Using
 
@@ -11,12 +13,13 @@ import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.LandedFile
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
+import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.jdbc.{JdbcSourceConnector, SourceColumn, SourceDatabase}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CapturedLogs, LocalSparkSuite}
 import org.apache.logging.log4j.Level
-import org.apache.spark.sql.Row
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.types._
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
@@ -523,12 +526,7 @@ final class JdbcSourceConnectorSpec
         "public.orders",
         load = s"{ mode: incremental, watermark: { column: $column, safety_margin: 1m } }"
       )
-      val (_, logged) = CapturedLogs.of(classOf[JdbcSourceConnector]) {
-        // What reads a window is not built yet: the plan ends there, after what it asks.
-        intercept[RunFailedException](plan(incremental)).getMessage should include(
-          "is loaded by a watermark, and this version of the connector reads a table whole"
-        )
-      }
+      val (_, logged) = CapturedLogs.of(classOf[JdbcSourceConnector])(plan(incremental))
       logged.filter(_.level == Level.WARN)
     }
 
@@ -539,6 +537,277 @@ final class JdbcSourceConnectorSpec
     )
     // One that the table says is never null has nothing to be warned of.
     planOf("updated_at") shouldBe empty
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A load by a watermark: the window of a plan, and what it reads
+  // ---------------------------------------------------------------------------------------------
+
+  /** A source that is loaded by a watermark, an hour behind the clock of its source. */
+  private def byWatermark(
+      table: String = "public.changes",
+      column: String = "updated_at",
+      more: String = ""
+  ): Source =
+    source(
+      table,
+      load = s"{ mode: incremental, watermark: { column: $column, safety_margin: 1h }$more }"
+    )
+
+  /** The plan of a window, as a run would have written it down. */
+  private def windowOf(column: String, lower: Option[Instant], upper: Instant = Upper): Json =
+    WatermarkPlan(SqlIdentifier.parse(column).value, lower, upper, horizon = upper).toJson
+
+  private def windowRead(of: Source, window: Json): ReadResult.OnePass =
+    bound(of).read(window, ReadContext(spark)) match {
+      case once: ReadResult.OnePass => once
+      case other => fail(s"the rows of a window are read as they are gone over, and not $other")
+    }
+
+  private def idsOf(rows: DataFrame): Seq[Int] =
+    rows.select("id").collect().map(_.getInt(0)).sorted.toSeq
+
+  /** What the source says the time is, asked by the test. */
+  private def clockOfTheSource(): Instant =
+    Using.resource(pg.connect("sales_owner", "sales")) { c =>
+      Using.resource(c.createStatement()) { statement =>
+        val rows = statement.executeQuery("SELECT CURRENT_TIMESTAMP")
+        rows.next()
+        rows.getObject(1, classOf[OffsetDateTime]).toInstant
+      }
+    }
+
+  /** The statement that asked the source for the rows of `table`, after `mark`. */
+  private def rowsStatement(mark: Int, table: String): Logged =
+    statementsSince(mark)
+      .filter(_.sql.contains(s""""public"."$table""""))
+      .filterNot(_.sql.contains("WHERE 1=0"))
+      .lastOption
+      .getOrElse(throw new AssertionError(s"no statement asked for the rows of $table"))
+
+  test("the plan of a watermark is a window of the clock of the source, and not the engine's") {
+    val changes = byWatermark()
+    // The clock of the engine is years from that of the source: it bounds nothing.
+    val context = planContext.copy(now = Instant.parse("2001-01-01T00:00:00Z"))
+    val mark = logMark()
+    val before = clockOfTheSource()
+
+    val planned = WatermarkPlan.fromJson(bound(changes).plan(context).value).value
+
+    val after = clockOfTheSource()
+    planned.column.value shouldBe "updated_at"
+    // The first batch of a source with no start: the table, up to the horizon.
+    planned.lower shouldBe None
+    planned.upper shouldBe planned.horizon
+    planned.more shouldBe false
+    // The horizon is what the source said, less the margin. The two looks of the test are
+    // around it, by a clock that this machine steps by most of a second.
+    val said = planned.horizon.plus(1, ChronoUnit.HOURS)
+    withClue(s"the source said $said, between $before and $after: ") {
+      said.isBefore(before.minusSeconds(5)) shouldBe false
+      said.isAfter(after.plusSeconds(5)) shouldBe false
+    }
+    // Asked with a constant statement, after the columns of the table.
+    eventually {
+      everyStatementSince(mark).filterNot(sql =>
+        sql.contains("pg_catalog.") || sql.startsWith("SET ")
+      ) shouldBe Seq("""SELECT * FROM "public"."changes" WHERE 1=0""", "SELECT CURRENT_TIMESTAMP")
+    }
+
+    // What the commit of the plan records is its upper bound, said with nothing asked.
+    val quiet = logMark()
+    bound(changes).progress(planned.toJson) shouldBe
+      Progress(watermark = Some(StoredWatermark(planned.upper).toJson), files = None)
+    Thread.sleep(300)
+    everyStatementSince(quiet) shouldBe empty
+  }
+
+  test("the next window starts from the watermark that the engine gives, as the load says") {
+    val changes = byWatermark(more = ", max_batch_range: 1d")
+    val reached = Instant.parse("2026-11-01T10:00:00Z")
+    val context = planContext.copy(watermark = Some(StoredWatermark(reached).toJson))
+
+    val planned = WatermarkPlan.fromJson(bound(changes).plan(context).value).value
+
+    planned.lower shouldBe Some(reached)
+    // Cut by the range, counted from the watermark: the source is weeks behind its clock.
+    planned.upper shouldBe Instant.parse("2026-11-02T10:00:00Z")
+    planned.more shouldBe true
+  }
+
+  test("a window is read by its bounds, which reach the source as predicates of its statement") {
+    val changes = byWatermark()
+    val mark = logMark()
+
+    val read = windowRead(changes, windowOf("updated_at", Some(Lower)))
+
+    // The row at the lower bound is not in the window, the one a microsecond after it is, and
+    // so is the one at the upper bound: `(lower, upper]`, to the microsecond.
+    idsOf(read.rows) shouldBe Seq(3, 4)
+    eventually {
+      val rows = rowsStatement(mark, "changes")
+      rows.kind shouldBe "portal"
+      rows.sql should endWith(
+        """ WHERE ("updated_at" IS NOT NULL) AND ("updated_at" > '2026-11-01 10:00:00.123456') """ +
+          """AND ("updated_at" <= '2026-11-01 11:00:00.0')"""
+      )
+    }
+
+    // The first row is asked for with the same bounds.
+    val asked = logMark()
+    read.probe.head(1) should have length 1
+    eventually {
+      rowsStatement(asked, "changes").sql should endWith(
+        """("updated_at" > '2026-11-01 10:00:00.123456') AND ("updated_at" <= '2026-11-01 11:00:00.0')"""
+      )
+    }
+  }
+
+  test("a first window has no lower bound, and a row with no watermark is in no window") {
+    // A timestamp without a zone, which is taken as UTC, and may be null.
+    val touched = byWatermark(column = "touched_at")
+    val mark = logMark()
+
+    // Every row up to the upper bound, but the one whose watermark is null.
+    idsOf(windowRead(touched, windowOf("touched_at", lower = None)).rows) shouldBe Seq(1, 2, 3, 4)
+    eventually {
+      rowsStatement(mark, "changes").sql should endWith(
+        """ WHERE ("touched_at" IS NOT NULL) AND ("touched_at" <= '2026-11-01 11:00:00.0')"""
+      )
+    }
+    // And its bounds are as exact as those of a timestamp with a zone.
+    idsOf(windowRead(touched, windowOf("touched_at", Some(Lower))).rows) shouldBe Seq(3, 4)
+    idsOf(
+      windowRead(touched, windowOf("touched_at", Some(Upper), Upper.plusSeconds(60))).rows
+    ) shouldBe Seq(5)
+  }
+
+  test("a row whose watermark is infinity is in no window, and -infinity fails the first one") {
+    val ever = byWatermark(table = "public.ever")
+
+    // Neither is a time between two bounds.
+    idsOf(windowRead(ever, windowOf("updated_at", Some(Lower))).rows) shouldBe Seq(1)
+    // No upper bound is after infinity, however late: such a row is never ingested.
+    val late = Instant.parse("9999-12-31T23:59:59.999999Z")
+    idsOf(windowRead(ever, windowOf("updated_at", Some(Lower), late)).rows) shouldBe Seq(1)
+
+    // A window with no lower bound has the row at -infinity, which Bronze cannot keep.
+    val refused = failureOf(ever)(
+      idsOf(windowRead(ever, windowOf("updated_at", lower = None)).rows)
+    )
+    refused.failure shouldBe FailureClass.Permanent
+    refused.getMessage shouldBe
+      s"the column updated_at of the table public.ever of ${where(ever)} has -infinity in a " +
+      "row of the batch, and it is the watermark of the source (load.watermark.column): the " +
+      "row was changed at no time that a batch is bounded by, and Spark would write it to " +
+      "Bronze as another date. Nothing of the batch was written. A watermark is read as the " +
+      "timestamp that it is, and never as text: give the row a time at its source, or have " +
+      "the source start after it (load.watermark.start), since a window that has a lower " +
+      "bound holds no -infinity"
+  }
+
+  test("a plan is read under the load, and the watermark column, that it was planned under") {
+    val whole = source("public.changes")
+    val changes = byWatermark()
+    val snapshot = plan(whole)
+    val window = windowOf("updated_at", Some(Lower))
+    val asked: Seq[(BoundSource, Json) => Any] =
+      Seq(_.read(_, ReadContext(spark)), _.progress(_))
+
+    asked.foreach { ask =>
+      // A snapshot of the table is not read as a window, nor a window as a snapshot.
+      val asAWindow = intercept[RunFailedException](ask(bound(changes), snapshot))
+      asAWindow.failure shouldBe FailureClass.Permanent
+      asAWindow.getMessage shouldBe
+        "the batch of test.read was planned as a snapshot of its table (load.mode: full), " +
+        "and the source has load.mode: incremental now. A plan is read under the load that " +
+        "it was planned under, and nothing was read. Give the source the load that it had, " +
+        "run it, and change its load once the batch is committed"
+      val asASnapshot = intercept[RunFailedException](ask(bound(whole), window))
+      asASnapshot.failure shouldBe FailureClass.Permanent
+      asASnapshot.getMessage should startWith(
+        "the batch of test.read was planned as a window of a watermark (load.mode: " +
+          "incremental), and the source has load.mode: full now"
+      )
+
+      // A window of one column says nothing of another.
+      val ofAnother =
+        intercept[RunFailedException](ask(bound(byWatermark(column = "touched_at")), window))
+      ofAnother.failure shouldBe FailureClass.Permanent
+      ofAnother.getMessage shouldBe
+        "the batch of test.read was planned as a window of the column updated_at " +
+        "(load.watermark.column), and the configuration of the source has touched_at now. A " +
+        "plan is read as it was written, and nothing was read. Give the source the watermark " +
+        "column that it had and run it again"
+
+      // And a document of no form of this connector is of no load.
+      val ofNone = intercept[RunFailedException](
+        ask(bound(changes), Json.obj("version" -> Json.fromInt(1)))
+      )
+      ofNone.getMessage should startWith(
+        "the plan of the batch of test.read is not one that the JDBC connector reads, and " +
+          "nothing was read: it has no column"
+      )
+    }
+  }
+
+  test("a clock of the source that is behind its watermark plans nothing, and is warned of") {
+    val changes = byWatermark()
+    def planned(watermark: Instant): (Option[Json], Seq[String]) = {
+      val context = planContext.copy(watermark = Some(StoredWatermark(watermark).toJson))
+      val (plan, logged) =
+        CapturedLogs.of(classOf[JdbcSourceConnector])(bound(changes).plan(context))
+      (plan, logged.filter(_.level == Level.WARN).map(_.message))
+    }
+
+    // As if the clock had gone back by a day: the watermark is a day after it.
+    val ahead = clockOfTheSource().plus(1, ChronoUnit.DAYS)
+    val (none, warnings) = planned(ahead)
+    none shouldBe None
+    warnings should have size 1
+    warnings.head should startWith("test.read: the clock of its source says ")
+    warnings.head should include(s", which is before the watermark of the source, $ahead. ")
+    warnings.head should include("No batch is planned until it has passed the watermark by ")
+
+    // A source that is read up to its horizon has nothing new, and nothing to be warned of:
+    // its watermark is behind the clock, by less than the margin.
+    planned(clockOfTheSource().minus(30, ChronoUnit.MINUTES)) shouldBe (None -> Nil)
+  }
+
+  test("a window is read only where the JVM and the session of Spark are in UTC") {
+    val changes = byWatermark()
+    val window = windowOf("updated_at", Some(Lower))
+    val mark = logMark()
+    def refusal(): String = {
+      val refused = intercept[RunFailedException](bound(changes).read(window, ReadContext(spark)))
+      refused.failure shouldBe FailureClass.Permanent
+      refused.getMessage
+    }
+
+    val zoneOfTheJvm = TimeZone.getDefault
+    val inMadrid =
+      try {
+        TimeZone.setDefault(TimeZone.getTimeZone("Europe/Madrid"))
+        refusal()
+      } finally TimeZone.setDefault(zoneOfTheJvm)
+    inMadrid should startWith(
+      "test.read is loaded by a watermark, and the JVM is in Europe/Madrid, which is not UTC. "
+    )
+    inMadrid should include("Nothing was read")
+
+    val sessionInMadrid =
+      try {
+        spark.conf.set("spark.sql.session.timeZone", "Europe/Madrid")
+        refusal()
+      } finally spark.conf.set("spark.sql.session.timeZone", "UTC")
+    sessionInMadrid should startWith(
+      "test.read is loaded by a watermark, and the session of Spark is in Europe/Madrid " +
+        "(spark.sql.session.timeZone), which is not UTC. "
+    )
+
+    // The source was asked nothing, and in UTC the window is read.
+    everyStatementSince(mark) shouldBe empty
+    idsOf(windowRead(changes, window).rows) shouldBe Seq(3, 4)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -678,6 +947,14 @@ final class JdbcSourceConnectorSpec
       .filter(_.sql.contains(" FROM "))
       .toSeq
 
+  /** Every statement of `sales_ro` that the server logged after `mark`, as it was written. */
+  private def everyStatementSince(mark: Int): Seq[String] =
+    pg.serverLog()
+      .substring(mark)
+      .linesIterator
+      .collect { case Statement(_, sql) => sql.trim }
+      .toSeq
+
   private def execute(c: Connection, sql: String): Unit =
     Using.resource(c.createStatement())(_.execute(sql): Unit)
 }
@@ -689,6 +966,10 @@ object JdbcSourceConnectorSpec {
 
   /** A statement as the server logs it when it starts: run whole, or as a portal. */
   private val Statement = """^\S+ \S+ \S+ \[\d+\] LOG:  (execute [^:]+): (.*)$""".r
+
+  /** The bounds of the window that the tests of a watermark read of `changes`. */
+  private val Lower = Instant.parse("2026-11-01T10:00:00.123456Z")
+  private val Upper = Instant.parse("2026-11-01T11:00:00Z")
 
   implicit final private class LoneOrFail(statements: Seq[String]) {
     def loneOrFail: String = statements match {
@@ -786,6 +1067,20 @@ object JdbcSourceConnectorSpec {
     """CREATE TABLE alike (id int, "Total" int, total int)""",
     """CREATE TABLE orders (id int NOT NULL, updated_at timestamptz NOT NULL, created_on date,
       |touched_at timestamptz)""".stripMargin,
+    // A row at each side of each bound of the window `(Lower, Upper]`, to the microsecond, with
+    // the same time in a timestamp without a zone; and one whose such timestamp is null.
+    """CREATE TABLE changes (id int NOT NULL, updated_at timestamptz NOT NULL,
+      |touched_at timestamp, valid_to date)""".stripMargin,
+    """INSERT INTO changes VALUES
+      |(1, '2026-11-01 10:00:00.123455+00', '2026-11-01 10:00:00.123455', '2027-01-01'),
+      |(2, '2026-11-01 10:00:00.123456+00', '2026-11-01 10:00:00.123456', '2027-01-01'),
+      |(3, '2026-11-01 10:00:00.123457+00', '2026-11-01 10:00:00.123457', '2027-01-01'),
+      |(4, '2026-11-01 11:00:00+00', '2026-11-01 11:00:00', '2027-01-01'),
+      |(5, '2026-11-01 11:00:00.000001+00', '2026-11-01 11:00:00.000001', '2027-01-01'),
+      |(6, '2026-11-01 11:00:00.000001+00', NULL, '2027-01-01')""".stripMargin,
+    "CREATE TABLE ever (id int NOT NULL, updated_at timestamptz NOT NULL)",
+    """INSERT INTO ever VALUES (1, '2026-11-01 10:30:00+00'), (2, 'infinity'),
+      |(3, '-infinity')""".stripMargin,
     "CREATE TABLE kept_from_the_reader (id int)",
     "REVOKE ALL ON kept_from_the_reader FROM sales_ro"
   )
