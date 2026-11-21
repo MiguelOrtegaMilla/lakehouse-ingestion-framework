@@ -7,10 +7,19 @@ import java.nio.file.{Files, Path, Paths}
 import java.io.IOException
 import java.sql.SQLException
 import java.time.Instant
+import java.util.TimeZone
 
-import lakehouse.ingestion.core.config.{ConfigLoader, Profile, SourceId}
+import lakehouse.ingestion.core.config.{
+  ConfigLoader,
+  ConnectorKind,
+  Profile,
+  SecretResolver,
+  SourceId
+}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.IngestionService.Outcome
+import lakehouse.ingestion.engine.connector.ConnectorRegistry
+import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.logstore.coordination.CoordinationSettings
 import lakehouse.ingestion.logstore.{
   FaultHooks,
@@ -428,15 +437,42 @@ final class MainSpec
     SparkSession.getDefaultSession shouldBe empty
   }
 
-  test("run: a source that this version has no connector for ends in 4, before any database") {
-    val ran = runOf(runProfile("jdbc"), runSources("jdbc"), "sales.orders")
+  test("run: the application has a connector for every kind of source that it reads") {
+    val loaded = ConfigLoader.load(runProfile("kinds"), runSources("kinds")).value.value
+    val profile = loaded.profile
+    val registry = RunCommand.connectors(profile, SecretResolver(_ => None))
 
-    ran.exit shouldBe Main.Exit.Permanent
-    ran.errors shouldBe Seq(
-      "error: the source sales.orders is of kind 'jdbc', and this version of the application " +
-        "has no connector for it: it has 'file'",
-      "Nothing was run."
-    )
+    registry.kinds.map(_.name).toSet shouldBe ConnectorKind.BuiltIn.map(_.name).toSet
+    loaded.sources.foreach(RunCommand.withoutConnector(_, registry) shouldBe None)
+    // One that was put together with a kind left out says so of a source of that kind.
+    val orders = loaded.sources.find(_.id.value == "sales.orders").value
+    val filesOnly = ConnectorRegistry(new FileSourceConnector(new Landing(profile.landing.root)))
+    RunCommand.withoutConnector(orders, filesOnly).value shouldBe
+      "the source sales.orders is of kind 'jdbc', and this version of the application has no " +
+      "connector for it: it has 'file'"
+  }
+
+  test("run: the JVM is set to UTC, and one that cannot be set so is refused") {
+    val before = TimeZone.getDefault
+    try {
+      TimeZone.setDefault(TimeZone.getTimeZone("Europe/Madrid"))
+      // A JVM that does not take the zone, as one would not that has a rule against it.
+      RunSession.jvmToUtc(set = _ => ()).left.value shouldBe
+        "the time zone of the JVM is Europe/Madrid, and could not be set to UTC. A time with " +
+        "no zone would mean one thing to the engine and another to a source, and rows would " +
+        "be read twice, or not at all. Start the JVM with -Duser.timezone=UTC"
+      RunSession
+        .jvmToUtc(set = _ => throw new SecurityException("setDefault is not allowed"))
+        .left
+        .value should include("could not be set to UTC (setDefault is not allowed). A time")
+      TimeZone.getDefault.getID shouldBe "Europe/Madrid"
+
+      RunSession.jvmToUtc() shouldBe Right(())
+      TimeZone.getDefault.getID shouldBe "UTC"
+      java.time.ZoneId.systemDefault().getId shouldBe "UTC"
+      // A JVM that is in UTC already is left as it is.
+      RunSession.jvmToUtc(set = _ => ()) shouldBe Right(())
+    } finally TimeZone.setDefault(before)
   }
 
   test("run: roots that are not there end in 4, each said, before any database") {
@@ -518,6 +554,7 @@ final class MainSpec
     engine("spark.sql.catalog.spark_catalog") shouldBe
       "org.apache.spark.sql.delta.catalog.DeltaCatalog"
     engine("spark.databricks.delta.history.metricsEnabled") shouldBe "true"
+    engine("spark.sql.session.timeZone") shouldBe "UTC"
     engine(StartupGuard.logStoreKey("file")) shouldBe classOf[PostgresLogStore].getName
     engine(s"spark.hadoop.${CoordinationSettings.User}") shouldBe "ingest_coordination"
     engine(s"spark.hadoop.${CoordinationSettings.PasswordRef}") shouldBe

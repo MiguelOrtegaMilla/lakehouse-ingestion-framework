@@ -11,6 +11,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.control.{ControlDatabase, DatabaseFailure}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
+import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
 import lakehouse.ingestion.logstore.{StartupGuard, StartupRefusedException}
 import org.apache.hadoop.fs.{Path => HadoopPath}
 import org.apache.spark.sql.SparkSession
@@ -27,6 +28,8 @@ import org.apache.spark.sql.SparkSession
  *  1. a connector for its kind in this application (4);
  *  1. the roots of the lake and of the landing zone, which must be there: the engine makes
  *     neither, since a root that is missing is more often a disk that is not mounted (4);
+ *  1. the time zone of the JVM, which is set to UTC before a database is connected to or a
+ *     session is made, and which only a JVM that cannot be set so is refused for (4);
  *  1. the control plane, reached and at its version: not reached (3), or refused (4);
  *  1. the session of Spark, with no setting from outside the profile that a profile would be
  *     refused for (4), and the startup guard of the LogStore: a coordination database that is
@@ -42,8 +45,11 @@ object RunCommand {
    * The connectors of the application: the one place where a kind of source is added to it
    * (RNF-04).
    */
-  def connectors(profile: Profile): ConnectorRegistry =
-    ConnectorRegistry(new FileSourceConnector(new Landing(profile.landing.root)))
+  def connectors(profile: Profile, secrets: SecretResolver): ConnectorRegistry =
+    ConnectorRegistry(
+      new FileSourceConnector(new Landing(profile.landing.root)),
+      new JdbcSourceConnector(secrets)
+    )
 
   def run(
       profilePath: Path,
@@ -78,15 +84,11 @@ object RunCommand {
             Main.Exit.Ok
 
           case Some(source) =>
-            val registry = connectors(profile)
+            val registry = connectors(profile, secrets)
             val refused =
-              Option
-                .when(!registry.kinds.exists(_.name == source.connector.kind))(
-                  s"the source ${id.value} is of kind '${source.connector.kind}', and this " +
-                    "version of the application has no connector for it: it has " +
-                    registry.kinds.map(kind => s"'${kind.name}'").mkString(", ")
-                )
-                .toSeq ++ missingRoots(profile)
+              withoutConnector(source, registry).toSeq ++ missingRoots(profile) ++
+                // Before a database is connected to: a connection takes the zone of the JVM.
+                RunSession.jvmToUtc().left.toSeq
             if (refused.nonEmpty) {
               refused.foreach(problem => err.println(s"error: $problem"))
               err.println("Nothing was run.")
@@ -168,6 +170,18 @@ object RunCommand {
         err.println("Nothing was run.")
         Some(exitOfRefusal(refused))
     }
+
+  /**
+   * Why a source cannot be run by an application with these connectors, if it has none for the
+   * kind of the source: a kind whose configuration is read, and whose connector was not
+   * registered (`connectors`).
+   */
+  def withoutConnector(source: Source, registry: ConnectorRegistry): Option[String] =
+    Option.when(!registry.kinds.exists(_.name == source.connector.kind))(
+      s"the source ${source.id.value} is of kind '${source.connector.kind}', and this version " +
+        "of the application has no connector for it: it has " +
+        registry.kinds.map(kind => s"'${kind.name}'").mkString(", ")
+    )
 
   /**
    * A coordination database that was not reached may be reached the next time (3), when it is
