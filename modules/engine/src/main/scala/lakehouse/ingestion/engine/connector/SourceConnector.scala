@@ -7,6 +7,7 @@ import scala.reflect.ClassTag
 import io.circe.Json
 import lakehouse.ingestion.core.config.{ConnectorConfig, ConnectorKind, RelativePath, Source}
 import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
+import lakehouse.ingestion.engine.RunFailedException
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
 /**
@@ -45,7 +46,8 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  *    to read (`PlanContext`).
  *  - '''A failure whose class is known is said with it''' (`RunFailedException`): a directory
  *    or a table that is not there is permanent. One that is not known is let through, for the
- *    classification of errors (P8).
+ *    classification of errors (P8). Rows that are read as they are written fail in the hands
+ *    of the engine, and the engine asks their connector what the failure is (`failure`).
  *
  * What a connector needs that is not in the configuration of a source, as the root of the
  * landing zone or a way to resolve secrets, it is given when it is made.
@@ -85,6 +87,20 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
   def progress(source: Source, config: C, plan: Json): Progress
 
   /**
+   * What a failure that came up while the engine went over the rows of a read of this connector
+   * is, if it is one of the source's: its class, and what to do about it. The engine asks it of
+   * rows that are read as they are gone over (`ReadResult.OnePass`), whose source fails after
+   * `read` has answered: a connection that is cut, a statement that runs too long, a value
+   * that the read refuses.
+   *
+   * It is asked of failures of anything: of the write of a table as much as of the read, since
+   * the two are one pass. A connector answers for what its source said, and for nothing else.
+   *
+   * @return none, for a failure that is not the source's, which is then let through as it is
+   */
+  def failure(source: Source, config: C, error: Throwable): Option[RunFailedException] = None
+
+  /**
    * This connector for one source: none if the source is of another kind. The engine holds a
    * source by what this gives, and never sees `C`.
    */
@@ -103,6 +119,9 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
 
     override def progress(plan: Json): Progress =
       SourceConnector.this.progress(source, config, plan)
+
+    override def failure(error: Throwable): Option[RunFailedException] =
+      SourceConnector.this.failure(source, config, error)
   }
 }
 
@@ -117,6 +136,9 @@ abstract class BoundSource private[connector] (val source: Source) {
 
   /** @see [[SourceConnector.progress]] */
   def progress(plan: Json): Progress
+
+  /** @see [[SourceConnector.failure]] */
+  def failure(error: Throwable): Option[RunFailedException]
 }
 
 /**

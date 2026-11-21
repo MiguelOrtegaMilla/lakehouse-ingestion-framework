@@ -55,5 +55,30 @@ object PostgresJdbc {
   }
 
   /** The driver takes timeouts in whole seconds, and zero would be no timeout. */
+  /**
+   * How a connection to the database of a source is opened, by the engine and by Spark alike
+   * (discovery §17, P6.2): as `properties`, and with the settings of a session that a read of
+   * a source stands on. They go with the start of the connection, where they take the place of
+   * what the database or the role has them at.
+   *
+   *  - `statement_timeout`, as above. A batch is read with a cursor, so it bounds one fetch.
+   *  - `standard_conforming_strings` on: a backslash in a value is a backslash. With it off,
+   *    which a source may have, a value that Spark writes into a statement could end its
+   *    literal early.
+   *  - `idle_in_transaction_session_timeout` off: between two fetches a read is idle in its
+   *    transaction for as long as the write of its rows takes, and a source that ends such
+   *    sessions would cut the batch.
+   */
+  def ofASource(connection: DatabaseConnection): Map[String, String] =
+    properties(connection) ++ Map(
+      "options" -> Seq(
+        s"statement_timeout=${connection.timeouts.statement.toMillis}",
+        "standard_conforming_strings=on",
+        "idle_in_transaction_session_timeout=0"
+      ).map(setting => s"-c $setting").mkString(" "),
+      // A connection that waits for the write of its rows says nothing for a while.
+      "tcpKeepAlive" -> "true"
+    )
+
   private def wholeSeconds(millis: Long): Long = math.max(1L, math.ceil(millis / 1000.0).toLong)
 }

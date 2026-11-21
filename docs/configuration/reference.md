@@ -183,6 +183,30 @@ A table of a relational database. PostgreSQL, for now. It loads by `full` or by 
 | `connector.connection` | The [connection](#a-connection-to-a-database) to the database | required |
 | `connector.table` | The table: a [name](#a-name), or `schema.name` | required |
 
+- **A table is read in one statement, with a cursor.** The rows come a thousand at a time, and are written to Bronze as they come: the table is never held whole, and a full load is one snapshot of it. `timeouts.statement` bounds one fetch.
+- **The role needs to read the table, and nothing else.** The table is asked for its columns before a batch is planned: one that is not there, or that the role may not read, fails the run with nothing planned.
+- **A session of a read has its own settings**, whatever the database or the role has them at: `standard_conforming_strings` on, `idle_in_transaction_session_timeout` off, and the statement timeout above.
+- **Two columns whose names differ only in their case are refused**: a table of Delta cannot have both.
+
+Bronze keeps the types of the source, and changes no value without saying so. A type that Spark has no type for that holds its every value is kept as text, which is the value as the server writes it:
+
+| In PostgreSQL | In Bronze |
+|---|---|
+| `smallint`, `integer`, `bigint`, `real`, `double precision`, `boolean` | The same |
+| `numeric(p, s)` of 38 digits at most | `decimal(p, s)` |
+| `numeric` with no bound, of more than 38 digits, or with a scale below zero | Text: every digit, and `NaN` |
+| `text`, `varchar`, `char(n)` | Text; a `char(n)` with its padding |
+| `date`, `timestamp`, `timestamptz` | A date, and a timestamp in UTC to the microsecond. A `timestamp` without a zone is taken as UTC |
+| `time`, `timetz` | Text |
+| `bytea` | Binary |
+| `bit(1)` | Boolean |
+| `bit(n)`, `varbit` | Text, of zeros and ones |
+| `uuid`, `json`, `jsonb`, `xml`, `inet`, `interval`, `money`, an enum, the geometric types | Text, as the server writes it; `money` with the symbol of the server's locale |
+| An array | An array of what its values are kept as. Text, if they are kept as text, or are dates or timestamps |
+
+- **`infinity` fails a batch.** PostgreSQL has `infinity` and `-infinity` for a date and for a timestamp, and Spark has not: it would write the last day of the year 9999 in its place. The source is asked of each row, in the statement that reads it, and a row that has one fails its batch for good, with the column named. `9999-12-31` itself is a date like any other.
+- **A bounded `numeric` that holds `NaN` fails its batch as well**: a decimal has none.
+
 ### The `file` connector
 
 Files that are left in a directory of the landing zone. It loads by `new_files`. The directory is listed, and not the directories under it; a file whose name starts with `.` or `_` is never taken.
