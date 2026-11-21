@@ -58,7 +58,7 @@ U = min(H, A + max_batch_range)
 
 ## Consequences
 
-- **A transaction shorter than `safety_margin` and `lookback` together loses nothing. A longer one loses its rows, without a word**: the window that held their timestamp was read before they were there. It is the known limit of every load by a column, and what CDC is for. A test pins the loss (P6.8), `validate` warns of a watermark with no margin at all, and the reference says which setting to use.
+- **A transaction shorter than `safety_margin` and `lookback` together loses nothing. A longer one loses its rows, without a word**: the window that held their timestamp was read before they were there. It is the known limit of every load by a column, and what CDC is for. Two tests pin the loss (P6.8: `JdbcIngestionSpec` against the clock of the source, `GeneratedTableSpec` for every seed), `validate` warns of a watermark with no margin at all, and the reference says which setting to use.
 - **Deletes are not seen** (ADR-0009): a row that is gone is in no window.
 - **A row whose watermark column is null is in no window**, and is never ingested. What the engine says of a column that may be null is decided with what is asked of the source before a plan (P6.6).
 - **The column has to be set by every writer of the table, at every change.** The engine cannot know of one that is not.
