@@ -13,6 +13,7 @@ import lakehouse.ingestion.core.config.{
   ConfigLoader,
   ConnectorKind,
   Profile,
+  RelativePath,
   SecretResolver,
   SourceId
 }
@@ -548,6 +549,26 @@ final class MainSpec
     RunCommand.exitOf(failed(FailureClass.Conflict)) shouldBe 3
     RunCommand.exitOf(failed(FailureClass.Permanent)) shouldBe 4
     RunCommand.exitOf(failed(FailureClass.Data)) shouldBe 5
+  }
+
+  test("run: a count that a run did not make is said as not known, and not as zero") {
+    val run = RunId.generate()
+    val source = SourceId.parse("sales.orders").value
+    val batch = BatchId(TxnAppId.of(source, Layer.Bronze), BatchSeq.First)
+    val table = RelativePath.parse("bronze/sales/orders").value
+    def said(counts: RunCounts): String =
+      RunCommand
+        .report(source, Outcome.Ingested(run, batch, Seq(BatchOutput(table, Some(7L))), counts))
+        ._2
+
+    said(RunCounts(rowsRead = Some(3), rowsWritten = Some(3), rowsRejected = Some(0))) shouldBe
+      s"The run $run of sales.orders committed the batch $batch: 3 rows read, 3 written, " +
+      "0 rejected, into bronze/sales/orders at version 7."
+    // A batch that another writer of its sequence wrote: it has rows, which this run did not
+    // count, and the control plane has no count of them either.
+    said(RunCounts(rowsRejected = Some(0))) shouldBe
+      s"The run $run of sales.orders committed the batch $batch: an unknown number of rows " +
+      "read, an unknown number written, 0 rejected, into bronze/sales/orders at version 7."
   }
 
   test(
