@@ -403,7 +403,7 @@ final class JdbcSourceConnectorSpec
     val past = source("public.long_ago")
     val unnamed = failureOf(past)(read(past).rows.collect()).getMessage
     unnamed should startWith(
-      s"the column Seen At of the table public.long_ago of ${where(past)} has infinity or " +
+      s"the column Seen-At of the table public.long_ago of ${where(past)} has infinity or " +
         "-infinity in a row of the batch, which PostgreSQL has for a timestamptz and Spark has not"
     )
     unnamed should endWith(
@@ -1085,7 +1085,7 @@ object JdbcSourceConnectorSpec {
     """INSERT INTO validity VALUES (1, '2026-01-01', '2026-01-01 00:00:00+00'),
       |(2, '9999-12-31', '9999-12-31 23:59:59.999+00'),
       |(3, 'infinity', '2026-01-01 00:00:00+00')""".stripMargin,
-    """CREATE TABLE long_ago (id int, "Seen At" timestamptz)""",
+    """CREATE TABLE long_ago (id int, "Seen-At" timestamptz)""",
     """INSERT INTO long_ago VALUES (1, '2026-01-01 00:00:00+00'), (2, '-infinity')""",
     """CREATE TABLE flagged (id int, _lakehouse_infinite text, day date)""",
     """INSERT INTO flagged VALUES (1, 'the table''s own', '2026-01-01')""",
