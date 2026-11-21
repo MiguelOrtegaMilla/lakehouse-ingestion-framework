@@ -175,7 +175,7 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
         safetyMargin = 1.minute,
         start = Some(Instant.parse("2026-01-01T00:00:00Z"))
       ),
-      Some(7.days)
+      Some(28.days)
     )
     connector.connection.timeouts shouldBe Timeouts(connect = 5.seconds, statement = 30.minutes)
     source.keys shouldBe Vector(id("order_id"))

@@ -33,7 +33,7 @@ sbt "cli/run validate --profile conf/app/local.example.yaml --sources conf/sourc
 ```text
 The configuration is valid: conf/app/local.example.yaml, and 2 sources.
 The lake is file:///home/CHANGE_ME/lakehouse-data/lake.
-  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  f89a0016da8e
+  sales.orders   enabled  jdbc  incremental  bronze/sales/orders, silver/sales/orders  5828380c988b
   sales.returns  enabled  file  new_files    bronze/sales/returns                      2526a17a25b6
 ```
 
@@ -221,7 +221,7 @@ The whole contract is in [discovery §14.1](docs/architecture/00-architecture-di
 
 ### A table of a database: `sales.orders`
 
-The example source [`sales.orders`](conf/sources/sales.orders.yaml) reads `public.orders` of the database `sales` by `updated_at`, a week of changes a batch. The table is the source system's, and the engine makes none: a demo makes it and changes it as the source's applications would, as `sales_owner`. It is test code (`it.demo.SalesOrders`, with the generator of the tests), and is in no artifact of the application.
+The example source [`sales.orders`](conf/sources/sales.orders.yaml) reads `public.orders` of the database `sales` by `updated_at`, four weeks of changes a batch. The table is the source system's, and the engine makes none: a demo makes it and changes it as the source's applications would, as `sales_owner`. It is test code (`it.demo.SalesOrders`, with the generator of the tests), and is in no artifact of the application.
 
 ```bash
 export SALES_OWNER_PASSWORD="$(cat docker/secrets/sales_owner_password)"
@@ -234,12 +234,12 @@ sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source s
 ```
 
 ```text
-The run 019a… of sales.orders committed the batch sales.orders/bronze#1: 48 rows read, 48 written, 0 rejected, into bronze/sales/orders at version 0.
+The run 019a… of sales.orders committed the batch sales.orders/bronze#1: 80 rows read, 80 written, 0 rejected, into bronze/sales/orders at version 0.
 …
-The invocation of sales.orders made 47 runs and committed 47 batches.
+The invocation of sales.orders made 12 runs and committed 12 batches.
 ```
 
-The first invocation reads from `load.watermark.start` up to a minute before the clock of the database, its `safety_margin`: a run a week, each a batch, about a minute and a half in all. Then the demo changes some orders, and the next invocation reads what changed, and only that, once the margin has passed:
+The first invocation reads from `load.watermark.start` up to a minute before the clock of the database, its `safety_margin`: a run for each four weeks of the table (`load.max_batch_range`), each a batch. The numbers are those of a table made on 2026-11-21, and there is a batch more every four weeks. Then the demo changes some orders, and the next invocation reads what changed, and only that, once the margin has passed:
 
 ```bash
 sbt "integration-tests/Test/runMain lakehouse.ingestion.it.demo.SalesOrders --changes"   # rows inserted, updated and deleted, at moments of the last minute
@@ -247,7 +247,11 @@ sleep 61
 sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source sales.orders"
 ```
 
-A deleted order is not seen by a load by a watermark: it stays in Bronze as it was last read, until the reconciliation of keys (P10). The demo needs the role `sales_owner`, which a volume made before it was added lacks: see [Local services](#local-services).
+```text
+The run 019a… of sales.orders committed the batch sales.orders/bronze#13: 14 rows read, 14 written, 0 rejected, into bronze/sales/orders at version 12.
+```
+
+The demo says that it inserted 9 orders, updated 6 and deleted 2, and the batch has 14 rows: the 9 that are new, one of them inserted and updated again before it was read, which is its second image alone; and the 5 that were there and changed. A deleted order is not seen by a load by a watermark: it stays in Bronze as it was last read, until the reconciliation of keys (P10). The demo needs the role `sales_owner`, which a volume made before it was added lacks: see [Local services](#local-services).
 
 ## License
 
