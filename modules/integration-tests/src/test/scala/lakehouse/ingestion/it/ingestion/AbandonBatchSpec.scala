@@ -8,7 +8,7 @@ import java.time.temporal.ChronoUnit
 
 import scala.util.Using
 
-import lakehouse.ingestion.core.config.Source
+import lakehouse.ingestion.core.config.{ConnectorKind, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.watermark.WatermarkPlan
 import lakehouse.ingestion.engine.FaultPoint
@@ -28,7 +28,8 @@ import org.scalatest.matchers.should.Matchers
  */
 final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestionSuite {
 
-  private lazy val actions = new OperatorActions(database, spark, lakeRoot, timing)
+  private lazy val actions =
+    new OperatorActions(database, spark, lakeRoot, timing, ConnectorKind.BuiltIn)
 
   private val asked = OperatorRequest.of("ops.oncall", "the plan cannot be run").toOption.get
 

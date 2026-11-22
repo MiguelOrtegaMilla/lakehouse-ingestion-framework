@@ -379,6 +379,35 @@ final class WatermarkPlanSpec extends AnyFunSuite with Matchers with EitherValue
   // The plan and the watermark as they are written down
   // ---------------------------------------------------------------------------------------------
 
+  test("a reset sets the watermark to a moment, and the next batch counts from it") {
+    val reset = WatermarkPlanner.resetTo(load(lookback = 30.minutes), before(2.hours)).value
+    reset shouldBe StoredWatermark(before(2.hours))
+    val next = planned(plan(load(lookback = 30.minutes), Some(reset.value)))
+    next.lower shouldBe Some(before(150.minutes))
+    next.upper shouldBe Noon
+  }
+
+  test("a reset to start, or after it, is let through; one before start is refused") {
+    val started = load(start = Some(before(1.hour)))
+    WatermarkPlanner.resetTo(started, before(1.hour)).value shouldBe StoredWatermark(before(1.hour))
+    WatermarkPlanner.resetTo(started, Noon).value shouldBe StoredWatermark(Noon)
+    WatermarkPlanner.resetTo(started, before(1.hour).minusNanos(1000)).left.value shouldBe
+      "2026-11-20T10:59:59.999999Z is before load.watermark.start, 2026-11-20T11:00:00Z: the " +
+      "rows at or before it are not of the regular sequence of the source, which starts there, " +
+      "and a backfill reads them"
+    // A moment the source has not reached: its clock is not asked.
+    WatermarkPlanner.resetTo(load(), after(100.days)).value shouldBe StoredWatermark(
+      after(100.days)
+    )
+  }
+
+  test("a reset to a moment that no watermark holds is refused, and says why") {
+    WatermarkPlanner.resetTo(load(), Noon.plusNanos(1)).left.value shouldBe
+      "the moment is finer than a microsecond (2026-11-20T12:00:00.000000001Z)"
+    WatermarkPlanner.resetTo(load(), Timestamps.Min.minusSeconds(1)).left.value should
+      startWith("the moment is 1899-12-31T23:59:59Z, outside")
+  }
+
   private val Written = WatermarkPlan(
     Column,
     lower = Some(at("2026-11-20T10:00:00Z")),

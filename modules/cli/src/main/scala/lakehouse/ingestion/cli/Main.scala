@@ -6,6 +6,7 @@ import java.nio.file.Paths
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.{BatchSeq, OperatorRequest}
 import lakehouse.ingestion.engine.control.DatabaseFailure
+import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
 
 /**
  * The entry point of the application: a command and its options.
@@ -91,6 +92,10 @@ object Main {
        |                               [--max-batches <n>]
        |       lakehouse-ingestion abandon-batch --profile <file> --sources <directory>
        |                               --source <id> --batch <n> --reason <text>
+       |       lakehouse-ingestion reset-state --profile <file> --sources <directory>
+       |                               --source <id> --reason <text>
+       |                               (--watermark <moment> | --forget-watermark
+       |                                | --keep-watermark)
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
@@ -106,6 +111,11 @@ object Main {
        |              planned for does not have it: the next run plans anew from the state of
        |              the source. It is a run of its own, under the lease of the source, that
        |              records who asked for it (the user of the process) and why.
+       |  reset-state  Resets the state of a source: its watermark is set, forgotten or kept,
+       |              and its configuration as it is now is the one that later runs are
+       |              compared with, which lets a change through that a run refuses. The
+       |              numbers of its batches go on, and the files it took stay taken. A run of
+       |              its own, as abandon-batch is.
        |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
@@ -116,16 +126,23 @@ object Main {
        |  --max-batches  the most batches that run commits; no limit unless said
        |  --batch     the number of the batch to give up: the one that is planned
        |  --reason    why, in one line: kept with the run and with the batch
+       |  --watermark  the moment that the source is taken to be ingested up to, as
+       |              load.watermark.start is written: 2026-03-01T00:00:00Z
+       |  --forget-watermark  the next run plans as a source with no watermark does
+       |  --keep-watermark  the watermark stays; only what later runs are compared with is
+       |              reset. Its risks are warned of
        |
        |exit codes: 0 the configuration is valid, the schemas are at their version, the run
        |              ended well (a batch committed, nothing new, or a source that is
-       |              disabled), or the batch was given up;
+       |              disabled), the batch was given up, or the state was reset;
        |            2 another run holds the lease of the source: nothing was done;
        |            3 a database could not be reached, the run lost its lease, its batch was
        |              given up, or a table could not be read, and running again later may do;
        |            4 the configuration is not valid, a database refused, the run failed for a
-       |              reason that running again does not mend, or the batch was not given up:
-       |              none is planned, another is, or its table has it;
+       |              reason that running again does not mend, the batch was not given up:
+       |              none is planned, another is, or its table has it, or the state was not
+       |              reset: a batch is planned, the source has no state, or no such
+       |              watermark;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
        |            128 + n run was stopped by the signal n before its first run: nothing was
@@ -227,6 +244,44 @@ object Main {
           )
         case Left(problem) => usage(problem, err)
       }
+    case "reset-state" :: options =>
+      val modes = Set("--watermark", "--forget-watermark", "--keep-watermark")
+      val asked = for {
+        found <- parse(
+          options,
+          Set("--profile", "--sources", "--source", "--reason"),
+          optional = Set("--watermark"),
+          flags = modes - "--watermark"
+        )
+        source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
+        to <- modes.filter(found.contains).toSeq.sorted match {
+          case Seq("--watermark") =>
+            Timestamps
+              .parse(found("--watermark"))
+              .map(WatermarkReset.At(_))
+              .left
+              .map(reason => s"--watermark '${shown(found("--watermark"))}' $reason")
+          case Seq("--forget-watermark") => Right(WatermarkReset.Forget)
+          case Seq("--keep-watermark") => Right(WatermarkReset.Keep)
+          case Seq() => Left(s"one of ${modes.toSeq.sorted.mkString(", ")} must be given")
+          case more => Left(s"${more.mkString(" and ")} are given: one of them is")
+        }
+        request <- OperatorRequest.of(operator, found("--reason"))
+      } yield (found("--profile"), found("--sources"), source, to, request)
+      asked match {
+        case Right((profile, sources, source, to, request)) =>
+          ResetStateCommand.run(
+            Paths.get(profile),
+            Paths.get(sources),
+            source,
+            to,
+            request,
+            SecretResolver(environment),
+            out,
+            err
+          )
+        case Left(problem) => usage(problem, err)
+      }
     case ("--help" | "-h" | "help") :: Nil =>
       out.println(Usage)
       Exit.Ok
@@ -240,13 +295,17 @@ object Main {
     Exit.Usage
   }
 
-  /** `--name value` pairs: each of `required` once, each of `optional` once at most. */
+  /**
+   * `--name value` pairs: each of `required` once, each of `optional` once at most. `flags` are
+   * optional and take no value: one that is given is found with an empty one.
+   */
   private def parse(
       options: List[String],
       required: Set[String],
-      optional: Set[String] = Set.empty
+      optional: Set[String] = Set.empty,
+      flags: Set[String] = Set.empty
   ): Either[String, Map[String, String]] = {
-    val names = required ++ optional
+    val names = required ++ optional ++ flags
     def go(rest: List[String], found: Map[String, String]): Either[String, Map[String, String]] =
       rest match {
         case Nil =>
@@ -258,6 +317,7 @@ object Main {
           }
         case name :: _ if !names(name) => Left(s"'${shown(name)}' is not an option of this command")
         case name :: _ if found.contains(name) => Left(s"$name is given twice")
+        case name :: more if flags(name) => go(more, found + (name -> ""))
         case name :: Nil => Left(s"$name has no value after it")
         case name :: value :: more => go(more, found + (name -> value))
       }

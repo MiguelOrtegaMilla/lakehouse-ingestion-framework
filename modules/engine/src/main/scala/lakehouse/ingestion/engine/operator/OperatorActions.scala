@@ -4,8 +4,11 @@ import java.time.Instant
 
 import scala.util.control.NonFatal
 
+import io.circe.Json
+import lakehouse.ingestion.core.config.ConfigVersion.BreakingChange
 import lakehouse.ingestion.core.config.{
   ConfigVersion,
+  ConnectorKind,
   PathTableLocator,
   RootUri,
   Source,
@@ -14,9 +17,11 @@ import lakehouse.ingestion.core.config.{
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control.{
   Application,
+  ConfigSnapshots,
   ControlDatabase,
   LeasedRun,
-  LeaseLostException
+  LeaseLostException,
+  SourceStates
 }
 import lakehouse.ingestion.engine.delta.BatchLookup.Found
 import lakehouse.ingestion.engine.delta.{BatchLookup, DeltaTableTransactions}
@@ -34,12 +39,15 @@ import org.slf4j.LoggerFactory
  *
  * @param lake the root of the lake of the profile, where the configuration of a source names its
  *   table
+ * @param kinds the kinds of source of the application: what makes a moment into the watermark
+ *   of a source
  */
 final class OperatorActions(
     database: ControlDatabase,
     spark: SparkSession,
     lake: RootUri,
-    timing: LeaseTiming
+    timing: LeaseTiming,
+    kinds: Seq[ConnectorKind]
 ) {
   import OperatorActions._
 
@@ -119,6 +127,105 @@ final class OperatorActions(
           }
       }
     }
+  }
+
+  /**
+   * Resets the state of the regular sequence of `source` (ADR-0021 §3): its watermark is set,
+   * forgotten or kept, as `to` says, and the configuration that it is given is the one that
+   * later runs are compared with. That is how a change that Bronze cannot follow is let through.
+   *
+   * The last batch committed does not move, and the next batch has the next number: a sequence
+   * that started again would be skipped by every table that it wrote. The files that were taken
+   * stay taken. It is refused while a batch is planned, and for a source that has no state.
+   *
+   * What it lets through is said with the outcome. When the watermark is kept across such a
+   * change, so are its risks: a Bronze table that is another has none of the history, and a
+   * watermark kept for another column skips rows if that column does not mean what the old one
+   * did.
+   */
+  def reset(
+      source: Source,
+      config: ConfigVersion,
+      to: WatermarkReset,
+      request: OperatorRequest
+  ): Outcome = {
+    val start = starting(source, config, RunKind.Reset, request)
+    held(start, config) { leased =>
+      leased.planned() match {
+        case Some(planned) =>
+          refuse(
+            leased,
+            s"the batch ${planned.id} is planned: the state of a source is not reset while a " +
+              "batch is, since that batch is the next run's to finish under the configuration " +
+              "it was planned under, or an operator's to give up first (abandon-batch). " +
+              "Nothing was changed"
+          )
+        case None =>
+          database.run(SourceStates.find(_, source.id, start.layer)) match {
+            case None =>
+              refuse(
+                leased,
+                s"${source.id} has no state in ${start.layer.name}: no batch of it was ever " +
+                  "committed, and there is nothing to reset. Where its first batch starts is " +
+                  "load.watermark.start. Nothing was changed"
+              )
+            case Some(before) =>
+              watermarkOf(source, before.watermark, to) match {
+                case Left(why) => refuse(leased, s"$why. Nothing was changed")
+                case Right(watermark) =>
+                  val through = database
+                    .run(ConfigSnapshots.ofState(_, source.id, start.layer))
+                    .toSeq
+                    .flatMap(last => ConfigVersion.breakingChanges(last.content, config))
+                    .filter(_.breaksBronze)
+                  if (leased.reset(before, watermark)) {
+                    val done = s"the state of ${start.txnAppId} was reset by the run " +
+                      s"${start.id}, asked by ${request.requestedBy}: ${request.reason}. Its " +
+                      s"watermark was ${shown(before.watermark)} and is ${shown(watermark)}; " +
+                      s"the last batch committed is still ${before.lastCommitted}, and the " +
+                      s"next one is ${before.lastCommitted.value + 1}. The configuration of " +
+                      "this run is the one that later runs are compared with, and it lets " +
+                      (if (through.isEmpty) "no breaking change through"
+                       else s"through: ${through.map(_.message).mkString("; ")}")
+                    val warnings = if (to == WatermarkReset.Keep) risks(through) else Nil
+                    log.info(done)
+                    warnings.foreach(warning => log.warn(warning))
+                    Outcome.Done(start.id, done, warnings)
+                  } else lost(start, LeaseLoss.TakenOver)
+              }
+          }
+      }
+    }
+  }
+
+  /** The watermark that a reset leaves, or why it cannot. */
+  private def watermarkOf(
+      source: Source,
+      now: Option[Json],
+      to: WatermarkReset
+  ): Either[String, Option[Json]] = to match {
+    case WatermarkReset.Keep => Right(now)
+    case WatermarkReset.Forget =>
+      if (now.isEmpty)
+        Left(
+          s"${source.id} has no watermark to forget: what it took is said by the files that " +
+            "were taken, or it is loaded whole. --keep-watermark resets what later runs are " +
+            "compared with, and nothing else"
+        )
+      else Right(None)
+    case WatermarkReset.At(moment) =>
+      kinds.find(_.name == source.connector.kind).flatMap(_.watermarkAt(source.load)) match {
+        case None =>
+          Left(
+            s"${source.id} keeps no watermark: it is of the kind '${source.connector.kind}', " +
+              s"loaded ${source.load.mode.name}, and a moment is no watermark of it. " +
+              "--keep-watermark resets what later runs are compared with, and nothing else"
+          )
+        case Some(make) =>
+          make(moment).map(Some(_)).left.map { why =>
+            s"the watermark of ${source.id} cannot be set to $moment: $why"
+          }
+      }
   }
 
   private def starting(
@@ -212,6 +319,41 @@ object OperatorActions {
 
   private val log = LoggerFactory.getLogger(classOf[OperatorActions])
 
+  /** What a reset does to the watermark of a source (ADR-0021 §3). */
+  sealed trait WatermarkReset
+
+  object WatermarkReset {
+
+    /** Set to a moment, which the kind of the source makes into its watermark. */
+    final case class At(moment: Instant) extends WatermarkReset
+
+    /** Forgotten: the next run plans as a source with no watermark does. */
+    case object Forget extends WatermarkReset
+
+    /** Kept: only what later runs are compared with is reset. */
+    case object Keep extends WatermarkReset
+  }
+
+  private def shown(watermark: Option[Json]): String = watermark.fold("none")(_.noSpaces)
+
+  /**
+   * What keeping the watermark across the changes `through` may do, that the operator is to
+   * know: none, for changes that keeping it is right for.
+   */
+  private[operator] def risks(through: Seq[BreakingChange]): Seq[String] =
+    through.filter(_.movesBronze).map { change =>
+      s"the watermark was kept, and ${change.field} of the ${change.of} was ${change.was} and " +
+        s"is ${change.is}: the history of the source stays in the table that it was ingested " +
+        "to, and the new one receives only what is ingested from now on. It is read into the " +
+        "new one only by a reset to an earlier watermark, a backfill or a reprocess"
+    } ++ through.filter(_.ofWatermarkColumn).map { change =>
+      s"the watermark was kept, and it was a value of ${change.was}: it is taken now as a " +
+        s"value of ${change.is}. If ${change.is} does not mean what ${change.was} did, rows " +
+        s"whose ${change.is} is at or before the watermark are skipped without a word. Keeping " +
+        "it is right for a column that was renamed at the source; for another, reset with " +
+        "--watermark or --forget-watermark"
+    }
+
   /** How an operator's action ended. */
   sealed trait Outcome {
     def run: RunId
@@ -219,8 +361,8 @@ object OperatorActions {
 
   object Outcome {
 
-    /** It did what it was asked. */
-    final case class Done(run: RunId, message: String) extends Outcome
+    /** It did what it was asked, with what the operator is to know of what it did. */
+    final case class Done(run: RunId, message: String, warnings: Seq[String] = Nil) extends Outcome
 
     /** A run holds the lease of the sequence: nothing was done, and the action is recorded. */
     final case class Skipped(run: RunId, holder: RunId, until: Instant) extends Outcome
