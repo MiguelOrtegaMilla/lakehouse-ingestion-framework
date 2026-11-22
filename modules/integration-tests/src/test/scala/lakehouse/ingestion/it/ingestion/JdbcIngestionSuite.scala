@@ -8,6 +8,7 @@ import scala.util.Using
 import lakehouse.ingestion.core.config.{SecretResolver, Source}
 import lakehouse.ingestion.core.watermark.StoredWatermark
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
+import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
 import lakehouse.ingestion.engine.{FaultHooks, IngestionService}
 import org.scalatest.Suite
@@ -98,6 +99,13 @@ trait JdbcIngestionSuite extends IngestionSuite {
       .value
 
   /** The service, as an application puts it together, with the JDBC connector alone. */
+  /** The ledger asks the plans of a table, and those of files of a suite that has both. */
+  override protected def connectors: ConnectorRegistry =
+    ConnectorRegistry(
+      new FileSourceConnector(new Landing(landingRoot)),
+      new JdbcSourceConnector(SecretResolver(passwords.get))
+    )
+
   protected def reading(hooks: FaultHooks = FaultHooks.Off): IngestionService =
     new IngestionService(
       database,

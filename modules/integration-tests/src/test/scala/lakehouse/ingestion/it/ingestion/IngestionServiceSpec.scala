@@ -122,6 +122,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     ended.start.layer shouldBe Layer.Bronze
     ended.start.configHash shouldBe versionOf(orders).hash
     holderOf(orders) shouldBe None
+    assertLedger(orders)
   }
 
   test("a second run of the same files writes nothing, and a new file is the next batch") {
@@ -152,6 +153,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     takenOf(orders).map(file => file._1 -> file._3) shouldBe
       Seq("a.csv" -> 1L, "b.csv" -> 1L, "c.csv" -> 2L)
     stateOf(orders).value.lastCommitted.value shouldBe 2L
+    assertLedger(orders)
   }
 
   test("a batch says what comes after it: the horizon of its chain while there is more") {
@@ -174,6 +176,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
     second.next shouldBe Outcome.Next.Ends
     rowsOf(orders).map(_._3) shouldBe Seq("a.csv", "b.csv")
+    assertLedger(orders)
   }
 
   test("a batch that a run before it planned is followed by a plan made anew") {
@@ -190,6 +193,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
     // The batch of the run that died is run again: its horizon was another invocation's.
     ingested(launch(orders)).next shouldBe Outcome.Next.Afresh
+    assertLedger(orders)
   }
 
   test("a run with no new file ends well with no batch, and makes nothing") {
@@ -204,6 +208,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     stateOf(orders) shouldBe None
     tableIsThere(orders) shouldBe false
     holderOf(orders) shouldBe None
+    assertLedger(orders)
   }
 
   test("a file is not planned until it has gone unchanged for the time that its source says") {
@@ -224,6 +229,8 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     ingested(launch(slow, service(at = Now.plusSeconds(8 * 60)))).counts.rowsWritten shouldBe Some(
       1
     )
+    assertLedger(orders)
+    assertLedger(slow)
   }
 
   test("while another run holds the lease of the source, a run is skipped and does nothing") {
@@ -248,6 +255,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     // The lease given up, the next run does the work.
     holder.finish(RunEnd.Failed(FailureClass.Transient, "stopped by the test")) shouldBe true
     ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+    assertLedger(orders)
   }
 
   test("a source of another kind is run the same way, from where its last batch left it") {
@@ -325,6 +333,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     isThere(quarantine(orders)) shouldBe false
     batchOf(first).status shouldBe BatchStatus.Committed
     takenOf(orders) should have size 1
+    assertLedger(orders)
   }
 
   test("a run that stops at a fault point is left as a process that died leaves it") {
@@ -361,6 +370,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     batchOf(first).status shouldBe BatchStatus.Committed
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
     holderOf(orders) shouldBe None
+    assertLedger(orders)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -427,6 +437,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     drop(orders, "b.csv", "id\n3\n")
     ingested(launch(orders)).batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("2", 1L, "a.csv"), ("3", 2L, "b.csv"))
+    assertLedger(orders)
   }
 
   test("a batch whose data is not written is run again as it was planned, under its number") {
@@ -472,6 +483,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
         ingested(launch(orders)).batch shouldBe batchId(orders, 2)
         rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("2", 1L, "a.csv"), ("3", 2L, "b.csv"))
+        assertLedger(orders)
       }
     }
   }
@@ -512,6 +524,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
       commitContention = Some(0)
     )
     batchOf(first).outputs shouldBe Some(done.outputs.toVector)
+    assertLedger(orders)
   }
 
   test("a batch that is rolled forward records its quarantine too, each table at its version") {
@@ -537,6 +550,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     batchOf(second).outputs shouldBe Some(outputs.toVector)
     quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (2L, "b.csv", "6"))
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("4", 2L, "b.csv"))
+    assertLedger(orders)
   }
 
   test("a batch with no rows that a run left is run again, to the same nothing") {
@@ -554,6 +568,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     tableIsThere(orders) shouldBe false
     takenOf(orders) shouldBe Seq(("empty.csv", Files.size(blank), 1L))
     batchOf(first).status shouldBe BatchStatus.Committed
+    assertLedger(orders)
   }
 
   test("a file that changed since a run left its batch gives the batch up, and the next plans") {
@@ -586,6 +601,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     next.batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("10", 2L, "a.csv"), ("11", 2L, "a.csv"), ("2", 2L, "b.csv"))
     takenOf(orders) shouldBe Seq(("a.csv", Files.size(a), 2L), ("b.csv", 5L, 2L))
+    assertLedger(orders)
   }
 
   test("a batch is finished in the table that it was planned for, and in no other") {
@@ -633,6 +649,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     isThere(bronze(moved)) shouldBe false
     ingested(launch(orders)).batch shouldBe batchId(orders, 2)
     batchOf(batchId(orders, 2)).target shouldBe Some(bronze(orders).uri)
+    assertLedger(orders)
   }
 
   test("a batch that was planned before a batch said its table is finished where the source says") {
@@ -652,6 +669,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
     launch(orders) shouldBe a[Outcome.RolledForward]
     batchOf(first).status shouldBe BatchStatus.Committed
+    assertLedger(orders)
   }
 
   test("a batch whose commit the log no longer keeps is rolled forward at a version not known") {
@@ -698,6 +716,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     }
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
     takenOf(orders).map(_._1) shouldBe Seq("a.csv")
+    assertLedger(orders)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -762,6 +781,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     next.batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("10", 2L, "a.csv"), ("11", 2L, "a.csv"), ("2", 2L, "b.csv"))
     tableVersion(orders) shouldBe 0L
+    assertLedger(orders)
   }
 
   test("a run that lost its lease adds nothing to a table that is there, nor to its quarantine") {
@@ -788,6 +808,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     ingested(launch(orders)).batch shouldBe batchId(orders, 3)
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("7", 3L, "b.csv"), ("9", 3L, "b.csv"))
     quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (3L, "b.csv", "0"))
+    assertLedger(orders)
   }
 
   test("a run that lost its lease finds its batch written by the run that took over, once") {
@@ -817,6 +838,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     tableVersion(orders) shouldBe 0L
     batchOf(first).committedBy shouldBe Some(winner.run)
     runOf(outcome.run).status shouldBe RunStatus.Abandoned
+    assertLedger(orders)
   }
 
   test("a run that is taken over after its data is written: the other rolls its batch forward") {
@@ -841,6 +863,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     committed.plannedBy shouldBe outcome.run
     committed.committedBy shouldBe Some(successor.value.run)
     takenOf(orders).map(_._1) shouldBe Seq("a.csv")
+    assertLedger(orders)
   }
 
   test("a run that cannot announce its epoch reads nothing, and fails in a way that passes") {
@@ -876,6 +899,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     runOf(outcome.run).status shouldBe RunStatus.Failed
     holderOf(orders) shouldBe None
     ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+    assertLedger(orders)
   }
 
   test("a run whose epoch is not the one in force stops before it asks a table anything") {
@@ -962,6 +986,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     takenOf(orders) shouldBe empty
     stateOf(orders) shouldBe None
     Files.size(a) shouldBe 9L
+    assertLedger(orders)
   }
 
   test("the run after a batch that was given up takes the changed file as a new file") {
@@ -993,6 +1018,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
     val idle = launch(orders)
     idle shouldBe Outcome.NothingNew(idle.run)
+    assertLedger(orders)
   }
 
   test("a file that changes while it is read gives the batch up as well, after the read") {
@@ -1018,6 +1044,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     // The next run takes the file as it is by then.
     ingested(launch(orders)).batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("1", 2L, "a.csv"), ("2", 2L, "a.csv"))
+    assertLedger(orders)
   }
 
   test("a batch that its table has is never given up: the run stops, and changes nothing") {
@@ -1101,6 +1128,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     holderOf(orders) shouldBe Some(taker.start.id)
     taker.planned().value.id shouldBe first
     taker.finish(RunEnd.Failed(FailureClass.Transient, "stopped by the test")) shouldBe true
+    assertLedger(orders)
   }
 
   test("a file that changes once it was read changes nothing: what was read is what is written") {
@@ -1121,6 +1149,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     ingested(launch(orders)).batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("10", 2L, "a.csv"), ("11", 2L, "a.csv"))
     takenOf(orders) shouldBe Seq(("a.csv", 5L, 1L), ("a.csv", 9L, 2L))
+    assertLedger(orders)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1185,6 +1214,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     ingested(launch(orders)).outputs shouldBe Seq(BatchOutput(orders.targets.bronze.table, 1))
     rowsOf(orders) shouldBe Seq(("1", 2L, "a.csv"), ("2", 4L, "b.csv"))
     batchesOf(orders).map(_._2).distinct shouldBe Seq("COMMITTED")
+    assertLedger(orders)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1212,6 +1242,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     batchesOf(orders) shouldBe Seq(1L -> "PLANNED")
     tableIsThere(orders) shouldBe false
     takenOf(orders) shouldBe empty
+    assertLedger(orders)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1278,6 +1309,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     )
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("3", 1L, "a.csv"))
     takenOf(orders) shouldBe Seq(("a.csv", Files.size(a), 1L))
+    assertLedger(orders)
   }
 
   test("more rejected records than the source allows: the batch is not committed") {
@@ -1319,6 +1351,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     stateOf(orders) shouldBe None
     batchOf(first).status shouldBe BatchStatus.Planned
     batchOf(first).outputs shouldBe None
+    assertLedger(orders)
   }
 
   test("the share that a source allows is allowed whole, and one record more is too many") {
@@ -1338,6 +1371,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     }
     tableIsThere(less) shouldBe false
     quarantinedOf(less) shouldBe Seq((1L, "a.csv", "3"))
+    assertLedger(half)
   }
 
   test("a batch whose records were all rejected, as its source allows, writes no data") {
@@ -1369,6 +1403,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
       FaultPoint.AfterQuarantineWrite,
       FaultPoint.BeforeStateCommit
     )
+    assertLedger(events)
   }
 
   test("a quarantine grows with the batches that reject, and the others leave it as it was") {
@@ -1390,6 +1425,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     )
     quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"), (3L, "c.csv", "8,9,10"))
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("4", 2L, "b.csv"), ("6", 3L, "c.csv"))
+    assertLedger(orders)
   }
 
   test("the records of a batch that was given up are left out of what the quarantine is read as") {
@@ -1436,6 +1472,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     }
     batchesOf(orders) shouldBe Seq((1L, "ABANDONED"), (2L, "COMMITTED"), (3L, "PLANNED"))
     read() shouldBe Seq((2L, "a.csv", "3"), (3L, "c.csv", "10"), (3L, "c.csv", "11"))
+    assertLedger(orders)
   }
 
   test("a run that dies between the quarantine and the data leaves a batch to be replayed") {

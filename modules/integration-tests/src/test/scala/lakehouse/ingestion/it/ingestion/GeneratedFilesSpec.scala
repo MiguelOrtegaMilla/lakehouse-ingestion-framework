@@ -52,6 +52,7 @@ final class GeneratedFilesSpec extends AnyFunSuite with Matchers with GeneratedD
       val version = tableVersion(orders)
       launch(orders) shouldBe a[Outcome.NothingNew]
       tableVersion(orders) shouldBe version
+      assertLedger(orders)
     }
   }
 
@@ -86,6 +87,7 @@ final class GeneratedFilesSpec extends AnyFunSuite with Matchers with GeneratedD
     all.filter(_._1.contains("-d01-")).map(_._2(at)) should contain noneOf (None, Some(""))
     quarantinedOf(orders) shouldBe (setApart(1, first) ++ setApart(2, second)).sorted
     launch(orders) shouldBe a[Outcome.NothingNew]
+    assertLedger(orders)
   }
 
   test("a file sent twice is in Bronze twice, each time under its own name") {
@@ -101,5 +103,6 @@ final class GeneratedFilesSpec extends AnyFunSuite with Matchers with GeneratedD
     val rows = written(orders, Seq("id"))
     rows.filter(_._1 == again.name).map(_._2) shouldBe rows.filter(_._1 == original).map(_._2)
     rows.filter(_._1 == again.name) should have size again.records.size.toLong
+    assertLedger(orders)
   }
 }
