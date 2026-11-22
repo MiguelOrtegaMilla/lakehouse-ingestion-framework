@@ -7,7 +7,7 @@ import scala.concurrent.duration._
 import cats.syntax.all._
 import io.circe.Json
 import lakehouse.ingestion.core.config.Read.{Obj, Problem, Result}
-import lakehouse.ingestion.core.watermark.WatermarkPlanner
+import lakehouse.ingestion.core.state.StoredWatermark
 
 /** What a connector is told about the source it reads: the `connector` section of a source. */
 trait ConnectorConfig {
@@ -164,7 +164,7 @@ object JdbcConnector extends ConnectorKind {
   /** A load by a watermark keeps the upper bound of its last batch (`StoredWatermark`). */
   override def watermarkAt(load: Load): Option[Instant => Either[String, Json]] = load match {
     case incremental: Load.Incremental =>
-      Some(at => WatermarkPlanner.resetTo(incremental, at).map(_.toJson))
+      Some(at => StoredWatermark.reset(at, incremental.watermark.start).map(_.toJson))
     case _ => None
   }
 

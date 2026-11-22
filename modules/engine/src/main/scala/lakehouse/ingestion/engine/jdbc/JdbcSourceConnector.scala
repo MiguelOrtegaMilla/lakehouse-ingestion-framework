@@ -23,12 +23,8 @@ import lakehouse.ingestion.core.config.{
   Timestamps
 }
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
-import lakehouse.ingestion.core.watermark.{
-  StoredWatermark,
-  WatermarkHorizon,
-  WatermarkPlan,
-  WatermarkPlanner
-}
+import lakehouse.ingestion.core.state.StoredWatermark
+import lakehouse.ingestion.core.watermark.{WatermarkHorizon, WatermarkPlan, WatermarkPlanner}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
