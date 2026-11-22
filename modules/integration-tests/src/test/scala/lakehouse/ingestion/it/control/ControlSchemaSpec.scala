@@ -628,7 +628,10 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
             "abandon_reason" -> "'why'"
           ),
         "a status that is none" -> Seq("status" -> "'RUNNING'"),
-        "a number before the first" -> Seq("batch_seq" -> "0")
+        "a number before the first" -> Seq("batch_seq" -> "0"),
+        "a reprocess of no batch" -> Seq("run_kind" -> text(RunKind.Reprocess)),
+        "a regular batch that reprocesses one" -> Seq("reprocess_of" -> "1"),
+        "a reprocess of itself" -> Seq("run_kind" -> text(RunKind.Reprocess), "reprocess_of" -> "1")
       )
       notBatches.foreach { case (what, columns) =>
         withClue(s"$what: ")(
@@ -651,6 +654,57 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
           )
         ) shouldBe ForeignKeyViolation
       }
+    }
+  }
+
+  test("a reprocess names a batch of its sequence before it, which the engine's role writes") {
+    val source = newSource()
+    val (first, again) = (RunId.generate(), RunId.generate())
+    as(Engine) { c =>
+      snapshot(c)
+      insertRun(c, source, first)()
+      insertBatch(c, source, 1, first)()
+      update(
+        c,
+        s"UPDATE control.ingestion_batch SET $Committed, committed_by_run = '$first' " +
+          s"WHERE source_id = '$source'"
+      ) shouldBe 1
+      insertRun(c, source, again)(
+        "run_kind" -> text(RunKind.Reprocess),
+        "requested_by" -> "'ops'",
+        "reason" -> "'the parser was fixed'"
+      )
+      withClue("of a batch that there is not: ") {
+        sqlState(
+          insertBatch(c, source, 3, again)(
+            "run_kind" -> text(RunKind.Reprocess),
+            "reprocess_of" -> "2"
+          )
+        ) shouldBe ForeignKeyViolation
+      }
+      withClue("of a batch of another sequence: ") {
+        val other = newSource()
+        sqlState(
+          insertBatch(c, other, 2, again)(
+            "run_kind" -> text(RunKind.Reprocess),
+            "reprocess_of" -> "1"
+          )
+        ) shouldBe ForeignKeyViolation
+      }
+      insertBatch(c, source, 2, again)("run_kind" -> text(RunKind.Reprocess), "reprocess_of" -> "1")
+      query(
+        c,
+        "SELECT run_kind, reprocess_of::text FROM control.ingestion_batch WHERE source_id = ? " +
+          "AND batch_seq = 2",
+        source
+      ) shouldBe Seq(Seq("reprocess", "1"))
+      // What it reprocesses is written with its plan, and never changed.
+      sqlState(
+        update(
+          c,
+          s"UPDATE control.ingestion_batch SET reprocess_of = 1 WHERE source_id = '$source'"
+        )
+      ) shouldBe InsufficientPrivilege
     }
   }
 

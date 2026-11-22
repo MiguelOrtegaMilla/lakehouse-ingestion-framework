@@ -99,6 +99,25 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
     )
   )
 
+  /** A sixth batch that read the files of batch 1 again, by a reprocess, with no rows. */
+  private val r10 = RunId.generate()
+  private val reprocessed = clean.copy(
+    batches = clean.batches :+
+      Batch(
+        6,
+        BatchStatus.Committed,
+        T,
+        Some(r10),
+        Nil,
+        files = Set(file("a")),
+        reprocessOf = Some(1)
+      ),
+    runs = clean.runs :+ Run(r10, Some(6), RunStatus.Succeeded, Some(0), RunKind.Reprocess),
+    state = Some(State(None, 6, r10))
+  )
+  private def reprocessing(of: Long, files: Set[TakenFile] = Set(file("a"))): Facts =
+    batch(reprocessed, 6)(_.copy(reprocessOf = Some(of), files = files))
+
   // -----------------------------------------------------------------------------------------------
   // What is as it should be
   // -----------------------------------------------------------------------------------------------
@@ -175,6 +194,10 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
       between.copy(state = clean.state, resets = between.resets.take(1))
     ) shouldBe
       empty
+  }
+
+  test("a reprocess reads the files of a committed batch again, and takes none") {
+    IngestionLedger.check(reprocessed) shouldBe empty
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -320,6 +343,19 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
     rules(reset.copy(runs = reset.runs.filter(_.id != r9))) shouldBe Set(Rule.ResetNotSucceeded)
     IngestionLedger.check(run(reset, r9)(_.copy(status = RunStatus.Failed))).map(_.message) shouldBe
       Seq(s"the state was reset by the run $r9, of the kind reset, which ended FAILED")
+  }
+
+  test("a reprocess of a batch that was not committed, that is not before it, or of other files") {
+    rules(reprocessing(4, Set(file("d")))) shouldBe Set(Rule.ReprocessNotOfCommitted)
+    rules(reprocessing(9)) shouldBe Set(Rule.ReprocessNotOfCommitted)
+    rules(reprocessing(1, Set(file("b")))) shouldBe Set(Rule.ReprocessNotOfCommitted)
+    IngestionLedger.check(reprocessing(4, Set(file("d")))).map(_.message) shouldBe
+      Seq("batch 6 reprocesses batch 4, which is ABANDONED")
+  }
+
+  test("a reprocess whose files were taken again") {
+    rules(reprocessed.copy(taken = reprocessed.taken + (file("a") -> 6L))) shouldBe
+      Set(Rule.FilesNotAsCommitted)
   }
 
   test("files taken that are not those of the committed plans") {

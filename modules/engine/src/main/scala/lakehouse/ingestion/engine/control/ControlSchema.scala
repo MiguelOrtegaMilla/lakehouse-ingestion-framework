@@ -18,7 +18,7 @@ object ControlSchema {
   val Name = "control"
 
   /** The version of the schema that this application was built for: its last migration. */
-  val Version = 5
+  val Version = 6
 
   /** Where the migrations of the schema are, on the classpath of whatever applies them. */
   val Migrations = "classpath:db/migration/control"

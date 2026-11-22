@@ -92,6 +92,8 @@ object Main {
        |                               [--max-batches <n>]
        |       lakehouse-ingestion abandon-batch --profile <file> --sources <directory>
        |                               --source <id> --batch <n> --reason <text>
+       |       lakehouse-ingestion reprocess --profile <file> --sources <directory>
+       |                               --source <id> --batch <n> --reason <text>
        |       lakehouse-ingestion reset-state --profile <file> --sources <directory>
        |                               --source <id> --reason <text>
        |                               (--watermark <moment> | --forget-watermark
@@ -111,6 +113,9 @@ object Main {
        |              planned for does not have it: the next run plans anew from the state of
        |              the source. It is a run of its own, under the lease of the source, that
        |              records who asked for it (the user of the process) and why.
+       |  reprocess   Reads the files of a committed batch of a source again, into the table
+       |              that its configuration names now, as a batch of its own whose run says
+       |              who asked and why. The files stay taken by the batch that took them.
        |  reset-state  Resets the state of a source: its watermark is set, forgotten or kept,
        |              and its configuration as it is now is the one that later runs are
        |              compared with, which lets a change through that a run refuses. The
@@ -124,7 +129,8 @@ object Main {
        |              env:NAME or file:/run/secrets/name
        |  --user      the role that owns the schemas; $Migrator unless said
        |  --max-batches  the most batches that run commits; no limit unless said
-       |  --batch     the number of the batch to give up: the one that is planned
+       |  --batch     abandon-batch: the number of the batch to give up, the one that is
+       |              planned; reprocess: that of the committed batch whose files are read
        |  --reason    why, in one line: kept with the run and with the batch
        |  --watermark  the moment that the source is taken to be ingested up to, as
        |              load.watermark.start is written: 2026-03-01T00:00:00Z
@@ -134,7 +140,7 @@ object Main {
        |
        |exit codes: 0 the configuration is valid, the schemas are at their version, the run
        |              ended well (a batch committed, nothing new, or a source that is
-       |              disabled), the batch was given up, or the state was reset;
+       |              disabled), the batch was given up or reprocessed, or the state was reset;
        |            2 another run holds the lease of the source: nothing was done;
        |            3 a database could not be reached, the run lost its lease, its batch was
        |              given up, or a table could not be read, and running again later may do;
@@ -142,7 +148,8 @@ object Main {
        |              reason that running again does not mend, the batch was not given up:
        |              none is planned, another is, or its table has it, or the state was not
        |              reset: a batch is planned, the source has no state, or no such
-       |              watermark;
+       |              watermark, or the batch was not reprocessed: it was not committed, read
+       |              no files, or another is planned;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
        |            128 + n run was stopped by the signal n before its first run: nothing was
@@ -224,15 +231,33 @@ object Main {
       val asked = for {
         found <- parse(options, Set("--profile", "--sources", "--source", "--batch", "--reason"))
         source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
-        batch <- found("--batch").toLongOption
-          .filter(n => found("--batch") == n.toString)
-          .flatMap(BatchSeq.of(_).toOption)
-          .toRight(s"--batch '${shown(found("--batch"))}' is not the number of a batch, from 1")
+        batch <- batchOf(found("--batch"))
         request <- OperatorRequest.of(operator, found("--reason"))
       } yield (found("--profile"), found("--sources"), source, batch, request)
       asked match {
         case Right((profile, sources, source, batch, request)) =>
           AbandonBatchCommand.run(
+            Paths.get(profile),
+            Paths.get(sources),
+            source,
+            batch,
+            request,
+            SecretResolver(environment),
+            out,
+            err
+          )
+        case Left(problem) => usage(problem, err)
+      }
+    case "reprocess" :: options =>
+      val asked = for {
+        found <- parse(options, Set("--profile", "--sources", "--source", "--batch", "--reason"))
+        source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
+        batch <- batchOf(found("--batch"))
+        request <- OperatorRequest.of(operator, found("--reason"))
+      } yield (found("--profile"), found("--sources"), source, batch, request)
+      asked match {
+        case Right((profile, sources, source, batch, request)) =>
+          ReprocessCommand.run(
             Paths.get(profile),
             Paths.get(sources),
             source,
@@ -288,6 +313,13 @@ object Main {
     case Nil => usage("no command", err)
     case command :: _ => usage(s"'${shown(command)}' is not a command", err)
   }
+
+  /** The number of a batch, from 1, written as a number is and no other way. */
+  private def batchOf(text: String): Either[String, BatchSeq] =
+    text.toLongOption
+      .filter(n => text == n.toString)
+      .flatMap(BatchSeq.of(_).toOption)
+      .toRight(s"--batch '${shown(text)}' is not the number of a batch, from 1")
 
   private def usage(problem: String, err: PrintStream): Int = {
     err.println(s"error: $problem")

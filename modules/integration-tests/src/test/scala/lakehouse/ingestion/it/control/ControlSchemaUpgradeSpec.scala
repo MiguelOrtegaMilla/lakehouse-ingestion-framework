@@ -101,8 +101,8 @@ final class ControlSchemaUpgradeSpec
     val ran = ControlPlaneSchema.migrate(pg)
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
-    // V3, and V4 and V5 on top of it: the engine works on the schema that it was built for.
-    ran.lines.head shouldBe s"control: version 5, 3 migrations applied (${pg.jdbcUrl(Database)})"
+    // V3, and V4, V5 and V6 on top of it: the engine works on the schema that it was built for.
+    ran.lines.head shouldBe s"control: version 6, 4 migrations applied (${pg.jdbcUrl(Database)})"
     as(Engine) { c =>
       ControlSchema.verify(c) shouldBe Right(())
 

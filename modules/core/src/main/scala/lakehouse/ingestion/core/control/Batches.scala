@@ -26,13 +26,17 @@ final case class BatchId(app: TxnAppId, seq: BatchSeq) {
  *   and nothing ever changes it: the run that recovers the batch asks that table whether it has
  *   the batch, and no other. None, for a batch that was planned before the control plane kept
  *   it (schema version 3)
+ * @param reprocessOf the batch of the sequence whose files it reads again, for a batch that an
+ *   operator's reprocess planned (ADR-0021 §4); none, for any other. Its commit records no file
+ *   as taken: they were taken by that batch
  */
 final case class PlannedBatch(
     id: BatchId,
     plan: Json,
     plannedBy: RunId,
     plannedAt: Instant,
-    target: Option[String] = None
+    target: Option[String] = None,
+    reprocessOf: Option[BatchSeq] = None
 )
 
 /**
@@ -76,6 +80,7 @@ final case class BatchAbandonment(
  *
  * @param abandoned who gave it up and why, for a batch that is `ABANDONED`, and for no other
  * @param target where it was planned to write its data (`PlannedBatch.target`)
+ * @param reprocessOf the batch whose files it reads again (`PlannedBatch.reprocessOf`)
  */
 final case class BatchRecord(
     id: BatchId,
@@ -90,7 +95,8 @@ final case class BatchRecord(
     committedBy: Option[RunId],
     committedAt: Option[Instant],
     outputs: Option[Vector[BatchOutput]],
-    abandoned: Option[BatchAbandonment]
+    abandoned: Option[BatchAbandonment],
+    reprocessOf: Option[BatchSeq] = None
 )
 
 /**

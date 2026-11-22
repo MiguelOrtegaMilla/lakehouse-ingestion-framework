@@ -311,7 +311,8 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
               file.modifiedAt.toEpochMilli
             )
           }
-        }.toSet
+        }.toSet,
+        reprocessOf = record.reprocessOf.map(_.value)
       )
     }
 

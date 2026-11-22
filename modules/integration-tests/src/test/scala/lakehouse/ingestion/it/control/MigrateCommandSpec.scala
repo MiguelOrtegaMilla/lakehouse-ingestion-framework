@@ -108,7 +108,7 @@ final class MigrateCommandSpec
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
     ran.lines shouldBe Seq(
-      s"control: version 5, 5 migrations applied (${pg.jdbcUrl(Database)})",
+      s"control: version 6, 6 migrations applied (${pg.jdbcUrl(Database)})",
       s"delta_coordination: version 4, 4 migrations applied (${pg.jdbcUrl(Database)})"
     )
     (ran.out + ran.err) should not include pg.password(Migrator)
@@ -130,7 +130,7 @@ final class MigrateCommandSpec
       query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe
         Seq(Seq(PostgresCoordinationStore.SchemaVersion.toString))
     }
-    ControlSchema.Version shouldBe 5
+    ControlSchema.Version shouldBe 6
   }
 
   test("migrating again changes nothing, with the password in a file as a deployment has it") {
@@ -150,7 +150,7 @@ final class MigrateCommandSpec
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
     ran.lines shouldBe Seq(
-      s"control: version 5, nothing to apply (${pg.jdbcUrl(Database)})",
+      s"control: version 6, nothing to apply (${pg.jdbcUrl(Database)})",
       s"delta_coordination: version 4, nothing to apply (${pg.jdbcUrl(Database)})"
     )
   }
@@ -164,11 +164,11 @@ final class MigrateCommandSpec
     }
 
     try {
-      at(4).left.value shouldBe
-        "the schema control is at version 4, and this application needs version 5: apply the " +
+      at(5).left.value shouldBe
+        "the schema control is at version 5, and this application needs version 6: apply the " +
         "migrations (the command migrate) before it runs"
-      at(6).left.value shouldBe
-        "the schema control is at version 6, and this application was built for version 5: it " +
+      at(7).left.value shouldBe
+        "the schema control is at version 7, and this application was built for version 6: it " +
         "is older than the database, and must be upgraded before it runs"
     } finally (at(ControlSchema.Version) shouldBe Right(())): Unit
   }
@@ -176,14 +176,14 @@ final class MigrateCommandSpec
   test("migrations that do not make the version the application needs are refused") {
     // An application put together from a LogStore and an engine of two different builds.
     val loaded = ConfigLoader.loadProfile(profile(pg)).value.value
-    val control = Migrations.targets(loaded).head.copy(version = 6)
+    val control = Migrations.targets(loaded).head.copy(version = 7)
 
     val refused = Migrations
       .migrate(control, SqlIdentifier.parse(Migrator).value, new Secret(pg.password(Migrator)))
 
     refused.left.value shouldBe DatabaseFailure.Refused(
-      "the schema control is at version '5' with every migration applied, and this application " +
-        "needs version 6: it was not built whole"
+      "the schema control is at version '6' with every migration applied, and this application " +
+        "needs version 7: it was not built whole"
     )
   }
 
