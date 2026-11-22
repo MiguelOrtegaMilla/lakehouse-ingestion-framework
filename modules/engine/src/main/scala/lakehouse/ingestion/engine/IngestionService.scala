@@ -1,6 +1,5 @@
 package lakehouse.ingestion.engine
 
-import java.io.IOException
 import java.time.{Clock, Instant}
 
 import scala.util.control.NonFatal
@@ -35,7 +34,7 @@ import lakehouse.ingestion.engine.control.{
 import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.engine.quarantine.{QuarantineBatch, QuarantineWriter}
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
-import lakehouse.ingestion.logstore.{CommitContext, EpochNotInForceException, WriterEpochs}
+import lakehouse.ingestion.logstore.{CommitContext, EpochNotInForceException}
 import org.apache.spark.sql.SparkSession
 import org.slf4j.LoggerFactory
 
@@ -402,42 +401,13 @@ final class IngestionService(
       }
 
     /**
-     * Says to the LogStore that the epoch of this run is the one in force for its lease
-     * (ADR-0019). Once it has, a commit of a run under an earlier epoch is in its table, where
-     * this run finds it, or will never be.
-     *
-     * A later epoch in force has one of two authors. A run of this control plane that took the
-     * lease over: it ended this run, as `ABANDONED`, in the transaction that took the lease. Or
-     * another control plane, whose epochs the coordination store remembers, as it does when this
-     * one was made anew over it (ADR-0019): then the lease is still this run's, nobody ended it,
-     * and every run of the source will be told the same until an operator forgets those epochs.
-     * The control plane tells the two apart, when the run asks it to record that it failed for
-     * good (`ended`): taken over, the run was ended already, and it reports that it lost its
-     * lease (3); not taken over, the run is recorded as failed, its lease is given up, and it
-     * reports a failure that running again does not mend (4).
+     * Says to the LogStore that the epoch of this run is the one in force for its lease, before
+     * a table is asked anything (`EpochAnnouncement`).
      *
      * @return how the run ended, if a later epoch is in force; none, if its own is
      */
-    private def announce(): Option[Outcome] = {
-      val inForce =
-        try WriterEpochs.announce(hadoop, turn)
-        catch {
-          case e: IOException =>
-            throw RunFailedException.transient(
-              s"the epoch of the lease of ${start.leaseKey} could not be announced to the " +
-                s"coordination store, and nothing was read or written: ${e.getMessage}",
-              e
-            )
-        }
-      Option.when(inForce != turn.epoch) {
-        val message =
-          s"the coordination store has the epoch $inForce in force for ${start.leaseKey}, and " +
-            s"this run holds its lease under ${turn.epoch}, which no run of this control plane " +
-            "gave up to a later one: the store remembers the epochs of another control plane, " +
-            "as it does when this one was made anew over it. Every run of the source is " +
-            "refused until an operator forgets them with the maintenance role (ADR-0019): " +
-            "DELETE FROM delta_coordination.writer_epoch WHERE epoch_key = " +
-            s"'${start.leaseKey}'. Nothing was read or written"
+    private def announce(): Option[Outcome] =
+      EpochAnnouncement.announce(hadoop, start, turn).left.toOption.map { message =>
         ended(leased, RunEnd.Failed(FailureClass.Permanent, message)) match {
           case refused @ Outcome.Failed(_, FailureClass.Permanent, _) =>
             log.error(s"the run ${start.id} of ${source.id} failed: $message")
@@ -446,7 +416,6 @@ final class IngestionService(
           case lost => lost
         }
       }
-    }
 
     /** Plans the next batch of the source, and ingests it. */
     private def planNext(): Outcome = {

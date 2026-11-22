@@ -13,34 +13,18 @@ import lakehouse.ingestion.core.control.{FailureClass, LeaseTiming}
 import lakehouse.ingestion.engine.IngestionService
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
-import lakehouse.ingestion.engine.control.{ControlDatabase, DatabaseFailure}
+import lakehouse.ingestion.engine.control.DatabaseFailure
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
-import lakehouse.ingestion.logstore.{StartupGuard, StartupRefusedException}
-import org.apache.hadoop.fs.{Path => HadoopPath}
-import org.apache.spark.sql.SparkSession
+import lakehouse.ingestion.logstore.StartupRefusedException
 
 /**
  * The command `run`: the runs of one source into Bronze, as an orchestrator starts it (a
- * process runs one source). What can be refused is refused before anything costly is started,
- * the cheapest first, and each refusal ends in the code that says what to do with it
- * (discovery §14.1):
- *
- *  1. the whole configuration, validated as `validate` does (4);
- *  1. the source, which must be in it (4); one that is disabled is a pause that somebody chose,
- *     and the run ends well with nothing opened (0);
- *  1. a connector for its kind in this application (4);
- *  1. the roots of the lake and of the landing zone, which must be there: the engine makes
- *     neither, since a root that is missing is more often a disk that is not mounted (4);
- *  1. the time zone of the JVM, which is set to UTC before a database is connected to or a
- *     session is made, and which only a JVM that cannot be set so is refused for (4);
- *  1. the control plane, reached and at its version: not reached (3), or refused (4);
- *  1. the session of Spark, with no setting from outside the profile that a profile would be
- *     refused for (4), and the startup guard of the LogStore: a coordination database that is
- *     not reached (3), anything else (4);
- *  1. the runs: one, and the next while the batch that it committed says that the source has
- *     more, up to `--max-batches` and until a signal asks it to stop (`runs`). The code is that
- *     of the last run (`exitOf`).
+ * process runs one source). What it stands on, and what is refused before anything costly is
+ * started, is `SourceCommand`'s, with the connector of the source and the landing zone, and with
+ * nothing done for a source that is disabled (0). Then the runs: one, and the next while the
+ * batch that it committed says that the source has more, up to `--max-batches` and until a
+ * signal asks it to stop (`runs`). The code is that of the last run (`exitOf`, discovery §14.1).
  *
  * An exception that nothing classified is let through, after the session and the control plane
  * are closed: the process ends with the JVM's 1 until `Main` catches it (P8, 70).
@@ -67,63 +51,24 @@ object RunCommand {
       maxBatches: Option[Int] = None,
       stop: Stop = Stop.Never
   ): Int =
-    ConfigLoader.load(profilePath, sourcesPath) match {
-      case Left(errors) =>
-        errors.toChain.toVector.foreach(error => err.println(error.message))
-        err.println("The configuration is not valid, and nothing was run.")
-        Main.Exit.Permanent
-
-      case Right(Loaded(configuration, warnings)) =>
-        warnings.foreach(warning => err.println(s"warning: ${warning.message}"))
-        val profile = configuration.profile
-        configuration.sources.find(_.id == id) match {
-          case None =>
-            err.println(
-              s"error: there is no source ${id.value} in $sourcesPath, and nothing was run. " +
-                s"The sources are: ${configuration.sources.map(_.id.value).sorted.mkString(", ")}"
-            )
-            Main.Exit.Permanent
-
-          case Some(source) if !source.enabled =>
-            out.println(
-              s"The source ${id.value} is disabled (enabled: false), and was not run: nothing " +
-                "was opened, read or recorded. Set enabled to true to run it again."
-            )
-            Main.Exit.Ok
-
-          case Some(source) =>
-            val registry = connectors(profile, secrets)
-            val refused =
-              withoutConnector(source, registry).toSeq ++ missingRoots(profile) ++
-                // Before a database is connected to: a connection takes the zone of the JVM.
-                RunSession.jvmToUtc().left.toSeq
-            if (refused.nonEmpty) {
-              refused.foreach(problem => err.println(s"error: $problem"))
-              err.println("Nothing was run.")
-              Main.Exit.Permanent
-            } else
-              ControlDatabase.open(profile.databases.control, secrets) match {
-                case Left(failure) =>
-                  err.println(s"error: ${failure.message}")
-                  err.println("Nothing was run.")
-                  failure match {
-                    case _: DatabaseFailure.Unreachable => Main.Exit.Transient
-                    case _: DatabaseFailure.Refused => Main.Exit.Permanent
-                  }
-                case Right(database) =>
-                  try
-                    withSession(
-                      profile,
-                      source,
-                      registry,
-                      database,
-                      Chain(maxBatches, stop),
-                      out,
-                      err
-                    )
-                  finally database.close()
-              }
-        }
+    SourceCommand(
+      profilePath,
+      sourcesPath,
+      id,
+      secrets,
+      out,
+      err,
+      ingests = true,
+      done = "run"
+    ) { ready =>
+      val service = new IngestionService(
+        ready.database,
+        connectors(ready.profile, secrets),
+        ready.spark,
+        ready.profile.lake.uri,
+        LeaseTiming(ready.profile.leases.ttl)
+      )
+      runs(service, ready.source, ready.config, Chain(maxBatches, stop), out, err)
     }
 
   /**
@@ -131,66 +76,6 @@ object RunCommand {
    * `stop` has asked.
    */
   final private case class Chain(maxBatches: Option[Int], stop: Stop)
-
-  /** The runs, in a session of their own, which is stopped however they end. */
-  private def withSession(
-      profile: Profile,
-      source: Source,
-      registry: ConnectorRegistry,
-      database: ControlDatabase,
-      chain: Chain,
-      out: PrintStream,
-      err: PrintStream
-  ): Int = {
-    val engine = RunSession.engine(profile, source.id)
-    val spark = RunSession.open(RunSession.settings(profile, source.id))
-    try {
-      val effective = spark.sparkContext.getConf.getAll.toMap ++ spark.conf.getAll
-      val foreign = RunSession.foreign(effective, engine)
-      if (foreign.nonEmpty) {
-        foreign.foreach { case (key, reason) =>
-          err.println(
-            s"error: the Spark session has $key from outside the profile (spark-defaults.conf, " +
-              s"a system property of the JVM, or --conf), and it $reason"
-          )
-        }
-        err.println("Nothing was run.")
-        Main.Exit.Permanent
-      } else
-        guarded(spark, profile, err).getOrElse {
-          val service = new IngestionService(
-            database,
-            registry,
-            spark,
-            profile.lake.uri,
-            LeaseTiming(profile.leases.ttl)
-          )
-          runs(service, source, ConfigVersion.of(profile, source), chain, out, err)
-        }
-    } finally RunSession.close(spark)
-  }
-
-  /**
-   * The startup guard of the LogStore, with the Hadoop configuration that Delta would hand it.
-   *
-   * @return the exit code, if the process may not start
-   */
-  private def guarded(spark: SparkSession, profile: Profile, err: PrintStream): Option[Int] =
-    try {
-      StartupGuard.require(
-        spark.sessionState.newHadoopConf(),
-        new HadoopPath(profile.lake.uri.value)
-      )
-      None
-    } catch {
-      case refused: StartupRefusedException =>
-        refused.problems.foreach(problem => err.println(s"error: $problem"))
-        refused.coordinationFailure.foreach { failure =>
-          err.println(s"error: the coordination database said: ${DatabaseFailure.said(failure)}")
-        }
-        err.println("Nothing was run.")
-        Some(exitOfRefusal(refused))
-    }
 
   /**
    * Why a source cannot be run by an application with these connectors, if it has none for the
@@ -219,8 +104,9 @@ object RunCommand {
    * a lake on object storage is the startup guard's to try, and a landing zone there is
    * refused when it is listed (E2).
    */
-  def missingRoots(profile: Profile): Seq[String] =
-    Seq("lake.uri" -> profile.lake.uri, "landing.root" -> profile.landing.root).collect {
+  def missingRoots(profile: Profile, landing: Boolean = true): Seq[String] =
+    (Seq("lake.uri" -> profile.lake.uri) ++
+      Option.when(landing)("landing.root" -> profile.landing.root)).collect {
       case (field, root) if root.isLocal && !Files.isDirectory(Paths.get(URI.create(root.value))) =>
         s"the root of $field, ${root.value}, is not a directory: it is not there, or is not a " +
           "directory. The engine does not make it, since a root that is missing is more often " +
