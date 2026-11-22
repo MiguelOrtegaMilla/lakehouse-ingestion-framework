@@ -25,6 +25,7 @@ import lakehouse.ingestion.engine.connector.{
 }
 import lakehouse.ingestion.engine.control.{
   Application,
+  Batches,
   ConfigSnapshots,
   ControlDatabase,
   LeasedRun,
@@ -216,6 +217,42 @@ final class IngestionService(
   }
 
   /**
+   * Reads the files of the committed batch `of` again, as a batch of the regular sequence of
+   * `source` of the kind `reprocess`, by a run of that kind that `request` asked for (ADR-0021
+   * §4). The batch has the next number and the plan of `of`, files, sizes and times, and is
+   * written to the table that the configuration names now. From its plan on it is a batch like
+   * any other: replayed or rolled forward by the run after one that died, given up if one of its
+   * files changed since. Its commit records no file as taken.
+   *
+   * It is refused, as a permanent failure with nothing planned, while a batch is planned, for a
+   * batch that was not committed, and for a source whose batches are no files: a window of a
+   * table is read again by a backfill, which moves no watermark back, and a full load reads
+   * the whole table at every run.
+   *
+   * @throws java.lang.IllegalArgumentException if the application has no connector for the
+   *   source. Nothing was started
+   */
+  def reprocess(
+      source: Source,
+      config: ConfigVersion,
+      of: BatchSeq,
+      request: OperatorRequest
+  ): Outcome = {
+    val bound = connectors.bind(source)
+    val start = RunStart(
+      RunId.generate(),
+      source.id,
+      Layer.Bronze,
+      RunKind.Reprocess,
+      Application.instance,
+      Application.version,
+      config.hash,
+      Some(request)
+    )
+    held(start, bound, config, None)(_.reprocess(of))
+  }
+
+  /**
    * Takes the lease for `start`, and does `body` with the run that holds it; a run that does not
    * get the lease is skipped. How the run ends, whatever `body` throws, is said here, for every
    * kind of run that reads a source.
@@ -378,7 +415,58 @@ final class IngestionService(
     // it, and each is held to the epoch of the run.
     private val commits = CommitContext.forRun(start.id.uuid, turn)
 
-    def run(): Outcome = {
+    def run(): Outcome =
+      prepared {
+        leased.planned() match {
+          case Some(left) => recover(left)
+          case None => planNext()
+        }
+      }
+
+    /** Plans a batch that reads the files of the committed batch `of` again, and ingests it. */
+    def reprocess(of: BatchSeq): Outcome =
+      prepared {
+        leased.planned() match {
+          case Some(left) =>
+            throw RunFailedException.permanent(
+              s"the batch ${left.id} is planned: no batch is reprocessed while one is, since " +
+                "it is the next run's to finish, or an operator's to give up first " +
+                "(abandon-batch). Nothing was planned, read or written"
+            )
+          case None =>
+            val earlier = BatchId(start.txnAppId, of)
+            val record = database.run(Batches.find(_, earlier)).getOrElse {
+              throw RunFailedException.permanent(
+                s"there is no batch $earlier to reprocess. Nothing was planned, read or written"
+              )
+            }
+            if (record.status != BatchStatus.Committed)
+              throw RunFailedException.permanent(
+                s"the batch $earlier is ${record.status.name}, and only a batch that was " +
+                  "committed is reprocessed: its files are the ones that were taken. Nothing " +
+                  "was planned, read or written"
+              )
+            if (bound.progress(record.plan).files.isEmpty)
+              throw RunFailedException.permanent(
+                s"the batch $earlier read no files, and only files are reprocessed: a window " +
+                  "of a table is read again by a backfill, which moves no watermark back, and " +
+                  "a full load reads the whole table at every run. Nothing was planned, read " +
+                  "or written"
+              )
+            val batch = leased.plan(record.plan, table, Some(of))
+            log.info(
+              s"the run ${start.id} planned ${batch.id}, which reads the files of $earlier again"
+            )
+            hooks.at(FaultPoint.AfterPlan, batch)
+            ingest(batch)
+        }
+      }
+
+    /**
+     * What every run does before it looks for a batch, and then `next`, unless a later epoch is
+     * in force.
+     */
+    private def prepared(next: => Outcome): Outcome = {
       confinement.confine(table)
       confinement.confine(quarantine)
       // Before a batch is looked for: one that is rolled forward moves the state of the source
@@ -386,12 +474,7 @@ final class IngestionService(
       heldToWhatWasIngested()
       // Before a table is asked anything: what it then says of a batch is not changed behind
       // this run by one that held the lease before.
-      announce().getOrElse {
-        leased.planned() match {
-          case Some(left) => recover(left)
-          case None => planNext()
-        }
-      }
+      announce().getOrElse(next)
     }
 
     /**

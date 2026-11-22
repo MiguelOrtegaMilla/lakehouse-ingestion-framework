@@ -17,7 +17,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)); the model of the control plane and the recovery decision; and the plan of a batch, of files and of a window of a watermark. |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
 | `engine` | Connectors, Delta writers, control-plane repositories, engine service. So far: the control plane, the connector contract with the file connector and the JDBC connector, the writers of Bronze and of the quarantine, and `IngestionService`, one run of one source. |
-| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run`, `abandon-batch` and `reset-state`. |
+| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run`, `abandon-batch`, `reset-state` and `reprocess`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
 The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`, which also fails if two packages of `core` depend on each other, directly or through others, by the dependencies that the compiler records between classes (`project/PackageCycles.scala`).
@@ -268,6 +268,18 @@ A watermark kept across a change has two risks, and the command warns of each on
 | 3 | A database did not answer, or the action lost its lease |
 | 4 | Refused, with nothing changed: a batch is planned (it is the next run's, or `abandon-batch`'s), the source has no state, or it keeps no watermark of the kind asked for, or the moment cannot be one |
 | 64 | The command line is not one: `--reason` and exactly one of the three options are required |
+
+### Reading files again: `reprocess`
+
+A file that was taken is not read again by a run. When it has to be, because the parser was fixed, or the Bronze table was moved by a reset and is to have the history, an operator reprocesses the batch that took it:
+
+```bash
+sbt "cli/run reprocess --profile conf/app/local.yaml --sources conf/sources --source sales.returns --batch 3 --reason 'the parser of dates was fixed'"
+```
+
+It is a run of its own under the lease of the source, with who asked and why, that plans the next batch of the source with the files of batch 3, as they were then (names, sizes and times), and ingests it into the table that the configuration names now. The batch says which batch it reads again, and takes no file: the files stay taken by the batch that took them. Bronze keeps both copies, each with its run. From its plan on it is a batch like any other: one that a run left halfway is finished by the next run, and one whose file changed since, or is gone, is given up. It is for sources of files: a window of a table is read again by a backfill ([ADR-0021](docs/adr/0021-operator-actions-and-backfills.md)).
+
+Its codes are those of `run`: 0 the batch was committed, 2 a run holds the lease, 3 a database did not answer, the lease was lost or a file changed since, 4 refused with nothing planned (a batch is planned, the batch named was not committed or read no files, or a configuration that Bronze cannot follow), 5 more records rejected than the source allows, 64 the command line is not one.
 
 ### A table of a database: `sales.orders`
 

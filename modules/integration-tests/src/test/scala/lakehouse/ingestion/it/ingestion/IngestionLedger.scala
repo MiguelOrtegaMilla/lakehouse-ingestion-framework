@@ -11,10 +11,10 @@ import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
  * whatever the test did before: a batch that is committed is in its table once, and in no
  * other; a batch that was given up is in none; a row says a run, and the run says its batch; the
  * state is that of the last batch, or of the reset after it; each reset was of the state that
- * there was, and went on from its last batch; the files taken are those of the committed plans;
+ * there was, and went on from its last batch; the files taken are those of the committed plans,
+ * but for a reprocess, which reads again those of a committed batch before it and takes none;
  * no run is still running, and the run that committed a batch, or reset the state, succeeded. A
- * test
- * that kills a run, takes its lease over or changes its source asks it of what is left once the
+ * test that kills a run, takes its lease over or changes its source asks it of what is left once the
  * next run has finished.
  *
  * It is plain data and one pure function, so that every rule is tested on facts made by hand
@@ -40,6 +40,7 @@ object IngestionLedger {
    *   none, for a version that was not known
    * @param watermark what its commit moves the watermark to, from its plan
    * @param files the files of its plan, for a batch of files
+   * @param reprocessOf the batch whose files it reads again, for a batch of a reprocess
    */
   final case class Batch(
       seq: Long,
@@ -48,7 +49,8 @@ object IngestionLedger {
       committedBy: Option[RunId] = None,
       outputs: Seq[Output] = Nil,
       watermark: Option[Json] = None,
-      files: Set[TakenFile] = Set.empty
+      files: Set[TakenFile] = Set.empty,
+      reprocessOf: Option[Long] = None
   )
 
   final case class Output(table: String, version: Option[Long])
@@ -126,6 +128,7 @@ object IngestionLedger {
     case object StateNotOfLastBatch extends Rule("StateNotOfLastBatch")
     case object ResetNotChained extends Rule("ResetNotChained")
     case object ResetNotSucceeded extends Rule("ResetNotSucceeded")
+    case object ReprocessNotOfCommitted extends Rule("ReprocessNotOfCommitted")
     case object FilesNotAsCommitted extends Rule("FilesNotAsCommitted")
     case object StillRunning extends Rule("StillRunning")
     case object CommitterNotSucceeded extends Rule("CommitterNotSucceeded")
@@ -138,7 +141,7 @@ object IngestionLedger {
   /** Every way in which the facts disagree; none, for a source that is as it should be. */
   def check(facts: Facts): Seq[Violation] =
     tables(facts) ++ txns(facts) ++ rows(facts) ++ state(facts) ++ resets(facts) ++
-      files(facts) ++ runs(facts)
+      files(facts) ++ reprocesses(facts) ++ runs(facts)
 
   // -----------------------------------------------------------------------------------------------
   // Batches and the commits of the tables
@@ -432,9 +435,10 @@ object IngestionLedger {
     }
   }
 
+  /** A reprocess takes no file: the files it reads again were taken by the batch it names. */
   private def files(facts: Facts): Seq[Violation] = {
     val committed = facts.batches
-      .filter(_.status == BatchStatus.Committed)
+      .filter(batch => batch.status == BatchStatus.Committed && batch.reprocessOf.isEmpty)
       .flatMap(batch => batch.files.map(_ -> batch.seq))
       .toSet
     def show(files: Set[(TakenFile, Long)]) =
@@ -446,6 +450,28 @@ object IngestionLedger {
     ) ++ show(facts.taken -- committed).map(file =>
       Violation(Rule.FilesNotAsCommitted, s"$file: taken, and in no committed plan")
     )
+  }
+
+  /**
+   * A batch of a reprocess reads the files of a batch before it that was committed, and no
+   * others (ADR-0021 §4).
+   */
+  private def reprocesses(facts: Facts): Seq[Violation] = {
+    val bySeq = facts.batches.map(batch => batch.seq -> batch).toMap
+    facts.batches.sortBy(_.seq).flatMap { batch =>
+      batch.reprocessOf.toSeq.flatMap { of =>
+        val what = s"batch ${batch.seq} reprocesses batch $of"
+        (bySeq.get(of) match {
+          case None => Some(s"$what, which there is not")
+          case Some(earlier) if earlier.status != BatchStatus.Committed =>
+            Some(s"$what, which is ${earlier.status.name}")
+          case Some(_) if of >= batch.seq => Some(s"$what, which is not before it")
+          case Some(earlier) if earlier.files != batch.files =>
+            Some(s"$what, and its files are not that batch's")
+          case Some(_) => None
+        }).map(Violation(Rule.ReprocessNotOfCommitted, _))
+      }
+    }
   }
 
   private def runs(facts: Facts): Seq[Violation] = {

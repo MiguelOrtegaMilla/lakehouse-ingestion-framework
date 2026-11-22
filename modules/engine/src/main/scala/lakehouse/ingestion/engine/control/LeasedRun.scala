@@ -64,14 +64,19 @@ final class LeasedRun private (
    *
    * @param target the table that the batch is to write its data to: the one that the run that
    *   finishes the batch asks whether it has it
+   * @param reprocessOf the batch whose files it reads again, for a run of the kind `reprocess`
    * @throws LeaseLostException if the lease is another run's by now
    * @throws java.sql.SQLException with state 23505 if a batch is planned already: it is to be
    *   finished first (`planned`)
    */
   @throws[SQLException]
   @throws[LeaseLostException]
-  def plan(plan: Json, target: TableLocation): PlannedBatch = holding { connection =>
-    val batch = Batches.plan(connection, start, plan, target)
+  def plan(
+      plan: Json,
+      target: TableLocation,
+      reprocessOf: Option[BatchSeq] = None
+  ): PlannedBatch = holding { connection =>
+    val batch = Batches.plan(connection, start, plan, target, reprocessOf)
     Runs.took(connection, start.id, batch.id)
     batch
   }
@@ -91,8 +96,9 @@ final class LeasedRun private (
    * condition that the lease is still this run's under its epoch, or none of it.
    *
    * @param watermark where the next batch starts from; none, for a source that has none
-   * @param files the plan of the batch, for a file source: its files are recorded as taken. It
-   *   must be the plan that was written down for the batch
+   * @param files the plan of the batch, for a file source: its files are recorded as taken,
+   *   unless the batch reads again those of another. It must be the plan that was written down
+   *   for the batch
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed. The batch is the other run's to finish, and the data that this one wrote is
    *   in the table once all the same, by the number of the batch
@@ -134,10 +140,13 @@ final class LeasedRun private (
             written.exists(planned => FilePlan.fromJson(planned.plan) == Right(plan)),
             "the files given are not those of its plan"
           )
-          must(
-            ProcessedFiles.record(connection, start.source, batch, plan),
-            "a file of its plan was taken by a batch already"
-          )
+          // A batch that reads again the files of another records none: that batch took them,
+          // and the plan of this one is the record that they were read again (ADR-0021 §4).
+          if (written.forall(_.reprocessOf.isEmpty))
+            must(
+              ProcessedFiles.record(connection, start.source, batch, plan),
+              "a file of its plan was taken by a batch already"
+            )
         }
         must(Batches.commit(connection, batch, start.id, outputs), "it is not a planned batch")
         must(

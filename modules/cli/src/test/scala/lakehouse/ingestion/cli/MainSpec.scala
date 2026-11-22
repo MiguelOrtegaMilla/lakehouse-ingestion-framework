@@ -562,9 +562,26 @@ final class MainSpec
 
     Main.Usage should include("lakehouse-ingestion abandon-batch --profile <file>")
     Main.Usage should include("--batch <n> --reason <text>")
-    Main.Usage should include("the batch was given up, or the state was reset;")
+    Main.Usage should include("the batch was given up or reprocessed, or the state was reset;")
     Main.Usage should include("or a table could not be read")
     Main.Usage should include("none is planned, another is, or its table has it")
+  }
+
+  test("reprocess: a batch by its number and a reason, or the command line is not one: 64") {
+    def reprocess(more: String*): Ran =
+      run(
+        Seq("reprocess", "--profile", "p.yaml", "--sources", "conf/sources", "--source", "s.a") ++
+          more: _*
+      )
+    reprocess("--reason", "fixed").errors.head shouldBe "error: --batch must be given"
+    reprocess("--batch", "1").errors.head shouldBe "error: --reason must be given"
+    reprocess("--batch", "01", "--reason", "fixed").errors.head shouldBe
+      "error: --batch '01' is not the number of a batch, from 1"
+    reprocess("--batch", "1", "--reason", "fixed", "--keep-watermark").exit shouldBe Main.Exit.Usage
+
+    Main.Usage should include("lakehouse-ingestion reprocess --profile <file>")
+    Main.Usage should include("the batch was given up or reprocessed")
+    Main.Usage should include("or the batch was not reprocessed: it was not committed")
   }
 
   test("reset-state: one way of the watermark, a moment as start is written, and a reason: 64") {

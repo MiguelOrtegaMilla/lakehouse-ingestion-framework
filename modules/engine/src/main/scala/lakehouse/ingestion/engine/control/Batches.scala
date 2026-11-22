@@ -28,7 +28,7 @@ object Batches {
     """txn_app_id, batch_seq, source_id, layer, run_kind, plan::text AS plan, status,
       |planned_by_run, planned_at, committed_by_run, committed_at, outputs::text AS outputs,
       |abandoned_by_run, abandoned_at, abandon_reason, abandon_detail::text AS abandon_detail,
-      |target_table""".stripMargin
+      |target_table, reprocess_of""".stripMargin
 
   /**
    * The batch of a sequence that is planned and not committed. There is one at most: the next
@@ -44,7 +44,14 @@ object Batches {
       statement.setString(1, app.value)
       Using.resource(statement.executeQuery()) { row =>
         Option.when(row.next())(record(row)).map { batch =>
-          PlannedBatch(batch.id, batch.plan, batch.plannedBy, batch.plannedAt, batch.target)
+          PlannedBatch(
+            batch.id,
+            batch.plan,
+            batch.plannedBy,
+            batch.plannedAt,
+            batch.target,
+            batch.reprocessOf
+          )
         }
       }
     }
@@ -56,6 +63,8 @@ object Batches {
    * @param target the table that the batch is to write its data to. It is written down with the
    *   plan, and as little changed afterwards: it is the table that is asked whether it has the
    *   batch, by whichever run finishes it
+   * @param reprocessOf the batch whose files it reads again, for a run of the kind `reprocess`,
+   *   which names one, and for no other (ADR-0021 §4)
    * @throws java.lang.IllegalArgumentException if the plan could not be read back (`StoredJson`):
    *   it is not written, since a plan that cannot be read is a source that cannot be recovered
    * @throws java.sql.SQLException with state 23505 if the sequence has a planned batch already
@@ -65,14 +74,20 @@ object Batches {
       connection: Connection,
       start: RunStart,
       plan: Json,
-      target: TableLocation
+      target: TableLocation,
+      reprocessOf: Option[BatchSeq] = None
   ): PlannedBatch = {
+    require(
+      (start.kind == RunKind.Reprocess) == reprocessOf.nonEmpty,
+      s"a batch of the kind ${start.kind.name} reprocesses ${reprocessOf.fold("none")(_.toString)}"
+    )
     readable("plan", plan)
     Using.resource(
       connection.prepareStatement(
         """INSERT INTO control.ingestion_batch
-          |  (txn_app_id, batch_seq, source_id, layer, run_kind, plan, planned_by_run, target_table)
-          |SELECT ?, COALESCE(max(batch_seq), 0) + 1, ?, ?, ?, ?::jsonb, ?, ?
+          |  (txn_app_id, batch_seq, source_id, layer, run_kind, plan, planned_by_run, target_table,
+          |   reprocess_of)
+          |SELECT ?, COALESCE(max(batch_seq), 0) + 1, ?, ?, ?, ?::jsonb, ?, ?, ?
           |  FROM control.ingestion_batch WHERE txn_app_id = ?
           |RETURNING batch_seq, planned_at""".stripMargin
       )
@@ -84,7 +99,11 @@ object Batches {
       statement.setString(5, plan.noSpaces)
       statement.setObject(6, start.id.uuid)
       statement.setString(7, target.uri)
-      statement.setString(8, start.txnAppId.value)
+      reprocessOf match {
+        case Some(seq) => statement.setLong(8, seq.value)
+        case None => statement.setNull(8, java.sql.Types.BIGINT)
+      }
+      statement.setString(9, start.txnAppId.value)
       Using.resource(statement.executeQuery()) { row =>
         if (!row.next())
           throw new IllegalStateException(s"no batch was written for ${start.txnAppId}")
@@ -93,7 +112,8 @@ object Batches {
           plan,
           start.id,
           row.getObject("planned_at", classOf[OffsetDateTime]).toInstant,
-          Some(target.uri)
+          Some(target.uri),
+          reprocessOf
         )
       }
     }
@@ -284,7 +304,9 @@ object Batches {
           reason = row.getString("abandon_reason"),
           detail = Option(row.getString("abandon_detail")).map(stored(id, "abandon detail", _))
         )
-      }
+      },
+      reprocessOf = Option(row.getObject("reprocess_of", classOf[java.lang.Long]))
+        .map(seq => known("reprocess_of", BatchSeq.of(seq.longValue)))
     )
   }
 
