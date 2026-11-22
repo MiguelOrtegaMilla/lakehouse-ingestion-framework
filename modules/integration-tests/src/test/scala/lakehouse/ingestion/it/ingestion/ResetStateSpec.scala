@@ -8,7 +8,8 @@ import scala.util.Using
 import io.circe.Json
 import lakehouse.ingestion.core.config.{ConnectorKind, Source}
 import lakehouse.ingestion.core.control._
-import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkPlan}
+import lakehouse.ingestion.core.state.StoredWatermark
+import lakehouse.ingestion.core.watermark.WatermarkPlan
 import lakehouse.ingestion.engine.FaultPoint
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.{LeasedRun, StateChanges, StoredJson}

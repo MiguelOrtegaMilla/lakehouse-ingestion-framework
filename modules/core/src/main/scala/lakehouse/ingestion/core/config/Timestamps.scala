@@ -3,6 +3,8 @@ package lakehouse.ingestion.core.config
 import java.time.format.DateTimeParseException
 import java.time.{Instant, OffsetDateTime}
 
+import lakehouse.ingestion.core.state.Moment
+
 /**
  * A moment as configuration writes it: a date, a time of day to the second or finer, and its
  * zone, as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00` (ISO 8601).
@@ -20,11 +22,11 @@ import java.time.{Instant, OffsetDateTime}
  */
 object Timestamps {
 
-  /** The earliest moment that a field may be. */
-  val Min: Instant = Instant.parse("1900-01-01T00:00:00Z")
+  /** The earliest moment that a field may be: that of a plan and of a watermark (`Moment`). */
+  val Min: Instant = Moment.Min
 
   /** The latest moment that a field may be: the last microsecond of 9999. */
-  val Max: Instant = Instant.parse("9999-12-31T23:59:59.999999Z")
+  val Max: Instant = Moment.Max
 
   private val Example = "2026-01-01T00:00:00Z"
 

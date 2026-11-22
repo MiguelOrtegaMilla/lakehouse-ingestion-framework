@@ -5,7 +5,7 @@ import java.time.Instant
 import io.circe.Json
 import lakehouse.ingestion.core.config.{JdbcConnectorConfig, Load, Source}
 import lakehouse.ingestion.core.control.FailureClass
-import lakehouse.ingestion.core.watermark.StoredWatermark
+import lakehouse.ingestion.core.state.StoredWatermark
 import lakehouse.ingestion.engine.RunFailedException
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers

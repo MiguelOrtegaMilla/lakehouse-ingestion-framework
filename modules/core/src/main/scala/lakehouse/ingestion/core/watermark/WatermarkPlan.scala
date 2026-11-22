@@ -2,99 +2,11 @@ package lakehouse.ingestion.core.watermark
 
 import java.time.{Duration => Span, Instant}
 
-import scala.concurrent.duration.FiniteDuration
-
 import cats.syntax.all._
-import io.circe.{ACursor, Json}
+import io.circe.Json
 import lakehouse.ingestion.core.StoredForm
 import lakehouse.ingestion.core.config.{Load, SqlIdentifier, Timestamps}
-
-/**
- * A moment that a plan or a watermark holds: a time of the clock of a source.
- *
- *  - '''To the microsecond''', which is what PostgreSQL keeps. A bound that is finer would be
- *    rounded by the source, and would not be the bound that was written down.
- *  - '''From 1900 to the end of 9999''', as a moment of configuration is (`Timestamps`): Spark
- *    writes no later timestamp into a statement, and writes one before 1582 as another day.
- *  - '''Written in UTC, in one way''': `2026-01-01T00:00:00Z`, with the digits after the second
- *    that it has. A document with a moment written otherwise is not one that this application
- *    wrote.
- */
-private[watermark] object Moment {
-
-  def toTheMicrosecond(at: Instant): Boolean = at.getNano % 1000 == 0
-
-  def inRange(at: Instant): Boolean =
-    !at.isBefore(Timestamps.Min) && !at.isAfter(Timestamps.Max)
-
-  /** What is wrong with a moment, to follow its name: none, if a plan can hold it. */
-  def problem(at: Instant): Option[String] =
-    if (!toTheMicrosecond(at)) Some(s"is finer than a microsecond ($at)")
-    else if (!inRange(at))
-      Some(s"is $at, outside ${Timestamps.Min} to ${Timestamps.Max}")
-    else None
-
-  def write(at: Instant): Json = Json.fromString(at.toString)
-
-  /** `Left` says what is wrong, starting with the name of the field. */
-  def read(at: ACursor, field: String): Either[String, Instant] =
-    for {
-      text <- at.downField(field).as[String].leftMap(_ => s"$field is not a moment")
-      moment <- Either.catchNonFatal(Instant.parse(text)).leftMap(_ => s"$field is not a moment")
-      _ <- Either.cond(
-        moment.toString == text,
-        (),
-        s"$field is not written as a moment is, in UTC and in one way: ${moment.toString}"
-      )
-      _ <- problem(moment).map(what => s"$field $what").toLeft(())
-    } yield moment
-
-  /** A duration of configuration, which is whole milliseconds (`Durations`). */
-  def millis(duration: FiniteDuration): Long = {
-    require(duration.toNanos % 1000000 == 0, s"$duration is not whole milliseconds")
-    duration.toMillis
-  }
-
-  def earlier(a: Instant, b: Instant): Instant = if (a.isBefore(b)) a else b
-  def later(a: Instant, b: Instant): Instant = if (a.isAfter(b)) a else b
-}
-
-/**
- * How far a source has been ingested by its watermark column, as the control plane stores it
- * (`source_state.watermark`): every row whose column is at or before `value`, and that was
- * there to be read when its window was, is in Bronze (ADR-0020).
- *
- * It is the upper bound of the last batch that was committed, and never a value that a batch
- * happened to read. It only moves forward.
- */
-final case class StoredWatermark(value: Instant) {
-  Moment.problem(value).foreach(what => throw new IllegalArgumentException(s"a watermark $what"))
-
-  /** As the control plane stores it. */
-  def toJson: Json = Json.obj(
-    "version" -> Json.fromInt(StoredWatermark.Version),
-    "value" -> Moment.write(value)
-  )
-}
-
-object StoredWatermark {
-
-  /**
-   * The form of the JSON. A watermark outlives every process: an application that reads
-   * another form refuses it, and does not go on from a moment that it guessed.
-   */
-  val Version = 1
-
-  /** @return the watermark, or what is wrong with the document */
-  def fromJson(json: Json): Either[String, StoredWatermark] = {
-    val top = json.hcursor
-    for {
-      _ <- StoredForm.exactly(top, "version", "value")
-      _ <- StoredForm.version(top, Version)
-      value <- Moment.read(top, "value")
-    } yield StoredWatermark(value)
-  }
-}
+import lakehouse.ingestion.core.state.{Moment, StoredWatermark}
 
 /**
  * The plan of a batch of a watermark (ADR-0020, ADR-0005 §3): the rows whose `column` is in
@@ -337,30 +249,4 @@ object WatermarkPlanner {
     }
   }
 
-  /**
-   * The watermark that an operator's reset sets a source to (ADR-0021 §3): every row whose
-   * column is at or before `at` is taken as ingested, and the next batch counts from it.
-   *
-   * A moment before `start` is refused. The rows at or before `start` are not of the regular
-   * sequence of the source, which starts there, and a backfill reads them (ADR-0021 §5). A
-   * moment equal to it is where a source with no watermark starts. A moment that the source has
-   * not reached is not refused: the clock of the source is not asked, and the runs after the
-   * reset plan nothing until it is passed, and say how far behind it the clock is.
-   *
-   * @return the watermark, or why `at` cannot be one
-   */
-  def resetTo(load: Load.Incremental, at: Instant): Either[String, StoredWatermark] =
-    Moment.problem(at) match {
-      case Some(what) => Left(s"the moment $what")
-      case None =>
-        load.watermark.start.filter(at.isBefore) match {
-          case Some(start) =>
-            Left(
-              s"$at is before load.watermark.start, $start: the rows at or before it are not " +
-                "of the regular sequence of the source, which starts there, and a backfill " +
-                "reads them"
-            )
-          case None => Right(StoredWatermark(at))
-        }
-    }
 }

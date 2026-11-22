@@ -13,7 +13,8 @@ import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.LandedFile
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
-import lakehouse.ingestion.core.watermark.{StoredWatermark, WatermarkHorizon, WatermarkPlan}
+import lakehouse.ingestion.core.state.StoredWatermark
+import lakehouse.ingestion.core.watermark.{WatermarkHorizon, WatermarkPlan}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.PostgresJdbc

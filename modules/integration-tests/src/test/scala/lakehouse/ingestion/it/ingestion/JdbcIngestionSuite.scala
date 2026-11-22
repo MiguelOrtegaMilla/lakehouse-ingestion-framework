@@ -6,7 +6,7 @@ import java.time.{Clock, Instant, ZoneOffset}
 import scala.util.Using
 
 import lakehouse.ingestion.core.config.{SecretResolver, Source}
-import lakehouse.ingestion.core.watermark.StoredWatermark
+import lakehouse.ingestion.core.state.StoredWatermark
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
