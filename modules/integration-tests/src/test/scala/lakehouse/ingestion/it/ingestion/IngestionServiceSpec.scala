@@ -9,6 +9,9 @@ import java.time.temporal.ChronoUnit
 import java.time.{Clock, Instant, ZoneOffset}
 
 import scala.collection.mutable
+import scala.concurrent.duration._
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.util.Using
 
 import io.circe.Json
 import io.delta.tables.DeltaTable
@@ -25,7 +28,12 @@ import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.logstore.coordination.{CoordinationSettings, WriterEpoch}
+import lakehouse.ingestion.it.support.CoordinationSchema
+import lakehouse.ingestion.logstore.coordination.{
+  CoordinationSettings,
+  PostgresCoordinationStore,
+  WriterEpoch
+}
 import lakehouse.ingestion.logstore.{CommitContext, WriterEpochs}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
@@ -902,7 +910,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     assertLedger(orders)
   }
 
-  test("a run whose epoch is not the one in force stops before it asks a table anything") {
+  test("a run told of an epoch that no run of its control plane announced fails for good") {
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")
     val key = LeaseKey.of(orders.id, Layer.Bronze)
@@ -915,9 +923,86 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
     val outcome = launch(orders)
 
-    lostItsLease(outcome, orders)
+    // Nobody took the lease: running again does not mend it, and the run says what does.
+    outcome match {
+      case Outcome.Failed(_, failure, message) =>
+        failure shouldBe FailureClass.Permanent
+        message should include(s"has the epoch 7 in force for $key")
+        message should include(
+          s"DELETE FROM delta_coordination.writer_epoch WHERE epoch_key = '$key'"
+        )
+      case other => fail(s"the run did not fail: $other")
+    }
+    // It is recorded as failed, and its lease is given up: the next run is not kept waiting for
+    // it to expire, and is told the same.
+    val ended = runOf(outcome.run)
+    ended.status shouldBe RunStatus.Failed
+    ended.failure.value.failure shouldBe FailureClass.Permanent
+    holderOf(orders) shouldBe None
     batchesOf(orders) shouldBe empty
     tableIsThere(orders) shouldBe false
+    launch(orders) shouldBe a[Outcome.Failed]
+    assertLedger(orders)
+
+    // Once the epochs are forgotten, the source goes on.
+    Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
+      update(c, "DELETE FROM delta_coordination.writer_epoch WHERE epoch_key = ?", key.value)
+    } shouldBe 1
+    ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+    assertLedger(orders)
+  }
+
+  test("a run whose lease is taken over while it announces its epoch has lost its lease") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val key = LeaseKey.of(orders.id, Layer.Bronze)
+    // The announcement of the run that takes over, in flight: the run's own waits for it.
+    val announcer = pg.connect(CoordinationSchema.CommitPathRole, CoordinationSchema.Database)
+    try {
+      announcer.setAutoCommit(false)
+      update(
+        announcer,
+        "INSERT INTO delta_coordination.writer_epoch (epoch_key, epoch) VALUES (?, 2)",
+        key.value
+      ) shouldBe 1
+      val running = Future(launch(orders))(ExecutionContext.global)
+      eventually(announcementsWaiting() == 1)
+
+      // The lease runs out and is taken, in the control plane, as a run that took over takes it.
+      expire(orders)
+      val taker = LeasedRun.open(database, starting(orders), versionOf(orders), timing).value
+      taker.epoch.value shouldBe 2L
+      announcer.commit()
+
+      val outcome = Await.result(running, 1.minute)
+      lostItsLease(outcome, orders)
+      runOf(outcome.run).status shouldBe RunStatus.Abandoned
+      holderOf(orders) shouldBe Some(taker.start.id)
+      taker.finish(RunEnd.Failed(FailureClass.Transient, "stopped by the test")) shouldBe true
+    } finally announcer.close()
+
+    batchesOf(orders) shouldBe empty
+    ingested(launch(orders)).batch shouldBe batchId(orders, 1)
+    assertLedger(orders)
+  }
+
+  /** How many announcements of the LogStore are waiting for a lock, seen by the superuser. */
+  private def announcementsWaiting(): Int =
+    Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
+      query(
+        c,
+        "SELECT count(*)::text FROM pg_stat_activity " +
+          "WHERE application_name = ? AND wait_event_type = 'Lock'",
+        PostgresCoordinationStore.ApplicationName
+      ).head.head.toInt
+    }
+
+  private def eventually(condition: => Boolean): Unit = {
+    val deadline = 30.seconds.fromNow
+    while (!condition) {
+      if (deadline.isOverdue()) fail("the condition did not become true in time")
+      Thread.sleep(25)
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
