@@ -18,7 +18,10 @@ object PackageCycles {
   /** The cycles among the packages of `analysis`: for each, the edges in it, each with a cause. */
   def of(analysis: Analysis): Seq[Seq[String]] = {
     def packageOf(className: String): String =
-      className.split('.').takeWhile(s => s.nonEmpty && !s.head.isUpper && s != "package").mkString(".")
+      className
+        .split('.')
+        .takeWhile(s => s.nonEmpty && !s.head.isUpper && s != "package")
+        .mkString(".")
 
     val edges: Map[(String, String), (String, String)] =
       analysis.relations.internalClassDep.all.toSeq
@@ -71,7 +74,11 @@ object PackageCycles {
         throw new MessageOnlyException(
           cycles
             .map(_.mkString("\n    "))
-            .mkString(s"[$id] has packages that depend on each other in a cycle:\n  - ", "\n  - ", "")
+            .mkString(
+              s"[$id] has packages that depend on each other in a cycle:\n  - ",
+              "\n  - ",
+              ""
+            )
         )
       log.info(s"[$id] no cycle among its packages")
     }
