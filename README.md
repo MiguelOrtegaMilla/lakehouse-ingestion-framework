@@ -20,7 +20,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run`, `abandon-batch` and `reset-state`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
-The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`.
+The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`, which also fails if two packages of `core` depend on each other, directly or through others, by the dependencies that the compiler records between classes (`project/PackageCycles.scala`).
 
 ## Configuration
 
