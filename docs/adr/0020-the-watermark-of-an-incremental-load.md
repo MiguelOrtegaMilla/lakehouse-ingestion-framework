@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Accepted (P6.4, 2026-11-20) |
 | **Related** | [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0008](0008-layer-responsibilities.md), [ADR-0009](0009-delete-detection.md), [ADR-0013](0013-application-security-baseline.md), [ADR-0018](0018-a-run-gives-up-a-batch-whose-source-changed.md) |
+| **Amended by** | [ADR-0021](0021-operator-actions-and-backfills.md) (P7.1, 2026-11-22): what `load.watermark.start` means. Points 6 and 7 have the rows at or before it as not the source's to ingest; with backfills, `start` is where the regular sequence of the source begins, and a backfill reads what its range says, before `start` too. Both points keep their original text and point to it. |
 
 ## Context
 
@@ -36,6 +37,9 @@ U = min(H, A + max_batch_range)
 5. **The commit moves the watermark to `U`**, which the connector says from the plan alone, and not to the highest value that the batch read. A window with no rows is a batch with no rows, and it moves the watermark as any other.
 6. **The first batch.** Without `load.watermark.start` it has no lower bound, and reads the table up to `H` in one statement. With it, the rows at or before `start` are not the source's to ingest: the first window begins there, with no lookback.
 7. **`lookback` reads no row at or before `start`**, in any batch: `L = max(W − lookback, start)`. Past the first batch that is all `start` does. One that is moved to after the watermark bounds nothing and skips nothing, since `L` is never after `W`: moving it is still no breaking change of a configuration.
+
+   > **Amended by [ADR-0021](0021-operator-actions-and-backfills.md)** (P7.1, 2026-11-22), with point 6: the rows at or before `start` are not the *regular sequence's* to read. `start` is where that sequence begins, and it still bounds every window of it, `lookback` included. A backfill is a sequence of its own, bounded by its own range and not by `start`: it is how the history before `start` is loaded.
+
 8. **`max_batch_range` cuts a window, counted from the watermark and not from `L`**: `U ≤ W + max_batch_range`. Counted from `L`, a `lookback` as long as the range would hold `U` at `W`, and the watermark would never move. The first batch of a source with `start` is counted from `start`. The first batch of a source without it has nothing to count from, and is not cut; `validate` warns of it.
 9. **The horizon is fixed by the first plan of an invocation, and is written in every plan.** A plan says that there is more when its `U` is before its `H`. A chain of runs (discovery §17, P6.10) goes on by that and plans each next batch against the same `H`, so it ends though the source goes on writing: what the source writes after the first plan is the next invocation's.
 10. **The watermark never goes back.** A horizon that is not after `A` plans no batch, and the run ends well with nothing read. That is the case when the clock of the source went back, when `safety_margin` was raised, when `start` is yet to come, and when a chain has reached its horizon. The lookback is not read on its own: a batch that would not move the watermark is not planned.

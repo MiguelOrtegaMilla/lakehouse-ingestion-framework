@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Accepted (2026-09-25) |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md) |
-| **Amended by** | [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md) (P5.10, 2026-11-19): the epoch is also what a commit to a table names, and the LogStore refuses a commit whose epoch is not the one in force. The last consequence below keeps its original text and points to it. |
+| **Amended by** | [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md) (P5.10, 2026-11-19): the epoch is also what a commit to a table names, and the LogStore refuses a commit whose epoch is not the one in force. The last consequence below keeps its original text and points to it. [ADR-0021](0021-operator-actions-and-backfills.md) (P7.1, 2026-11-22): the key of the lease of a backfill is the name of its sequence, `<source_id>/<layer>/backfill/<backfill_id>`. The first point of the decision keeps its original text and points to it. |
 
 ## Context
 
@@ -17,6 +17,9 @@ Two runs advancing the same incremental state at the same time would corrupt it:
 A **lease** row per lease key in `control.source_lease`:
 
 - **Keys:** `<source_id>/<layer>` for regular runs; `backfill/<backfill_id>` for backfills. Backfills do not touch incremental state, so they do not contend with the regular lease.
+
+  > **Amended by [ADR-0021](0021-operator-actions-and-backfills.md)** (P7.1, 2026-11-22): the key of the lease of a backfill is `<source_id>/<layer>/backfill/<backfill_id>`, the name of its sequence, as the key of a regular lease is the name of the regular sequence. An id is then unique within its source.
+
 - **Acquire** with one atomic statement, using the **PostgreSQL clock**:
 
   ```sql
