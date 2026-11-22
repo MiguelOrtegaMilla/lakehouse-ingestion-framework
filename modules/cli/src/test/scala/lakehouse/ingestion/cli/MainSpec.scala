@@ -551,6 +551,21 @@ final class MainSpec
     RunCommand.exitOf(failed(FailureClass.Data)) shouldBe 5
   }
 
+  test("abandon-batch: each way an operator's action ends has its code, and the usage says it") {
+    import lakehouse.ingestion.engine.operator.OperatorActions.{Outcome => Action}
+    val run = RunId.generate()
+    AbandonBatchCommand.exitOf(Action.Done(run, "given up")) shouldBe 0
+    AbandonBatchCommand.exitOf(Action.Skipped(run, RunId.generate(), Instant.EPOCH)) shouldBe 2
+    AbandonBatchCommand.exitOf(Action.Failed(run, FailureClass.Transient, "why")) shouldBe 3
+    AbandonBatchCommand.exitOf(Action.Failed(run, FailureClass.Permanent, "why")) shouldBe 4
+
+    Main.Usage should include("lakehouse-ingestion abandon-batch --profile <file>")
+    Main.Usage should include("--batch <n> --reason <text>")
+    Main.Usage should include("or the batch was given up;")
+    Main.Usage should include("or a table could not be read")
+    Main.Usage should include("none is planned, another is, or its table has it")
+  }
+
   test("run: a count that a run did not make is said as not known, and not as zero") {
     val run = RunId.generate()
     val source = SourceId.parse("sales.orders").value

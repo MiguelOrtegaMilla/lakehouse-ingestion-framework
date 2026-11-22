@@ -80,7 +80,7 @@ final class TlsOnlyPostgresSpec
     val again = ControlPlaneSchema.migrate(pg, rootCertificate = Some(pg.rootCertificate))
     withClue(again.err)(again.exit shouldBe Main.Exit.Ok)
     again.lines.map(_.takeWhile(_ != '(').trim) shouldBe Seq(
-      "control: version 4, nothing to apply",
+      "control: version 5, nothing to apply",
       "delta_coordination: version 4, nothing to apply"
     )
 

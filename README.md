@@ -17,7 +17,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)); the model of the control plane and the recovery decision; and the plan of a batch, of files and of a window of a watermark. |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
 | `engine` | Connectors, Delta writers, control-plane repositories, engine service. So far: the control plane, the connector contract with the file connector and the JDBC connector, the writers of Bronze and of the quarantine, and `IngestionService`, one run of one source. |
-| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate` and `run`. |
+| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run` and `abandon-batch`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
 The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`.
@@ -221,6 +221,24 @@ Run it again and it finds nothing new. A source with more than one batch takes (
 | 64 | The command line is not one |
 
 The whole contract is in [discovery §14.1](docs/architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them; `JdbcRunCommandSpec`, with a table of a database, cut for real by a proxy.
+
+### When a source is stuck: `abandon-batch`
+
+A batch is planned before anything is read, and every run replays its plan until it is committed. A plan that cannot be run, because the directory or the table it names is no longer the source's, stops the source. An operator gives it up:
+
+```bash
+sbt "cli/run abandon-batch --profile conf/app/local.yaml --sources conf/sources --source sales.returns --batch 3 --reason 'the landing directory was moved'"
+```
+
+It is a run of its own under the lease of the source, and records who asked (the user of the process) and why. It gives the batch up only when the table it was planned for is known not to have it: a batch whose rows are written is committed by the next run, and a table that cannot be read is asked again later (3). The next run plans anew from the state of the source. It mends a plan, not data: a file whose records cannot be read is planned again, and fails the same way ([ADR-0021](docs/adr/0021-operator-actions-and-backfills.md)).
+
+| Code | Meaning |
+|---|---|
+| 0 | The batch was given up |
+| 2 | A run holds the lease of the source: nothing was changed |
+| 3 | A database did not answer, the table could not be read, or the action lost its lease |
+| 4 | Refused, with nothing changed: no batch is planned, another is, or its table has it |
+| 64 | The command line is not one: `--reason` and `--batch` are required |
 
 ### A table of a database: `sales.orders`
 

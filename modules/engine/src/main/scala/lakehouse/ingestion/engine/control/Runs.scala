@@ -29,13 +29,14 @@ object Runs {
   private val Columns =
     """run_id, source_id, layer, run_kind, txn_app_id, batch_seq, status, instance_id, app_version,
       |config_hash, lease_epoch, started_at, finished_at, rows_read, rows_written, rows_rejected,
-      |bytes_read, retries, write_conflicts, commit_contention, error_class, error_message""".stripMargin
+      |bytes_read, retries, write_conflicts, commit_contention, error_class, error_message,
+      |requested_by, reason""".stripMargin
 
   private val Insert =
     """INSERT INTO control.ingestion_run
       |  (run_id, source_id, layer, run_kind, txn_app_id, status, instance_id, app_version,
-      |   config_hash, lease_epoch, finished_at)
-      |VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? THEN now() END)""".stripMargin
+      |   config_hash, lease_epoch, finished_at, requested_by, reason)
+      |VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? THEN now() END, ?, ?)""".stripMargin
 
   /**
    * Opens a run that took its lease: `RUNNING`, under the epoch it was given.
@@ -73,6 +74,9 @@ object Runs {
       statement.setString(9, start.configHash)
       setLong(statement, 10, epoch.map(_.value))
       statement.setBoolean(11, status.ended)
+      // Who asked for an operator's action, and why (ADR-0021 §1); a regular run has neither.
+      statement.setString(12, start.request.map(_.requestedBy).orNull)
+      statement.setString(13, start.request.map(_.reason).orNull)
       statement.executeUpdate(): Unit
     }
 
@@ -195,7 +199,10 @@ object Runs {
         kind = known("run_kind", RunKind.parse),
         instance = known("instance_id", InstanceId.parse),
         appVersion = row.getString("app_version"),
-        configHash = row.getString("config_hash")
+        configHash = row.getString("config_hash"),
+        request = Option(row.getString("reason")).map { reason =>
+          OperatorRequest.stored(row.getString("requested_by"), reason)
+        }
       ),
       txnAppId = known("txn_app_id", TxnAppId.parse),
       batch = long("batch_seq").map(seq => known("batch_seq", _ => BatchSeq.of(seq))),

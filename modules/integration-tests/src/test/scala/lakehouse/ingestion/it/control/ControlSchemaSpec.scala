@@ -143,12 +143,13 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       FailureClass.All.map(_.name).toSet
     checks("control.ingestion_batch.ingestion_batch_status_check") shouldBe
       BatchStatus.All.map(_.name).toSet
-    Seq("ingestion_run", "ingestion_batch", "source_state").foreach { table =>
+    Seq("ingestion_run", "ingestion_batch", "source_state", "state_change_log").foreach { table =>
       withClue(table)(checks(s"control.$table.${table}_layer_check") shouldBe layers)
     }
-    Seq("ingestion_run", "ingestion_batch").foreach { table =>
-      withClue(table)(checks(s"control.$table.${table}_run_kind_check") shouldBe kinds)
-    }
+    checks("control.ingestion_run.ingestion_run_run_kind_check") shouldBe kinds
+    // A batch is of a kind that plans one (ADR-0021 §4).
+    checks("control.ingestion_batch.ingestion_batch_run_kind_check") shouldBe
+      RunKind.OfBatches.map(_.name).toSet
   }
 
   test("the engine's role can write the whole life of a run, from its lease to its commit") {
@@ -273,6 +274,25 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "a status that is none" -> Seq("status" -> "'DONE'", "finished_at" -> "now()"),
       "a layer that is none" -> Seq("layer" -> "'gold'"),
       "a kind that is none" -> Seq("run_kind" -> "'backfill'"),
+      // ADR-0021 §1: who asked and why, for an operator's action alone, and both or neither.
+      "a regular run that says why" ->
+        Seq("requested_by" -> "'ops'", "reason" -> "'because'"),
+      "an operator's action that does not say why" ->
+        Seq("run_kind" -> text(RunKind.Reset)),
+      "an operator's action that says why and not who" ->
+        Seq("run_kind" -> text(RunKind.Reset), "reason" -> "'because'"),
+      "an operator's action that says who and not why" ->
+        Seq("run_kind" -> text(RunKind.Reset), "requested_by" -> "'ops'"),
+      "a reason of white space" ->
+        Seq("run_kind" -> text(RunKind.Reset), "requested_by" -> "'ops'", "reason" -> "E' \\t '"),
+      "a reason that is too long" ->
+        Seq(
+          "run_kind" -> text(RunKind.Reset),
+          "requested_by" -> "'ops'",
+          "reason" -> "repeat('x', 1001)"
+        ),
+      "a user that is no name" ->
+        Seq("run_kind" -> text(RunKind.Reset), "requested_by" -> "' '", "reason" -> "'because'"),
       "a class of failure that is none" ->
         Seq("status" -> "'FAILED'", "finished_at" -> "now()", "error_class" -> "'fatal'"),
       "an epoch before the first" -> Seq("lease_epoch" -> "0"),
@@ -290,6 +310,79 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
     }
     as(Engine) { c =>
       withClue("a hash that is not one: ")(sqlState(snapshot(c, "ABC")) shouldBe CheckViolation)
+    }
+  }
+
+  test("an operator's action is a run that says who asked for it and why, and keeps both") {
+    val source = newSource()
+    val run = RunId.generate()
+    as(Engine) { c =>
+      snapshot(c)
+      insertRun(c, source, run)(
+        "run_kind" -> text(RunKind.Abandon),
+        "requested_by" -> "'ops.oncall'",
+        "reason" -> "'the directory of the source was moved'"
+      )
+      query(
+        c,
+        "SELECT run_kind, requested_by, reason FROM control.ingestion_run WHERE run_id = ?",
+        run.uuid
+      ) shouldBe Seq(Seq("abandon", "ops.oncall", "the directory of the source was moved"))
+      // Written with the run, and not changed afterwards: the engine has no UPDATE on them.
+      Seq("requested_by = 'someone else'", "reason = 'another reason'").foreach { change =>
+        withClue(s"$change: ") {
+          sqlState(
+            update(c, s"UPDATE control.ingestion_run SET $change WHERE run_id = ?", run.uuid)
+          ) shouldBe InsufficientPrivilege
+        }
+      }
+    }
+  }
+
+  test("a change of the state of a source is written once, by a run, and never changed") {
+    val source = newSource()
+    val run = RunId.generate()
+    as(Engine) { c =>
+      snapshot(c)
+      insertRun(c, source, run)(
+        "run_kind" -> text(RunKind.Reset),
+        "requested_by" -> "'ops'",
+        "reason" -> "'the table of the source was renamed'"
+      )
+      def change(columns: (String, String)*): String =
+        insert(
+          c,
+          "state_change_log",
+          Seq(
+            "run_id" -> text(run),
+            "source_id" -> text(source),
+            "layer" -> text(Layer.Bronze),
+            "before" -> """'{"watermark": null}'::jsonb""",
+            "after" -> """'{"watermark": null}'::jsonb"""
+          )
+        )(columns: _*)
+      change()
+      query(
+        c,
+        "SELECT run_id::text, changed_at <= now() FROM control.state_change_log WHERE source_id = ?",
+        source
+      ) shouldBe Seq(Seq(run.toString, "t"))
+
+      withClue("by a run that is not one: ")(
+        sqlState(change("run_id" -> text(RunId.generate()))) shouldBe ForeignKeyViolation
+      )
+      withClue("of a layer that is none: ")(
+        sqlState(change("layer" -> "'gold'")) shouldBe CheckViolation
+      )
+      withClue("with no state before: ")(sqlState(change("before" -> "NULL")) shouldBe "23502")
+      withClue("with an id of its own: ")(sqlState(change("change_id" -> "7")) shouldBe "428C9")
+      Seq(
+        "UPDATE control.state_change_log SET source_id = 'x'",
+        "UPDATE control.state_change_log SET after = '{}'::jsonb",
+        "DELETE FROM control.state_change_log"
+      ).foreach { statement =>
+        withClue(s"$statement: ")(sqlState(update(c, statement)) shouldBe InsufficientPrivilege)
+      }
     }
   }
 
@@ -716,6 +809,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "SELECT * FROM control.ingestion_run",
       "SELECT * FROM control.source_state",
       "SELECT * FROM control.processed_file",
+      "SELECT * FROM control.state_change_log",
       "SELECT version FROM control.schema_version",
       "INSERT INTO control.source_lease (lease_key) VALUES ('test.source/bronze')",
       "UPDATE control.source_lease SET epoch = epoch + 1",
