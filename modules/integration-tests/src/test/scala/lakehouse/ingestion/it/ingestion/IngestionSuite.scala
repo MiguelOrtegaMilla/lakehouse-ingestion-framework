@@ -10,6 +10,7 @@ import scala.concurrent.duration._
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
+  EngineColumns,
   PathTableLocator,
   RelativePath,
   RootUri,
@@ -24,9 +25,12 @@ import lakehouse.ingestion.engine.delta.DeltaTableTransactions
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.control.ControlPlaneSuite
+import lakehouse.ingestion.it.ingestion.IngestionLedger.{Facts, TakenFile, Violation}
+import lakehouse.ingestion.it.stress.LogReader
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, LocalSparkSuite}
 import org.apache.spark.sql.delta.DeltaLog
+import org.apache.spark.sql.functions.col
 import org.scalatest.Suite
 import org.scalatest.matchers.should.Matchers
 
@@ -225,6 +229,160 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       "UPDATE control.source_lease SET expires_at = now() - interval '1 second' WHERE lease_key = ?",
       LeaseKey.of(of.id, Layer.Bronze).value
     ) shouldBe 1: Unit
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The ledger of a source (P7.2)
+  // ---------------------------------------------------------------------------------------------
+
+  /**
+   * The connectors that the ledger asks what the plan of a batch commits: the watermark and the
+   * files. A suite whose sources are of another kind gives its own.
+   */
+  protected def connectors: ConnectorRegistry =
+    ConnectorRegistry(new FileSourceConnector(new Landing(landingRoot)))
+
+  /** Every way in which the control plane, the tables and the files taken of a source disagree. */
+  protected def ledgerViolations(of: Source): Seq[Violation] =
+    IngestionLedger.check(ledgerOf(of))
+
+  /** Asks the ledger of a source, once no run of it is in flight. */
+  protected def assertLedger(of: Source): Unit = {
+    val violations = ledgerViolations(of)
+    withClue(violations.mkString(s"the ledger of ${of.id}:\n  ", "\n  ", "\n")) {
+      violations shouldBe empty
+    }: Unit
+  }
+
+  /**
+   * What the control plane, the tables and `processed_file` say of the regular sequence of a
+   * source.
+   *
+   * Delta is asked before the log is read as files: a read publishes a commit that a writer took
+   * and did not publish (ADR-0004 §3.3), and what is looked at is the table that the next reader
+   * gets.
+   */
+  protected def ledgerOf(of: Source): Facts = {
+    val app = TxnAppId.of(of.id, Layer.Bronze)
+    val bound = connectors.bind(of)
+    val configured = bronze(of)
+
+    val records = asSuperuser { c =>
+      query(
+        c,
+        "SELECT batch_seq::text FROM control.ingestion_batch WHERE txn_app_id = ? ORDER BY 1",
+        app.value
+      )
+    }.map(row =>
+      database.run(Batches.find(_, BatchId(app, BatchSeq.of(row.head.toLong).value))).value
+    )
+
+    val batches = records.map { record =>
+      val progress = bound.progress(record.plan)
+      IngestionLedger.Batch(
+        seq = record.id.seq.value,
+        status = record.status,
+        target = record.target.getOrElse(configured.uri),
+        committedBy = record.committedBy,
+        outputs = record.outputs.toSeq.flatten.map { output =>
+          IngestionLedger.Output(locator.locate(output.table).uri, output.version)
+        },
+        watermark = progress.watermark,
+        files = progress.files.toSeq.flatMap { plan =>
+          plan.files.map { file =>
+            TakenFile(
+              s"${plan.directory.value}/${file.name.value}",
+              file.size,
+              file.modifiedAt.toEpochMilli
+            )
+          }
+        }.toSet
+      )
+    }
+
+    val runs = asSuperuser { c =>
+      query(
+        c,
+        "SELECT run_id::text FROM control.ingestion_run WHERE source_id = ? AND layer = ?",
+        of.id.value,
+        Layer.Bronze.name
+      )
+    }.map { row =>
+      val run = runOf(RunId.parse(row.head).value)
+      IngestionLedger.Run(run.start.id, run.batch.map(_.value), run.status, run.counts.rowsWritten)
+    }
+
+    val taken = asSuperuser { c =>
+      query(
+        c,
+        "SELECT path, size::text, (extract(epoch FROM modified_at) * 1000)::bigint::text, " +
+          "batch_seq::text FROM control.processed_file WHERE source_id = ? AND txn_app_id = ?",
+        of.id.value,
+        app.value
+      )
+    }.map(row => TakenFile(row(0), row(1).toLong, row(2).toLong) -> row(3).toLong).toSet
+
+    val data = (batches.map(_.target) :+ configured.uri).distinct.map { uri =>
+      ledgerTable(
+        uri,
+        app,
+        EngineColumns.RunId,
+        EngineColumns.BatchSeq,
+        // A table of several sources has the rows of each: these are the source's.
+        Some(col(EngineColumns.SourceId) === of.id.value)
+      )
+    }
+    val apart = ledgerTable(quarantine(of).uri, app, Quarantine.RunId, Quarantine.BatchSeq, None)
+
+    Facts(
+      batches,
+      runs,
+      stateOf(of).map(state =>
+        IngestionLedger.State(state.watermark, state.lastCommitted.value, state.updatedBy)
+      ),
+      taken,
+      data,
+      apart
+    )
+  }
+
+  private def ledgerTable(
+      uri: String,
+      app: TxnAppId,
+      run: String,
+      batch: String,
+      ofTheSource: Option[org.apache.spark.sql.Column]
+  ): IngestionLedger.Table = {
+    val directory = Paths.get(URI.create(uri))
+    if (!Files.isDirectory(directory.resolve("_delta_log"))) IngestionLedger.Table(uri)
+    else {
+      val location = locator.locate(
+        RelativePath.stored(uri.stripPrefix(s"${lakeRoot.value}/")).fold(e => fail(e), identity)
+      )
+      val lastTxn = delta.lastVersion(location, app)
+      val log = LogReader.logView(spark, directory)
+      withClue(s"the log of $uri: ")(log.unreadable shouldBe empty)
+      val all = spark.read.format("delta").load(uri)
+      val rows = ofTheSource
+        .fold(all)(all.filter)
+        .groupBy(col(run), col(batch))
+        .count()
+        .collect()
+        .map(row => IngestionLedger.Rows(row.getString(0), row.getLong(1), row.getLong(2)))
+        .toSeq
+      IngestionLedger.Table(
+        uri,
+        log.commits.map(commit =>
+          IngestionLedger.Commit(
+            commit.version,
+            commit.txns.filter(_.appId == app.value).map(_.version)
+          )
+        ),
+        log.versions.minOption,
+        lastTxn,
+        rows
+      )
+    }
   }
 
   protected val NothingCounted = RunCounts(

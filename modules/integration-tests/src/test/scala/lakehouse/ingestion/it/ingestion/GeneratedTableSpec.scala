@@ -229,6 +229,7 @@ final class GeneratedTableSpec extends AnyFunSuite with Matchers with JdbcIngest
       // What the source has and Bronze does not is what was lost.
       val inBronze = all.map(_._2).toSet
       table.rows.values.filterNot(inBronze).toSet shouldBe rounds.flatMap(_.lost).toSet
+      assertLedger(orders)
     }
   }
 
@@ -287,5 +288,6 @@ final class GeneratedTableSpec extends AnyFunSuite with Matchers with JdbcIngest
     last.batch shouldBe batchId(orders, Rounds.toLong)
     batchOf(last.batch).status shouldBe BatchStatus.Committed
     batches(orders) shouldBe expected
+    assertLedger(orders)
   }
 }

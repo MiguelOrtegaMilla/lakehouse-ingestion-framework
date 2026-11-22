@@ -270,6 +270,7 @@ final class JdbcIngestionSpec
       (3, "c", 2L),
       (4, "d", 2L)
     )
+    assertLedger(items)
   }
 
   test("a table with no rows writes nothing, and its batch is committed") {
@@ -286,6 +287,7 @@ final class JdbcIngestionSpec
     )
     hasABatch(noRows) shouldBe false
     batchOf(done.batch).status shouldBe BatchStatus.Committed
+    assertLedger(noRows)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -315,6 +317,7 @@ final class JdbcIngestionSpec
     // No connection to the source was opened: nothing was logged of it.
     Thread.sleep(500)
     statementsSince(mark, "written_once") shouldBe empty
+    assertLedger(source)
   }
 
   test("a batch that a dead run did not write is read again, as the table is by then") {
@@ -336,6 +339,7 @@ final class JdbcIngestionSpec
     // It is the table as it is now, which is all that a plan made anew would read: the
     // invocation ends with it, and does not read the table a second time.
     done.next shouldBe Outcome.Next.Ends
+    assertLedger(source)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -404,6 +408,7 @@ final class JdbcIngestionSpec
           s"""AND ("updated_at" <= '${literal(next.upper)}')"""
       )
     }
+    assertLedger(orders)
   }
 
   test("a window with no rows moves the watermark, and touches no table") {
@@ -435,6 +440,7 @@ final class JdbcIngestionSpec
     windowOf(second.batch).lower shouldBe Some(Instant.parse("2026-01-02T00:00:00Z"))
     snapshots(quiet) shouldBe Seq((1, "a", 2L))
     watermarkOf(quiet) shouldBe Some(Instant.parse("2026-01-03T00:00:00Z"))
+    assertLedger(quiet)
   }
 
   test("a window is cut by max_batch_range, and the next run goes on from where it was cut") {
@@ -468,6 +474,7 @@ final class JdbcIngestionSpec
     val next = windowOf(second.batch)
     (next.lower, next.upper) shouldBe (Some(aDayOn) -> from.plus(2, ChronoUnit.DAYS))
     snapshots(history) shouldBe Seq((1, "a", 1L), (2, "b", 1L), (3, "c", 2L), (4, "d", 2L))
+    assertLedger(history)
   }
 
   test("a chain of runs ends at the horizon of its first plan, though the source goes on writing") {
@@ -508,6 +515,7 @@ final class JdbcIngestionSpec
     (1 to 3).map(n => windowOf(batchId(chained, n.toLong)).horizon).distinct shouldBe
       Seq(first.horizon)
     snapshots(chained) shouldBe Seq((1, "a", 1L), (2, "b", 2L), (3, "c", 3L))
+    assertLedger(chained)
   }
 
   test("a lookback reads the last stretch again, and Bronze keeps both copies") {
@@ -531,6 +539,7 @@ final class JdbcIngestionSpec
     window.lower shouldBe Some(from.plus(18, ChronoUnit.HOURS))
     window.upper shouldBe from.plus(2, ChronoUnit.DAYS)
     snapshots(twice) shouldBe Seq((1, "a", 1L), (2, "b", 1L), (2, "b", 2L), (3, "c", 2L))
+    assertLedger(twice)
   }
 
   test("a time without a zone that is stamped behind UTC is read by the first batch alone") {
@@ -577,6 +586,7 @@ final class JdbcIngestionSpec
       }
     }
     stamp.isBefore(reached) shouldBe true
+    assertLedger(there)
   }
 
   test("a source that is to start later has nothing new, and its run ends well") {
@@ -592,6 +602,7 @@ final class JdbcIngestionSpec
     batchesOf(notYet) shouldBe empty
     stateOf(notYet) shouldBe None
     holderOf(notYet) shouldBe None
+    assertLedger(notYet)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -661,6 +672,7 @@ final class JdbcIngestionSpec
     // The next window starts where that one ended, and the row, committed by then, is in it.
     windowOf(second.batch).lower shouldBe Some(windowOf(first.batch).upper)
     snapshots(late) shouldBe Seq((1, "late", 2L))
+    assertLedger(late)
   }
 
   test("a row of a transaction longer than the margin is lost, and no later batch reads it") {
@@ -687,6 +699,7 @@ final class JdbcIngestionSpec
     windowOf(second.batch).lower shouldBe Some(window.upper)
     rowsAtTheSource("late_beyond") shouldBe 1
     tableIsThere(late) shouldBe false
+    assertLedger(late)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -808,6 +821,7 @@ final class JdbcIngestionSpec
     // Nothing was planned for either, and the source goes on as it was.
     batchesOf(followed) shouldBe Seq((1L, "COMMITTED"))
     ingested(launch(followed, reading())).batch shouldBe batchId(followed, 2)
+    assertLedger(followed)
   }
 
   test("a window that a run left is not read from a table whose column changed since") {
@@ -860,6 +874,7 @@ final class JdbcIngestionSpec
     )
     ingested(launch(altered, reading())).batch shouldBe batchId(altered, 1)
     snapshots(altered) shouldBe Seq((1, "a", 1L))
+    assertLedger(altered)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -902,6 +917,7 @@ final class JdbcIngestionSpec
     val done = ingested(launch(patient, reading()))
     done.batch shouldBe batchId(hurried, 1)
     done.counts.rowsWritten shouldBe Some(10)
+    assertLedger(hurried)
   }
 
   test("a connection that is cut while the rows are read may pass, and nothing is written") {
@@ -941,6 +957,7 @@ final class JdbcIngestionSpec
     done.batch shouldBe batchId(wide, 1)
     done.counts.rowsWritten shouldBe Some(5000)
     spark.read.format("delta").load(bronze(wide).uri).count() shouldBe 5000L
+    assertLedger(wide)
   }
 
   test("a row that Bronze cannot keep fails its batch for good, and none of its rows is written") {
@@ -983,6 +1000,7 @@ final class JdbcIngestionSpec
       .map(row => row.getInt(0) -> row.getString(1))
       .sortBy(_._1)
       .toSeq shouldBe Seq(1 -> "2027-01-01", 2 -> "infinity")
+    assertLedger(contracts)
   }
 
   test("a column under a name of the engine's fails its run for good, before a batch is planned") {
@@ -1017,6 +1035,7 @@ final class JdbcIngestionSpec
       batchesOf(named) shouldBe empty
       tableIsThere(named) shouldBe false
       holderOf(named) shouldBe None
+      assertLedger(named)
     }
   }
 
@@ -1030,6 +1049,7 @@ final class JdbcIngestionSpec
     runOf(refused.run).status shouldBe RunStatus.Failed
     batchesOf(nowhere) shouldBe empty
     holderOf(nowhere) shouldBe None
+    assertLedger(nowhere)
   }
 }
 

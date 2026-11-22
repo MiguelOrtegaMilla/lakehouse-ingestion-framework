@@ -180,7 +180,9 @@ final class FanInSpec extends AnyFunSuite with Matchers with GeneratedDeliveries
 
     // And nothing ran but one run of each source in each round.
     runsOf(shop) shouldBe Seq.fill(rounds)("SUCCEEDED")
-    runsOf(web) shouldBe Seq.fill(rounds)("SUCCEEDED"): Unit
+    runsOf(web) shouldBe Seq.fill(rounds)("SUCCEEDED")
+    assertLedger(shop)
+    assertLedger(web)
   }
 
   test("two sources, in two processes at once, write one table: every row of each is there once") {

@@ -13,6 +13,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.delta.{BatchAppend, BatchCommit, Lake}
+import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService, RunFailedException}
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.DataFrame
@@ -62,6 +63,13 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
    * @param whole whether the connector says that a plan of it is its source whole, as it is
    *   when the plan is read
    */
+  /** The ledger asks the plans of the numbers and of files. */
+  override protected def connectors: ConnectorRegistry =
+    ConnectorRegistry(
+      new FileSourceConnector(new Landing(landingRoot)),
+      new NumbersConnector(held = false)
+    )
+
   private def numbers(
       hooks: FaultHooks = FaultHooks.Off,
       held: Boolean = false,
@@ -133,6 +141,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     next.counts.rowsWritten shouldBe Some(5)
     written(source) shouldBe (0L until 5L).map(_ -> 1L) ++ (5L until 10L).map(_ -> 2L)
     givenAsRows(source) shouldBe 10L
+    assertLedger(source)
   }
 
   test("a batch with no first row writes nothing, and its rows are never gone over") {
@@ -154,6 +163,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     batch.status shouldBe BatchStatus.Committed
     batch.outputs shouldBe Some(Vector.empty)
     stateOf(source).value.watermark shouldBe Some(Json.fromLong(5))
+    assertLedger(source)
   }
 
   test("a batch whose rows are gone by the time it is written is a commit of no rows") {
@@ -180,6 +190,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     ingested(launch(source, numbers())).outputs shouldBe
       Seq(BatchOutput(source.targets.bronze.table, 1))
     written(source) shouldBe (5L until 10L).map(_ -> 2L)
+    assertLedger(source)
   }
 
   test("a run that dies before it writes leaves a plan, which the next run reads once") {
@@ -195,6 +206,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     done.counts.rowsWritten shouldBe Some(5)
     written(source) shouldBe (0L until 5L).map(_ -> 1L)
     givenAsRows(source) shouldBe 5L
+    assertLedger(source)
   }
 
   test("a batch that a dead run wrote is rolled forward, and its source is asked nothing") {
@@ -216,6 +228,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     // Neither for a first row, nor for the rows.
     givenAsRows(source) shouldBe rows
     givenToProbes(source) shouldBe probes
+    assertLedger(source)
   }
 
   test("a batch that another writer of its sequence wrote is not read, nor counted") {
@@ -315,6 +328,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     done.counts.rowsRejected shouldBe Some(0)
     runOf(done.run).status shouldBe RunStatus.Succeeded
     written(source) shouldBe (0L until 5L).map(_ -> 1L)
+    assertLedger(source)
   }
 
   test("what a run wrote is what the commit says, and not what the run counted before") {
@@ -335,6 +349,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     done.counts.rowsRejected shouldBe Some(0)
     runOf(done.run).counts shouldBe done.counts
     written(source) shouldBe Seq(0L, 1L, 2L, 4L).map(_ -> 1L)
+    assertLedger(source)
   }
 
   test("the rows of a batch of files are counted by the commit as well, and the counts agree") {
@@ -346,6 +361,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
     done.counts.rowsRead shouldBe Some(3)
     done.counts.rowsWritten shouldBe delta.commit(bronze(orders), done.batch).value.rows
     done.counts.rowsWritten shouldBe Some(3)
+    assertLedger(orders)
   }
 }
 
