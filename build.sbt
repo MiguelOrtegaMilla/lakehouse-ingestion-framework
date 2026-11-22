@@ -40,10 +40,14 @@ lazy val root = (project in file("."))
     publish / skip := true
   )
 
-/** Pure domain: configuration model, validation, planning. No Spark, no JDBC. */
+/**
+ * Pure domain: configuration model, validation, planning. No Spark, no JDBC, and no cycle among
+ * its packages (PackageCycles).
+ */
 lazy val core = module("core", artifact = "core")
   .settings(
     rules(forbidden = Seq(Forbid.spark, Forbid.anyDelta, Forbid.hadoop) ++ Forbid.jdbc),
+    PackageCycles.rules,
     libraryDependencies ++= Seq(catsCore, circeCore, snakeyamlEngine, scalatest)
   )
 
