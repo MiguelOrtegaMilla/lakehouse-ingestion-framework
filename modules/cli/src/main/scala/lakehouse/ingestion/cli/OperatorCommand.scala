@@ -31,7 +31,8 @@ private[cli] object OperatorCommand {
       secrets,
       out,
       err,
-      ingests = false,
+      reads = false,
+      operator = true,
       done = "changed"
     ) { ready =>
       val actions = new OperatorActions(

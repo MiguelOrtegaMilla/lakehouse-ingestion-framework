@@ -19,10 +19,10 @@ import org.apache.spark.sql.SparkSession
  *  1. the source, which must be in it (4). One that is disabled is a pause that somebody chose:
  *     `run` ends well with nothing opened (0), and an operator may act on it, which is how a
  *     source is mended while it is paused;
- *  1. for `run`, a connector for its kind in this application (4);
+ *  1. for a command that reads the source, a connector for its kind in this application (4);
  *  1. the roots that the command needs, which must be there: the engine makes none, since a root
  *     that is missing is more often a disk that is not mounted (4). The lake for every command;
- *     the landing zone for `run`, which reads it;
+ *     the landing zone for one that reads the source;
  *  1. the time zone of the JVM, which is set to UTC before a database is connected to or a
  *     session is made, and which only a JVM that cannot be set so is refused for (4);
  *  1. the control plane, reached and at its version: not reached (3), or refused (4);
@@ -45,8 +45,10 @@ private[cli] object SourceCommand {
   )
 
   /**
-   * @param ingests whether the command reads the source: `run`. It needs the connector of the
-   *   source and the landing zone, and does nothing with a source that is disabled
+   * @param reads whether the command reads the source. It needs the connector of the source and
+   *   the landing zone
+   * @param operator whether the command is an operator's action, which acts on a source that is
+   *   disabled; `run` does nothing with one
    * @param done what the command would have done, as a refusal says that it did not: "run",
    *   "changed"
    */
@@ -57,7 +59,8 @@ private[cli] object SourceCommand {
       secrets: SecretResolver,
       out: PrintStream,
       err: PrintStream,
-      ingests: Boolean,
+      reads: Boolean,
+      operator: Boolean,
       done: String
   )(body: Ready => Int): Int = {
     val nothing = s"Nothing was $done."
@@ -78,7 +81,7 @@ private[cli] object SourceCommand {
             )
             Main.Exit.Permanent
 
-          case Some(source) if ingests && !source.enabled =>
+          case Some(source) if !operator && !source.enabled =>
             out.println(
               s"The source ${id.value} is disabled (enabled: false), and was not run: nothing " +
                 "was opened, read or recorded. Set enabled to true to run it again."
@@ -88,11 +91,11 @@ private[cli] object SourceCommand {
           case Some(source) =>
             val refused =
               Option
-                .when(ingests)(
+                .when(reads)(
                   RunCommand.withoutConnector(source, RunCommand.connectors(profile, secrets))
                 )
                 .flatten
-                .toSeq ++ RunCommand.missingRoots(profile, landing = ingests) ++
+                .toSeq ++ RunCommand.missingRoots(profile, landing = reads) ++
                 // Before a database is connected to: a connection takes the zone of the JVM.
                 RunSession.jvmToUtc().left.toSeq
             if (refused.nonEmpty) {

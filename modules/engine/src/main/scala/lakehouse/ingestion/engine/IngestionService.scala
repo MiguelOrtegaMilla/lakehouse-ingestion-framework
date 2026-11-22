@@ -212,6 +212,23 @@ final class IngestionService(
       config.hash
     )
 
+    held(start, bound, config, horizon)(_.run())
+  }
+
+  /**
+   * Takes the lease for `start`, and does `body` with the run that holds it; a run that does not
+   * get the lease is skipped. How the run ends, whatever `body` throws, is said here, for every
+   * kind of run that reads a source.
+   */
+  private def held(
+      start: RunStart,
+      bound: BoundSource,
+      config: ConfigVersion,
+      horizon: Option[Json]
+  )(
+      body: Attempt => Outcome
+  ): Outcome = {
+    val source = bound.source
     LeasedRun.open(database, start, config, timing) match {
       case Left(skipped) => Outcome.Skipped(start.id, skipped.holder, skipped.until)
       case Right(leased) =>
@@ -220,7 +237,7 @@ final class IngestionService(
         leased.onLost { loss =>
           jobs.stop(s"the run ${start.id} lost the lease of ${start.leaseKey}: ${loss.reason}")
         }
-        try jobs.during(new Attempt(leased, bound, config, horizon).run())
+        try jobs.during(body(new Attempt(leased, bound, config, horizon)))
         catch {
           // Before anything else: whatever it is wrapped in, it says that the lease is lost.
           case refused: Throwable if outOfTurn(refused).nonEmpty =>
