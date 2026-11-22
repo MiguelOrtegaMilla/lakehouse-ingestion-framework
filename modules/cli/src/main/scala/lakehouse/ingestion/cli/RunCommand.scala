@@ -58,7 +58,8 @@ object RunCommand {
       secrets,
       out,
       err,
-      ingests = true,
+      reads = true,
+      operator = false,
       done = "run"
     ) { ready =>
       val service = new IngestionService(
