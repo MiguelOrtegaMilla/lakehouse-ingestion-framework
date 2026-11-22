@@ -17,7 +17,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `core` | Domain and configuration model, validation, planning. No Spark, no JDBC. So far: the configuration, read from YAML and validated ([reference](docs/configuration/reference.md)); the model of the control plane and the recovery decision; and the plan of a batch, of files and of a window of a watermark. |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | PostgreSQL-coordinated Delta `LogStore` for safe multi-writer tables. Depends on no other module. Its README has how to use it, the fault scenarios with their tests, and its known limitations. |
 | `engine` | Connectors, Delta writers, control-plane repositories, engine service. So far: the control plane, the connector contract with the file connector and the JDBC connector, the writers of Bronze and of the quarantine, and `IngestionService`, one run of one source. |
-| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run` and `abandon-batch`. |
+| `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run`, `abandon-batch` and `reset-state`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
 The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`.
@@ -239,6 +239,35 @@ It is a run of its own under the lease of the source, and records who asked (the
 | 3 | A database did not answer, the table could not be read, or the action lost its lease |
 | 4 | Refused, with nothing changed: no batch is planned, another is, or its table has it |
 | 64 | The command line is not one: `--reason` and `--batch` are required |
+
+### When a source's configuration changed: `reset-state`
+
+A run compares the configuration it is given with the one that the state of its source was last moved with, and refuses a change that what Bronze has cannot follow: another lake, another Bronze table, another watermark column, or another table to read from. When the change is meant, an operator resets the state of the source, and says what happens to its watermark:
+
+```bash
+sbt "cli/run reset-state --profile conf/app/local.yaml --sources conf/sources --source sales.orders --reason 'updated_at was renamed modified_at' --keep-watermark"
+```
+
+| Option | The watermark | For |
+|---|---|---|
+| `--watermark <moment>` | Set to the moment, written as `load.watermark.start` is. The next batch counts from it. Not before `start`: those rows are a backfill's | Reading part of the history again, or skipping it |
+| `--forget-watermark` | None. The next run plans as a first run does, from `start` or the whole table | Reading everything again |
+| `--keep-watermark` | As it was. Only what later runs are compared with is reset | A table that was moved, a column that was renamed, a source of files |
+
+The configuration of the reset is the one that later runs are compared with, and the change it let through is said with it. The numbers of the batches go on, since a table skips a number it has had, and the files that were taken stay taken. A reset is a run of its own under the lease of the source, with who asked and why, and writes the state before and after to `control.state_change_log` ([ADR-0021](docs/adr/0021-operator-actions-and-backfills.md)).
+
+A watermark kept across a change has two risks, and the command warns of each one that applies:
+
+- **Another Bronze table, or another lake.** The history of the source stays in the old table, and the new one receives only what is ingested from now on. Reading it into the new one is a reset to an earlier watermark, a backfill or a reprocess.
+- **Another watermark column.** The watermark was a value of the old column, and is taken as a value of the new one. If the new column does not mean what the old one did, rows whose new column is at or before the watermark are skipped without a word. Keeping it is right for a column that was renamed at the source; for any other, use `--watermark` or `--forget-watermark`.
+
+| Code | Meaning |
+|---|---|
+| 0 | The state was reset, with a warning on standard error for each risk of a kept watermark |
+| 2 | A run holds the lease of the source: nothing was changed |
+| 3 | A database did not answer, or the action lost its lease |
+| 4 | Refused, with nothing changed: a batch is planned (it is the next run's, or `abandon-batch`'s), the source has no state, or it keeps no watermark of the kind asked for, or the moment cannot be one |
+| 64 | The command line is not one: `--reason` and exactly one of the three options are required |
 
 ### A table of a database: `sales.orders`
 

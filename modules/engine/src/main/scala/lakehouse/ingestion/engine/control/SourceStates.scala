@@ -14,9 +14,10 @@ import lakehouse.ingestion.core.control.{BatchSeq, Layer, RunId, SourceState}
  * How far each source has been ingested in each layer (discovery §13.2): the watermark that the
  * next batch starts from, and the last batch that is accounted for.
  *
- * It is moved by the commit of a batch and by nothing else, in the transaction that also marks
- * the batch committed and its run succeeded (ADR-0005 §3, step 7): there is no moment at which
- * the state says more, or less, than what the batches say.
+ * It is moved by the commit of a batch, in the transaction that also marks the batch committed
+ * and its run succeeded (ADR-0005 §3, step 7): there is no moment at which the state says more,
+ * or less, than what the batches say. And by an operator's reset, which says why
+ * (`state_change_log`, ADR-0021 §3), and moves the watermark and nothing of the batches.
  *
  * Every method runs on the connection it is given.
  */
@@ -88,6 +89,46 @@ object SourceStates {
       }
       statement.setLong(4, batch.value)
       statement.setObject(5, run.uuid)
+      statement.executeUpdate() == 1
+    }
+  }
+
+  /**
+   * Resets the state of a source to `watermark`, by the run `run` (ADR-0021 §3): the
+   * configuration of that run is the one that later runs are compared with, since the state was
+   * last moved by it. The last batch committed does not move: the sequence goes on.
+   *
+   * @param before the state as it was read: the reset is of that state, and of no other
+   * @return false if the state is not `before` any more, and nothing was changed
+   */
+  @throws[SQLException]
+  def reset(
+      connection: Connection,
+      before: SourceState,
+      watermark: Option[Json],
+      run: RunId
+  ): Boolean = {
+    watermark.foreach(Batches.readable("watermark", _))
+    Using.resource(
+      connection.prepareStatement(
+        """UPDATE control.source_state
+          |   SET watermark = ?::jsonb, updated_by_run = ?, updated_at = now()
+          | WHERE source_id = ? AND layer = ?
+          |   AND last_committed_batch_seq = ? AND updated_by_run = ?
+          |   AND watermark IS NOT DISTINCT FROM ?::jsonb""".stripMargin
+      )
+    ) { statement =>
+      def setWatermark(index: Int, value: Option[Json]): Unit = value match {
+        case Some(json) => statement.setString(index, json.noSpaces)
+        case None => statement.setNull(index, Types.VARCHAR)
+      }
+      setWatermark(1, watermark)
+      statement.setObject(2, run.uuid)
+      statement.setString(3, before.source.value)
+      statement.setString(4, before.layer.name)
+      statement.setLong(5, before.lastCommitted.value)
+      statement.setObject(6, before.updatedBy.uuid)
+      setWatermark(7, before.watermark)
       statement.executeUpdate() == 1
     }
   }

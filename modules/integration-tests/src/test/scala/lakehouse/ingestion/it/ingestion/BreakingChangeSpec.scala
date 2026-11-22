@@ -109,8 +109,10 @@ final class BreakingChangeSpec
       "without a word. Nothing was planned, read or written, and a batch that a run left " +
       "planned is as it was. The configuration that the state of the source was last " +
       s"advanced with is in control.config_snapshot, under the hash ${versionOf(fromA).hash}: " +
-      "give the source that one, and run it again. To go on under the new one the state of " +
-      "the source has to be reset, which this version of the application does not do yet"
+      "give the source that one, and run it again. To go on under the new one, an operator " +
+      "resets the state of the source with reset-state and a reason, setting its watermark " +
+      "(--watermark), forgetting it (--forget-watermark) or keeping it (--keep-watermark); " +
+      "its configuration is then the one that later runs are compared with"
     // The run is recorded as it ended, with the configuration that it came with, and gave its
     // lease up. Nothing of the source moved.
     val run = runOf(stopped.run)

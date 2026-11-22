@@ -1,10 +1,13 @@
 package lakehouse.ingestion.core.config
 
+import java.time.Instant
+
 import scala.concurrent.duration._
 
 import cats.syntax.all._
 import io.circe.Json
 import lakehouse.ingestion.core.config.Read.{Obj, Problem, Result}
+import lakehouse.ingestion.core.watermark.WatermarkPlanner
 
 /** What a connector is told about the source it reads: the `connector` section of a source. */
 trait ConnectorConfig {
@@ -69,6 +72,16 @@ trait ConnectorKind {
    * an error. No I/O: this runs when a configuration is validated.
    */
   def read(section: Obj): Result[ConnectorConfig]
+
+  /**
+   * How a moment is made into the watermark of a source of this kind that is loaded so, in the
+   * form that its connector stores it in, for an operator's reset of the state of the source
+   * (ADR-0021 §3); none, for a load that keeps no watermark. No I/O, as `read`: a reset does not
+   * open the source.
+   *
+   * The function gives the watermark, or why the moment cannot be one.
+   */
+  def watermarkAt(load: Load): Option[Instant => Either[String, Json]] = None
 }
 
 object ConnectorKind {
@@ -147,6 +160,13 @@ object JdbcConnector extends ConnectorKind {
 
   /** The field of the columns that are read as text. */
   val TextColumns = "text_columns"
+
+  /** A load by a watermark keeps the upper bound of its last batch (`StoredWatermark`). */
+  override def watermarkAt(load: Load): Option[Instant => Either[String, Json]] = load match {
+    case incremental: Load.Incremental =>
+      Some(at => WatermarkPlanner.resetTo(incremental, at).map(_.toJson))
+    case _ => None
+  }
 
   override def read(section: Obj): Result[ConnectorConfig] =
     (

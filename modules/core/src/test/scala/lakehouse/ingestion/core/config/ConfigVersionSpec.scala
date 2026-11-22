@@ -508,6 +508,10 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
       )
       .map(change => change.field -> change.breaksBronze) shouldBe
       Seq("targets.silver.partition_by" -> false)
+
+    // What a reset that keeps the watermark warns of (ADR-0021 §3).
+    found.filter(_.movesBronze).map(_.field) shouldBe Seq("lake.uri", "targets.bronze.table")
+    found.filter(_.ofWatermarkColumn).map(_.field) shouldBe Seq("load.watermark.column")
   }
 
   test("what a source stops doing, or starts doing, breaks nothing that was done") {

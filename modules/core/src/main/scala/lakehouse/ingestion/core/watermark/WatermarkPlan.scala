@@ -336,4 +336,31 @@ object WatermarkPlanner {
         Planned(WatermarkPlan(settings.column, lower, upper, horizon))
     }
   }
+
+  /**
+   * The watermark that an operator's reset sets a source to (ADR-0021 §3): every row whose
+   * column is at or before `at` is taken as ingested, and the next batch counts from it.
+   *
+   * A moment before `start` is refused. The rows at or before `start` are not of the regular
+   * sequence of the source, which starts there, and a backfill reads them (ADR-0021 §5). A
+   * moment equal to it is where a source with no watermark starts. A moment that the source has
+   * not reached is not refused: the clock of the source is not asked, and the runs after the
+   * reset plan nothing until it is passed, and say how far behind it the clock is.
+   *
+   * @return the watermark, or why `at` cannot be one
+   */
+  def resetTo(load: Load.Incremental, at: Instant): Either[String, StoredWatermark] =
+    Moment.problem(at) match {
+      case Some(what) => Left(s"the moment $what")
+      case None =>
+        load.watermark.start.filter(at.isBefore) match {
+          case Some(start) =>
+            Left(
+              s"$at is before load.watermark.start, $start: the rows at or before it are not " +
+                "of the regular sequence of the source, which starts there, and a backfill " +
+                "reads them"
+            )
+          case None => Right(StoredWatermark(at))
+        }
+    }
 }

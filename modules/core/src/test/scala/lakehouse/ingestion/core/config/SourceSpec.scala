@@ -190,6 +190,20 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
     source.freshnessSla shouldBe Some(2.hours)
   }
 
+  test("a source loaded by a watermark makes a moment into its watermark; any other has none") {
+    val january = Instant.parse("2026-01-01T00:00:00Z")
+    val incremental = example("sales.orders.yaml").value
+    val reset = JdbcConnector.watermarkAt(incremental.load).getOrElse(fail("it has none"))
+    reset(Instant.parse("2026-03-01T00:00:00Z")).value.noSpaces shouldBe
+      """{"version":1,"value":"2026-03-01T00:00:00Z"}"""
+    // Its start, 2026-01-01, bounds it.
+    reset(january).value.noSpaces should include("2026-01-01T00:00:00Z")
+    reset(january.minusSeconds(1)).left.value should include("is before load.watermark.start")
+
+    JdbcConnector.watermarkAt(Load.Full) shouldBe None
+    FileConnector.watermarkAt(example("sales.returns.yaml").value.load) shouldBe None
+  }
+
   test("the example of a file source is valid, with the defaults for what it leaves out") {
     val Loaded(source, warnings) = example("sales.returns.yaml")
 

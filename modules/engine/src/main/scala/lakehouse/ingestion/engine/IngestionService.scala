@@ -395,8 +395,11 @@ final class IngestionService(
               "planned, read or written, and a batch that a run left planned is as it was. " +
               "The configuration that the state of the source was last advanced with is in " +
               s"control.config_snapshot, under the hash ${last.hash}: give the source that " +
-              "one, and run it again. To go on under the new one the state of the source " +
-              "has to be reset, which this version of the application does not do yet"
+              "one, and run it again. To go on under the new one, an operator resets the " +
+              "state of the source with reset-state and a reason, setting its watermark " +
+              "(--watermark), forgetting it (--forget-watermark) or keeping it " +
+              "(--keep-watermark); its configuration is then the one that later runs are " +
+              "compared with"
           )
       }
 

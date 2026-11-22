@@ -211,6 +211,64 @@ final class LeasedRun private (
   }
 
   /**
+   * Resets the state of the source (ADR-0021 §3): sets its watermark to `watermark`, makes this
+   * run the one that last moved it, writes the change to `state_change_log`, ends the run as
+   * succeeded, and gives the lease up. All of it in one transaction, on condition that the lease
+   * is still this run's under its epoch, or none of it.
+   *
+   * The last batch committed does not move, and no file taken is forgotten. That no batch is
+   * planned is the caller's to have asked, under this lease; it is asked again here, in the
+   * transaction, as `finish` asks it.
+   *
+   * @param before the state that the reset is of, as it was read under this lease
+   * @return false if the lease is another run's: this process was a zombie, and nothing was
+   *   changed
+   * @throws java.lang.IllegalStateException if the lease is this run's and the state is not
+   *   `before`, or a batch is planned. Nothing was changed, and the lease is no longer renewed
+   * @throws java.lang.IllegalArgumentException if the watermark could not be stored. Nothing
+   *   was changed, and the lease is still renewed
+   */
+  @throws[SQLException]
+  def reset(before: SourceState, watermark: Option[Json]): Boolean = {
+    require(
+      before.source == start.source && before.layer == start.layer,
+      s"the state of ${before.source}/${before.layer} is not of ${start.leaseKey}"
+    )
+    watermark.foreach(Batches.readable("watermark", _))
+    heartbeat.close()
+    database.transaction { connection =>
+      Leases.holds(connection, start.leaseKey, start.id, epoch) && {
+        def must(done: Boolean, what: String): Unit =
+          if (!done)
+            throw new IllegalStateException(s"the state of ${start.txnAppId} was not reset: $what")
+
+        Batches.planned(connection, start.txnAppId).foreach { batch =>
+          must(done = false, s"the batch ${batch.id} is planned")
+        }
+        must(
+          SourceStates.reset(connection, before, watermark, start.id),
+          "it is not the state that was read"
+        )
+        StateChanges.record(
+          connection,
+          start.id,
+          before,
+          StateChanges.document(watermark, before.lastCommitted, start.id)
+        )
+        must(
+          Runs.end(connection, start.id, RunEnd.Succeeded()),
+          s"the run ${start.id} is not running"
+        )
+        must(
+          Leases.release(connection, start.leaseKey, start.id, epoch),
+          "its lease could not be given up"
+        )
+        true
+      }
+    }
+  }
+
+  /**
    * Runs `body` in a transaction that has the lease locked, and found it to be this run's. What
    * `body` writes is then written by the holder of the lease, whatever happens next.
    */

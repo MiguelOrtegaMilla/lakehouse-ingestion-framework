@@ -7,6 +7,7 @@ import java.nio.file.{Files, Path, Paths}
 import java.time.{Clock, Instant, ZoneOffset}
 
 import scala.concurrent.duration._
+import scala.util.Try
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
@@ -19,7 +20,7 @@ import lakehouse.ingestion.core.config.{
 }
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.IngestionService.Outcome
-import lakehouse.ingestion.engine.connector.ConnectorRegistry
+import lakehouse.ingestion.engine.connector.{ConnectorRegistry, Progress}
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.engine.delta.DeltaTableTransactions
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
@@ -243,12 +244,18 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
     ConnectorRegistry(new FileSourceConnector(new Landing(landingRoot)))
 
   /** Every way in which the control plane, the tables and the files taken of a source disagree. */
-  protected def ledgerViolations(of: Source): Seq[Violation] =
-    IngestionLedger.check(ledgerOf(of))
+  protected def ledgerViolations(of: Source, earlier: Source*): Seq[Violation] =
+    IngestionLedger.check(ledgerOf(of, earlier: _*))
 
-  /** Asks the ledger of a source, once no run of it is in flight. */
-  protected def assertLedger(of: Source): Unit = {
-    val violations = ledgerViolations(of)
+  /**
+   * Asks the ledger of a source, once no run of it is in flight.
+   *
+   * @param earlier the configurations that the source had before, that a batch may have been
+   *   planned under: a plan is read by its connector as it was written, and a connector refuses
+   *   one of another configuration (a window of another watermark column)
+   */
+  protected def assertLedger(of: Source, earlier: Source*): Unit = {
+    val violations = ledgerViolations(of, earlier: _*)
     withClue(violations.mkString(s"the ledger of ${of.id}:\n  ", "\n  ", "\n")) {
       violations shouldBe empty
     }: Unit
@@ -262,10 +269,18 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
    * and did not publish (ADR-0004 §3.3), and what is looked at is the table that the next reader
    * gets.
    */
-  protected def ledgerOf(of: Source): Facts = {
+  protected def ledgerOf(of: Source, earlier: Source*): Facts = {
     val app = TxnAppId.of(of.id, Layer.Bronze)
-    val bound = connectors.bind(of)
+    val bound = (of +: earlier).map(connectors.bind)
     val configured = bronze(of)
+
+    /** What the commit of a plan records, by the first configuration that reads it. */
+    def progressOf(plan: Json): Progress =
+      bound.iterator
+        .map(source => Try(source.progress(plan)))
+        .find(_.isSuccess)
+        .getOrElse(Try(bound.head.progress(plan)))
+        .get
 
     val records = asSuperuser { c =>
       query(
@@ -278,7 +293,7 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
     )
 
     val batches = records.map { record =>
-      val progress = bound.progress(record.plan)
+      val progress = progressOf(record.plan)
       IngestionLedger.Batch(
         seq = record.id.seq.value,
         status = record.status,
@@ -309,7 +324,33 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       )
     }.map { row =>
       val run = runOf(RunId.parse(row.head).value)
-      IngestionLedger.Run(run.start.id, run.batch.map(_.value), run.status, run.counts.rowsWritten)
+      IngestionLedger.Run(
+        run.start.id,
+        run.batch.map(_.value),
+        run.status,
+        run.counts.rowsWritten,
+        run.start.kind
+      )
+    }
+
+    val resets = asSuperuser { c =>
+      query(
+        c,
+        "SELECT run_id::text, before::text, after::text FROM control.state_change_log " +
+          "WHERE source_id = ? AND layer = ? ORDER BY change_id",
+        of.id.value,
+        Layer.Bronze.name
+      )
+    }.map { row =>
+      def state(text: String): IngestionLedger.State = {
+        val document = StoredJson.parse(text).value.hcursor
+        IngestionLedger.State(
+          document.downField("watermark").focus.filterNot(_.isNull),
+          document.get[Long]("last_committed_batch_seq").value,
+          RunId.parse(document.get[String]("updated_by_run").value).value
+        )
+      }
+      IngestionLedger.Reset(RunId.parse(row(0)).value, state(row(1)), state(row(2)))
     }
 
     val taken = asSuperuser { c =>
@@ -342,7 +383,8 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       ),
       taken,
       data,
-      apart
+      apart,
+      resets
     )
   }
 

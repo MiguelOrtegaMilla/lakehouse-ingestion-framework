@@ -554,16 +554,67 @@ final class MainSpec
   test("abandon-batch: each way an operator's action ends has its code, and the usage says it") {
     import lakehouse.ingestion.engine.operator.OperatorActions.{Outcome => Action}
     val run = RunId.generate()
-    AbandonBatchCommand.exitOf(Action.Done(run, "given up")) shouldBe 0
-    AbandonBatchCommand.exitOf(Action.Skipped(run, RunId.generate(), Instant.EPOCH)) shouldBe 2
-    AbandonBatchCommand.exitOf(Action.Failed(run, FailureClass.Transient, "why")) shouldBe 3
-    AbandonBatchCommand.exitOf(Action.Failed(run, FailureClass.Permanent, "why")) shouldBe 4
+    OperatorCommand.exitOf(Action.Done(run, "given up")) shouldBe 0
+    OperatorCommand.exitOf(Action.Done(run, "reset", Seq("a risk"))) shouldBe 0
+    OperatorCommand.exitOf(Action.Skipped(run, RunId.generate(), Instant.EPOCH)) shouldBe 2
+    OperatorCommand.exitOf(Action.Failed(run, FailureClass.Transient, "why")) shouldBe 3
+    OperatorCommand.exitOf(Action.Failed(run, FailureClass.Permanent, "why")) shouldBe 4
 
     Main.Usage should include("lakehouse-ingestion abandon-batch --profile <file>")
     Main.Usage should include("--batch <n> --reason <text>")
-    Main.Usage should include("or the batch was given up;")
+    Main.Usage should include("the batch was given up, or the state was reset;")
     Main.Usage should include("or a table could not be read")
     Main.Usage should include("none is planned, another is, or its table has it")
+  }
+
+  test("reset-state: one way of the watermark, a moment as start is written, and a reason: 64") {
+    def reset(more: String*): Ran =
+      run(
+        Seq(
+          "reset-state",
+          "--profile",
+          "p.yaml",
+          "--sources",
+          "conf/sources",
+          "--source",
+          "sales.orders"
+        ) ++ more: _*
+      )
+    def refused(ran: Ran, problem: String): Unit = {
+      ran.exit shouldBe Main.Exit.Usage
+      ran.errors.head shouldBe s"error: $problem"
+      ran.out shouldBe empty: Unit
+    }
+
+    refused(
+      reset("--reason", "moved"),
+      "one of --forget-watermark, --keep-watermark, --watermark must be given"
+    )
+    refused(
+      reset("--reason", "moved", "--keep-watermark", "--forget-watermark"),
+      "--forget-watermark and --keep-watermark are given: one of them is"
+    )
+    refused(
+      reset("--reason", "moved", "--keep-watermark", "--watermark", "2026-03-01T00:00:00Z"),
+      "--keep-watermark and --watermark are given: one of them is"
+    )
+    refused(
+      reset("--keep-watermark", "--keep-watermark", "--reason", "x"),
+      "--keep-watermark is given twice"
+    )
+    refused(reset("--keep-watermark"), "--reason must be given")
+    reset("--keep-watermark", "--reason", " ").errors.head should startWith(
+      "error: --reason says nothing"
+    )
+    reset("--reason", "moved", "--watermark", "2026-03-01").exit shouldBe Main.Exit.Usage
+    reset("--reason", "moved", "--watermark", "2026-03-01T00:00:00.0000001Z").errors.head should
+      include("more than six digits after the second")
+    refused(reset("--reason", "moved", "--watermark"), "--watermark has no value after it")
+
+    Main.Usage should include("lakehouse-ingestion reset-state --profile <file>")
+    Main.Usage should include("(--watermark <moment> | --forget-watermark")
+    Main.Usage should include("or the state was reset;")
+    Main.Usage should include("reset: a batch is planned, the source has no state, or no such")
   }
 
   test("run: a count that a run did not make is said as not known, and not as zero") {

@@ -1,7 +1,7 @@
 package lakehouse.ingestion.it.ingestion
 
 import io.circe.Json
-import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunStatus}
+import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
 import lakehouse.ingestion.it.ingestion.IngestionLedger._
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -86,6 +86,19 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
     runs = clean.runs :+ Run(r7, Some(6), RunStatus.Abandoned)
   )
 
+  /** Two resets after batch 5 (ADR-0021 §3): r8 kept the watermark, and r9 set one. */
+  private val r8, r9 = RunId.generate()
+  private val at = Json.obj("value" -> Json.fromString("2026-11-19T11:00:00Z"))
+  private def resetBy(id: RunId) = Run(id, None, RunStatus.Succeeded, kind = RunKind.Reset)
+  private val reset = clean.copy(
+    runs = clean.runs ++ Seq(resetBy(r8), resetBy(r9)),
+    state = Some(State(Some(at), 5, r9)),
+    resets = Seq(
+      Reset(r8, State(None, 5, r6), State(None, 5, r8)),
+      Reset(r9, State(None, 5, r8), State(Some(at), 5, r9))
+    )
+  )
+
   // -----------------------------------------------------------------------------------------------
   // What is as it should be
   // -----------------------------------------------------------------------------------------------
@@ -143,6 +156,25 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
     val loaded = batch(clean, 5)(_.copy(watermark = Some(at)))
     IngestionLedger.check(loaded.copy(state = Some(State(Some(at), 5, r6)))) shouldBe empty
     rules(loaded) shouldBe Set(Rule.StateNotOfLastBatch)
+  }
+
+  test("a state reset after the last batch is the reset's, and each reset is of what there was") {
+    IngestionLedger.check(reset) shouldBe empty
+    // A reset before batch 5, of the state of batch 3; and one after it, of the state of 5.
+    val between = clean.copy(
+      runs = clean.runs ++ Seq(resetBy(r8), resetBy(r9)),
+      state = Some(State(None, 5, r9)),
+      resets = Seq(
+        Reset(r8, State(None, 3, r4), State(None, 3, r8)),
+        Reset(r9, State(None, 5, r6), State(None, 5, r9))
+      )
+    )
+    IngestionLedger.check(between) shouldBe empty
+    // And with a batch after both, the state is that batch's again.
+    IngestionLedger.check(
+      between.copy(state = clean.state, resets = between.resets.take(1))
+    ) shouldBe
+      empty
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -246,6 +278,48 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
     )
     rules(nothing) shouldBe Set(Rule.StateNotOfLastBatch)
     IngestionLedger.check(nothing.copy(state = None)) shouldBe empty
+  }
+
+  test("a state that is not what the last reset left") {
+    rules(reset.copy(state = Some(State(None, 5, r9)))) shouldBe Set(Rule.StateNotOfLastBatch)
+    rules(reset.copy(state = clean.state)) shouldBe Set(Rule.StateNotOfLastBatch)
+  }
+
+  test("a reset of a state that was not there, that moves the sequence, or says another run") {
+    // Of the state of batch 5, which r8 had reset already.
+    rules(
+      reset.copy(resets =
+        reset.resets.updated(1, reset.resets(1).copy(before = State(None, 5, r6)))
+      )
+    ) shouldBe
+      Set(Rule.ResetNotChained)
+    // To batch 1: the sequence started again. What r9 reset is then not what r8 left.
+    rules(
+      reset.copy(resets = reset.resets.updated(0, reset.resets(0).copy(after = State(None, 1, r8))))
+    ) shouldBe
+      Set(Rule.ResetNotChained)
+    // Moved by a run that is not the reset's.
+    rules(
+      reset.copy(
+        state = Some(State(Some(at), 5, r8)),
+        resets = reset.resets.updated(1, reset.resets(1).copy(after = State(Some(at), 5, r8)))
+      )
+    ) shouldBe Set(Rule.ResetNotChained)
+    // Of no committed batch.
+    rules(
+      reset.copy(resets =
+        reset.resets.updated(0, reset.resets(0).copy(before = State(None, 4, r5)))
+      )
+    ) shouldBe
+      Set(Rule.ResetNotChained)
+  }
+
+  test("a reset by a run that did not succeed, that does not reset, or that is no run") {
+    rules(run(reset, r9)(_.copy(status = RunStatus.Failed))) shouldBe Set(Rule.ResetNotSucceeded)
+    rules(run(reset, r9)(_.copy(kind = RunKind.Regular))) shouldBe Set(Rule.ResetNotSucceeded)
+    rules(reset.copy(runs = reset.runs.filter(_.id != r9))) shouldBe Set(Rule.ResetNotSucceeded)
+    IngestionLedger.check(run(reset, r9)(_.copy(status = RunStatus.Failed))).map(_.message) shouldBe
+      Seq(s"the state was reset by the run $r9, of the kind reset, which ended FAILED")
   }
 
   test("files taken that are not those of the committed plans") {

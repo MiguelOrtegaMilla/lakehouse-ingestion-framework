@@ -192,6 +192,16 @@ object ConfigVersion {
       breaksBronze: Boolean
   ) {
     def message: String = s"$field of the $of was $was and is $is: $consequence"
+
+    /**
+     * Whether what is ingested from now on goes to another table than the one that has what
+     * was: the lake was moved, or the Bronze table is another.
+     */
+    def movesBronze: Boolean =
+      (of, field) == ("profile", "lake.uri") || (of, field) == ("source", "targets.bronze.table")
+
+    /** Whether the watermark is now a value of another column. */
+    def ofWatermarkColumn: Boolean = (of, field) == ("source", "load.watermark.column")
   }
 
   /**

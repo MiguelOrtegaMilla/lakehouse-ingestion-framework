@@ -1,7 +1,7 @@
 package lakehouse.ingestion.it.ingestion
 
 import io.circe.Json
-import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunStatus}
+import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
 
 /**
  * What the control plane, the tables of a source and `processed_file` must say of each other
@@ -10,8 +10,10 @@ import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunStatus}
  * Each test of a run checks what it is about. This checks what every one of them stands on,
  * whatever the test did before: a batch that is committed is in its table once, and in no
  * other; a batch that was given up is in none; a row says a run, and the run says its batch; the
- * state is that of the last batch; the files taken are those of the committed plans; no run is
- * still running, and the run that committed a batch succeeded. A test
+ * state is that of the last batch, or of the reset after it; each reset was of the state that
+ * there was, and went on from its last batch; the files taken are those of the committed plans;
+ * no run is still running, and the run that committed a batch, or reset the state, succeeded. A
+ * test
  * that kills a run, takes its lease over or changes its source asks it of what is left once the
  * next run has finished.
  *
@@ -56,10 +58,14 @@ object IngestionLedger {
       id: RunId,
       batch: Option[Long],
       status: RunStatus,
-      rowsWritten: Option[Long] = None
+      rowsWritten: Option[Long] = None,
+      kind: RunKind = RunKind.Regular
   )
 
   final case class State(watermark: Option[Json], lastCommitted: Long, updatedBy: RunId)
+
+  /** A reset of the state by an operator's run, as `state_change_log` has it (ADR-0021 §3). */
+  final case class Reset(run: RunId, before: State, after: State)
 
   /** A commit of a table, with the `txnVersion`s that it carries under the source's `txnAppId`. */
   final case class Commit(version: Long, txns: Seq[Long])
@@ -87,6 +93,7 @@ object IngestionLedger {
   /**
    * @param data every table that a batch of the source was planned for, and the one that its
    *   configuration names
+   * @param resets the resets of the state, in the order they were made
    */
   final case class Facts(
       batches: Seq[Batch],
@@ -94,7 +101,8 @@ object IngestionLedger {
       state: Option[State],
       taken: Set[(TakenFile, Long)],
       data: Seq[Table],
-      quarantine: Table
+      quarantine: Table,
+      resets: Seq[Reset] = Nil
   )
 
   sealed abstract class Rule(val name: String) {
@@ -116,6 +124,8 @@ object IngestionLedger {
     case object BatchByTwoRuns extends Rule("BatchByTwoRuns")
     case object RowsNotAsCounted extends Rule("RowsNotAsCounted")
     case object StateNotOfLastBatch extends Rule("StateNotOfLastBatch")
+    case object ResetNotChained extends Rule("ResetNotChained")
+    case object ResetNotSucceeded extends Rule("ResetNotSucceeded")
     case object FilesNotAsCommitted extends Rule("FilesNotAsCommitted")
     case object StillRunning extends Rule("StillRunning")
     case object CommitterNotSucceeded extends Rule("CommitterNotSucceeded")
@@ -127,7 +137,8 @@ object IngestionLedger {
 
   /** Every way in which the facts disagree; none, for a source that is as it should be. */
   def check(facts: Facts): Seq[Violation] =
-    tables(facts) ++ txns(facts) ++ rows(facts) ++ state(facts) ++ files(facts) ++ runs(facts)
+    tables(facts) ++ txns(facts) ++ rows(facts) ++ state(facts) ++ resets(facts) ++
+      files(facts) ++ runs(facts)
 
   // -----------------------------------------------------------------------------------------------
   // Batches and the commits of the tables
@@ -338,6 +349,17 @@ object IngestionLedger {
             s"batch ${batch.seq} is committed, and the source has no state"
           )
         )
+      case (Some(batch), Some(state)) if lastReset(facts, batch).nonEmpty =>
+        val reset = lastReset(facts, batch).get
+        Option
+          .when(state != reset.after)(
+            Violation(
+              Rule.StateNotOfLastBatch,
+              s"the state is ${shown(state)}, and the reset by the run ${reset.run} after batch " +
+                s"${batch.seq} left it ${shown(reset.after)}"
+            )
+          )
+          .toSeq
       case (Some(batch), Some(state)) =>
         val wrong = Seq(
           Option.when(state.lastCommitted != batch.seq)(
@@ -353,6 +375,60 @@ object IngestionLedger {
           )
         ).flatten
         wrong.map(why => Violation(Rule.StateNotOfLastBatch, s"the state $why"))
+    }
+  }
+
+  /** The last reset after the last batch committed, which the state is then of. */
+  private def lastReset(facts: Facts, last: Batch): Option[Reset] =
+    facts.resets.lastOption.filter(_.after.lastCommitted == last.seq)
+
+  private def shown(state: State): String =
+    s"(watermark ${state.watermark.fold("none")(_.noSpaces)}, batch ${state.lastCommitted}, " +
+      s"by ${state.updatedBy})"
+
+  /**
+   * Each reset is of the state that there was: that of the reset before it, if no batch was
+   * committed between them, or else that of the last batch committed. It moves no batch, and
+   * says it was made by its run, a run that resets and that succeeded.
+   */
+  private def resets(facts: Facts): Seq[Violation] = {
+    val committed = facts.batches.filter(_.status == BatchStatus.Committed).map(b => b.seq -> b)
+    val byId = facts.runs.map(run => run.id -> run).toMap
+    facts.resets.zipWithIndex.flatMap { case (reset, index) =>
+      val was = facts.resets
+        .take(index)
+        .lastOption
+        .filter(_.after.lastCommitted == reset.before.lastCommitted)
+        .map(_.after)
+        .orElse(committed.toMap.get(reset.before.lastCommitted).flatMap { batch =>
+          batch.committedBy.map(State(batch.watermark, batch.seq, _))
+        })
+      val by = s"the reset by the run ${reset.run}"
+      Seq(
+        Option.when(!was.contains(reset.before))(
+          s"$by says the state was ${shown(reset.before)}, and it was " +
+            was.fold("no state of a committed batch")(shown)
+        ),
+        Option.when(reset.after.lastCommitted != reset.before.lastCommitted)(
+          s"$by moved the last batch from ${reset.before.lastCommitted} to " +
+            s"${reset.after.lastCommitted}: the sequence goes on"
+        ),
+        Option.when(reset.after.updatedBy != reset.run)(
+          s"$by says the state was moved by ${reset.after.updatedBy}"
+        )
+      ).flatten.map(Violation(Rule.ResetNotChained, _)) ++
+        (byId.get(reset.run) match {
+          case Some(run) if run.kind == RunKind.Reset && run.status == RunStatus.Succeeded => None
+          case found =>
+            Some(
+              Violation(
+                Rule.ResetNotSucceeded,
+                s"the state was reset by " + found.fold(s"${reset.run}, which is no run") { run =>
+                  s"the run ${run.id}, of the kind ${run.kind.name}, which ended ${run.status.name}"
+                }
+              )
+            )
+        })
     }
   }
 
