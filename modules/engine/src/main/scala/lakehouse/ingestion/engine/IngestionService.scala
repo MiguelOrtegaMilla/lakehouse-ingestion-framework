@@ -370,10 +370,11 @@ final class IngestionService(
       heldToWhatWasIngested()
       // Before a table is asked anything: what it then says of a batch is not changed behind
       // this run by one that held the lease before.
-      announce()
-      leased.planned() match {
-        case Some(left) => recover(left)
-        case None => planNext()
+      announce().getOrElse {
+        leased.planned() match {
+          case Some(left) => recover(left)
+          case None => planNext()
+        }
       }
     }
 
@@ -405,9 +406,19 @@ final class IngestionService(
      * (ADR-0019). Once it has, a commit of a run under an earlier epoch is in its table, where
      * this run finds it, or will never be.
      *
-     * @throws LeaseLostException if a later epoch is in force: the lease was taken again
+     * A later epoch in force has one of two authors. A run of this control plane that took the
+     * lease over: it ended this run, as `ABANDONED`, in the transaction that took the lease. Or
+     * another control plane, whose epochs the coordination store remembers, as it does when this
+     * one was made anew over it (ADR-0019): then the lease is still this run's, nobody ended it,
+     * and every run of the source will be told the same until an operator forgets those epochs.
+     * The control plane tells the two apart, when the run asks it to record that it failed for
+     * good (`ended`): taken over, the run was ended already, and it reports that it lost its
+     * lease (3); not taken over, the run is recorded as failed, its lease is given up, and it
+     * reports a failure that running again does not mend (4).
+     *
+     * @return how the run ended, if a later epoch is in force; none, if its own is
      */
-    private def announce(): Unit = {
+    private def announce(): Option[Outcome] = {
       val inForce =
         try WriterEpochs.announce(hadoop, turn)
         catch {
@@ -418,13 +429,22 @@ final class IngestionService(
               e
             )
         }
-      if (inForce != turn.epoch) {
-        log.error(
-          s"the run ${start.id} holds $turn, and the epoch in force is $inForce. Either the " +
-            "lease was taken again, or the epochs of this key were announced by another " +
-            "control plane: those are forgotten with the maintenance role (ADR-0019)"
-        )
-        throw new LeaseLostException(start.leaseKey.value, LeaseLoss.TakenOver)
+      Option.when(inForce != turn.epoch) {
+        val message =
+          s"the coordination store has the epoch $inForce in force for ${start.leaseKey}, and " +
+            s"this run holds its lease under ${turn.epoch}, which no run of this control plane " +
+            "gave up to a later one: the store remembers the epochs of another control plane, " +
+            "as it does when this one was made anew over it. Every run of the source is " +
+            "refused until an operator forgets them with the maintenance role (ADR-0019): " +
+            "DELETE FROM delta_coordination.writer_epoch WHERE epoch_key = " +
+            s"'${start.leaseKey}'. Nothing was read or written"
+        ended(leased, RunEnd.Failed(FailureClass.Permanent, message)) match {
+          case refused @ Outcome.Failed(_, FailureClass.Permanent, _) =>
+            log.error(s"the run ${start.id} of ${source.id} failed: $message")
+            refused
+          // Ended by the run that took the lease over: `fenced` said so.
+          case lost => lost
+        }
       }
     }
 
