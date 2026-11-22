@@ -25,6 +25,23 @@ final class TableLocation private[config] (val uri: String) {
  * A trait, because a table need not be a path: one that a catalog manages would be found by its
  * name, with another locator and the same engine (ADR-0011 §1).
  */
+object TableLocation {
+
+  /**
+   * A location as the control plane keeps it, with the batch that was planned for it
+   * (`ingestion_batch.target_table`). It was made by a locator, under the lake that the profile
+   * had then, which may not be the lake of the profile now: it is taken as it was written, if it
+   * is an absolute URI.
+   */
+  def stored(uri: String): Either[String, TableLocation] =
+    scala.util
+      .Try(new java.net.URI(uri))
+      .toOption
+      .filter(parsed => parsed.isAbsolute && !parsed.isOpaque)
+      .map(_ => new TableLocation(uri))
+      .toRight(s"'$uri' is not the location of a table: an absolute URI with a path")
+}
+
 trait TableLocator {
   def locate(table: RelativePath): TableLocation
 }

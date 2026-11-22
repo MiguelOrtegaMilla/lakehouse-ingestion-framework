@@ -102,3 +102,13 @@ What is common to the four is that they change what the protocol of ADR-0005 res
 - **`abandon-batch` does not get a source past data that it cannot read.** The open item of §20 is closed for plans that cannot be run, and stays open, for P8 and P9, for data.
 - **A backfill makes a second writer of the same tables as a matter of course**, which is the second type of concurrency of §6.2. It is tested as such: two processes, one table, and a kill of the backfill in the middle (P7.8).
 - **A connector that can read a range says so.** One that does not is refused a backfill, before anything is planned, and adding a connector still asks nothing of the engine (RNF-04).
+
+## As built (P7.3, 2026-11-22)
+
+- **An operator's action is a run** of the kind `abandon`, `reset` or `reprocess` (migration V5 of `control`), with `requested_by` and `reason`, which the constraints of `ingestion_run` require of those kinds and refuse of a regular run. `OperatorActions`, in `engine`, takes the lease, announces the epoch by the helper that every run uses (`EpochAnnouncement`), and does the action under it. `state_change_log` is made with the migration, and written from P7.4.
+- **`abandon-batch`** (§2) gives up the planned batch whose number it is told, in one transaction with the end of its run and the release of its lease (`LeasedRun.abandon`, which takes how the run ends: an operator's run that gives a batch up succeeds).
+- **"The table does not have the batch" is said only where it is known** (`BatchLookup`). The table that is asked is the one that the batch was planned for, wherever it is. A directory that is not there may be of a table never made, or on a disk that is not mounted, and the file system does not tell them apart; the coordination store does, since the first commit of a table registers it (`CoordinatedTables`, in the LogStore):
+  - a table that is not registered has no batch;
+  - a table that is registered is read: its directory and its log must be there and readable, and Delta is asked;
+  - anything else, a registered table whose directory is not there, a path whose existence cannot be told, a directory or a log that cannot be listed, a read that fails, is not an answer. Nothing is given up, and the action ends as a transient failure (3): once the table can be read, it is asked again.
+- **The limit, as the tests show it:** a file whose records are more rejected than its source allows fails the next batch the same way once its batch is given up.

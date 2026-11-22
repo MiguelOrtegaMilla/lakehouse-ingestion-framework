@@ -49,19 +49,31 @@ object RunStatus {
 }
 
 /**
- * What a run is for (ADR-0005 §2). A regular run ingests what is new, in full or by its
- * watermark or its files. A backfill has a kind of its own, with its own sequence of batches,
- * and comes with backfills (P7). The names are those of `run_kind` in the control plane.
+ * What a run is for (ADR-0005 §2, ADR-0021). A regular run ingests what is new, in full or by its
+ * watermark or its files. The others are what an operator does to a source, each a run under
+ * the lease of the sequence that it acts on, which says who asked for it and why: giving a
+ * planned batch up, resetting the state of a source, reading the files of a committed batch
+ * again. A backfill has a kind of its own, with its own sequence of batches, and comes with
+ * backfills (P7.6). The names are those of `run_kind` in the control plane.
+ *
+ * @param operators whether an operator asks for it, and it says who and why
+ * @param plans whether it plans a batch, which then has its kind
  */
-sealed abstract class RunKind(val name: String) {
+sealed abstract class RunKind(val name: String, val operators: Boolean, val plans: Boolean) {
   override def toString: String = name
 }
 
 object RunKind {
 
-  case object Regular extends RunKind("regular")
+  case object Regular extends RunKind("regular", operators = false, plans = true)
+  case object Abandon extends RunKind("abandon", operators = true, plans = false)
+  case object Reset extends RunKind("reset", operators = true, plans = false)
+  case object Reprocess extends RunKind("reprocess", operators = true, plans = true)
 
-  val All: Seq[RunKind] = Seq(Regular)
+  val All: Seq[RunKind] = Seq(Regular, Abandon, Reset, Reprocess)
+
+  /** The kinds that a batch may have: those of the runs that plan one. */
+  val OfBatches: Seq[RunKind] = All.filter(_.plans)
 
   def parse(name: String): Either[String, RunKind] =
     All.find(_.name == name).toRight(s"must be one of ${All.map(_.name).mkString(", ")}")

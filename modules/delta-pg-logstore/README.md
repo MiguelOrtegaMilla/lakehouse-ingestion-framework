@@ -63,7 +63,7 @@ commits.attribute { rows.write.format("delta").mode("append").save(path) }
 
 A commit made in such a context takes its version only while its epoch is the one in force under its key. Otherwise it is refused with `EpochNotInForceException`, which is not retried, by the LogStore or by Delta: the writer has lost its turn. A claim and an announcement of one key exclude each other in the database, so once an announcement has returned, a commit under an earlier epoch is either recorded, where the next reader of the table finds it, or will never be. A commit that names no epoch is held to none.
 
-**Tables.** A table created through the LogStore is registered by its first commit. A table that exists already is adopted (below). Commits to any other table are refused.
+**Tables.** A table created through the LogStore is registered by its first commit. A table that exists already is adopted (below). Commits to any other table are refused. `CoordinatedTables.registered(conf, path)` says whether a table is registered: one that is not has no commit made through the LogStore, which a directory that is not there cannot say, since it may be on a disk that is not mounted.
 
 ## What an operator does
 

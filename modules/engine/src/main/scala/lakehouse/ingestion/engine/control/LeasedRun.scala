@@ -168,7 +168,9 @@ final class LeasedRun private (
    *
    * @param reason why, for a person: it is kept with the batch
    * @param detail what of the plan could not be run, in a form of the engine's own
-   * @param end how the run ends. It did not do what it was asked, so it does not succeed
+   * @param end how the run ends. A run that was to ingest the batch did not do what it was
+   *   asked, and does not succeed; an operator's run that was asked to give it up does
+   *   (ADR-0021 §2)
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed. The batch is the other run's, to finish or to give up
    * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
@@ -182,7 +184,7 @@ final class LeasedRun private (
       batch: BatchId,
       reason: String,
       detail: Option[Json],
-      end: RunEnd.Failed
+      end: RunEnd
   ): Boolean = {
     require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
     // Before the lease stops being renewed, as the watermark of a commit: what cannot be

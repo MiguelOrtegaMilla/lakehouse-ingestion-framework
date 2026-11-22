@@ -2,7 +2,7 @@ package lakehouse.ingestion.core.control
 
 import java.time.Instant
 
-import lakehouse.ingestion.core.config.SourceId
+import lakehouse.ingestion.core.config.{SourceId, Unwritten}
 
 /**
  * Which process ran a run: `<host>:<pid>:<when the process started, in milliseconds>`.
@@ -35,11 +35,67 @@ object InstanceId {
 }
 
 /**
+ * Who asked an operator's action of a source, and why (ADR-0021 §1).
+ *
+ * Who is the user of the operating system that ran the process, as the process reports it: a
+ * datum of the audit trail, which says where to ask, and not an identity that anything verified.
+ * Anyone who can run the command with the secret of the engine's role can say they are anyone.
+ *
+ * @param requestedBy who, as the process says it
+ * @param reason why, for a person to read: required, and one line
+ */
+final case class OperatorRequest private (requestedBy: String, reason: String)
+
+object OperatorRequest {
+
+  val MaxReason = 1000
+  val MaxRequestedBy = 200
+
+  /**
+   * A request from what the process says of its user and what the command was told.
+   *
+   * The user is kept as a name: what a name of a user does not have, a character that a
+   * terminal would obey among them, is left out, and a user that is nothing that can be kept is
+   * `unknown`. The reason is refused rather than changed: it is what a person wrote, and is to
+   * be read as they wrote it.
+   */
+  def of(user: String, reason: String): Either[String, OperatorRequest] = {
+    val name = user.filter(c => c.isLetterOrDigit || ".-_@\\".contains(c)).take(MaxRequestedBy)
+    val text = reason.trim
+    if (text.isEmpty) Left("--reason says nothing: an operator's action says why it was asked for")
+    else if (text.codePointCount(0, text.length) > MaxReason)
+      Left(s"--reason is longer than $MaxReason characters")
+    else
+      Unwritten.firstOutside(text, printable) match {
+        case Some((codePoint, at)) =>
+          Left(
+            s"--reason has ${Unwritten.describe(codePoint)} at position $at: a reason is one " +
+              "line of text, with no character that a terminal obeys"
+          )
+        case None => Right(new OperatorRequest(if (name.isEmpty) "unknown" else name, text))
+      }
+  }
+
+  /** A request as it is read back from the database. */
+  def stored(requestedBy: String, reason: String): OperatorRequest =
+    new OperatorRequest(requestedBy, reason)
+
+  private def printable(codePoint: Int): Boolean =
+    !(Character.getType(codePoint) match {
+      case Character.CONTROL | Character.FORMAT | Character.LINE_SEPARATOR |
+          Character.PARAGRAPH_SEPARATOR | Character.SURROGATE | Character.UNASSIGNED =>
+        true
+      case _ => false
+    })
+}
+
+/**
  * What is known of a run when it starts, and never changes: who runs, what, with which
  * configuration (discovery §13.2). The control plane lets none of it be written twice.
  *
  * @param appVersion the version of the application that runs it
  * @param configHash the hash of the configuration it runs with, whose snapshot is stored
+ * @param request who asked for it and why: for an operator's action, and for no other run
  */
 final case class RunStart(
     id: RunId,
@@ -48,8 +104,13 @@ final case class RunStart(
     kind: RunKind,
     instance: InstanceId,
     appVersion: String,
-    configHash: String
+    configHash: String,
+    request: Option[OperatorRequest] = None
 ) {
+  require(
+    kind.operators == request.nonEmpty,
+    s"a run of the kind $kind says who asked for it and why exactly when an operator asks for it"
+  )
 
   /** The sequence that its batch belongs to. That of a backfill is its own (P7). */
   def txnAppId: TxnAppId = TxnAppId.of(source, layer)

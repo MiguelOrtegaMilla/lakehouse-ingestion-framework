@@ -3,12 +3,12 @@ package lakehouse.ingestion.core.control
 import java.time.Instant
 
 import lakehouse.ingestion.core.config.SourceId
-import org.scalatest.EitherValues
+import org.scalatest.{EitherValues, OptionValues}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /** What a run is known by when it starts, and how it says it ended. */
-final class RunsSpec extends AnyFunSuite with Matchers with EitherValues {
+final class RunsSpec extends AnyFunSuite with Matchers with EitherValues with OptionValues {
 
   private val started = Instant.parse("2026-11-18T09:10:25.123Z")
 
@@ -53,6 +53,61 @@ final class RunsSpec extends AnyFunSuite with Matchers with EitherValues {
 
     start.leaseKey.value shouldBe "sales.orders/silver"
     start.txnAppId.value shouldBe "sales.orders/silver"
+  }
+
+  private def starting(kind: RunKind, request: Option[OperatorRequest]) =
+    RunStart(
+      RunId.generate(),
+      SourceId.parse("sales.orders").value,
+      Layer.Bronze,
+      kind,
+      InstanceId.of("host", 1, started),
+      "0.1.0",
+      "0" * 64,
+      request
+    )
+
+  test("an operator's action says who asked for it and why, and no other run does") {
+    val asked = OperatorRequest.of("ops.oncall", "the directory of the source was moved").value
+    val abandon = starting(RunKind.Abandon, Some(asked))
+    abandon.request.value.requestedBy shouldBe "ops.oncall"
+    abandon.request.value.reason shouldBe "the directory of the source was moved"
+    // An action of an operator is on the sequence of the source, under its lease.
+    abandon.leaseKey.value shouldBe "sales.orders/bronze"
+    abandon.txnAppId.value shouldBe "sales.orders/bronze"
+
+    an[IllegalArgumentException] should be thrownBy starting(RunKind.Reset, None)
+    an[IllegalArgumentException] should be thrownBy starting(RunKind.Regular, Some(asked))
+  }
+
+  test("who asked is kept as a name, whatever the process says it is") {
+    // A user of a domain, and one with characters that a terminal would obey.
+    OperatorRequest.of("CORP\\ana.ortiz", "r").value.requestedBy shouldBe "CORP\\ana.ortiz"
+    OperatorRequest.of("ops\u001b[2J user", "r").value.requestedBy shouldBe "ops2Juser"
+    OperatorRequest.of("", "r").value.requestedBy shouldBe "unknown"
+    OperatorRequest.of("\n\t", "r").value.requestedBy shouldBe "unknown"
+    OperatorRequest
+      .of("u" * 500, "r")
+      .value
+      .requestedBy
+      .length shouldBe OperatorRequest.MaxRequestedBy
+  }
+
+  test("why is one line that a person wrote, kept as written, or refused") {
+    OperatorRequest.of("u", "  the plan names a directory that is gone  ").value.reason shouldBe
+      "the plan names a directory that is gone"
+    OperatorRequest.of("u", "año, ¿por qué? ✓").value.reason shouldBe "año, ¿por qué? ✓"
+    OperatorRequest.of("u", "x" * 1000).value.reason should have length 1000
+
+    OperatorRequest.of("u", "   ").left.value should include("says nothing")
+    OperatorRequest.of("u", "x" * 1001).left.value shouldBe
+      "--reason is longer than 1000 characters"
+    OperatorRequest.of("u", "two\nlines").left.value should startWith(
+      "--reason has U+000A LINE FEED (LF) at position 4"
+    )
+    OperatorRequest.of("u", "clear\u001b[2J").left.value should include("U+001B")
+    // A character that hides what is written: a mark that reverses the text after it.
+    OperatorRequest.of("u", "abc\u202Edef").left.value should include("U+202E")
   }
 
   test("a run that was running says that it succeeded or failed, and nothing else") {

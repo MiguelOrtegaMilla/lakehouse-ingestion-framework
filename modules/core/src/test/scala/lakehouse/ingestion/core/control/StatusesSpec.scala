@@ -49,11 +49,18 @@ final class StatusesSpec extends AnyFunSuite with Matchers with EitherValues {
     RunStatus.mayBecome(Running, Running) shouldBe false
   }
 
-  test("a run is of a kind, and a regular run is the one there is so far") {
-    RunKind.All.map(_.name) shouldBe Seq("regular")
-    RunKind.parse("regular").value shouldBe RunKind.Regular
-    // A backfill has a kind of its own when there are backfills (P7), and not before.
-    RunKind.parse("backfill").left.value shouldBe "must be one of regular"
+  test("a run is of a kind: a regular run, or what an operator does to a source") {
+    RunKind.All.map(_.name) shouldBe Seq("regular", "abandon", "reset", "reprocess")
+    RunKind.All.foreach(kind => RunKind.parse(kind.name).value shouldBe kind)
+    // ADR-0021 §1: every kind but the regular one is asked for by an operator.
+    RunKind.All.filter(_.operators) shouldBe Seq(RunKind.Abandon, RunKind.Reset, RunKind.Reprocess)
+    // A batch is of a kind that plans one: a regular batch, or the files of one read again.
+    RunKind.OfBatches shouldBe Seq(RunKind.Regular, RunKind.Reprocess)
+    // A backfill has a kind of its own when there are backfills (P7.6), and not before.
+    RunKind
+      .parse("backfill")
+      .left
+      .value shouldBe "must be one of regular, abandon, reset, reprocess"
   }
 
   test("a failure has one of the four classes of the requirements") {

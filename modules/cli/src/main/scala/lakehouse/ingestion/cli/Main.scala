@@ -4,6 +4,7 @@ import java.io.PrintStream
 import java.nio.file.Paths
 
 import lakehouse.ingestion.core.config._
+import lakehouse.ingestion.core.control.{BatchSeq, OperatorRequest}
 import lakehouse.ingestion.engine.control.DatabaseFailure
 
 /**
@@ -88,6 +89,8 @@ object Main {
        |       lakehouse-ingestion migrate --profile <file> --password <reference> [--user <role>]
        |       lakehouse-ingestion run --profile <file> --sources <directory> --source <id>
        |                               [--max-batches <n>]
+       |       lakehouse-ingestion abandon-batch --profile <file> --sources <directory>
+       |                               --source <id> --batch <n> --reason <text>
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
@@ -99,6 +102,11 @@ object Main {
        |              The configuration is validated whole first. SIGTERM or SIGINT lets the
        |              batch in course finish, and starts no other; a second ends it at once.
        |
+       |  abandon-batch  Gives up the batch of a source that is planned, if the table it was
+       |              planned for does not have it: the next run plans anew from the state of
+       |              the source. It is a run of its own, under the lease of the source, that
+       |              records who asked for it (the user of the process) and why.
+       |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
        |  --source    the id of the source to run, as sales.returns
@@ -106,14 +114,18 @@ object Main {
        |              env:NAME or file:/run/secrets/name
        |  --user      the role that owns the schemas; $Migrator unless said
        |  --max-batches  the most batches that run commits; no limit unless said
+       |  --batch     the number of the batch to give up: the one that is planned
+       |  --reason    why, in one line: kept with the run and with the batch
        |
-       |exit codes: 0 the configuration is valid, the schemas are at their version, or the run
-       |              ended well: a batch committed, nothing new, or a source that is disabled;
+       |exit codes: 0 the configuration is valid, the schemas are at their version, the run
+       |              ended well (a batch committed, nothing new, or a source that is
+       |              disabled), or the batch was given up;
        |            2 another run holds the lease of the source: nothing was done;
-       |            3 a database could not be reached, the run lost its lease, or its batch
-       |              was given up, and running again later may do;
-       |            4 the configuration is not valid, a database refused, or the run failed
-       |              for a reason that running again does not mend;
+       |            3 a database could not be reached, the run lost its lease, its batch was
+       |              given up, or a table could not be read, and running again later may do;
+       |            4 the configuration is not valid, a database refused, the run failed for a
+       |              reason that running again does not mend, or the batch was not given up:
+       |              none is planned, another is, or its table has it;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
        |            128 + n run was stopped by the signal n before its first run: nothing was
@@ -130,13 +142,15 @@ object Main {
    * @param environment how a variable is looked up; the environment of the process, unless a
    *   test says otherwise
    * @param stop whether the process has been asked to stop: its signals, in `main`
+   * @param operator who runs the process, as it says: who asked for an operator's action
    */
   def run(
       args: Seq[String],
       out: PrintStream,
       err: PrintStream,
       environment: String => Option[String] = sys.env.get,
-      stop: Stop = Stop.Never
+      stop: Stop = Stop.Never,
+      operator: String = sys.props.getOrElse("user.name", "")
   ): Int = args.toList match {
     case "validate" :: options =>
       parse(options, Set("--profile", "--sources")) match {
@@ -186,6 +200,30 @@ object Main {
             err,
             limit,
             stop
+          )
+        case Left(problem) => usage(problem, err)
+      }
+    case "abandon-batch" :: options =>
+      val asked = for {
+        found <- parse(options, Set("--profile", "--sources", "--source", "--batch", "--reason"))
+        source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
+        batch <- found("--batch").toLongOption
+          .filter(n => found("--batch") == n.toString)
+          .flatMap(BatchSeq.of(_).toOption)
+          .toRight(s"--batch '${shown(found("--batch"))}' is not the number of a batch, from 1")
+        request <- OperatorRequest.of(operator, found("--reason"))
+      } yield (found("--profile"), found("--sources"), source, batch, request)
+      asked match {
+        case Right((profile, sources, source, batch, request)) =>
+          AbandonBatchCommand.run(
+            Paths.get(profile),
+            Paths.get(sources),
+            source,
+            batch,
+            request,
+            SecretResolver(environment),
+            out,
+            err
           )
         case Left(problem) => usage(problem, err)
       }

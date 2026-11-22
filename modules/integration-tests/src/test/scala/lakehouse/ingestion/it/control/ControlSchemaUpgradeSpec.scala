@@ -7,7 +7,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.cli.Main
 import lakehouse.ingestion.core.control._
-import lakehouse.ingestion.engine.control.{Batches, ControlSchema}
+import lakehouse.ingestion.engine.control.{Batches, ControlSchema, Runs}
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, ControlPlaneSchema}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.{BeforeAndAfterAll, EitherValues, OptionValues}
@@ -101,8 +101,8 @@ final class ControlSchemaUpgradeSpec
     val ran = ControlPlaneSchema.migrate(pg)
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
-    // V3, and V4 on top of it: the engine works on the schema that it was built for.
-    ran.lines.head shouldBe s"control: version 4, 2 migrations applied (${pg.jdbcUrl(Database)})"
+    // V3, and V4 and V5 on top of it: the engine works on the schema that it was built for.
+    ran.lines.head shouldBe s"control: version 5, 3 migrations applied (${pg.jdbcUrl(Database)})"
     as(Engine) { c =>
       ControlSchema.verify(c) shouldBe Right(())
 
@@ -116,6 +116,10 @@ final class ControlSchemaUpgradeSpec
       Seq(planned, committed, abandoned).map(Batches.find(c, _).value.target) shouldBe
         Seq(None, None, None)
       Batches.planned(c, planned.app).value.target shouldBe None
+      // V5: a run of before is a regular run, and says neither who asked for it nor why.
+      val plannedBy = Batches.find(c, planned).value.plannedBy
+      Runs.find(c, plannedBy).value.start.kind shouldBe RunKind.Regular
+      Runs.find(c, plannedBy).value.start.request shouldBe None
       val stillCommitted = Batches.find(c, committed).value
       stillCommitted.status shouldBe BatchStatus.Committed
       stillCommitted.outputs.value.map(_.version) shouldBe Vector(Some(4L))
