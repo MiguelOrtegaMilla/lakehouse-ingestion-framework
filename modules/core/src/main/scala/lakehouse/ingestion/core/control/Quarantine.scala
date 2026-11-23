@@ -15,9 +15,12 @@ import lakehouse.ingestion.core.config.{RelativePath, SourceId}
  * A batch writes its quarantine before its data (ADR-0005 §3, step 5), under the same number,
  * and whatever becomes of the batch. So the records of a batch that is given up afterwards
  * (ADR-0018) stay in it, and the batch after it sets the same records apart again under its own
- * number. A record says its batch (`batch_seq`), and the control plane says how the batch
- * ended: whoever reads a quarantine leaves out the batches that are `ABANDONED` there, as the
- * reader of the engine does (`QuarantineReader`).
+ * number. A record says its run (`run_id`), and the control plane says which batch the run
+ * took, in which sequence, and how that batch ended: whoever reads a quarantine leaves out the
+ * records of the runs whose batch is `ABANDONED` there, as the reader of the engine does
+ * (`QuarantineReader`). The number of a record (`batch_seq`) does not say its batch by itself:
+ * every sequence of a source, the regular one and that of each backfill, writes to the one
+ * quarantine of the source, and numbers its batches from 1.
  */
 object Quarantine {
 
@@ -35,7 +38,7 @@ object Quarantine {
   /** The run that set the record apart: the attempt, which the audit trail has. */
   val RunId = "run_id"
 
-  /** The batch that the record was read for. */
+  /** The number of the batch that the record was read for, in the sequence of its run. */
   val BatchSeq = "batch_seq"
 
   /** The file that the record was read from; none for a source that is no file. */

@@ -1533,10 +1533,14 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     // of its files is then written again, so the run after it gives the batch up.
     drop(orders, "a.csv", "id,amount\n1,2\n3\n")
     drop(orders, "b.csv", "id,amount\n4,5\n")
-    dies(orders, FaultPoint.AfterQuarantineWrite)
+    val dead = dies(orders, FaultPoint.AfterQuarantineWrite)
     drop(orders, "b.csv", "id,amount\n6,7\n8,9\n", at = Now.minusSeconds(1800))
-    launch(orders) shouldBe a[Outcome.GivenUp]
-    reader.abandoned(orders.id).map(_.value) shouldBe Vector(1L)
+    val givingUp = launch(orders) match {
+      case given: Outcome.GivenUp => given.run
+      case other => fail(s"the batch was not given up: $other")
+    }
+    // The runs that took the batch: the one that planned it and died, and the one that gave it up.
+    reader.leftOut(orders.id) shouldBe Vector(dead, givingUp)
     // Its record is in the table, and counts for nothing.
     quarantinedOf(orders) shouldBe Seq((1L, "a.csv", "3"))
     read() shouldBe empty

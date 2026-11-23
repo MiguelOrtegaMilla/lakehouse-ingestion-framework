@@ -1,6 +1,7 @@
 package lakehouse.ingestion.it.control
 
 import java.sql.SQLException
+import java.time.Instant
 
 import scala.concurrent.duration._
 import scala.util.Using
@@ -209,39 +210,69 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     refused.getSQLState shouldBe "42501"
   }
 
-  test("the batches of a sequence that were given up are named, in their order") {
+  test("the runs that took a batch that was given up are named, in every sequence of a source") {
     val orders = newSource()
     val other = newSource()
     val delta = new SimulatedDelta
-    def givenUp(of: Source): BatchSeq = {
-      val leased = open(of)
+    def leftOut(of: Source, layer: Layer = Layer.Bronze): Vector[RunId] =
+      database.run(Batches.abandonedBy(_, of.id, layer))
+    def givenUp(leased: LeasedRun): RunId = {
       val planned = leased.plan(range(0, 10))
       leased.abandon(planned.id, Reason, None, GivenUp) shouldBe true
-      planned.id.seq
+      leased.start.id
     }
-    def committed(of: Source): BatchSeq = {
-      val leased = open(of)
-      val planned = leased.plan(range(0, 10))
-      finish(leased, of, delta, planned) shouldBe true
-      planned.id.seq
-    }
-    val app = TxnAppId.of(orders.id, Layer.Bronze)
-    database.run(Batches.abandoned(_, app)) shouldBe empty
+    def committed(leased: LeasedRun): Unit =
+      finish(leased, orders, delta, leased.plan(range(0, 10))) shouldBe true: Unit
+    val history = BackfillId.parse("history").value
+    def openBackfill(): LeasedRun = LeasedRun
+      .open(
+        database,
+        starting(orders).copy(
+          kind = RunKind.Backfill,
+          request = Some(OperatorRequest.of("ops", "the history").value),
+          backfill = Some(history)
+        ),
+        versionOf(orders),
+        timing
+      )
+      .value
+    leftOut(orders) shouldBe empty
 
-    val first = givenUp(orders)
-    committed(orders)
-    val third = givenUp(orders)
-    givenUp(other)
-    // One that is planned is not given up, whatever becomes of it.
+    // The batch 1 of the regular sequence is planned by a run that dies, and given up by the run
+    // after it: both took it.
+    val dead = open(orders)
+    val first = dead.plan(range(0, 10))
+    dies(dead)
+    val next = open(orders)
+    next.planned().value.id shouldBe first.id
+    next.abandon(first.id, Reason, None, GivenUp) shouldBe true
+    // The batch 2 is committed, and the batch 3 is given up by the run that planned it.
+    committed(open(orders))
+    val third = givenUp(open(orders))
+
+    // A backfill of the source numbers its chunks from 1: its chunk 1 is committed, though the
+    // batch 1 of the source was given up, and its chunk 2 is given up, though the batch 2 was
+    // committed.
+    val creating = openBackfill()
+    creating.backfill(
+      Instant.parse("2024-01-01T00:00:00Z"),
+      Instant.parse("2024-02-01T00:00:00Z"),
+      1.day
+    ) shouldBe a[LeasedRun.Backfill.Created]
+    committed(creating)
+    val chunk = givenUp(openBackfill())
+
+    // Nor is a run named whose batch is planned, whatever becomes of it, nor one of another
+    // source, nor one of another layer of the source.
     val last = open(orders)
-    val planned = last.plan(range(10, 20))
+    last.plan(range(10, 20)).id.seq.value shouldBe 4L
     last.close()
+    val elsewhere = givenUp(open(other))
+    val silver = givenUp(open(orders, Layer.Silver))
 
-    database.run(Batches.abandoned(_, app)) shouldBe Vector(first, third)
-    database.run(Batches.abandoned(_, app)).map(_.value) shouldBe Vector(1L, 3L)
-    planned.id.seq.value shouldBe 4L
-    database.run(Batches.abandoned(_, TxnAppId.of(other.id, Layer.Bronze))).map(_.value) shouldBe
-      Vector(1L)
+    leftOut(orders) should contain theSameElementsAs Seq(dead.start.id, next.start.id, third, chunk)
+    leftOut(other) shouldBe Vector(elsewhere)
+    leftOut(orders, Layer.Silver) shouldBe Vector(silver)
   }
 
   test("the next batch has the next number, and starts from where the state is") {
@@ -683,7 +714,7 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     val delta = new SimulatedDelta
     (1 to 2).foreach { _ =>
       val leased = open(orders)
-      finish(leased, orders, delta, leased.plan(range(0, 10))) shouldBe true
+      finish(leased, orders, delta, leased.plan(range(0, 10))) shouldBe true: Unit
     }
     val moved = state(orders).value
     moved.lastCommitted.value shouldBe 2L
