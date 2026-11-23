@@ -120,23 +120,42 @@ object Batches {
   }
 
   /**
-   * The numbers of the batches of a sequence that were given up, in their order: what a reader
-   * of a table that batches write before their end, as a quarantine, leaves out (ADR-0018).
+   * The runs of a source that took a batch that was given up, in any of its sequences, in the
+   * order they started: those whose writes to a table that batches write before their end, as a
+   * quarantine, a reader leaves out (ADR-0018).
+   *
+   * A run takes one batch (`Runs.took`), and what it writes is of that batch. So the run of a
+   * record says which batch it is of, in which sequence, where the number of the batch alone
+   * does not: a chunk of a backfill and a batch of the regular sequence may have one number.
+   * One batch may have been taken by several runs: the one that planned it and died, and the one
+   * that gave it up.
    */
   @throws[SQLException]
-  def abandoned(connection: Connection, app: TxnAppId): Vector[BatchSeq] =
+  def abandonedBy(connection: Connection, source: SourceId, layer: Layer): Vector[RunId] =
     Using.resource(
       connection.prepareStatement(
-        "SELECT batch_seq FROM control.ingestion_batch " +
-          "WHERE txn_app_id = ? AND status = 'ABANDONED' ORDER BY batch_seq"
+        """SELECT run.run_id
+          |  FROM control.ingestion_run run
+          |  JOIN control.ingestion_batch batch
+          |    ON batch.txn_app_id = run.txn_app_id AND batch.batch_seq = run.batch_seq
+          | WHERE run.source_id = ? AND run.layer = ? AND batch.status = 'ABANDONED'
+          | ORDER BY run.started_at, run.run_id""".stripMargin
       )
     ) { statement =>
-      statement.setString(1, app.value)
+      statement.setString(1, source.value)
+      statement.setString(2, layer.name)
       Using.resource(statement.executeQuery()) { rows =>
         Iterator
           .continually(rows)
           .takeWhile(_.next())
-          .map(row => known("batch_seq", BatchSeq.of(row.getLong("batch_seq"))))
+          .map { row =>
+            RunId
+              .of(row.getObject("run_id", classOf[UUID]))
+              .fold(
+                reason => throw new IllegalStateException(s"control.ingestion_run.run_id $reason"),
+                identity
+              )
+          }
           .toVector
       }
     }

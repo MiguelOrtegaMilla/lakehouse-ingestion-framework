@@ -127,3 +127,13 @@ What is common to the four is that they change what the protocol of ADR-0005 res
 - **Whether a commit takes the files of its plan is the batch's to say**, not the run's: a regular run that finishes a reprocess left halfway takes none either.
 - **A source whose batches are no files is told by its connector** (`progress` of the plan of the batch named has no files): the engine names no kind of source.
 - **The table is the one that the configuration names now**, so that a reprocess after a reset to another Bronze table gives that table the history that the reset warns of.
+
+## As built (P7.6, 2026-11-23)
+
+What the engine does of a backfill (§5) and of the quarantine of its source (§6). The command, the warning of §5.8 and the chaining of §5.10 are P7.7's.
+
+- **Its keys and its range are in `core`, with no I/O** (`BackfillId`, `TxnAppId.backfill`, `LeaseKey.backfill`, `BackfillRange`). Its id is lower-case letters, digits, `.`, `_` and `-`, 63 at most. A chunk is planned by `WatermarkPlanner.chunk`: the planner of ADR-0020 with the progress of the backfill as its watermark, `from` as its start, `to` as its horizon, the chunk as `max_batch_range` and no lookback.
+- **The control plane keeps it** (`control.backfill`, migration V7): its range as two moments, its chunk, the run that created it and its progress, moved by the commit of each chunk in its transaction; `completed_at` is set by the commit of the chunk whose plan has no more. A batch is planned, committed and given up by runs of its own sequence, which the database holds by a foreign key of each run with its sequence, and a run's kind says which sequence it may act on.
+- **The capability of §5.1 plans, and nothing else** (`SourceConnector.ranges`, `RangePlanner`): the horizon of the source, its clock less `safety_margin`, and the next chunk of a range from a progress. A chunk is read and recorded as any batch. The JDBC connector has it for a load by a watermark alone.
+- **Creating, resuming and refusing are the engine's, under the lease of the backfill** (`IngestionService.backfill`), and not the command's: two invocations under one id cannot both create it. A run reads one chunk. A run that asks for no chunk takes the backfill's, so that the command that created it, run again as it was, resumes it. A backfill that is complete reads nothing, and its run ends well with no batch, and is not held to its configuration (§5.9), which it no longer reads with.
+- **A record of a quarantine is told by its run** (§6): `QuarantineReader` leaves out the records of the runs that took a batch that was given up, in any sequence of the source (`Batches.abandonedBy`). No column is added to the quarantine nor to Bronze.

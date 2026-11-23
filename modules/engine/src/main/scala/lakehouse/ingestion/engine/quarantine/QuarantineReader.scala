@@ -4,7 +4,7 @@ import java.sql.SQLException
 
 import io.delta.tables.DeltaTable
 import lakehouse.ingestion.core.config.{PathTableLocator, RootUri, SourceId, TableLocation}
-import lakehouse.ingestion.core.control.{BatchSeq, Layer, Quarantine, TxnAppId}
+import lakehouse.ingestion.core.control.{Layer, Quarantine, RunId}
 import lakehouse.ingestion.engine.control.{Batches, ControlDatabase}
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.{DataFrame, SparkSession}
@@ -22,15 +22,27 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  * file as it no longer is.
  *
  * '''What says that a batch was given up is the control plane, and nothing else.''' A record
- * says the batch that it was read for (`batch_seq`), and the control plane says how that batch
- * ended. Nothing is deleted from a quarantine nor rewritten in it for a batch that is given up:
- * its records are what the run read, and the audit trail says why they count for nothing.
+ * says the run that set it apart (`run_id`), and the control plane says which batch that run
+ * took, in which sequence, and how the batch ended. Nothing is deleted from a quarantine nor
+ * rewritten in it for a batch that is given up: its records are what the run read, and the
+ * audit trail says why they count for nothing.
  *
- * '''Whoever reads a quarantine directly must do the same''', and leave out the batches that
+ * '''A record is told by its run, and not by its number''' (`batch_seq`). Every sequence of a
+ * source writes to its one quarantine: the regular one and that of each backfill (ADR-0005 §2,
+ * ADR-0021 §5), each numbering its batches from 1. A number says a batch only with its
+ * sequence, and the run says the sequence: the chunk 2 of a backfill that was given up and the
+ * batch 2 of the regular sequence that was committed are two batches, whose records are left
+ * out and kept.
+ *
+ * '''Whoever reads a quarantine directly must do the same''', and leave out the runs that
  *
  * {{{
- * SELECT batch_seq FROM control.ingestion_batch
- *  WHERE txn_app_id = '<source_id>/<layer>' AND status = 'ABANDONED'
+ * SELECT run.run_id
+ *   FROM control.ingestion_run run
+ *   JOIN control.ingestion_batch batch
+ *     ON batch.txn_app_id = run.txn_app_id AND batch.batch_seq = run.batch_seq
+ *  WHERE run.source_id = '<source_id>' AND run.layer = '<layer>'
+ *    AND batch.status = 'ABANDONED'
  * }}}
  *
  * gives. The records of a batch that is still planned are kept: of a batch that was not
@@ -47,8 +59,8 @@ final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lak
     locator.locate(Quarantine.table(source, layer))
 
   /**
-   * The records in the quarantine of `source` that are of batches that were not given up, with
-   * the columns of a quarantine (`Quarantine.Columns`).
+   * The records in the quarantine of `source` that are of batches that were not given up, in
+   * any of its sequences, with the columns of a quarantine (`Quarantine.Columns`).
    *
    * The batches that were given up are those that the control plane has as such when it is
    * asked, which is before the table is read.
@@ -59,15 +71,18 @@ final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lak
   def records(source: SourceId, layer: Layer = Layer.Bronze): Option[DataFrame] = {
     val quarantine = table(source, layer)
     Option.when(DeltaTable.isDeltaTable(spark, quarantine.uri)) {
-      val givenUp = abandoned(source, layer)
+      val givenUp = leftOut(source, layer)
       val all = spark.read.format("delta").load(quarantine.uri)
       if (givenUp.isEmpty) all
-      else all.where(!col(Quarantine.BatchSeq).isin(givenUp.map(_.value): _*))
+      else all.where(!col(Quarantine.RunId).isin(givenUp.map(_.toString): _*))
     }
   }
 
-  /** The batches of a source that were given up, by their numbers: what `records` leaves out. */
+  /**
+   * The runs of a source whose records `records` leaves out: those that took a batch that was
+   * given up, in any of its sequences, in the order they started.
+   */
   @throws[SQLException]
-  def abandoned(source: SourceId, layer: Layer = Layer.Bronze): Vector[BatchSeq] =
-    database.run(Batches.abandoned(_, TxnAppId.of(source, layer)))
+  def leftOut(source: SourceId, layer: Layer = Layer.Bronze): Vector[RunId] =
+    database.run(Batches.abandonedBy(_, source, layer))
 }

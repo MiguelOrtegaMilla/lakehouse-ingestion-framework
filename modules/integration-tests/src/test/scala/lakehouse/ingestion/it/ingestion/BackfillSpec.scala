@@ -1,18 +1,23 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.time.{Instant, OffsetDateTime, ZoneOffset}
+import java.time.{Clock, Instant, OffsetDateTime, ZoneOffset}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration._
 import scala.util.Using
 
-import lakehouse.ingestion.core.config.Source
+import io.circe.Json
+import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.state.StoredWatermark
 import lakehouse.ingestion.core.watermark.{BackfillRange, WatermarkHorizon, WatermarkPlan}
 import lakehouse.ingestion.engine.IngestionService.Outcome
+import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.{Backfills, Leases}
-import lakehouse.ingestion.engine.{FaultPoint, IngestionService}
+import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
+import lakehouse.ingestion.engine.quarantine.QuarantineReader
+import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService, RunFailedException}
+import lakehouse.ingestion.it.ingestion.BackfillSpec.Rejecting
 import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.funsuite.AnyFunSuite
@@ -24,7 +29,9 @@ import org.scalatest.matchers.should.Matchers
  * PostgreSQL as its source, a real Delta on the coordinated LogStore and a real control plane.
  * It is created by its first run and resumed by the next, refused with other arguments, held to
  * the configuration it was created with, recovered as any batch is, and run beside the regular
- * sequence of its source on the same table, which it neither waits for nor touches.
+ * sequence of its source on the same table, which it neither waits for nor touches. The
+ * records that its chunks set apart are in the quarantine of its source, and count by the run
+ * that set them apart.
  *
  * The rows are stamped in 2025, far behind the clock of the server, which no test sets: what a
  * chunk reads is decided by the range and the chunk alone. Each test ends with the ledger of
@@ -498,5 +505,182 @@ final class BackfillSpec extends AnyFunSuite with Matchers with JdbcIngestionSui
     ingested(backfill(orders, "h", day(1), day(3))).next shouldBe Outcome.Next.Ends
     copiesOf(orders).map(row => (row._1, row._2)) shouldBe Seq((1, 1L), (2, 2L))
     assertLedger(orders)
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // The quarantine of a source with a backfill
+  // -----------------------------------------------------------------------------------------------
+
+  test("a record of the quarantine counts by its run, in the sequence that the run acted on") {
+    // Each batch sets one record apart, which its source lets it: one of two is not beyond half.
+    val orders = changes().copy(quality = Quality(0.5))
+    stamped(orders, 1 -> day(1).plusSeconds(60), 2 -> day(2).plusSeconds(60), 3 -> day(5))
+    val connector = new Rejecting(new JdbcSourceConnector(SecretResolver(passwords.get)))
+    def by(hooks: FaultHooks = FaultHooks.Off): IngestionService =
+      new IngestionService(
+        database,
+        ConnectorRegistry(connector),
+        spark,
+        lakeRoot,
+        timing,
+        Clock.fixed(Now, ZoneOffset.UTC),
+        hooks
+      )
+    val dying = by(hookAt(FaultPoint.AfterQuarantineWrite)(_ => throw new Died))
+    def regular(service: IngestionService = by()): Outcome = service.run(orders, versionOf(orders))
+    def chunk(service: IngestionService = by()): Outcome =
+      backfill(orders, "h", day(1), day(3), by = service)
+
+    /** A run that finds that what the plan it took names changed, and gives the plan up. */
+    def changed(run: => Outcome): RunId = {
+      connector.changed = true
+      try
+        run match {
+          case given: Outcome.GivenUp => given.run
+          case other => fail(s"the batch was not given up: $other")
+        }
+      finally connector.changed = false
+    }
+
+    // The batch 1 of the regular sequence sets its record apart, and its run dies before its
+    // data is written: the run after it gives the batch up.
+    intercept[Died](regular(dying))
+    val dead = holderOf(orders).value
+    expire(orders)
+    val regularGivenUp = changed(regular())
+    // The chunk 1 of a backfill has the number of that batch, and is committed.
+    val first = ingested(chunk())
+    // Its chunk 2 is given up as the batch 1 was, and the batch 2 of the regular sequence, which
+    // has its number, is committed. The chunk 3 reads the window of the chunk 2 again.
+    intercept[Died](chunk(dying))
+    val deadChunk = holderOfBackfill(orders, "h").value
+    expireBackfill(orders, "h")
+    val chunkGivenUp = changed(chunk())
+    val second = ingested(regular())
+    val third = ingested(chunk())
+    third.next shouldBe Outcome.Next.Ends
+
+    val app = TxnAppId.of(orders.id, Layer.Bronze).value
+    val history = TxnAppId.backfill(orders.id, Layer.Bronze, backfillId("h")).value
+    val batches = sequencesOf(orders).map(batch => (batch._1, batch._2, batch._3))
+    batches should contain theSameElementsAs Seq(
+      (app, 1L, "ABANDONED"),
+      (app, 2L, "COMMITTED"),
+      (history, 1L, "COMMITTED"),
+      (history, 2L, "ABANDONED"),
+      (history, 3L, "COMMITTED")
+    )
+
+    // The quarantine has every record that a run set apart, under the number of its batch in the
+    // sequence of the run: two of each number but the last.
+    val reader = new QuarantineReader(database, spark, lakeRoot)
+    def recordsIn(records: org.apache.spark.sql.DataFrame): Seq[(String, Long, String)] =
+      records
+        .select(Quarantine.RunId, Quarantine.BatchSeq, Quarantine.RawRecord)
+        .collect()
+        .map(row => (row.getString(0), row.getLong(1), row.getString(2)))
+        .toSeq
+        .sorted
+    def record(run: RunId, batch: BatchId): (String, Long, String) =
+      (run.toString, batch.seq.value, Rejecting.recordOf(batchOf(batch).plan))
+    val regularFirst = batchId(orders, 1)
+    val chunkSecond = chunkOf(orders, "h", 2)
+    recordsIn(spark.read.format("delta").load(quarantine(orders).uri)) shouldBe Seq(
+      record(dead, regularFirst),
+      record(first.run, first.batch),
+      record(deadChunk, chunkSecond),
+      record(second.run, second.batch),
+      record(third.run, third.batch)
+    ).sorted
+
+    // Read as it counts, it has the records of the batches that were committed, in either
+    // sequence: by the number alone, the chunk 1 would be left out with the batch 1, and the
+    // chunk 2 kept with the batch 2.
+    reader.leftOut(orders.id) should contain theSameElementsAs
+      Seq(dead, regularGivenUp, deadChunk, chunkGivenUp)
+    recordsIn(reader.records(orders.id).value) shouldBe Seq(
+      record(first.run, first.batch),
+      record(second.run, second.batch),
+      record(third.run, third.batch)
+    ).sorted
+    assertLedger(orders)
+  }
+}
+
+object BackfillSpec {
+
+  /**
+   * The JDBC connector, with the reads of a source of text: one record of each batch could not
+   * be parsed, and is set apart, as the record that `recordOf` says of its plan. While `changed`
+   * is set, it says that what a plan names changed, as the connector of files says of a file
+   * that was written again (ADR-0018): the batch is given up, if none of it is in its table.
+   *
+   * It plans, and plans the chunks of a backfill, as the JDBC connector does: the ledger, which
+   * asks the JDBC connector what a plan commits, is told the same.
+   */
+  final class Rejecting(jdbc: JdbcSourceConnector) extends SourceConnector[JdbcConnectorConfig] {
+
+    @volatile var changed: Boolean = false
+
+    override def kind: ConnectorKind = jdbc.kind
+
+    override def plan(
+        source: Source,
+        config: JdbcConnectorConfig,
+        context: PlanContext
+    ): Option[Json] = jdbc.plan(source, config, context)
+
+    override def read(
+        source: Source,
+        config: JdbcConnectorConfig,
+        plan: Json,
+        context: ReadContext
+    ): ReadResult = {
+      if (changed)
+        throw new SourceChangedException(
+          "the window of the plan was written again",
+          Seq(SourceChangedException.Changed("the window", "was written again"))
+        )
+      val spark = context.spark
+      import spark.implicits._
+      val rows = jdbc.read(source, config, plan, context).rows
+      ReadResult.Kept(
+        spark.createDataFrame(rows.collectAsList(), rows.schema),
+        Some(
+          Seq((Option.empty[String], Rejecting.recordOf(plan)))
+            .toDF(EngineColumns.SourceFile, ReadResult.Record)
+        )
+      )
+    }
+
+    override def progress(source: Source, config: JdbcConnectorConfig, plan: Json): Progress =
+      jdbc.progress(source, config, plan)
+
+    override def more(source: Source, config: JdbcConnectorConfig, plan: Json): Option[Json] =
+      jdbc.more(source, config, plan)
+
+    override def wholeWhenRead(source: Source, config: JdbcConnectorConfig, plan: Json): Boolean =
+      jdbc.wholeWhenRead(source, config, plan)
+
+    override def failure(
+        source: Source,
+        config: JdbcConnectorConfig,
+        error: Throwable
+    ): Option[RunFailedException] = jdbc.failure(source, config, error)
+
+    override def ranges(source: Source, config: JdbcConnectorConfig): Option[RangePlanner] =
+      jdbc.ranges(source, config)
+  }
+
+  object Rejecting {
+
+    /** The record that a batch sets apart: one that names where the window of its plan ends. */
+    def recordOf(plan: Json): String =
+      WatermarkPlan
+        .fromJson(plan)
+        .fold(
+          reason => throw new IllegalStateException(s"the plan is not a window: $reason"),
+          window => s"a record up to ${window.upper} that is no row"
+        )
   }
 }
