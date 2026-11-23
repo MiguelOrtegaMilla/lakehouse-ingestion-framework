@@ -53,24 +53,72 @@ object RunStatus {
  * watermark or its files. The others are what an operator does to a source, each a run under
  * the lease of the sequence that it acts on, which says who asked for it and why: giving a
  * planned batch up, resetting the state of a source, reading the files of a committed batch
- * again. A backfill has a kind of its own, with its own sequence of batches, and comes with
- * backfills (P7.6). The names are those of `run_kind` in the control plane.
+ * again, and reading a range of its watermark on a sequence of its own, a backfill. The names are
+ * those of `run_kind` in the control plane.
+ *
+ * A kind acts on the regular sequence of its source, on that of a backfill of it, or on either:
+ * a batch is given up in the sequence that it is planned in, and the state of a source, or its
+ * files, are those of its regular sequence.
  *
  * @param operators whether an operator asks for it, and it says who and why
  * @param plans whether it plans a batch, which then has its kind
+ * @param ofRegular whether it may act on the regular sequence of its source
+ * @param ofBackfills whether it may act on the sequence of a backfill
  */
-sealed abstract class RunKind(val name: String, val operators: Boolean, val plans: Boolean) {
+sealed abstract class RunKind(
+    val name: String,
+    val operators: Boolean,
+    val plans: Boolean,
+    val ofRegular: Boolean,
+    val ofBackfills: Boolean
+) {
   override def toString: String = name
 }
 
 object RunKind {
 
-  case object Regular extends RunKind("regular", operators = false, plans = true)
-  case object Abandon extends RunKind("abandon", operators = true, plans = false)
-  case object Reset extends RunKind("reset", operators = true, plans = false)
-  case object Reprocess extends RunKind("reprocess", operators = true, plans = true)
+  case object Regular
+      extends RunKind(
+        "regular",
+        operators = false,
+        plans = true,
+        ofRegular = true,
+        ofBackfills = false
+      )
+  case object Abandon
+      extends RunKind(
+        "abandon",
+        operators = true,
+        plans = false,
+        ofRegular = true,
+        ofBackfills = true
+      )
+  case object Reset
+      extends RunKind(
+        "reset",
+        operators = true,
+        plans = false,
+        ofRegular = true,
+        ofBackfills = false
+      )
+  case object Reprocess
+      extends RunKind(
+        "reprocess",
+        operators = true,
+        plans = true,
+        ofRegular = true,
+        ofBackfills = false
+      )
+  case object Backfill
+      extends RunKind(
+        "backfill",
+        operators = true,
+        plans = true,
+        ofRegular = false,
+        ofBackfills = true
+      )
 
-  val All: Seq[RunKind] = Seq(Regular, Abandon, Reset, Reprocess)
+  val All: Seq[RunKind] = Seq(Regular, Abandon, Reset, Reprocess, Backfill)
 
   /** The kinds that a batch may have: those of the runs that plan one. */
   val OfBatches: Seq[RunKind] = All.filter(_.plans)

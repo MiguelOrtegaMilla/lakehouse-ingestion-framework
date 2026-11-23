@@ -50,17 +50,26 @@ final class StatusesSpec extends AnyFunSuite with Matchers with EitherValues {
   }
 
   test("a run is of a kind: a regular run, or what an operator does to a source") {
-    RunKind.All.map(_.name) shouldBe Seq("regular", "abandon", "reset", "reprocess")
+    RunKind.All.map(_.name) shouldBe Seq("regular", "abandon", "reset", "reprocess", "backfill")
     RunKind.All.foreach(kind => RunKind.parse(kind.name).value shouldBe kind)
     // ADR-0021 §1: every kind but the regular one is asked for by an operator.
-    RunKind.All.filter(_.operators) shouldBe Seq(RunKind.Abandon, RunKind.Reset, RunKind.Reprocess)
-    // A batch is of a kind that plans one: a regular batch, or the files of one read again.
-    RunKind.OfBatches shouldBe Seq(RunKind.Regular, RunKind.Reprocess)
-    // A backfill has a kind of its own when there are backfills (P7.6), and not before.
-    RunKind
-      .parse("backfill")
-      .left
-      .value shouldBe "must be one of regular, abandon, reset, reprocess"
+    RunKind.All.filter(_.operators) shouldBe
+      Seq(RunKind.Abandon, RunKind.Reset, RunKind.Reprocess, RunKind.Backfill)
+    // A batch is of a kind that plans one: a regular batch, the files of one read again, or a
+    // chunk of a backfill.
+    RunKind.OfBatches shouldBe Seq(RunKind.Regular, RunKind.Reprocess, RunKind.Backfill)
+    RunKind.parse("replay").left.value shouldBe
+      "must be one of regular, abandon, reset, reprocess, backfill"
+  }
+
+  test("a kind acts on the regular sequence of its source, on a backfill's, or on either") {
+    // ADR-0021 §5: a backfill on its own sequence alone; a batch is given up in the sequence
+    // that it is planned in; the state of a source and its files are its regular sequence's.
+    RunKind.All.filter(_.ofRegular) shouldBe
+      Seq(RunKind.Regular, RunKind.Abandon, RunKind.Reset, RunKind.Reprocess)
+    RunKind.All.filter(_.ofBackfills) shouldBe Seq(RunKind.Abandon, RunKind.Backfill)
+    // Each acts on one at least.
+    RunKind.All.filterNot(kind => kind.ofRegular || kind.ofBackfills) shouldBe empty
   }
 
   test("a failure has one of the four classes of the requirements") {

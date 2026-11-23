@@ -55,7 +55,11 @@ final class RunsSpec extends AnyFunSuite with Matchers with EitherValues with Op
     start.txnAppId.value shouldBe "sales.orders/silver"
   }
 
-  private def starting(kind: RunKind, request: Option[OperatorRequest]) =
+  private def starting(
+      kind: RunKind,
+      request: Option[OperatorRequest],
+      backfill: Option[BackfillId] = None
+  ) =
     RunStart(
       RunId.generate(),
       SourceId.parse("sales.orders").value,
@@ -64,12 +68,16 @@ final class RunsSpec extends AnyFunSuite with Matchers with EitherValues with Op
       InstanceId.of("host", 1, started),
       "0.1.0",
       "0" * 64,
-      request
+      request,
+      backfill
     )
 
+  private val history = BackfillId.parse("history-2024").value
+  private val asked = OperatorRequest.of("ops.oncall", "load the history before start").value
+
   test("an operator's action says who asked for it and why, and no other run does") {
-    val asked = OperatorRequest.of("ops.oncall", "the directory of the source was moved").value
-    val abandon = starting(RunKind.Abandon, Some(asked))
+    val moved = OperatorRequest.of("ops.oncall", "the directory of the source was moved").value
+    val abandon = starting(RunKind.Abandon, Some(moved))
     abandon.request.value.requestedBy shouldBe "ops.oncall"
     abandon.request.value.reason shouldBe "the directory of the source was moved"
     // An action of an operator is on the sequence of the source, under its lease.
@@ -77,7 +85,38 @@ final class RunsSpec extends AnyFunSuite with Matchers with EitherValues with Op
     abandon.txnAppId.value shouldBe "sales.orders/bronze"
 
     an[IllegalArgumentException] should be thrownBy starting(RunKind.Reset, None)
-    an[IllegalArgumentException] should be thrownBy starting(RunKind.Regular, Some(asked))
+    an[IllegalArgumentException] should be thrownBy starting(RunKind.Regular, Some(moved))
+  }
+
+  test("a run of a backfill takes the lease and the sequence of its backfill") {
+    val chunk = starting(RunKind.Backfill, Some(asked), Some(history))
+    chunk.backfill shouldBe Some(history)
+    chunk.txnAppId shouldBe TxnAppId.backfill(chunk.source, Layer.Bronze, history)
+    chunk.leaseKey shouldBe LeaseKey.backfill(chunk.source, Layer.Bronze, history)
+    chunk.leaseKey.value shouldBe "sales.orders/bronze/backfill/history-2024"
+    chunk.txnAppId.value shouldBe chunk.leaseKey.value
+    // An operator's run that gives up a chunk of it acts on the same sequence.
+    starting(RunKind.Abandon, Some(asked), Some(history)).leaseKey shouldBe chunk.leaseKey
+  }
+
+  test("a run acts on a sequence that its kind may act on, and on no other") {
+    // A backfill on its own sequence, and nowhere else.
+    val regular = the[IllegalArgumentException] thrownBy starting(RunKind.Backfill, Some(asked))
+    regular.getMessage shouldBe "requirement failed: a run of the kind backfill does not act " +
+      "on the regular sequence of its source"
+    // The regular sequence alone for a run, a reset and a reprocess: the state of a source and
+    // its files are its regular sequence's.
+    Seq(RunKind.Regular -> None, RunKind.Reset -> Some(asked), RunKind.Reprocess -> Some(asked))
+      .foreach { case (kind, request) =>
+        withClue(s"$kind: ") {
+          val refused =
+            the[IllegalArgumentException] thrownBy starting(kind, request, Some(history))
+          refused.getMessage shouldBe s"requirement failed: a run of the kind $kind does not " +
+            "act on the sequence of the backfill history-2024"
+        }
+      }
+    // A backfill is asked for by an operator, as every action of one.
+    an[IllegalArgumentException] should be thrownBy starting(RunKind.Backfill, None, Some(history))
   }
 
   test("who asked is kept as a name, whatever the process says it is") {

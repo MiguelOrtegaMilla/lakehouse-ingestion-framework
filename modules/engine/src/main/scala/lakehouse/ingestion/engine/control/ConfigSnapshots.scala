@@ -6,7 +6,7 @@ import scala.util.Using
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.{ConfigVersion, SourceId}
-import lakehouse.ingestion.core.control.Layer
+import lakehouse.ingestion.core.control.{Layer, TxnAppId}
 
 /**
  * The configurations that runs ran with (ADR-0007): each stored once, under its hash, and never
@@ -81,6 +81,25 @@ object ConfigSnapshots {
       statement.setString(1, source.value)
       statement.setString(2, layer.name)
     }
+
+  /**
+   * The configuration that a backfill was created with: that of the run that created it. It is
+   * what the configuration of each later run of the backfill is compared with, to find a change
+   * that what the backfill has written cannot follow (ADR-0021 §5.9). Not that of its last chunk,
+   * nor that of the state of its source: a reset of the source does not change it.
+   *
+   * @return none for a backfill that there is not
+   */
+  @throws[SQLException]
+  def ofBackfill(connection: Connection, backfill: TxnAppId): Option[Stored] =
+    one(
+      connection,
+      """SELECT snapshot.config_hash, snapshot.content::text
+        |  FROM control.backfill backfill
+        |  JOIN control.ingestion_run run ON run.run_id = backfill.created_by_run
+        |  JOIN control.config_snapshot snapshot ON snapshot.config_hash = run.config_hash
+        | WHERE backfill.txn_app_id = ?""".stripMargin
+    )(_.setString(1, backfill.value))
 
   private def one(connection: Connection, sql: String)(
       bind: java.sql.PreparedStatement => Unit

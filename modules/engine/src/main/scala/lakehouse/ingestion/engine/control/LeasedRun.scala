@@ -3,6 +3,8 @@ package lakehouse.ingestion.engine.control
 import java.sql.{Connection, SQLException}
 import java.time.Instant
 
+import scala.concurrent.duration.FiniteDuration
+
 import io.circe.Json
 import lakehouse.ingestion.core.config.{ConfigVersion, RelativePath, TableLocation}
 import lakehouse.ingestion.core.control._
@@ -82,6 +84,31 @@ final class LeasedRun private (
   }
 
   /**
+   * Creates the backfill whose sequence this run acts on, as its first run (ADR-0021 §5.3),
+   * unless it is there already: what is there is said, and nothing is written. Under the lease of
+   * the backfill, so that two runs of one backfill do not both create it.
+   *
+   * Its range is the caller's to check against the clock of the source before (`BackfillRange`);
+   * whether what is there is what this run was asked for is the caller's to say after.
+   *
+   * @return the backfill that this run created, or the one that was there
+   * @throws LeaseLostException if the lease is another run's by now
+   */
+  @throws[SQLException]
+  @throws[LeaseLostException]
+  def backfill(from: Instant, to: Instant, chunk: FiniteDuration): LeasedRun.Backfill =
+    holding { connection =>
+      val id = start.backfill.getOrElse(
+        throw new IllegalArgumentException(s"the run ${start.id} is not of a backfill")
+      )
+      Backfills.find(connection, start.source, start.layer, id) match {
+        case Some(there) => LeasedRun.Backfill.There(there)
+        case None =>
+          LeasedRun.Backfill.Created(Backfills.create(connection, start, from, to, chunk))
+      }
+    }
+
+  /**
    * The files of `directory` with these names that batches of the source have taken: what a
    * file source plans its next batch without (`FilePlanner`).
    */
@@ -91,14 +118,21 @@ final class LeasedRun private (
 
   /**
    * Commits a batch whose data is in its tables (ADR-0005 §3, steps 7 and 8): moves the state
-   * of the source past it, records the files it took, marks the batch committed with what it
+   * of its sequence past it, records the files it took, marks the batch committed with what it
    * wrote, ends the run as succeeded, and gives the lease up. All of it in one transaction, on
    * condition that the lease is still this run's under its epoch, or none of it.
    *
-   * @param watermark where the next batch starts from; none, for a source that has none
+   * The state of the sequence is that of the source, for its regular sequence, and the progress
+   * of the backfill, for a chunk of one (ADR-0021 §5.6): a backfill does not touch the state of
+   * its source.
+   *
+   * @param watermark where the next batch starts from; none, for a source that has none. A chunk
+   *   of a backfill has one: it is where the next chunk starts
    * @param files the plan of the batch, for a file source: its files are recorded as taken,
    *   unless the batch reads again those of another. It must be the plan that was written down
    *   for the batch
+   * @param completes whether the batch is the last chunk of a backfill, which is then complete;
+   *   false for the regular sequence, which is never complete
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed. The batch is the other run's to finish, and the data that this one wrote is
    *   in the table once all the same, by the number of the batch
@@ -112,12 +146,18 @@ final class LeasedRun private (
       watermark: Option[Json],
       outputs: Seq[BatchOutput],
       counts: RunCounts = RunCounts.Nothing,
-      files: Option[FilePlan] = None
+      files: Option[FilePlan] = None,
+      completes: Boolean = false
   ): Boolean = {
     require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
     // Before the lease stops being renewed: a watermark that cannot be stored is a mistake of
     // whoever gave it, and no reason to let the lease go.
     watermark.foreach(Batches.readable("watermark", _))
+    require(
+      start.backfill.isEmpty || watermark.nonEmpty,
+      s"the chunk $batch of a backfill records where the next one starts"
+    )
+    require(!completes || start.backfill.nonEmpty, "only a backfill is complete")
     heartbeat.close()
     database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
@@ -126,11 +166,19 @@ final class LeasedRun private (
         def must(done: Boolean, what: String): Unit =
           if (!done) throw new IllegalStateException(s"the batch $batch was not committed: $what")
 
-        must(
-          SourceStates
-            .advance(connection, start.source, start.layer, watermark, batch.seq, start.id),
-          s"the state of ${start.txnAppId} is at this batch already, or past it"
-        )
+        start.backfill match {
+          case None =>
+            must(
+              SourceStates
+                .advance(connection, start.source, start.layer, watermark, batch.seq, start.id),
+              s"the state of ${start.txnAppId} is at this batch already, or past it"
+            )
+          case Some(_) =>
+            must(
+              Backfills.advance(connection, batch, watermark.get, start.id, completes),
+              s"the backfill ${start.txnAppId} is at this chunk already, past it, or complete"
+            )
+        }
         files.foreach { plan =>
           // The files that are recorded are those that the batch read: the plan that was
           // written down for it, and not what a caller says it was.
@@ -335,6 +383,16 @@ final class LeasedRun private (
 }
 
 object LeasedRun {
+
+  /** What `backfill` found: the backfill that it created, or the one that was there. */
+  sealed trait Backfill {
+    def record: BackfillRecord
+  }
+
+  object Backfill {
+    final case class Created(record: BackfillRecord) extends Backfill
+    final case class There(record: BackfillRecord) extends Backfill
+  }
 
   private val logger = LoggerFactory.getLogger(classOf[LeasedRun])
 
