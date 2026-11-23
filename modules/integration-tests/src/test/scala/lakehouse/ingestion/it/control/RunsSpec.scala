@@ -193,9 +193,11 @@ final class RunsSpec extends AnyFunSuite with Matchers with ControlPlaneSuite {
     database.run(Runs.open(_, start, epoch(1)))
     asSuperuser { c =>
       update(c, "ALTER TABLE control.ingestion_run DROP CONSTRAINT ingestion_run_layer_check"): Unit
+      // With the name of its sequence in that layer, which V7 holds to its layer.
       update(
         c,
-        "UPDATE control.ingestion_run SET layer = 'gold' WHERE run_id = ?",
+        "UPDATE control.ingestion_run SET layer = 'gold', txn_app_id = source_id || '/gold' " +
+          "WHERE run_id = ?",
         start.id.uuid
       ) shouldBe 1
     }
@@ -207,7 +209,8 @@ final class RunsSpec extends AnyFunSuite with Matchers with ControlPlaneSuite {
       asSuperuser { c =>
         update(
           c,
-          "UPDATE control.ingestion_run SET layer = 'bronze' WHERE run_id = ?",
+          "UPDATE control.ingestion_run SET layer = 'bronze', txn_app_id = source_id || '/bronze' " +
+            "WHERE run_id = ?",
           start.id.uuid
         ): Unit
         update(

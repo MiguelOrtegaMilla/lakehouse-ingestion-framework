@@ -9,6 +9,7 @@ import lakehouse.ingestion.cli.Main
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, ControlPlaneSchema}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import org.postgresql.util.PSQLException
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -44,6 +45,10 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
     Using.resource(pg.connect(role, Database))(body)
 
   private def sqlState(action: => Any): String = intercept[SQLException](action).getSQLState
+
+  /** The constraint that refused `action`, as the server names it. */
+  private def violated(action: => Any): String =
+    intercept[PSQLException](action).getServerErrorMessage.getConstraint
 
   private def text(value: Any): String = s"'$value'"
 
@@ -143,9 +148,10 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       FailureClass.All.map(_.name).toSet
     checks("control.ingestion_batch.ingestion_batch_status_check") shouldBe
       BatchStatus.All.map(_.name).toSet
-    Seq("ingestion_run", "ingestion_batch", "source_state", "state_change_log").foreach { table =>
-      withClue(table)(checks(s"control.$table.${table}_layer_check") shouldBe layers)
-    }
+    Seq("ingestion_run", "ingestion_batch", "source_state", "state_change_log", "backfill")
+      .foreach { table =>
+        withClue(table)(checks(s"control.$table.${table}_layer_check") shouldBe layers)
+      }
     checks("control.ingestion_run.ingestion_run_run_kind_check") shouldBe kinds
     // A batch is of a kind that plans one (ADR-0021 §4).
     checks("control.ingestion_batch.ingestion_batch_run_kind_check") shouldBe
@@ -273,7 +279,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
         Seq("status" -> "'SUCCEEDED'", "finished_at" -> "now()", "error_class" -> "'transient'"),
       "a status that is none" -> Seq("status" -> "'DONE'", "finished_at" -> "now()"),
       "a layer that is none" -> Seq("layer" -> "'gold'"),
-      "a kind that is none" -> Seq("run_kind" -> "'backfill'"),
+      "a kind that is none" -> Seq("run_kind" -> "'replay'"),
       // ADR-0021 §1: who asked and why, for an operator's action alone, and both or neither.
       "a regular run that says why" ->
         Seq("requested_by" -> "'ops'", "reason" -> "'because'"),
@@ -543,8 +549,9 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
 
       // One that no run gave up: an operator's, when there is a command for it (P7).
       val other = newSource()
-      insertRun(c, other, RunId.generate())()
-      insertBatch(c, other, 1, run)(
+      val ofOther = RunId.generate()
+      insertRun(c, other, ofOther)()
+      insertBatch(c, other, 1, ofOther)(
         "status" -> "'ABANDONED'",
         "abandoned_at" -> "now()",
         "abandon_reason" -> "'the source was reset'"
@@ -578,10 +585,11 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       withClue("a number that was committed: ") {
         sqlState(insertBatch(c, source, 1, run)()) shouldBe UniqueViolation
       }
-      // Another source has a sequence of its own.
+      // Another source has a sequence of its own, which a run of its own plans in.
       val other = newSource()
-      insertRun(c, other, RunId.generate())()
-      insertBatch(c, other, 1, run)()
+      val ofOther = RunId.generate()
+      insertRun(c, other, ofOther)()
+      insertBatch(c, other, 1, ofOther)()
     }
   }
 
@@ -708,6 +716,313 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
     }
   }
 
+  // -----------------------------------------------------------------------------------------------
+  // Backfills (V7, ADR-0021 §5)
+  // -----------------------------------------------------------------------------------------------
+
+  private val Asked = Seq("requested_by" -> "'ops'", "reason" -> "'load the history'")
+
+  /** A run of `kind` on `sequence`, which an operator asked for unless the kind is regular. */
+  private def runOn(c: Connection, source: String, sequence: String, kind: RunKind)(
+      columns: (String, String)*
+  ): RunId = {
+    val run = RunId.generate()
+    val asked = if (kind.operators) Asked else Nil
+    insertRun(c, source, run)(
+      (Seq("run_kind" -> text(kind), "txn_app_id" -> text(sequence)) ++ asked ++ columns): _*
+    )
+    run
+  }
+
+  /** A backfill of `source` that `run` creates, unless `columns` say otherwise. */
+  private def insertBackfill(c: Connection, source: String, run: RunId)(
+      columns: (String, String)*
+  ): String =
+    insert(
+      c,
+      "backfill",
+      Seq(
+        "source_id" -> text(source),
+        "layer" -> text(Layer.Bronze),
+        "backfill_id" -> "'history-2024'",
+        "range_from" -> "'2024-01-01T00:00:00Z'",
+        "range_to" -> "'2024-06-01T00:00:00Z'",
+        "chunk" -> "interval '7 days'",
+        "created_by_run" -> text(run)
+      )
+    )(columns: _*)
+
+  test("a run acts on a sequence of its own source and layer that its kind may act on") {
+    val source = newSource()
+    val regular = s"$source/bronze"
+    val history = s"$source/bronze/backfill/history-2024"
+    as(Engine) { c =>
+      snapshot(c)
+      // A backfill on its own sequence; an abandonment on either; every other kind on the
+      // regular one, as the model has it (RunKind.ofRegular, ofBackfills).
+      RunKind.All.foreach { kind =>
+        if (kind.ofRegular) runOn(c, source, regular, kind)()
+        if (kind.ofBackfills) runOn(c, source, history, kind)()
+      }
+
+      val notRuns = Seq[(String, String, RunKind)](
+        ("a backfill on the regular sequence", regular, RunKind.Backfill),
+        ("a regular run on a backfill's", history, RunKind.Regular),
+        ("a reset on a backfill's", history, RunKind.Reset),
+        ("a reprocess on a backfill's", history, RunKind.Reprocess),
+        ("the sequence of another source", s"${newSource()}/bronze", RunKind.Regular),
+        ("the sequence of another layer", s"$source/silver", RunKind.Regular),
+        ("a backfill of another source", s"${newSource()}/bronze/backfill/x", RunKind.Backfill),
+        ("a backfill of another layer", s"$source/silver/backfill/x", RunKind.Backfill),
+        ("an id that is not one", s"$source/bronze/backfill/History", RunKind.Backfill),
+        ("an id with a '/'", s"$source/bronze/backfill/a/b", RunKind.Backfill),
+        ("no id", s"$source/bronze/backfill/", RunKind.Backfill),
+        ("an id that is too long", s"$source/bronze/backfill/${"x" * 64}", RunKind.Backfill),
+        ("another word than backfill", s"$source/bronze/refill/x", RunKind.Backfill),
+        // ADR-0006 had the lease of a backfill under this; ADR-0021 has it under its sequence.
+        ("the key of ADR-0006", "backfill/history-2024", RunKind.Backfill)
+      )
+      notRuns.foreach { case (what, sequence, kind) =>
+        withClue(s"$what: ") {
+          violated(runOn(c, source, sequence, kind)()) shouldBe "run_of_a_sequence_of_its_kind"
+        }
+      }
+    }
+  }
+
+  test("a batch is of a sequence that its kind plans in: a chunk of a backfill on its own") {
+    val source = newSource()
+    val regular = s"$source/bronze"
+    val history = s"$source/bronze/backfill/history-2024"
+    as(Engine) { c =>
+      snapshot(c)
+      val run = runOn(c, source, history, RunKind.Backfill)()
+      // Chunk 1 of the backfill, and batch 1 of the regular sequence: one number in two
+      // sequences, which are two batches, each planned by a run of its own sequence.
+      insertBatch(c, source, 1, run)(
+        "txn_app_id" -> text(history),
+        "run_kind" -> text(RunKind.Backfill)
+      )
+      val ofRegular = runOn(c, source, regular, RunKind.Regular)()
+      insertBatch(c, source, 1, ofRegular)()
+
+      // A run of one sequence plans, commits and gives up no batch of another.
+      // Given up already, so that the one batch of a sequence that is planned is not in the way.
+      withClue("a regular batch planned by a run of a backfill: ") {
+        violated(
+          insertBatch(c, source, 2, run)(
+            "status" -> "'ABANDONED'",
+            "abandoned_at" -> "now()",
+            "abandon_reason" -> "'why'"
+          )
+        ) shouldBe "batch_planned_by_a_run_of_its_sequence"
+      }
+      withClue("a chunk planned by a run of the regular sequence: ") {
+        violated(
+          insertBatch(c, source, 2, ofRegular)(
+            "txn_app_id" -> text(history),
+            "run_kind" -> text(RunKind.Backfill),
+            "status" -> "'ABANDONED'",
+            "abandoned_at" -> "now()",
+            "abandon_reason" -> "'why'"
+          )
+        ) shouldBe "batch_planned_by_a_run_of_its_sequence"
+      }
+      withClue("a chunk committed by a run of the regular sequence: ") {
+        violated(
+          update(
+            c,
+            s"UPDATE control.ingestion_batch SET $Committed, committed_by_run = ? " +
+              "WHERE txn_app_id = ? AND batch_seq = 1",
+            ofRegular.uuid,
+            history
+          )
+        ) shouldBe "batch_committed_by_a_run_of_its_sequence"
+      }
+      withClue("a chunk given up by a run of the regular sequence: ") {
+        violated(
+          update(
+            c,
+            s"UPDATE control.ingestion_batch SET $Abandoned, abandoned_by_run = ? " +
+              "WHERE txn_app_id = ? AND batch_seq = 1",
+            ofRegular.uuid,
+            history
+          )
+        ) shouldBe "batch_abandoned_by_a_run_of_its_sequence"
+      }
+
+      val notBatches = Seq[(String, String, RunKind)](
+        ("a chunk on the regular sequence", regular, RunKind.Backfill),
+        ("a regular batch on a backfill's", history, RunKind.Regular),
+        ("a reprocess on a backfill's", history, RunKind.Reprocess),
+        (
+          "a chunk of another source's backfill",
+          s"${newSource()}/bronze/backfill/x",
+          RunKind.Backfill
+        ),
+        ("a chunk of an id that is not one", s"$source/bronze/backfill/X", RunKind.Backfill)
+      )
+      notBatches.foreach { case (what, sequence, kind) =>
+        withClue(s"$what: ") {
+          val reprocessOf = Option.when(kind == RunKind.Reprocess)("reprocess_of" -> "1").toSeq
+          violated(
+            insertBatch(c, source, 2, run)(
+              (Seq("txn_app_id" -> text(sequence), "run_kind" -> text(kind)) ++ reprocessOf): _*
+            )
+          ) shouldBe "batch_of_a_sequence_of_its_kind"
+        }
+      }
+    }
+  }
+
+  test("a backfill is created by a run of its sequence, and what it reads is written once") {
+    val source = newSource()
+    val history = s"$source/bronze/backfill/history-2024"
+    as(Engine) { c =>
+      snapshot(c)
+      val run = runOn(c, source, history, RunKind.Backfill)()
+      insertBackfill(c, source, run)()
+      // The name of its sequence is made by the database, from its source, layer and id.
+      query(
+        c,
+        "SELECT txn_app_id, range_from < range_to, chunk::text, progress, completed_at " +
+          "FROM control.backfill WHERE source_id = ?",
+        source
+      ) shouldBe Seq(Seq(history, "t", "7 days", null, null))
+
+      withClue("the same id again: ")(
+        sqlState(insertBackfill(c, source, run)()) shouldBe UniqueViolation
+      )
+      val notBackfills = Seq[(String, Seq[(String, String)], String)](
+        (
+          "a range of no moment",
+          Seq("range_to" -> "'2024-01-01T00:00:00Z'"),
+          "range_holds_a_moment"
+        ),
+        ("a range backwards", Seq("range_to" -> "'2023-01-01T00:00:00Z'"), "range_holds_a_moment"),
+        (
+          "a range before 1900",
+          Seq("range_from" -> "'1899-12-31T23:59:59.999999Z'"),
+          "range_of_moments_a_plan_holds"
+        ),
+        (
+          "a range after 9999",
+          Seq("range_to" -> "'infinity'"),
+          "range_of_moments_a_plan_holds"
+        ),
+        ("a chunk of nothing", Seq("chunk" -> "interval '0'"), "chunk_is_a_stretch_of_time"),
+        ("a chunk backwards", Seq("chunk" -> "interval '-1 day'"), "chunk_is_a_stretch_of_time"),
+        ("an id that is not one", Seq("backfill_id" -> "'History'"), "backfill_backfill_id_check"),
+        ("an id with a '/'", Seq("backfill_id" -> "'a/b'"), "backfill_backfill_id_check"),
+        ("a layer that is none", Seq("layer" -> "'gold'"), "backfill_layer_check"),
+        (
+          "progress with no chunk committed",
+          Seq("backfill_id" -> "'other'", "progress" -> """'{"value": 1}'::jsonb"""),
+          "moved_whole_or_not_at_all"
+        ),
+        (
+          "complete with nothing read",
+          Seq("backfill_id" -> "'other'", "completed_at" -> "now()"),
+          "completed_by_a_chunk"
+        )
+      )
+      notBackfills.foreach { case (what, columns, constraint) =>
+        withClue(s"$what: ")(
+          violated(insertBackfill(c, source, run)(columns: _*)) shouldBe constraint
+        )
+      }
+      withClue("with a name of its own: ") {
+        sqlState(insertBackfill(c, source, run)("txn_app_id" -> text(history))) shouldBe "428C9"
+      }
+
+      // Created by a run of its sequence, and by no other: not by a run of the regular sequence
+      // of its source, nor by one of another backfill.
+      val regular = runOn(c, source, s"$source/bronze", RunKind.Regular)()
+      val another = runOn(c, source, s"$source/bronze/backfill/other", RunKind.Backfill)()
+      Seq(regular, another, RunId.generate()).foreach { by =>
+        withClue(s"created by $by: ") {
+          violated(insertBackfill(c, source, by)("backfill_id" -> "'third'")) shouldBe
+            "backfill_created_by_a_run_of_its_sequence"
+        }
+      }
+
+      // What it reads, and who created it, are written once: the engine has no UPDATE on them.
+      Seq(
+        "range_from = '2023-01-01T00:00:00Z'",
+        "range_to = '2024-02-01T00:00:00Z'",
+        "chunk = interval '1 day'",
+        s"created_by_run = '$regular'",
+        "created_at = now()",
+        "backfill_id = 'renamed'",
+        "source_id = 'other'",
+        "layer = 'silver'"
+      ).foreach { change =>
+        withClue(s"$change: ") {
+          sqlState(
+            update(c, s"UPDATE control.backfill SET $change WHERE source_id = ?", source)
+          ) shouldBe InsufficientPrivilege
+        }
+      }
+    }
+  }
+
+  test("a backfill moves whole, by a run of its sequence, and once complete does not change") {
+    val source = newSource()
+    val history = s"$source/bronze/backfill/history-2024"
+    as(Engine) { c =>
+      snapshot(c)
+      val first = runOn(c, source, history, RunKind.Backfill)()
+      insertBackfill(c, source, first)()
+      def move(change: String): Int =
+        update(c, s"UPDATE control.backfill SET $change WHERE source_id = ?", source)
+      def moved(seq: Int, by: RunId) =
+        s"""progress = '{"value": $seq}'::jsonb, last_committed_batch_seq = $seq, """ +
+          s"updated_by_run = '$by', updated_at = now()"
+
+      move(moved(1, first)) shouldBe 1
+      // A later run of it moves it on.
+      val second = runOn(c, source, history, RunKind.Backfill)()
+      move(moved(2, second)) shouldBe 1
+
+      withClue("in part: ")(
+        violated(move("last_committed_batch_seq = NULL")) shouldBe "moved_whole_or_not_at_all"
+      )
+      withClue("a chunk before the first: ")(
+        sqlState(move(moved(0, second))) shouldBe CheckViolation
+      )
+      withClue("moved by a run of the regular sequence: ") {
+        val regular = runOn(c, source, s"$source/bronze", RunKind.Regular)()
+        violated(move(moved(3, regular))) shouldBe "backfill_moved_by_a_run_of_its_sequence"
+      }
+
+      move(s"${moved(3, second)}, completed_at = now()") shouldBe 1
+      // Whoever asks, and whatever it sets: what is complete stays as it is.
+      Seq(moved(4, second), "completed_at = NULL", "progress = progress").foreach { change =>
+        withClue(s"$change: ") {
+          val refused = intercept[SQLException](move(change))
+          refused.getSQLState shouldBe CheckViolation
+          refused.getMessage should include(s"the backfill $history is complete")
+        }
+      }
+      // Nor the superuser: it is a rule of the table, and not a privilege.
+      Using.resource(pg.connectAsSuperuser(Database)) { superuser =>
+        sqlState(
+          update(
+            superuser,
+            "UPDATE control.backfill SET completed_at = NULL WHERE source_id = ?",
+            source
+          )
+        ) shouldBe CheckViolation
+      }
+      query(
+        c,
+        "SELECT last_committed_batch_seq, completed_at IS NOT NULL FROM control.backfill " +
+          "WHERE source_id = ?",
+        source
+      ) shouldBe Seq(Seq("3", "t"))
+    }
+  }
+
   test("a file is taken by a batch that exists, with a size and a time to the millisecond") {
     val source = newSource()
     val run = RunId.generate()
@@ -809,6 +1124,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "DELETE FROM control.source_state",
       "DELETE FROM control.source_lease",
       "DELETE FROM control.processed_file",
+      "DELETE FROM control.backfill",
       "TRUNCATE control.ingestion_run",
       // A run ends, and is counted. Who ran, what, with which configuration and under which
       // epoch never change.
@@ -844,6 +1160,8 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "DROP TRIGGER ingestion_run_ended_stays ON control.ingestion_run",
       "DROP TABLE control.ingestion_run",
       "SELECT control.refuse_change_of_what_ended()",
+      "ALTER TABLE control.backfill DISABLE TRIGGER backfill_complete_stays",
+      "SELECT control.refuse_change_of_a_complete_backfill()",
       // Nothing outside its own tables: not the migration history, not the commit coordination.
       "SELECT * FROM control.flyway_schema_history",
       "SELECT * FROM delta_coordination.commit_entry",
@@ -864,6 +1182,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       "SELECT * FROM control.source_state",
       "SELECT * FROM control.processed_file",
       "SELECT * FROM control.state_change_log",
+      "SELECT * FROM control.backfill",
       "SELECT version FROM control.schema_version",
       "INSERT INTO control.source_lease (lease_key) VALUES ('test.source/bronze')",
       "UPDATE control.source_lease SET epoch = epoch + 1",

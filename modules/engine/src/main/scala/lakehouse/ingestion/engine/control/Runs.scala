@@ -202,7 +202,10 @@ object Runs {
         configHash = row.getString("config_hash"),
         request = Option(row.getString("reason")).map { reason =>
           OperatorRequest.stored(row.getString("requested_by"), reason)
-        }
+        },
+        // The sequence that it acts on is the one it was written with: that of a backfill, or
+        // the regular one of its source (ADR-0021 §5).
+        backfill = known("txn_app_id", TxnAppId.parse).backfill
       ),
       txnAppId = known("txn_app_id", TxnAppId.parse),
       batch = long("batch_seq").map(seq => known("batch_seq", _ => BatchSeq.of(seq))),

@@ -96,6 +96,8 @@ object OperatorRequest {
  * @param appVersion the version of the application that runs it
  * @param configHash the hash of the configuration it runs with, whose snapshot is stored
  * @param request who asked for it and why: for an operator's action, and for no other run
+ * @param backfill the backfill whose sequence it acts on; none, for the regular sequence of its
+ *   source. Which a run may act on is its kind's to say (`RunKind.ofRegular`, `ofBackfills`)
  */
 final case class RunStart(
     id: RunId,
@@ -105,18 +107,26 @@ final case class RunStart(
     instance: InstanceId,
     appVersion: String,
     configHash: String,
-    request: Option[OperatorRequest] = None
+    request: Option[OperatorRequest] = None,
+    backfill: Option[BackfillId] = None
 ) {
   require(
     kind.operators == request.nonEmpty,
     s"a run of the kind $kind says who asked for it and why exactly when an operator asks for it"
   )
+  require(
+    if (backfill.isEmpty) kind.ofRegular else kind.ofBackfills,
+    s"a run of the kind $kind does not act on " +
+      backfill.fold("the regular sequence of its source")(id => s"the sequence of the backfill $id")
+  )
 
-  /** The sequence that its batch belongs to. That of a backfill is its own (P7). */
-  def txnAppId: TxnAppId = TxnAppId.of(source, layer)
+  /** The sequence that its batch belongs to: the regular one, or that of its backfill. */
+  def txnAppId: TxnAppId =
+    backfill.fold(TxnAppId.of(source, layer))(TxnAppId.backfill(source, layer, _))
 
-  /** What it must hold the lease of. */
-  def leaseKey: LeaseKey = LeaseKey.of(source, layer)
+  /** What it must hold the lease of: its sequence, by the same name. */
+  def leaseKey: LeaseKey =
+    backfill.fold(LeaseKey.of(source, layer))(LeaseKey.backfill(source, layer, _))
 }
 
 /**

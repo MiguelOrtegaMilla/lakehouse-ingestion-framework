@@ -16,7 +16,9 @@ import org.scalatest.matchers.should.Matchers
 
 /**
  * The control plane upgraded under a write-ahead log that is in use: batches written by version
- * 2 of the schema, then migration V3 (who gave a batch up, when and why: ADR-0018).
+ * 2 of the schema, then migration V3 (who gave a batch up, when and why: ADR-0018) and those
+ * after it, up to V7 (backfills: ADR-0021 §5), whose rules on a sequence and the kinds of its
+ * runs and batches take the rows of before as they are.
  * `ControlSchemaSpec` has the schema as the migrations build it on an empty database.
  */
 final class ControlSchemaUpgradeSpec
@@ -78,6 +80,42 @@ final class ControlSchemaUpgradeSpec
     BatchId(TxnAppId.parse(s"$source/bronze").value, BatchSeq.First)
   }
 
+  /**
+   * What an operator did to the source of `committed` under version 6: a run of each of its
+   * kinds, and the batch of the reprocess, which reads the files of the committed batch again.
+   *
+   * @return each run, with its kind
+   */
+  private def actionsOfVersion6(c: Connection, committed: BatchId): Seq[(RunId, RunKind)] = {
+    val source = committed.app.value.stripSuffix("/bronze")
+    val runs = Seq(RunKind.Abandon, RunKind.Reset, RunKind.Reprocess).map(RunId.generate() -> _)
+    runs.foreach { case (run, kind) =>
+      update(
+        c,
+        """INSERT INTO control.ingestion_run
+          |  (run_id, source_id, layer, run_kind, txn_app_id, status, instance_id, app_version,
+          |   config_hash, lease_epoch, requested_by, reason)
+          |VALUES (?, ?, 'bronze', ?, ?, 'RUNNING', 'host:1:0', '0.1.0', ?, 1, 'ops', ?)""".stripMargin,
+        run.uuid,
+        source,
+        kind.name,
+        committed.app.value,
+        Hash,
+        s"what an operator did: $kind"
+      ) shouldBe 1
+    }
+    update(
+      c,
+      """INSERT INTO control.ingestion_batch
+        |  (txn_app_id, batch_seq, source_id, layer, run_kind, plan, planned_by_run, reprocess_of)
+        |VALUES (?, 2, ?, 'bronze', 'reprocess', '{"from": 0, "to": 10}'::jsonb, ?, 1)""".stripMargin,
+      committed.app.value,
+      source,
+      runs.last._1.uuid
+    ) shouldBe 1
+    runs
+  }
+
   private def newSource(): String = s"test.s${UUID.randomUUID().toString.take(8)}"
 
   test("V3 leaves the batches of version 2 as they were, and each can end as V3 has it") {
@@ -98,11 +136,16 @@ final class ControlSchemaUpgradeSpec
     }
     val before = as(Engine)(c => query(c, "SELECT now()::text")).head.head
 
+    // V3 to V6, and what an operator did under version 6 (ADR-0021): a batch given up, a reset,
+    // and the files of the committed batch read again, as a batch of the regular sequence.
+    ControlPlaneSchema.migrateUpTo(pg, "6") shouldBe 4
+    val operators = as(Engine)(c => actionsOfVersion6(c, committed))
+
     val ran = ControlPlaneSchema.migrate(pg)
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
-    // V3, and V4, V5 and V6 on top of it: the engine works on the schema that it was built for.
-    ran.lines.head shouldBe s"control: version 6, 4 migrations applied (${pg.jdbcUrl(Database)})"
+    // And V7 on top of them: the engine works on the schema that it was built for.
+    ran.lines.head shouldBe s"control: version 7, 1 migration applied (${pg.jdbcUrl(Database)})"
     as(Engine) { c =>
       ControlSchema.verify(c) shouldBe Right(())
 
@@ -120,6 +163,20 @@ final class ControlSchemaUpgradeSpec
       val plannedBy = Batches.find(c, planned).value.plannedBy
       Runs.find(c, plannedBy).value.start.kind shouldBe RunKind.Regular
       Runs.find(c, plannedBy).value.start.request shouldBe None
+      // V7: and it acts on the regular sequence of its source, as every run of before does.
+      Runs.find(c, plannedBy).value.start.backfill shouldBe None
+      Runs.find(c, plannedBy).value.txnAppId shouldBe planned.app
+      planned.app.backfill shouldBe None
+      // So does what an operator did under version 6, which V7 takes as it was written.
+      operators.foreach { case (run, kind) =>
+        val found = Runs.find(c, run).value
+        found.start.kind shouldBe kind
+        found.start.backfill shouldBe None
+        found.start.request.value.reason shouldBe s"what an operator did: $kind"
+      }
+      val reprocess = Batches.find(c, BatchId(committed.app, BatchSeq.First.next)).value
+      reprocess.kind shouldBe RunKind.Reprocess
+      reprocess.reprocessOf shouldBe Some(BatchSeq.First)
       val stillCommitted = Batches.find(c, committed).value
       stillCommitted.status shouldBe BatchStatus.Committed
       stillCommitted.outputs.value.map(_.version) shouldBe Vector(Some(4L))
