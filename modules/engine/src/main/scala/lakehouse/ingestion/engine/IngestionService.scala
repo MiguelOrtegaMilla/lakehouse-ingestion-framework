@@ -7,24 +7,29 @@ import scala.util.control.NonFatal
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
   ConfigVersion,
+  Durations,
+  Load,
   PathTableLocator,
   RootUri,
   Source,
   TableLocation
 }
 import lakehouse.ingestion.core.control._
+import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.connector.{
   BoundSource,
   ConnectorRegistry,
   PlanContext,
   Progress,
+  RangePlanner,
   ReadContext,
   ReadResult,
   SourceChangedException
 }
 import lakehouse.ingestion.engine.control.{
   Application,
+  Backfills,
   Batches,
   ConfigSnapshots,
   ControlDatabase,
@@ -168,6 +173,12 @@ import org.slf4j.LoggerFactory
  *    the lease over marks this one `ABANDONED`. Telling such errors apart is the classification
  *    of errors (P8).
  *
+ * '''A backfill is a sequence of its own''' (ADR-0021 §5). Its runs hold its lease, announce its
+ * epoch and number its chunks, apart from the regular sequence of the source, which they
+ * neither wait for nor touch. Its chunks are planned by the connector (`RangePlanner`), and the
+ * commit of each moves the progress of the backfill, and not the state of the source. What is
+ * between, the read, the writes and recovery, is that of any batch.
+ *
  * @param lake the root of the lake of the profile: every table of a source is under it
  * @param clock what "now" is for a plan, and when the rows of a batch were read
  * @param hooks what a run does at each fault point: nothing, outside tests
@@ -250,6 +261,46 @@ final class IngestionService(
       Some(request)
     )
     held(start, bound, config, None)(_.reprocess(of))
+  }
+
+  /**
+   * One run of the backfill `request.id` of `source` (ADR-0021 §5), on the sequence of the
+   * backfill, by a run of the kind `backfill` that `operator` asked for: one chunk of its range,
+   * read and committed, as `run` reads one batch.
+   *
+   * The first run under the id creates the backfill, under its lease: its range ends no later
+   * than the clock of the source less `safety_margin`, and its chunk is the one asked for, or
+   * `max_batch_range` of the source. Each run after it resumes the backfill, held to the
+   * configuration that it was created with, and is refused if it asks for another range or
+   * another chunk. A chunk that a run left planned is finished first, as a batch of the regular
+   * sequence is. A backfill that is complete has nothing more to read, and the run ends well
+   * with no batch.
+   *
+   * It is refused, as a permanent failure with nothing created or planned, for a source whose
+   * connector reads no range of it.
+   *
+   * @throws java.lang.IllegalArgumentException if the application has no connector for the
+   *   source. Nothing was started
+   */
+  def backfill(
+      source: Source,
+      config: ConfigVersion,
+      request: BackfillRequest,
+      operator: OperatorRequest
+  ): Outcome = {
+    val bound = connectors.bind(source)
+    val start = RunStart(
+      RunId.generate(),
+      source.id,
+      Layer.Bronze,
+      RunKind.Backfill,
+      Application.instance,
+      Application.version,
+      config.hash,
+      Some(operator),
+      Some(request.id)
+    )
+    held(start, bound, config, None)(_.backfill(request))
   }
 
   /**
@@ -416,7 +467,7 @@ final class IngestionService(
     private val commits = CommitContext.forRun(start.id.uuid, turn)
 
     def run(): Outcome =
-      prepared {
+      prepared(heldToWhatWasIngested()) { _ =>
         leased.planned() match {
           case Some(left) => recover(left)
           case None => planNext()
@@ -425,7 +476,7 @@ final class IngestionService(
 
     /** Plans a batch that reads the files of the committed batch `of` again, and ingests it. */
     def reprocess(of: BatchSeq): Outcome =
-      prepared {
+      prepared(heldToWhatWasIngested()) { _ =>
         leased.planned() match {
           case Some(left) =>
             throw RunFailedException.permanent(
@@ -463,18 +514,191 @@ final class IngestionService(
       }
 
     /**
+     * Reads the next chunk of the backfill of this run's sequence, creating the backfill if it
+     * is not there; or finishes the chunk that a run before left planned.
+     */
+    def backfill(request: BackfillRequest): Outcome =
+      prepared(backfillOf(request)) { case (backfill, planner) =>
+        if (backfill.completedAt.nonEmpty) complete(backfill)
+        else
+          leased.planned() match {
+            case Some(left) => recover(left)
+            case None => nextChunk(backfill, planner)
+          }
+      }
+
+    /**
      * What every run does before it looks for a batch, and then `next`, unless a later epoch is
      * in force.
+     *
+     * @param held what holds the run to what its sequence has written: it refuses a
+     *   configuration that this cannot follow, and gives what the run goes on with
      */
-    private def prepared(next: => Outcome): Outcome = {
+    private def prepared[A](held: => A)(next: A => Outcome): Outcome = {
       confinement.confine(table)
       confinement.confine(quarantine)
-      // Before a batch is looked for: one that is rolled forward moves the state of the source
-      // under the configuration of this run.
-      heldToWhatWasIngested()
+      // Before a batch is looked for: one that is rolled forward moves the state of its
+      // sequence under the configuration of this run.
+      val holding = held
       // Before a table is asked anything: what it then says of a batch is not changed behind
       // this run by one that held the lease before.
-      announce().getOrElse(next)
+      announce().getOrElse(next(holding))
+    }
+
+    /**
+     * The backfill of this run's sequence, and the connector's planner of its chunks: found and
+     * held to what it was created with, or created now (ADR-0021 §5.3).
+     *
+     * @throws RunFailedException a permanent failure, for a source whose connector reads no
+     *   range of it, for a backfill that is not what this run asks for or that cannot be
+     *   created as it asks, and for a configuration that what the backfill has read cannot
+     *   follow, unless it is complete and reads nothing more. Nothing was planned, read or
+     *   written
+     */
+    private def backfillOf(request: BackfillRequest): (BackfillRecord, RangePlanner) = {
+      val planner = bound.ranges.getOrElse {
+        throw RunFailedException.permanent(
+          s"${source.id} is not backfilled: its connector reads no range of it. A backfill " +
+            "reads a range of the watermark column of a source that is loaded by one " +
+            "(load.mode: incremental), by a connector that says that it can (ADR-0021 §5). " +
+            "Nothing was created, planned, read or written"
+        )
+      }
+      val backfill = database.run(Backfills.find(_, source.id, start.layer, request.id)) match {
+        case Some(there) => resumed(there, request)
+        case None => created(request, planner)
+      }
+      // A backfill that is complete reads nothing more, under whatever configuration.
+      if (backfill.completedAt.isEmpty) heldToItsCreation(backfill)
+      (backfill, planner)
+    }
+
+    /**
+     * Creates the backfill that `request` asks for, under the lease of its sequence: its range
+     * ends no later than the horizon of the source now, and its chunk is the one asked for or
+     * `max_batch_range` of the source (ADR-0021 §5.4, §5.5).
+     */
+    private def created(request: BackfillRequest, planner: RangePlanner): BackfillRecord = {
+      def refused(problem: String): Nothing =
+        throw RunFailedException.permanent(
+          s"the backfill ${start.txnAppId} is not created: $problem. Nothing was created, " +
+            "planned, read or written"
+        )
+      val widest = source.load match {
+        case incremental: Load.Incremental => incremental.maxBatchRange
+        case _ => None
+      }
+      val chunk = request.chunk.orElse(widest).getOrElse {
+        refused(
+          "it is given no chunk (--chunk), and the source has no max_batch_range. A backfill " +
+            "is read in chunks, since a history read in one statement is what a backfill is " +
+            "for avoiding"
+        )
+      }
+      request.range.settledBy(planner.horizon()).left.foreach(refused)
+      leased.backfill(request.range.from, request.range.to, chunk) match {
+        case LeasedRun.Backfill.Created(backfill) =>
+          log.info(
+            s"the run ${start.id} created the backfill ${start.txnAppId}, which reads " +
+              s"${request.range} in chunks of ${Durations.render(backfill.chunk)}: the rows " +
+              s"whose watermark is after ${backfill.from} and not after ${backfill.to}"
+          )
+          backfill
+        // Not while this run holds the lease of its sequence: it is resumed, as any.
+        case LeasedRun.Backfill.There(backfill) => resumed(backfill, request)
+      }
+    }
+
+    /**
+     * A backfill that a run before this one created, resumed if this run asks for what it was
+     * created with (ADR-0021 §5.3). A run that asks for no chunk takes the backfill's.
+     */
+    private def resumed(there: BackfillRecord, request: BackfillRequest): BackfillRecord = {
+      val other = Seq(
+        Option.when(there.from != request.range.from || there.to != request.range.to)(
+          s"the range ${request.range}, and it reads (${there.from}, ${there.to}]"
+        ),
+        request.chunk
+          .filter(_ != there.chunk)
+          .map(chunk =>
+            s"chunks of ${Durations.render(chunk)}, and its chunks are of " +
+              Durations.render(there.chunk)
+          )
+      ).flatten
+      if (other.nonEmpty)
+        throw RunFailedException.permanent(
+          s"the backfill ${start.txnAppId} was created by the run ${there.createdBy} at " +
+            s"${there.createdAt}, and this run asks for ${other.mkString(", and for ")}. A " +
+            "backfill is resumed with what it was created with, and another range is another " +
+            "backfill, under another id. Nothing was planned, read or written"
+        )
+      log.info(
+        s"the run ${start.id} resumes the backfill ${start.txnAppId}, which reads " +
+          s"(${there.from}, ${there.to}] in chunks of ${Durations.render(there.chunk)}, " +
+          there.progress.fold("from its start")(at => s"after its chunk ${at.lastCommitted}")
+      )
+      there
+    }
+
+    /**
+     * Refuses a configuration that changed, since the backfill of this run's sequence was
+     * created, in a way that what it has read cannot follow (ADR-0021 §5.9, ADR-0007): against
+     * the configuration of the run that created it, which a reset of the source does not change.
+     *
+     * @throws RunFailedException a permanent failure, with each such change. Nothing was
+     *   planned, read or written
+     */
+    private def heldToItsCreation(backfill: BackfillRecord): Unit =
+      database.run(ConfigSnapshots.ofBackfill(_, start.txnAppId)).foreach { created =>
+        val broken = ConfigVersion.breakingChanges(created.content, config).filter(_.breaksBronze)
+        if (broken.nonEmpty)
+          throw RunFailedException.permanent(
+            s"the configuration of ${source.id} changed since the run ${backfill.createdBy} " +
+              s"created the backfill ${start.txnAppId}, in a way that what the backfill has " +
+              s"read cannot follow: ${broken.map(_.message).mkString("; ")}. Nothing was " +
+              "planned, read or written, and a chunk that a run left planned is as it was. A " +
+              "backfill is held to the configuration that it was created with, which is in " +
+              s"control.config_snapshot under the hash ${created.hash}, and which a reset of " +
+              "the state of the source does not change: give the source that one, and run " +
+              "the backfill again; or read what is left of its range as a backfill of its " +
+              "own, under another id"
+          )
+      }
+
+    /** A backfill that is complete: there is nothing more of it to read. */
+    private def complete(backfill: BackfillRecord): Outcome = {
+      log.info(
+        s"the backfill ${start.txnAppId} is complete: it has read (${backfill.from}, " +
+          s"${backfill.to}], and the run ${start.id} has nothing to read"
+      )
+      if (leased.finish(RunEnd.Succeeded(Idle))) Outcome.NothingNew(start.id)
+      else fenced(start, "another run ended it")
+    }
+
+    /** Plans the next chunk of a backfill, from where its last one left it, and ingests it. */
+    private def nextChunk(backfill: BackfillRecord, planner: RangePlanner): Outcome = {
+      val range = BackfillRange
+        .of(backfill.from, backfill.to)
+        .fold(
+          problem =>
+            throw new IllegalStateException(
+              s"the backfill ${start.txnAppId} has a range that no backfill is made with: $problem"
+            ),
+          identity
+        )
+      planner.chunk(range, backfill.chunk, backfill.progress.map(_.watermark)) match {
+        case None =>
+          throw new IllegalStateException(
+            s"the backfill ${start.txnAppId} has read its range $range, and is not complete: " +
+              "the commit of the chunk that ends its range completes it"
+          )
+        case Some(plan) =>
+          // The write-ahead step, as for any batch.
+          val batch = leased.plan(plan, table)
+          log.info(s"the run ${start.id} planned ${batch.id}, a chunk of its backfill")
+          hooks.at(FaultPoint.AfterPlan, batch)
+          ingest(batch)
+      }
     }
 
     /**
@@ -590,11 +814,23 @@ final class IngestionService(
       val counts = RunCounts(rowsRead = Some(0L), bytesRead = Some(0L))
 
       hooks.at(FaultPoint.BeforeStateCommit, batch)
-      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
-        log.info(s"the run ${start.id} committed ${batch.id}, rolled forward")
+      val last = completes(batch)
+      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files, last)) {
+        log.info(s"the run ${start.id} committed ${batch.id}, rolled forward${completed(last)}")
         Outcome.RolledForward(start.id, batch.id, outputs, counts)
       } else fenced(start, "another run holds it")
     }
+
+    /**
+     * Whether the commit of a batch completes its sequence: the chunk of a backfill whose plan
+     * says that there is no more after it, as it ends the range. The regular sequence is never
+     * complete.
+     */
+    private def completes(batch: PlannedBatch): Boolean =
+      start.backfill.nonEmpty && bound.more(batch.plan).isEmpty
+
+    private def completed(last: Boolean): String =
+      if (last) s", and the backfill ${start.txnAppId} is complete" else ""
 
     private def has(in: TableLocation, batch: PlannedBatch): Boolean =
       tables.lastVersion(in, batch.id.app).exists(_ >= batch.id.seq.value)
@@ -707,14 +943,16 @@ final class IngestionService(
         readByThisRun: Boolean
     ): Outcome = {
       hooks.at(FaultPoint.BeforeStateCommit, batch)
-      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files)) {
-        log.info(s"the run ${start.id} committed ${batch.id}")
-        // What comes after: what the plan says, for a plan of this run's. For one that a run
-        // before it planned, under a horizon that was not this invocation's, a plan made
-        // anew; unless the plan is its source whole and this run has just read it, which is
-        // what a plan made anew would read.
+      val last = completes(batch)
+      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files, last)) {
+        log.info(s"the run ${start.id} committed ${batch.id}${completed(last)}")
+        // What comes after: what the plan says, for a plan of this run's, and for a chunk of a
+        // backfill, whose range is the same whoever planned it. For a batch that a run before
+        // this one planned, under a horizon that was not this invocation's, a plan made anew;
+        // unless the plan is its source whole and this run has just read it, which is what a
+        // plan made anew would read.
         val next =
-          if (batch.plannedBy == start.id)
+          if (batch.plannedBy == start.id || start.backfill.nonEmpty)
             bound.more(batch.plan).fold[Outcome.Next](Outcome.Next.Ends)(Outcome.Next.Within)
           else if (readByThisRun && bound.wholeWhenRead(batch.plan)) Outcome.Next.Ends
           else Outcome.Next.Afresh
@@ -928,7 +1166,11 @@ object IngestionService {
        */
       case object Ends extends Next
 
-      /** The plan says that there is more, and the next run plans against this horizon. */
+      /**
+       * The plan says that there is more, and the next run plans against this horizon. For a
+       * chunk of a backfill, it is the end of its range, which the next run of the backfill
+       * has already.
+       */
       final case class Within(horizon: Json) extends Next
 
       /**

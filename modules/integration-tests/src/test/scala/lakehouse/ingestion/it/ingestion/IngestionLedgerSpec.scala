@@ -1,5 +1,7 @@
 package lakehouse.ingestion.it.ingestion
 
+import java.time.Instant
+
 import io.circe.Json
 import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
 import lakehouse.ingestion.it.ingestion.IngestionLedger._
@@ -380,5 +382,117 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
     found.map(_.message) shouldBe Seq(
       s"the run $r1 wrote and committed batch 1, and says 3 rows written; $T has 2"
     )
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // The sequence of a backfill (P7.6)
+  // -----------------------------------------------------------------------------------------------
+
+  private def day(n: Int): Instant = Instant.parse(f"2025-01-$n%02dT00:00:00Z")
+  private def reached(at: Instant) = Some(Json.obj("value" -> Json.fromString(at.toString)))
+
+  private def chunk(seq: Long, status: BatchStatus, from: Int, to: Int, by: Option[RunId] = None) =
+    Batch(
+      seq,
+      status,
+      T,
+      by,
+      by.fold(Seq.empty[Output])(_ => Seq(Output(T, Some(2 + seq)))),
+      watermark = reached(day(to)),
+      window = Some(Window(Some(day(from)), day(to)))
+    )
+
+  // The runs of a backfill of (1 January, 4 January], in chunks of a day. b2 died with chunk 2
+  // planned, and it was given up: b3 read the same day again. Chunk 4 had no rows.
+  private val b1, b2, b3, b4 = RunId.generate()
+  private def backfillRun(id: RunId, seq: Long, status: RunStatus, rows: Option[Long] = None) =
+    Run(id, Some(seq), status, rows, RunKind.Backfill)
+
+  private val backfilled = Facts(
+    batches = Seq(
+      chunk(1, BatchStatus.Committed, 1, 2, Some(b1)),
+      chunk(2, BatchStatus.Abandoned, 2, 3),
+      chunk(3, BatchStatus.Committed, 2, 3, Some(b3)),
+      chunk(4, BatchStatus.Committed, 3, 4, Some(b4)).copy(outputs = Nil)
+    ),
+    runs = Seq(
+      backfillRun(b1, 1, RunStatus.Succeeded, Some(2)),
+      backfillRun(b2, 2, RunStatus.Failed),
+      backfillRun(b3, 3, RunStatus.Succeeded, Some(1)),
+      backfillRun(b4, 4, RunStatus.Succeeded, Some(0))
+    ),
+    state = Some(State(reached(day(4)), 4, b4)),
+    taken = Set.empty,
+    data = Seq(
+      Table(
+        T,
+        Seq(Commit(3, Seq(1)), Commit(5, Seq(3))),
+        keptFrom = Some(0),
+        lastTxn = Some(3),
+        rows = Seq(Rows(b1.toString, 1, 2), Rows(b3.toString, 3, 1))
+      )
+    ),
+    quarantine = Table(Q),
+    backfill = Some(Backfill(day(1), day(4), complete = true))
+  )
+
+  /** The same backfill with chunk 4 planned, by a run that died: it is not complete. */
+  private val backfilling = backfilled.copy(
+    batches = backfilled.batches.init :+ chunk(4, BatchStatus.Planned, 3, 4),
+    runs = backfilled.runs.init :+ backfillRun(b4, 4, RunStatus.Abandoned),
+    state = Some(State(reached(day(3)), 3, b3)),
+    backfill = Some(Backfill(day(1), day(4), complete = false))
+  )
+
+  private def window(facts: Facts, seq: Long)(lower: Instant, upper: Instant): Facts =
+    batch(facts, seq)(_.copy(window = Some(Window(Some(lower), upper))))
+
+  test("a backfill whose chunks follow each other to the end of its range breaks no rule") {
+    IngestionLedger.check(backfilled) shouldBe empty
+  }
+
+  test("a backfill with a chunk planned, by a run that died, is not complete, and breaks no rule") {
+    IngestionLedger.check(backfilling) shouldBe empty
+  }
+
+  test("chunks that leave a gap, read a moment twice, end past the range, or have no window") {
+    val gap = window(backfilled, 3)(day(2).plusSeconds(3600), day(3))
+    rules(gap) shouldBe Set(Rule.ChunksNotTiled)
+    IngestionLedger.check(gap).map(_.message) shouldBe Seq(
+      "chunk 3 starts at 2025-01-02T01:00:00Z, and the chunks committed before it read up to " +
+        "2025-01-02T00:00:00Z"
+    )
+    rules(window(backfilled, 3)(day(1), day(3))) shouldBe Set(Rule.ChunksNotTiled)
+    // A chunk given up starts where the one before it ended, as the one that reads it again.
+    rules(window(backfilled, 2)(day(1), day(3))) shouldBe Set(Rule.ChunksNotTiled)
+    rules(window(backfilling, 4)(day(3), day(5))) shouldBe Set(Rule.ChunksNotTiled)
+    IngestionLedger.check(window(backfilling, 4)(day(3), day(5))).map(_.message) shouldBe Seq(
+      "chunk 4 ends at 2025-01-05T00:00:00Z, outside (2025-01-03T00:00:00Z, 2025-01-04T00:00:00Z]"
+    )
+    rules(window(backfilling, 4)(day(3), day(3))) shouldBe Set(Rule.ChunksNotTiled)
+    rules(batch(backfilling, 4)(_.copy(window = None))) shouldBe Set(Rule.ChunksNotTiled)
+  }
+
+  test(
+    "a backfill complete short of the end of its range, and one read to its end and not complete"
+  ) {
+    rules(backfilling.copy(backfill = Some(Backfill(day(1), day(4), complete = true)))) shouldBe
+      Set(Rule.CompleteNotAsRead)
+    rules(backfilled.copy(backfill = Some(Backfill(day(1), day(4), complete = false)))) shouldBe
+      Set(Rule.CompleteNotAsRead)
+    IngestionLedger
+      .check(backfilling.copy(backfill = Some(Backfill(day(1), day(4), complete = true))))
+      .map(_.message) shouldBe Seq(
+      "the backfill is complete, and its chunks committed read up to 2025-01-03T00:00:00Z, " +
+        "short of 2025-01-04T00:00:00Z"
+    )
+  }
+
+  test("the progress of a backfill is that of its last chunk committed, by the run that did") {
+    rules(backfilled.copy(state = Some(State(reached(day(3)), 3, b3)))) shouldBe
+      Set(Rule.StateNotOfLastBatch)
+    rules(backfilled.copy(state = Some(State(reached(day(4)), 4, b3)))) shouldBe
+      Set(Rule.StateNotOfLastBatch)
+    rules(backfilled.copy(state = None)) shouldBe Set(Rule.StateNotOfLastBatch)
   }
 }

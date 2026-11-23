@@ -6,6 +6,7 @@ import java.time.temporal.ChronoUnit
 import java.time.{Instant, OffsetDateTime}
 import java.util.{Properties, TimeZone}
 
+import scala.concurrent.duration._
 import scala.util.Using
 
 import io.circe.Json
@@ -14,7 +15,7 @@ import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.LandedFile
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.core.state.StoredWatermark
-import lakehouse.ingestion.core.watermark.{WatermarkHorizon, WatermarkPlan}
+import lakehouse.ingestion.core.watermark.{BackfillRange, WatermarkHorizon, WatermarkPlan}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.PostgresJdbc
@@ -969,6 +970,77 @@ final class JdbcSourceConnectorSpec
     // The source was asked nothing, and in UTC the window is read.
     everyStatementSince(mark) shouldBe empty
     idsOf(windowRead(changes, window).rows) shouldBe Seq(3, 4)
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The chunks of a backfill (P7.6)
+  // ---------------------------------------------------------------------------------------------
+
+  private val From = Instant.parse("2026-11-01T00:00:00Z")
+  private val To = Instant.parse("2026-11-03T00:00:00Z")
+
+  private def planner(of: Source): RangePlanner = bound(of).ranges.value
+
+  private def chunkOf(of: Source, progress: Option[Instant]): Option[WatermarkPlan] =
+    planner(of)
+      .chunk(
+        BackfillRange.of(From, To).value,
+        1.day,
+        progress.map(StoredWatermark(_).toJson)
+      )
+      .map(WatermarkPlan.fromJson(_).value)
+
+  test("a backfill of a load by a watermark is planned in windows of its column, a chunk each") {
+    // A table read whole has no range to backfill.
+    bound(source("public.changes")).ranges shouldBe None
+    // Where its range ends, at the latest: the clock of the source less the margin.
+    val changes = byWatermark()
+    val before = clockOfTheSource()
+    val horizon = planner(changes).horizon()
+    val after = clockOfTheSource()
+    val said = horizon.plus(1, ChronoUnit.HOURS)
+    withClue(s"the source said $said, between $before and $after: ") {
+      said.isBefore(before.minusSeconds(5)) shouldBe false
+      said.isAfter(after.plusSeconds(5)) shouldBe false
+    }
+
+    // Each chunk starts where the last ended, the first after from; the last ends at to.
+    val first = chunkOf(changes, progress = None).value
+    (first.column.value, first.lower, first.upper, first.horizon) shouldBe
+      (("updated_at", Some(From), From.plus(1, ChronoUnit.DAYS), To))
+    bound(changes).more(first.toJson) shouldBe Some(WatermarkHorizon(To).toJson)
+    bound(changes).progress(first.toJson) shouldBe
+      Progress(watermark = Some(StoredWatermark(first.upper).toJson), files = None)
+    val last = chunkOf(changes, progress = Some(first.upper)).value
+    (last.lower, last.upper) shouldBe ((Some(first.upper), To))
+    bound(changes).more(last.toJson) shouldBe None
+    chunkOf(changes, progress = Some(To)) shouldBe None
+
+    // Where the regular sequence starts, and what it reads again, bound no chunk.
+    val started = source(
+      "public.changes",
+      load = "{ mode: incremental, watermark: { column: updated_at, safety_margin: 1h, " +
+        "lookback: 6h, start: \"2026-11-02T12:00:00Z\" } }"
+    )
+    chunkOf(started, progress = None).value.lower shouldBe Some(From)
+    chunkOf(started, progress = Some(first.upper)).value.lower shouldBe Some(first.upper)
+  }
+
+  test("no chunk is planned from a table that has not its column, nor from another progress") {
+    val missing = byWatermark(column = "modified_at")
+    val refused = intercept[RunFailedException](chunkOf(missing, progress = None))
+    refused.failure shouldBe FailureClass.Permanent
+    refused.getMessage should include(
+      "has no column modified_at (load.watermark.column)"
+    )
+    refused.getMessage should endWith("Nothing was planned")
+
+    val changes = byWatermark()
+    val guessed = intercept[RunFailedException](
+      planner(changes).chunk(BackfillRange.of(From, To).value, 1.day, Some(Json.fromString("noon")))
+    )
+    guessed.failure shouldBe FailureClass.Permanent
+    guessed.getMessage should include("is not one that this application wrote")
   }
 
   // ---------------------------------------------------------------------------------------------

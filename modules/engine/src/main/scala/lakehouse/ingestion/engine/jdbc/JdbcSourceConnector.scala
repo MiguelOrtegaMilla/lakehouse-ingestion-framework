@@ -3,6 +3,7 @@ package lakehouse.ingestion.engine.jdbc
 import java.time.{Duration => Span, Instant, ZoneId, ZoneOffset}
 import java.util.Locale
 
+import scala.concurrent.duration.FiniteDuration
 import scala.util.Try
 import scala.util.control.NonFatal
 
@@ -24,11 +25,17 @@ import lakehouse.ingestion.core.config.{
 }
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.core.state.StoredWatermark
-import lakehouse.ingestion.core.watermark.{WatermarkHorizon, WatermarkPlan, WatermarkPlanner}
+import lakehouse.ingestion.core.watermark.{
+  BackfillRange,
+  WatermarkHorizon,
+  WatermarkPlan,
+  WatermarkPlanner
+}
 import lakehouse.ingestion.engine.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
   Progress,
+  RangePlanner,
   ReadContext,
   ReadResult,
   SourceConnector
@@ -59,6 +66,11 @@ import org.slf4j.LoggerFactory
  * the upper bound of its plan, whatever the rows were, and though there were none. A window
  * that has no moment in it, since the source has been read up to where it may be, is no
  * batch: the run ends well, with nothing read.
+ *
+ * '''A backfill of such a source is read in windows as well''' (ADR-0021 §5, `ranges`): each
+ * chunk is a window of the same column, planned by the same planner with the range of the
+ * backfill as its bounds, and read and recorded as any window. A table loaded whole has no
+ * range to backfill.
  *
  * '''A plan is read under the load that it was planned under.''' A window is not read as a
  * table, nor a table as a window, nor a window of one column under another: the source is
@@ -123,17 +135,7 @@ final class JdbcSourceConnector(secrets: SecretResolver)
         val (said, clock) = asked(source, config) { database =>
           (database.columns(config.table), if (chain.isEmpty) Some(database.clock()) else None)
         }
-        val columns = kept(source, config, said)
-        val column = incremental.watermark.column.value
-        WatermarkColumn.check(columns, column) match {
-          case Left(problem) =>
-            throw RunFailedException.permanent(
-              s"the table ${config.table} of ${where(source, config)} $problem. Nothing was " +
-                "planned"
-            )
-          case Right(warnings) =>
-            warnings.foreach(text => log.warn(s"${source.id}: in the table ${config.table}, $text"))
-        }
+        windowed(source, config, incremental, kept(source, config, said))
         (chain, clock) match {
           case (Some(horizon), _) =>
             windowUpTo(source, incremental, context.watermark, horizon.value, clock = None)
@@ -145,6 +147,35 @@ final class JdbcSourceConnector(secrets: SecretResolver)
         throw RunFailedException.permanent(
           s"${source.id} has the load ${other.mode.name}, which is no load of a table"
         )
+    }
+
+  /**
+   * A backfill reads a range of the watermark of a source loaded by one (ADR-0021 §5), in
+   * chunks that are windows of its watermark column: a chunk is planned as a window is, read
+   * as one, and recorded as one. A table loaded whole has no range to read.
+   */
+  override def ranges(source: Source, config: JdbcConnectorConfig): Option[RangePlanner] =
+    source.load match {
+      case incremental: Load.Incremental =>
+        Some(new RangePlanner {
+          override def horizon(): Instant =
+            horizonBy(source, config, incremental, asked(source, config)(_.clock()))
+
+          override def chunk(
+              range: BackfillRange,
+              chunk: FiniteDuration,
+              progress: Option[Json]
+          ): Option[Json] = {
+            // The table as a window of it needs it, as for the plan of a batch.
+            windowed(source, config, incremental, columnsOf(source, config))
+            val reached = progress.map(storedWatermark(source, _))
+            WatermarkPlanner.chunk(incremental.watermark.column, range, chunk, reached) match {
+              case WatermarkPlanner.Planned(plan) => Some(plan.toJson)
+              case _: WatermarkPlanner.NothingNew => None
+            }
+          }
+        })
+      case _ => None
     }
 
   override def read(
@@ -277,6 +308,28 @@ final class JdbcSourceConnector(secrets: SecretResolver)
       error: Throwable
   ): Option[RunFailedException] =
     JdbcFailures.of(where(source, config), config.connection, error)
+
+  /**
+   * Refuses a table that a window of its watermark column cannot be read from, before a window
+   * is planned: one that has not the column, or has it of another type than a timestamp. What
+   * is only to be warned of, is.
+   *
+   * @throws RunFailedException a permanent failure, with nothing planned
+   */
+  private def windowed(
+      source: Source,
+      config: JdbcConnectorConfig,
+      load: Load.Incremental,
+      columns: Seq[SourceColumn]
+  ): Unit =
+    WatermarkColumn.check(columns, load.watermark.column.value) match {
+      case Left(problem) =>
+        throw RunFailedException.permanent(
+          s"the table ${config.table} of ${where(source, config)} $problem. Nothing was planned"
+        )
+      case Right(warnings) =>
+        warnings.foreach(text => log.warn(s"${source.id}: in the table ${config.table}, $text"))
+    }
 
   /**
    * The columns of the table of a source, asked of the source.
@@ -538,7 +591,23 @@ object JdbcSourceConnector {
       clock: Instant
   ): Option[Json] = {
     stored.foreach(storedWatermark(source, _))
-    val horizon = WatermarkPlanner.horizon(load.watermark, clock) match {
+    windowUpTo(source, load, stored, horizonBy(source, config, load, clock), Some(clock))
+  }
+
+  /**
+   * How far a source may be read by what its clock says: the clock less `safety_margin`
+   * (ADR-0020). It bounds the windows of an invocation, and the range of a backfill when the
+   * backfill is created.
+   *
+   * @throws RunFailedException a permanent failure, if the clock says a time that no plan holds
+   */
+  private def horizonBy(
+      source: Source,
+      config: JdbcConnectorConfig,
+      load: Load.Incremental,
+      clock: Instant
+  ): Instant =
+    WatermarkPlanner.horizon(load.watermark, clock) match {
       case Right(moment) => moment
       case Left(problem) =>
         throw RunFailedException.permanent(
@@ -547,8 +616,6 @@ object JdbcSourceConnector {
             s"outside ${Timestamps.Min} to ${Timestamps.Max}"
         )
     }
-    windowUpTo(source, load, stored, horizon, Some(clock))
-  }
 
   /**
    * The plan of the next window of a source up to a horizon, or none if the source has been

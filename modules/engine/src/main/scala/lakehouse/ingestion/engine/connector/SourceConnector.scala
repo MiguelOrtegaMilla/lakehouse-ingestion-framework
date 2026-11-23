@@ -2,11 +2,13 @@ package lakehouse.ingestion.engine.connector
 
 import java.time.Instant
 
+import scala.concurrent.duration.FiniteDuration
 import scala.reflect.ClassTag
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.{ConnectorConfig, ConnectorKind, RelativePath, Source}
 import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
+import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.RunFailedException
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
@@ -138,6 +140,18 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
   def failure(source: Source, config: C, error: Throwable): Option[RunFailedException] = None
 
   /**
+   * How this connector plans the chunks of a backfill of a source (ADR-0021 §5): none, for a
+   * source that it does not read a range of. It is a capability that a connector does not have
+   * unless it says so, and a source is not backfilled without it.
+   *
+   * What it plans is a batch as any other: its plan is written down, read by `read`, and
+   * recorded by `progress` and `more`. A connector that has it says, of the plan of a chunk,
+   * that there is more while the chunk ends before the end of its range, and that there is no
+   * more once it ends there: that is what completes a backfill.
+   */
+  def ranges(source: Source, config: C): Option[RangePlanner] = None
+
+  /**
    * This connector for one source: none if the source is of another kind. The engine holds a
    * source by what this gives, and never sees `C`.
    */
@@ -165,6 +179,8 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
 
     override def failure(error: Throwable): Option[RunFailedException] =
       SourceConnector.this.failure(source, config, error)
+
+    override def ranges: Option[RangePlanner] = SourceConnector.this.ranges(source, config)
   }
 }
 
@@ -188,6 +204,41 @@ abstract class BoundSource private[connector] (val source: Source) {
 
   /** @see [[SourceConnector.failure]] */
   def failure(error: Throwable): Option[RunFailedException]
+
+  /** @see [[SourceConnector.ranges]] */
+  def ranges: Option[RangePlanner]
+}
+
+/**
+ * How a connector plans the chunks of a backfill of one source (ADR-0021 §5): what time it is
+ * where the rows are stamped, and the next chunk of a range. It plans, and reads nothing: a
+ * chunk is read by `SourceConnector.read`, as any batch.
+ */
+trait RangePlanner {
+
+  /**
+   * Where the range of a backfill that is created now ends, at the latest: the clock of the
+   * source less what its rows may still be stamped behind it (`safety_margin`, ADR-0020). The
+   * source is asked.
+   *
+   * @throws lakehouse.ingestion.engine.RunFailedException with its class, if the source cannot
+   *   be asked, or says a time that no range ends at
+   */
+  def horizon(): Instant
+
+  /**
+   * The plan of the next chunk of a backfill, or none once its progress is at the end of its
+   * range. As `SourceConnector.plan`, it is a function of what it is given and of what the
+   * source has, and asks the source what a plan of it needs to: the table and its columns.
+   *
+   * @param chunk how long a chunk is, at most
+   * @param progress where the last chunk that was committed left the backfill, as this
+   *   connector wrote it (`Progress.watermark`); none before the first
+   * @throws lakehouse.ingestion.engine.RunFailedException with its class, if the source cannot
+   *   be asked, has no table that a chunk can be read from, or the progress is not one that
+   *   this connector wrote
+   */
+  def chunk(range: BackfillRange, chunk: FiniteDuration, progress: Option[Json]): Option[Json]
 }
 
 /**

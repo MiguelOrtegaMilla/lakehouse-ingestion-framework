@@ -19,6 +19,7 @@ import lakehouse.ingestion.core.config.{
   TableLocation
 }
 import lakehouse.ingestion.core.control._
+import lakehouse.ingestion.core.watermark.WatermarkPlan
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector.{ConnectorRegistry, Progress}
 import lakehouse.ingestion.engine.control._
@@ -31,7 +32,8 @@ import lakehouse.ingestion.it.stress.LogReader
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, LocalSparkSuite}
 import org.apache.spark.sql.delta.DeltaLog
-import org.apache.spark.sql.functions.col
+import org.apache.spark.sql.Column
+import org.apache.spark.sql.functions.{col, lit}
 import org.scalatest.Suite
 import org.scalatest.matchers.should.Matchers
 
@@ -243,9 +245,19 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
   protected def connectors: ConnectorRegistry =
     ConnectorRegistry(new FileSourceConnector(new Landing(landingRoot)))
 
-  /** Every way in which the control plane, the tables and the files taken of a source disagree. */
+  /**
+   * Every way in which the control plane, the tables and the files taken of a source disagree,
+   * in each of its sequences: its regular one, and that of each backfill that a run acted on.
+   */
   protected def ledgerViolations(of: Source, earlier: Source*): Seq[Violation] =
-    IngestionLedger.check(ledgerOf(of, earlier: _*))
+    ledgersOf(of, earlier: _*).flatMap { case (app, facts) =>
+      val found = IngestionLedger.check(facts)
+      app.backfill.fold(found) { id =>
+        found.map(violation =>
+          violation.copy(message = s"in the backfill $id, ${violation.message}")
+        )
+      }
+    }
 
   /**
    * Asks the ledger of a source, once no run of it is in flight.
@@ -262,15 +274,52 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
   }
 
   /**
-   * What the control plane, the tables and `processed_file` say of the regular sequence of a
-   * source.
+   * The facts of each sequence of a source: its regular one, always, and that of each backfill
+   * that a run acted on. The tables are the same for all, and each has what is of its sequence:
+   * the commits under its `txnAppId`, and the rows that its runs wrote. A row whose run is of no
+   * sequence is the regular one's, which has no such run.
+   */
+  protected def ledgersOf(of: Source, earlier: Source*): Seq[(TxnAppId, Facts)] = {
+    val regular = TxnAppId.of(of.id, Layer.Bronze)
+    val runs = asSuperuser { c =>
+      query(
+        c,
+        "SELECT run_id::text, txn_app_id FROM control.ingestion_run " +
+          "WHERE source_id = ? AND layer = ?",
+        of.id.value,
+        Layer.Bronze.name
+      )
+    }.map(row => TxnAppId.parse(row(1)).value -> RunId.parse(row(0)).value)
+    val bySequence = runs.groupMap(_._1)(_._2)
+    val sequences = regular +: bySequence.keys.filter(_ != regular).toSeq.sortBy(_.value)
+    sequences.map { app =>
+      val its = bySequence.getOrElse(app, Nil)
+      val others = bySequence.view.filterKeys(_ != app).values.flatten.map(_.toString).toSeq
+      val itsRows: String => Column =
+        if (app != regular) run => col(run).isin(its.map(_.toString): _*)
+        else if (others.isEmpty) _ => lit(true)
+        else run => !col(run).isin(others: _*)
+      app -> ledgerOf(of, earlier, app, its, itsRows)
+    }
+  }
+
+  /**
+   * What the control plane, the tables and `processed_file` say of one sequence of a source.
    *
    * Delta is asked before the log is read as files: a read publishes a commit that a writer took
    * and did not publish (ADR-0004 §3.3), and what is looked at is the table that the next reader
    * gets.
+   *
+   * @param runIds the runs that acted on the sequence
+   * @param itsRows which rows of a table are of the sequence, by the column of their run
    */
-  protected def ledgerOf(of: Source, earlier: Source*): Facts = {
-    val app = TxnAppId.of(of.id, Layer.Bronze)
+  private def ledgerOf(
+      of: Source,
+      earlier: Seq[Source],
+      app: TxnAppId,
+      runIds: Seq[RunId],
+      itsRows: String => Column
+  ): Facts = {
     val bound = (of +: earlier).map(connectors.bind)
     val configured = bronze(of)
 
@@ -312,19 +361,16 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
             )
           }
         }.toSet,
-        reprocessOf = record.reprocessOf.map(_.value)
+        reprocessOf = record.reprocessOf.map(_.value),
+        window = WatermarkPlan
+          .fromJson(record.plan)
+          .toOption
+          .map(window => IngestionLedger.Window(window.lower, window.upper))
       )
     }
 
-    val runs = asSuperuser { c =>
-      query(
-        c,
-        "SELECT run_id::text FROM control.ingestion_run WHERE source_id = ? AND layer = ?",
-        of.id.value,
-        Layer.Bronze.name
-      )
-    }.map { row =>
-      val run = runOf(RunId.parse(row.head).value)
+    val runs = runIds.map { id =>
+      val run = runOf(id)
       IngestionLedger.Run(
         run.start.id,
         run.batch.map(_.value),
@@ -334,25 +380,28 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       )
     }
 
-    val resets = asSuperuser { c =>
-      query(
-        c,
-        "SELECT run_id::text, before::text, after::text FROM control.state_change_log " +
-          "WHERE source_id = ? AND layer = ? ORDER BY change_id",
-        of.id.value,
-        Layer.Bronze.name
-      )
-    }.map { row =>
-      def state(text: String): IngestionLedger.State = {
-        val document = StoredJson.parse(text).value.hcursor
-        IngestionLedger.State(
-          document.downField("watermark").focus.filterNot(_.isNull),
-          document.get[Long]("last_committed_batch_seq").value,
-          RunId.parse(document.get[String]("updated_by_run").value).value
+    // A reset is of the state of the source, which is that of its regular sequence.
+    val resets = app.backfill.fold {
+      asSuperuser { c =>
+        query(
+          c,
+          "SELECT run_id::text, before::text, after::text FROM control.state_change_log " +
+            "WHERE source_id = ? AND layer = ? ORDER BY change_id",
+          of.id.value,
+          Layer.Bronze.name
         )
+      }.map { row =>
+        def state(text: String): IngestionLedger.State = {
+          val document = StoredJson.parse(text).value.hcursor
+          IngestionLedger.State(
+            document.downField("watermark").focus.filterNot(_.isNull),
+            document.get[Long]("last_committed_batch_seq").value,
+            RunId.parse(document.get[String]("updated_by_run").value).value
+          )
+        }
+        IngestionLedger.Reset(RunId.parse(row(0)).value, state(row(1)), state(row(2)))
       }
-      IngestionLedger.Reset(RunId.parse(row(0)).value, state(row(1)), state(row(2)))
-    }
+    }(_ => Nil)
 
     val taken = asSuperuser { c =>
       query(
@@ -371,22 +420,40 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
         EngineColumns.RunId,
         EngineColumns.BatchSeq,
         // A table of several sources has the rows of each: these are the source's.
-        Some(col(EngineColumns.SourceId) === of.id.value)
+        itsRows(EngineColumns.RunId) && col(EngineColumns.SourceId) === of.id.value
       )
     }
-    val apart = ledgerTable(quarantine(of).uri, app, Quarantine.RunId, Quarantine.BatchSeq, None)
+    val apart =
+      ledgerTable(
+        quarantine(of).uri,
+        app,
+        Quarantine.RunId,
+        Quarantine.BatchSeq,
+        itsRows(Quarantine.RunId)
+      )
 
-    Facts(
-      batches,
-      runs,
-      stateOf(of).map(state =>
-        IngestionLedger.State(state.watermark, state.lastCommitted.value, state.updatedBy)
-      ),
-      taken,
-      data,
-      apart,
-      resets
-    )
+    // The state of the sequence: that of the source, or the progress of the backfill.
+    val (state, backfill) = app.backfill match {
+      case None =>
+        val state = stateOf(of).map(state =>
+          IngestionLedger.State(state.watermark, state.lastCommitted.value, state.updatedBy)
+        )
+        (state, None)
+      case Some(id) =>
+        database.run(Backfills.find(_, of.id, Layer.Bronze, id)) match {
+          case None => (None, None)
+          case Some(record) =>
+            val progress = record.progress.map { at =>
+              IngestionLedger.State(Some(at.watermark), at.lastCommitted.value, at.updatedBy)
+            }
+            (
+              progress,
+              Some(IngestionLedger.Backfill(record.from, record.to, record.completedAt.nonEmpty))
+            )
+        }
+    }
+
+    Facts(batches, runs, state, taken, data, apart, resets, backfill)
   }
 
   private def ledgerTable(
@@ -394,7 +461,7 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       app: TxnAppId,
       run: String,
       batch: String,
-      ofTheSource: Option[org.apache.spark.sql.Column]
+      itsRows: Column
   ): IngestionLedger.Table = {
     val directory = Paths.get(URI.create(uri))
     if (!Files.isDirectory(directory.resolve("_delta_log"))) IngestionLedger.Table(uri)
@@ -405,9 +472,10 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       val lastTxn = delta.lastVersion(location, app)
       val log = LogReader.logView(spark, directory)
       withClue(s"the log of $uri: ")(log.unreadable shouldBe empty)
-      val all = spark.read.format("delta").load(uri)
-      val rows = ofTheSource
-        .fold(all)(all.filter)
+      val rows = spark.read
+        .format("delta")
+        .load(uri)
+        .filter(itsRows)
         .groupBy(col(run), col(batch))
         .count()
         .collect()
