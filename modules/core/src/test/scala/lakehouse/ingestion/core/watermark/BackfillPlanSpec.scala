@@ -105,6 +105,23 @@ final class BackfillPlanSpec extends AnyFunSuite with Matchers with EitherValues
       "still commit rows. A range that ends at 2024-01-01T09:59:59.999999Z or before is read"
   }
 
+  test("what the regular sequence reads of a range too is the part after start, or all of it") {
+    // With no start, the regular sequence reads every row: all of the range.
+    range().readByRegular(None) shouldBe Some(range())
+    // A range that ends at start or before it is the backfill's alone: the first window of the
+    // regular sequence starts at start, and does not hold it.
+    range().readByRegular(Some(To)) shouldBe None
+    range().readByRegular(Some(at("2024-02-01T00:00:00Z"))) shouldBe None
+    // One that crosses start is read twice after it, and one after start is read twice whole.
+    range().readByRegular(Some(at("2024-01-01T04:00:00Z"))) shouldBe
+      Some(range(from = at("2024-01-01T04:00:00Z")))
+    range().readByRegular(Some(From)) shouldBe Some(range())
+    range().readByRegular(Some(at("2023-06-01T00:00:00Z"))) shouldBe Some(range())
+    // A start one microsecond before to leaves that microsecond read twice.
+    range().readByRegular(Some(To.minusNanos(1000))).map(_.toString) shouldBe
+      Some(s"(${To.minusNanos(1000)}, $To]")
+  }
+
   test("a range is made by of alone: there is no apply nor copy that skips its rules") {
     // Compiled or not, as the abstract case class has it: the two lines below do not compile,
     // and the one way that does is of, which says why it refuses.

@@ -4,7 +4,8 @@ import java.io.PrintStream
 import java.nio.file.Paths
 
 import lakehouse.ingestion.core.config._
-import lakehouse.ingestion.core.control.{BatchSeq, OperatorRequest}
+import lakehouse.ingestion.core.control.{BackfillId, BackfillRequest, BatchSeq, OperatorRequest}
+import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.control.DatabaseFailure
 import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
 
@@ -98,6 +99,10 @@ object Main {
        |                               --source <id> --reason <text>
        |                               (--watermark <moment> | --forget-watermark
        |                                | --keep-watermark)
+       |       lakehouse-ingestion backfill --profile <file> --sources <directory>
+       |                               --source <id> --backfill <id> --from <moment>
+       |                               --to <moment> [--chunk <duration>] --reason <text>
+       |                               [--max-batches <n>]
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
@@ -121,6 +126,14 @@ object Main {
        |              compared with, which lets a change through that a run refuses. The
        |              numbers of its batches go on, and the files it took stay taken. A run of
        |              its own, as abandon-batch is.
+       |  backfill    Reads the range (from, to] of the watermark column of a source: the rows
+       |              whose watermark is from exactly are not read, and those at to are. It is
+       |              read on a sequence of its own, a chunk a run, beside the regular runs of
+       |              the source, which it neither waits for nor moves the state of. The first
+       |              invocation under an id creates the backfill; each after it, with the same
+       |              arguments, resumes it, until it is complete. What the regular runs read
+       |              of the range too is in Bronze twice, and is warned of. Its runs say who
+       |              asked and why, and are chained and stopped as those of run are.
        |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
@@ -128,7 +141,8 @@ object Main {
        |  --password  where the password of that role is, and never the password itself:
        |              env:NAME or file:/run/secrets/name
        |  --user      the role that owns the schemas; $Migrator unless said
-       |  --max-batches  the most batches that run commits; no limit unless said
+       |  --max-batches  the most batches that run commits, or chunks that backfill does;
+       |              no limit unless said
        |  --batch     abandon-batch: the number of the batch to give up, the one that is
        |              planned; reprocess: that of the committed batch whose files are read
        |  --reason    why, in one line: kept with the run and with the batch
@@ -137,11 +151,22 @@ object Main {
        |  --forget-watermark  the next run plans as a source with no watermark does
        |  --keep-watermark  the watermark stays; only what later runs are compared with is
        |              reset. Its risks are warned of
+       |  --backfill  the id of the backfill, as history-2024: lower-case letters, digits, '.',
+       |              '_' and '-'
+       |  --from      where the range starts, as 2025-01-01T00:00:00Z: it is not in the range,
+       |              and a row whose watermark is from exactly is not read
+       |  --to        where the range ends, which is in it: no later than the clock of the
+       |              source less its safety_margin
+       |  --chunk     how much of the watermark a chunk reads, as a configuration writes it: 7d,
+       |              6h. max_batch_range of the source unless said; the backfill's own when it
+       |              is resumed
        |
        |exit codes: 0 the configuration is valid, the schemas are at their version, the run
        |              ended well (a batch committed, nothing new, or a source that is
-       |              disabled), the batch was given up or reprocessed, or the state was reset;
-       |            2 another run holds the lease of the source: nothing was done;
+       |              disabled), the backfill ended well (chunks committed, or it is
+       |              complete), the batch was given up or reprocessed, or the state was reset;
+       |            2 another run holds the lease of the source, or of the backfill: nothing
+       |              was done;
        |            3 a database could not be reached, the run lost its lease, its batch was
        |              given up, or a table could not be read, and running again later may do;
        |            4 the configuration is not valid, a database refused, the run failed for a
@@ -149,11 +174,13 @@ object Main {
        |              none is planned, another is, or its table has it, or the state was not
        |              reset: a batch is planned, the source has no state, or no such
        |              watermark, or the batch was not reprocessed: it was not committed, read
-       |              no files, or another is planned;
+       |              no files, or another is planned, or the backfill was refused: its source
+       |              reads no range, it has no chunk, to has not settled, its id has another
+       |              range or chunk, or its configuration changed in a way it cannot follow;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
-       |            128 + n run was stopped by the signal n before its first run: nothing was
-       |              run. A run stopped after one ends in the code of its last run""".stripMargin
+       |            128 + n run or backfill was stopped by the signal n before its first run:
+       |              nothing was run. One stopped after a run ends in the code of its last""".stripMargin
 
   def main(args: Array[String]): Unit =
     sys.exit(run(args.toSeq, System.out, System.err, sys.env.get, Stop.onSignals(System.err)))
@@ -204,14 +231,7 @@ object Main {
           optional = Set("--max-batches")
         )
         source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
-        limit <- found.get("--max-batches") match {
-          case None => Right(None)
-          case Some(text) =>
-            text.toIntOption
-              .filter(n => n >= 1 && text == n.toString)
-              .map(Some(_))
-              .toRight(s"--max-batches '${shown(text)}' is not a number of batches, from 1")
-        }
+        limit <- maxBatchesOf(found.get("--max-batches"))
       } yield (found("--profile"), found("--sources"), source, limit)
       asked match {
         case Right((profile, sources, source, limit)) =>
@@ -307,12 +327,77 @@ object Main {
           )
         case Left(problem) => usage(problem, err)
       }
+    case "backfill" :: options =>
+      val asked = for {
+        found <- parse(
+          options,
+          Set("--profile", "--sources", "--source", "--backfill", "--from", "--to", "--reason"),
+          optional = Set("--chunk", "--max-batches")
+        )
+        source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
+        id <- BackfillId
+          .parse(found("--backfill"))
+          .left
+          .map(reason => s"--backfill '${shown(found("--backfill"))}' $reason")
+        from <- momentOf("--from", found("--from"))
+        to <- momentOf("--to", found("--to"))
+        range <- BackfillRange.of(from, to).left.map(reason => s"--from and --to: $reason")
+        chunk <- found.get("--chunk") match {
+          case None => Right(None)
+          case Some(text) =>
+            Durations
+              .parse(text)
+              .filterOrElse(_.toMillis > 0, "is no stretch of time: a chunk is 1ms at least")
+              .map(Some(_))
+              .left
+              .map(reason => s"--chunk '${shown(text)}' $reason")
+        }
+        limit <- maxBatchesOf(found.get("--max-batches"))
+        request <- OperatorRequest.of(operator, found("--reason"))
+      } yield (
+        found("--profile"),
+        found("--sources"),
+        source,
+        BackfillRequest(id, range, chunk),
+        request,
+        limit
+      )
+      asked match {
+        case Right((profile, sources, source, backfill, request, limit)) =>
+          BackfillCommand.run(
+            Paths.get(profile),
+            Paths.get(sources),
+            source,
+            backfill,
+            request,
+            SecretResolver(environment),
+            out,
+            err,
+            limit,
+            stop
+          )
+        case Left(problem) => usage(problem, err)
+      }
     case ("--help" | "-h" | "help") :: Nil =>
       out.println(Usage)
       Exit.Ok
     case Nil => usage("no command", err)
     case command :: _ => usage(s"'${shown(command)}' is not a command", err)
   }
+
+  /** How many batches an invocation commits at most, from 1: none, for no limit. */
+  private def maxBatchesOf(given: Option[String]): Either[String, Option[Int]] = given match {
+    case None => Right(None)
+    case Some(text) =>
+      text.toIntOption
+        .filter(n => n >= 1 && text == n.toString)
+        .map(Some(_))
+        .toRight(s"--max-batches '${shown(text)}' is not a number of batches, from 1")
+  }
+
+  /** A moment of an option, as `load.watermark.start` is written. */
+  private def momentOf(option: String, text: String): Either[String, java.time.Instant] =
+    Timestamps.parse(text).left.map(reason => s"$option '${shown(text)}' $reason")
 
   /** The number of a batch, from 1, written as a number is and no other way. */
   private def batchOf(text: String): Either[String, BatchSeq] =

@@ -44,6 +44,25 @@ sealed abstract case class BackfillRange private (from: Instant, to: Instant) {
   /** Whether `at` is in the range: after `from`, and not after `to`. */
   def holds(at: Instant): Boolean = at.isAfter(from) && !at.isAfter(to)
 
+  /**
+   * The part of the range that the regular sequence of the source reads too (ADR-0021 §5.8). It
+   * reads every row after `load.watermark.start`, or every row if the source has no `start`,
+   * window by window up to the present, which is after `to`. So that part is read twice, or will
+   * be, unless a reset of the state took the watermark of the source past it, and Bronze has
+   * each of its rows once for each sequence, each copy with its run. It is warned of, and not
+   * refused: whether a copy is wanted is the operator's to say.
+   *
+   * @param start `load.watermark.start` of the source; none, if it has none
+   * @return `(max(from, start), to]`; none, if the range ends at `start` or before it, where the
+   *   first window of the regular sequence starts and does not hold it
+   */
+  def readByRegular(start: Option[Instant]): Option[BackfillRange] = start match {
+    case None => Some(this)
+    case Some(begin) if !to.isAfter(begin) => None
+    case Some(begin) if begin.isAfter(from) => Some(new BackfillRange(begin, to) {})
+    case Some(_) => Some(this)
+  }
+
   override def toString: String = s"($from, $to]"
 }
 
