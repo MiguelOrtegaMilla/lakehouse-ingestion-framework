@@ -19,14 +19,48 @@ object Layer {
 }
 
 /**
- * What a lease is taken on: the state of one source in one layer, `<source_id>/<layer>`
- * (ADR-0006). Whoever holds the lease of a key is the one run that may advance that state.
+ * What an operator calls a backfill (ADR-0021 §5): a sequence of batches of its own, which reads
+ * a range of the watermark of a source beside its regular sequence. The operator gives it, and
+ * the command creates the backfill the first time and resumes it each time after: an id that
+ * the application made would have an orchestrator that runs the command again create another.
+ *
+ * It is unique within its source and layer, and is a segment of the name of the sequence, so it
+ * has no `/`. It is written in lower case, as an id of a source is, so that two ids that differ
+ * in their case alone are not two backfills to a person and one to a reader that ignores case:
+ * letters, digits, `.`, `_` and `-`, starting with a letter or a digit, as `history-2024`.
+ */
+final class BackfillId private (val value: String) extends AnyVal {
+  override def toString: String = value
+}
+
+object BackfillId {
+
+  val MaxLength = 63
+
+  private val Written = """[a-z0-9][a-z0-9._-]*""".r
+
+  def parse(text: String): Either[String, BackfillId] =
+    if (text.isEmpty) Left("is empty")
+    else if (text.length > MaxLength)
+      Left(s"is ${text.length} characters long, and an id is $MaxLength at most")
+    else if (Written.matches(text)) Right(new BackfillId(text))
+    else
+      Left(
+        "must be lower-case letters, digits, '.', '_' and '-', starting with a letter or a " +
+          "digit, as history-2024"
+      )
+}
+
+/**
+ * What a lease is taken on: a sequence of batches of one source in one layer (ADR-0006). The
+ * key is the name of the sequence, as its `TxnAppId` has it: `<source_id>/<layer>` for the
+ * regular one, and `<source_id>/<layer>/backfill/<backfill_id>` for a backfill (ADR-0021 §5).
+ * Whoever holds the lease of a key is the one run that may advance the state of its sequence:
+ * the state of the source, or the progress of the backfill.
  *
  * It is not a lock on a table. Several sources may write one table at the same time, each
- * under its own key; keeping their commits apart is the LogStore's work (ADR-0004).
- *
- * A backfill has a key of its own, `backfill/<backfill_id>`, since it does not touch the
- * incremental state. That form comes with backfills (P7).
+ * under its own key, and so may a backfill beside the regular sequence of its own source;
+ * keeping their commits apart is the LogStore's work (ADR-0004).
  */
 final class LeaseKey private (val value: String) extends AnyVal {
   override def toString: String = value
@@ -34,36 +68,51 @@ final class LeaseKey private (val value: String) extends AnyVal {
 
 object LeaseKey {
 
-  def of(source: SourceId, layer: Layer): LeaseKey = new LeaseKey(s"$source/$layer")
+  def of(source: SourceId, layer: Layer): LeaseKey = new LeaseKey(Keys.regular(source, layer))
+
+  /** The key of the lease of a backfill: the name of its sequence. */
+  def backfill(source: SourceId, layer: Layer, id: BackfillId): LeaseKey =
+    new LeaseKey(Keys.backfill(source, layer, id))
 
   /** A key as it is read back from the database. */
   def parse(text: String): Either[String, LeaseKey] =
-    Keys.sourceAndLayer(text).map { case (source, layer) => of(source, layer) }
+    Keys.sequence(text).map(_ => new LeaseKey(text))
 }
 
 /**
- * The name under which the batches of one source in one layer are written to Delta,
- * `<source_id>/<layer>` (ADR-0005 §2). Delta keeps, in the log of each table, the last
- * `txnVersion` it committed for each such name, and skips a write that is not beyond it: that
- * is what makes a batch that is written twice a batch that is in the table once.
+ * The name under which the batches of a sequence are written to Delta (ADR-0005 §2):
+ * `<source_id>/<layer>` for the regular sequence of a source in a layer, and
+ * `<source_id>/<layer>/backfill/<backfill_id>` for a backfill of it (ADR-0021 §5). Delta keeps,
+ * in the log of each table, the last `txnVersion` it committed for each such name, and skips a
+ * write that is not beyond it: that is what makes a batch that is written twice a batch that is
+ * in the table once.
  *
- * It is by source and layer, not by table. Several sources write one table, and each needs a
- * sequence of its own. For a regular run it is the same text as the key of its lease, and it is
- * another thing: the key says who may advance the state, and this says which sequence a write
- * belongs to. A backfill has a name of its own, so that it runs next to the incremental load of
- * the same table without either disturbing the other's sequence; that form comes in P7.
+ * It is by sequence, not by table. Several sources write one table, and each needs a sequence of
+ * its own; a backfill has one so that it runs next to the incremental load of the same table
+ * without either disturbing the other's numbers. It is the same text as the key of the lease of
+ * the sequence, and it is another thing: the key says who may advance the state, and this says
+ * which sequence a write belongs to.
  */
 final class TxnAppId private (val value: String) extends AnyVal {
+
+  /** The backfill whose sequence this is; none for the regular sequence of its source. */
+  def backfill: Option[BackfillId] =
+    Keys.sequence(value).fold(reason => throw new IllegalStateException(reason), _._3)
+
   override def toString: String = value
 }
 
 object TxnAppId {
 
-  def of(source: SourceId, layer: Layer): TxnAppId = new TxnAppId(s"$source/$layer")
+  def of(source: SourceId, layer: Layer): TxnAppId = new TxnAppId(Keys.regular(source, layer))
+
+  /** The name of the sequence of a backfill, which is also the key of its lease. */
+  def backfill(source: SourceId, layer: Layer, id: BackfillId): TxnAppId =
+    new TxnAppId(Keys.backfill(source, layer, id))
 
   /** A name as it is read back from the database. */
   def parse(text: String): Either[String, TxnAppId] =
-    Keys.sourceAndLayer(text).map { case (source, layer) => of(source, layer) }
+    Keys.sequence(text).map(_ => new TxnAppId(text))
 }
 
 /**
@@ -110,14 +159,41 @@ object BatchSeq {
 
 private object Keys {
 
-  /** `<source_id>/<layer>`: an id has no `/`, so there is one way to take the text apart. */
-  def sourceAndLayer(text: String): Either[String, (SourceId, Layer)] =
+  /** The word between the layer and the id, in the name of the sequence of a backfill. */
+  private val Backfill = "backfill"
+
+  def regular(source: SourceId, layer: Layer): String = s"$source/$layer"
+
+  def backfill(source: SourceId, layer: Layer, id: BackfillId): String =
+    s"${regular(source, layer)}/$Backfill/$id"
+
+  /**
+   * `<source_id>/<layer>`, or `<source_id>/<layer>/backfill/<backfill_id>`: no id has a `/`, so
+   * there is one way to take the text apart.
+   */
+  def sequence(text: String): Either[String, (SourceId, Layer, Option[BackfillId])] = {
+    def sourceAndLayer(source: String, layer: String) =
+      for {
+        source <- SourceId.parse(source).left.map(reason => s"has a source id that $reason")
+        layer <- Layer.parse(layer).left.map(reason => s"has a layer that $reason")
+      } yield (source, layer)
+
     text.split("/", -1).toList match {
       case source :: layer :: Nil =>
-        for {
-          source <- SourceId.parse(source).left.map(reason => s"has a source id that $reason")
-          layer <- Layer.parse(layer).left.map(reason => s"has a layer that $reason")
-        } yield (source, layer)
-      case _ => Left("must be <source_id>/<layer>, as sales.orders/bronze")
+        sourceAndLayer(source, layer).map { case (s, l) => (s, l, None) }
+      case source :: layer :: Backfill :: id :: Nil =>
+        sourceAndLayer(source, layer).flatMap { case (s, l) =>
+          BackfillId
+            .parse(id)
+            .left
+            .map(reason => s"has a backfill id that $reason")
+            .map(id => (s, l, Some(id)))
+        }
+      case _ =>
+        Left(
+          "must be <source_id>/<layer>, as sales.orders/bronze, or " +
+            "<source_id>/<layer>/backfill/<backfill_id>, as sales.orders/bronze/backfill/history-2024"
+        )
     }
+  }
 }

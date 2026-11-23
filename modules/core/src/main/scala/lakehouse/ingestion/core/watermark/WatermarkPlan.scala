@@ -2,6 +2,8 @@ package lakehouse.ingestion.core.watermark
 
 import java.time.{Duration => Span, Instant}
 
+import scala.concurrent.duration.{Duration, FiniteDuration}
+
 import cats.syntax.all._
 import io.circe.Json
 import lakehouse.ingestion.core.StoredForm
@@ -247,6 +249,46 @@ object WatermarkPlanner {
         }
         Planned(WatermarkPlan(settings.column, lower, upper, horizon))
     }
+  }
+
+  /**
+   * The next chunk of a backfill, or none once its progress has reached the end of its range
+   * (ADR-0021 §5.5).
+   *
+   * A chunk is a window of ADR-0020 with the same plan, and is planned by `plan`: with the
+   * progress of the backfill as its watermark, `from` as its start, `to` as its horizon, `chunk`
+   * as its `max_batch_range`, and no lookback. So the first chunk starts at `from` and does not
+   * hold it, each next one starts where the last ended, none is longer than `chunk`, and the last
+   * ends at `to` and says that there is no more (`WatermarkPlan.more`).
+   *
+   * What the load of the source says of its watermark is not the backfill's, but for its column:
+   * `start` bounds the regular sequence and not a backfill; `lookback` reads the end of the last
+   * window again, and the chunks of a backfill follow each other with nothing read twice; and
+   * `to` was held to `safety_margin` when the backfill was created (`BackfillRange.settledBy`).
+   *
+   * @param column the watermark column of the source, which the plan names
+   * @param chunk how long a chunk is, at most: whole milliseconds, as a duration of a
+   *   configuration is
+   * @param progress the upper bound of the last chunk that was committed; none before the first
+   * @return the chunk, or `NothingNew` with `to` as its horizon: the backfill is complete
+   * @throws IllegalArgumentException if the chunk is no stretch of time, or the progress is not
+   *   in the range, which no commit of a chunk of it leaves
+   */
+  def chunk(
+      column: SqlIdentifier,
+      range: BackfillRange,
+      chunk: FiniteDuration,
+      progress: Option[StoredWatermark]
+  ): Planning = {
+    require(chunk.toNanos > 0, s"a chunk of $chunk is no stretch of time")
+    progress.foreach { reached =>
+      require(
+        range.holds(reached.value),
+        s"the progress ${reached.value} is not in the range $range, and no chunk of it ends there"
+      )
+    }
+    val settings = Load.Watermark(column, Duration.Zero, Duration.Zero, start = Some(range.from))
+    plan(Load.Incremental(settings, Some(chunk)), progress, range.to)
   }
 
 }
