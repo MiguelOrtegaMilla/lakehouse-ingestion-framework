@@ -6,17 +6,19 @@ import java.nio.file.{Files, Path, Paths}
 import java.time.{Instant, OffsetDateTime, ZoneOffset}
 import java.time.temporal.ChronoUnit
 
+import scala.concurrent.duration._
 import scala.util.Using
 
 import lakehouse.ingestion.core.config.{ConnectorKind, Source}
 import lakehouse.ingestion.core.control._
-import lakehouse.ingestion.core.watermark.WatermarkPlan
-import lakehouse.ingestion.engine.FaultPoint
+import lakehouse.ingestion.core.watermark.{BackfillRange, WatermarkPlan}
+import lakehouse.ingestion.engine.{FaultPoint, IngestionService}
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.engine.operator.OperatorActions
 import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
+import lakehouse.ingestion.it.support.ControlPlaneSchema.update
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -33,8 +35,12 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
 
   private val asked = OperatorRequest.of("ops.oncall", "the plan cannot be run").toOption.get
 
-  private def abandon(of: Source, seq: Long): OperatorActions.Outcome =
-    actions.abandon(of, versionOf(of), BatchSeq.of(seq).value, asked)
+  private def abandon(
+      of: Source,
+      seq: Long,
+      backfill: Option[BackfillId] = None
+  ): OperatorActions.Outcome =
+    actions.abandon(of, versionOf(of), BatchSeq.of(seq).value, asked, backfill)
 
   /** A run of the source that dies at `point`, and whose lease then runs out. */
   private def dies(of: Source, at: FaultPoint): RunId = {
@@ -178,6 +184,87 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
     WatermarkPlan.fromJson(batchOf(next.batch).plan).toOption.get.lower shouldBe planned.lower
     next.counts.rowsWritten shouldBe Some(1)
     assertLedger(window)
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // The chunk of a backfill (P7.7)
+  // -----------------------------------------------------------------------------------------------
+
+  test(
+    "the chunk of a backfill is given up under its lease, and the batch with its number is not"
+  ) {
+    asOwner(
+      execute(
+        _,
+        "CREATE TABLE given_up_chunk (id int PRIMARY KEY, updated_at timestamptz NOT NULL)"
+      )
+    )
+    asOwner(
+      execute(
+        _,
+        "INSERT INTO given_up_chunk VALUES (1, '2025-01-01T12:00:00Z'), (2, '2025-01-02T12:00:00Z')"
+      )
+    )
+    val changes = jdbcSource(
+      "public.given_up_chunk",
+      load = """load:
+               |  mode: incremental
+               |  watermark: { column: updated_at, safety_margin: 1h }""".stripMargin
+    )
+    val history = BackfillId.parse("history").value
+    val request = BackfillRequest(
+      history,
+      BackfillRange
+        .of(Instant.parse("2025-01-01T00:00:00Z"), Instant.parse("2025-01-03T00:00:00Z"))
+        .value,
+      Some(1.day)
+    )
+    def backfill(by: IngestionService): Outcome =
+      by.backfill(changes, versionOf(changes), request, asked)
+    val dying = reading(hookAt(FaultPoint.AfterPlan)(_ => throw new Died))
+    // The batch 1 of the source and the chunk 1 of the backfill, each planned by a run that died.
+    intercept[Died](launch(changes, dying))
+    expire(changes)
+    intercept[Died](backfill(dying))
+    asSuperuser { c =>
+      update(
+        c,
+        "UPDATE control.source_lease SET expires_at = now() - interval '1 second' " +
+          "WHERE lease_key = ?",
+        LeaseKey.backfill(changes.id, Layer.Bronze, history).value
+      ) shouldBe 1
+    }
+    val chunk = BatchId(TxnAppId.backfill(changes.id, Layer.Bronze, history), BatchSeq.of(1).value)
+    val window = WatermarkPlan.fromJson(batchOf(chunk).plan).toOption.get
+
+    val given = done(abandon(changes, 1, Some(history)))
+
+    given.message should include(s"the batch $chunk was given up by the run ${given.run}")
+    given.message should include(
+      "the next run of the backfill history plans the next batch from its progress as it is: " +
+        "the window of this one, again"
+    )
+    batchOf(chunk).status shouldBe BatchStatus.Abandoned
+    runOf(given.run).start.backfill shouldBe Some(history)
+    runOf(given.run).start.kind shouldBe RunKind.Abandon
+    batchOf(batchId(changes, 1)).status shouldBe BatchStatus.Planned
+    // Asked again, the backfill has no chunk planned; and one that is not there has none.
+    failed(abandon(changes, 1, Some(history)), FailureClass.Permanent) should include(
+      s"no batch of ${chunk.app} is planned"
+    )
+    failed(
+      abandon(changes, 1, Some(BackfillId.parse("nope").value)),
+      FailureClass.Permanent
+    ) should include(s"${changes.id} has no backfill nope")
+    batchOf(batchId(changes, 1)).status shouldBe BatchStatus.Planned
+
+    // The next run of the backfill reads the window of the chunk again, as its chunk 2; the next
+    // run of the source finishes its batch 1.
+    val next = ingested(backfill(reading()))
+    next.batch.seq.value shouldBe 2L
+    WatermarkPlan.fromJson(batchOf(next.batch).plan).toOption.get.lower shouldBe window.lower
+    ingested(launch(changes, reading())).batch shouldBe batchId(changes, 1)
+    assertLedger(changes)
   }
 
   // -----------------------------------------------------------------------------------------------

@@ -17,6 +17,7 @@ import lakehouse.ingestion.core.config.{
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control.{
   Application,
+  Backfills,
   ConfigSnapshots,
   ControlDatabase,
   LeasedRun,
@@ -57,8 +58,10 @@ final class OperatorActions(
   private val lookup = new BatchLookup(new DeltaTableTransactions(spark), () => hadoop)
 
   /**
-   * Gives up the batch of the regular sequence of `source` that is planned, if it is `seq` and
-   * the table that it was planned for does not have it (ADR-0021 §2).
+   * Gives up the batch of a sequence of `source` that is planned, if it is `seq` and the table
+   * that it was planned for does not have it (ADR-0021 §2): of the regular sequence, or of that of
+   * a backfill, the chunk that is planned, under the lease of the backfill. A backfill that is not
+   * there is refused, as having no batch.
    *
    * The table is the one that the batch was planned for (`ingestion_batch.target_table`), wherever
    * the configuration has the table of the source by now. A batch that it has is committed by the
@@ -68,64 +71,92 @@ final class OperatorActions(
    * @param config the configuration that the run is recorded with. It is not compared with the
    *   one that the batch was planned under: giving up a batch planned under another is what the
    *   action is for
+   * @param backfill the backfill whose chunk is given up; none, for the regular sequence
    */
   def abandon(
       source: Source,
       config: ConfigVersion,
       seq: BatchSeq,
-      request: OperatorRequest
+      request: OperatorRequest,
+      backfill: Option[BackfillId] = None
   ): Outcome = {
-    val start = starting(source, config, RunKind.Abandon, request)
+    val start = starting(source, config, RunKind.Abandon, request).copy(backfill = backfill)
+    // What runs next on the sequence: it commits a batch that its table has, or plans anew.
+    val next =
+      backfill.fold("the next run of the source")(id => s"the next run of the backfill $id")
     held(start, config) { leased =>
-      leased.planned() match {
-        case None =>
+      val missing =
+        backfill.filter(id => database.run(Backfills.find(_, source.id, start.layer, id)).isEmpty)
+      missing match {
+        case Some(id) =>
           refuse(
             leased,
-            s"no batch of ${start.txnAppId} is planned: there is no batch $seq to give up, " +
-              "and nothing was changed"
+            s"${source.id} has no backfill $id: there is no batch $seq of ${start.txnAppId} to " +
+              "give up, and nothing was changed"
           )
-        case Some(planned) if planned.id.seq != seq =>
-          refuse(
-            leased,
-            s"the batch of ${start.txnAppId} that is planned is ${planned.id.seq}, and not " +
-              s"$seq: an operator gives up the batch that was looked at, and nothing was changed"
-          )
-        case Some(planned) =>
-          val table = planned.target.fold(locator.locate(source.targets.bronze.table)) { uri =>
-            TableLocation
-              .stored(uri)
-              .fold(
-                reason => throw new IllegalStateException(s"the batch ${planned.id} names $reason"),
-                identity
-              )
-          }
-          lookup.of(table, planned.id) match {
-            case Found.Written =>
-              refuse(
-                leased,
-                s"the batch ${planned.id} is in ${table.uri}, which it was planned for: its " +
-                  "rows are written, and a batch whose rows are written is committed, never " +
-                  "given up. Nothing was changed: the next run of the source commits it, with " +
-                  "nothing read (ADR-0005)"
-              )
-            case Found.Unknown(why) =>
-              fail(
-                leased,
-                FailureClass.Transient,
-                s"$why. The batch ${planned.id} was not given up, since its rows may be " +
-                  "there: once the table can be read, ask again"
-              )
-            case Found.NotWritten =>
-              if (leased.abandon(planned.id, request.reason, None, RunEnd.Succeeded())) {
-                val done = s"the batch ${planned.id} was given up by the run ${start.id}, " +
-                  s"asked by ${request.requestedBy}: ${request.reason}. ${table.uri} does " +
-                  "not have it, and the next run of the source plans the next batch from its " +
-                  "state as it is"
-                log.info(done)
-                Outcome.Done(start.id, done)
-              } else lost(start, LeaseLoss.TakenOver)
-          }
+        case None => givenUp(leased, source, seq, request, next)
       }
+    }
+  }
+
+  /** The planned batch of the sequence of the run, given up if it is `seq` and not written. */
+  private def givenUp(
+      leased: LeasedRun,
+      source: Source,
+      seq: BatchSeq,
+      request: OperatorRequest,
+      next: String
+  ): Outcome = {
+    val start = leased.start
+    leased.planned() match {
+      case None =>
+        refuse(
+          leased,
+          s"no batch of ${start.txnAppId} is planned: there is no batch $seq to give up, " +
+            "and nothing was changed"
+        )
+      case Some(planned) if planned.id.seq != seq =>
+        refuse(
+          leased,
+          s"the batch of ${start.txnAppId} that is planned is ${planned.id.seq}, and not " +
+            s"$seq: an operator gives up the batch that was looked at, and nothing was changed"
+        )
+      case Some(planned) =>
+        val table = planned.target.fold(locator.locate(source.targets.bronze.table)) { uri =>
+          TableLocation
+            .stored(uri)
+            .fold(
+              reason => throw new IllegalStateException(s"the batch ${planned.id} names $reason"),
+              identity
+            )
+        }
+        lookup.of(table, planned.id) match {
+          case Found.Written =>
+            refuse(
+              leased,
+              s"the batch ${planned.id} is in ${table.uri}, which it was planned for: its " +
+                "rows are written, and a batch whose rows are written is committed, never " +
+                s"given up. Nothing was changed: $next commits it, with nothing read " +
+                "(ADR-0005)"
+            )
+          case Found.Unknown(why) =>
+            fail(
+              leased,
+              FailureClass.Transient,
+              s"$why. The batch ${planned.id} was not given up, since its rows may be " +
+                "there: once the table can be read, ask again"
+            )
+          case Found.NotWritten =>
+            if (leased.abandon(planned.id, request.reason, None, RunEnd.Succeeded())) {
+              val done = s"the batch ${planned.id} was given up by the run ${start.id}, " +
+                s"asked by ${request.requestedBy}: ${request.reason}. ${table.uri} does " +
+                s"not have it, and $next plans the next batch from its " +
+                (if (start.backfill.isEmpty) "state as it is"
+                 else "progress as it is: the window of this one, again")
+              log.info(done)
+              Outcome.Done(start.id, done)
+            } else lost(start, LeaseLoss.TakenOver)
+        }
     }
   }
 

@@ -44,6 +44,9 @@ final class MainSpec
 
   import MainSpec.Ran
 
+  /** The usage as words: what it says, whatever lines its sentences are broken into. */
+  private lazy val usage: String = Main.Usage.replaceAll("\\s+", " ")
+
   private def run(args: String*): Ran = runWith(Map.empty)(args: _*)
 
   /** With an environment of the test's own: no command of a test reads that of the build. */
@@ -209,12 +212,12 @@ final class MainSpec
   }
 
   test("the usage says which code is which") {
-    Main.Usage should include("exit codes: 0 the configuration is valid, the schemas are at")
-    Main.Usage should include("2 another run holds the lease of the source")
-    Main.Usage should include("3 a database could not be reached, the run lost its lease")
-    Main.Usage should include("4 the configuration is not valid, a database refused")
-    Main.Usage should include("5 more records were rejected than the source allows")
-    Main.Usage should include("64 the command line is not one")
+    usage should include("exit codes: 0 the configuration is valid, the schemas are at")
+    usage should include("2 another run holds the lease of the source")
+    usage should include("3 a database could not be reached, the run lost its lease")
+    usage should include("4 the configuration is not valid, a database refused")
+    usage should include("5 more records were rejected than the source allows")
+    usage should include("64 the command line is not one")
   }
 
   test("a command line that is not one ends in 64, with what is wrong and how it is written") {
@@ -560,11 +563,33 @@ final class MainSpec
     OperatorCommand.exitOf(Action.Failed(run, FailureClass.Transient, "why")) shouldBe 3
     OperatorCommand.exitOf(Action.Failed(run, FailureClass.Permanent, "why")) shouldBe 4
 
-    Main.Usage should include("lakehouse-ingestion abandon-batch --profile <file>")
-    Main.Usage should include("--batch <n> --reason <text>")
-    Main.Usage should include("the batch was given up or reprocessed, or the state was reset;")
-    Main.Usage should include("or a table could not be read")
-    Main.Usage should include("none is planned, another is, or its table has it")
+    usage should include("lakehouse-ingestion abandon-batch --profile <file>")
+    usage should include("--batch <n> --reason <text>")
+    usage should include("the batch was given up or reprocessed, or the state was reset;")
+    usage should include("or a table could not be read")
+    usage should include("none is planned, another is, or its table has it")
+
+    // The chunk of a backfill, by the id of the backfill: one out of its grammar is no id.
+    val misnamed = this.run(
+      "abandon-batch",
+      "--profile",
+      "p.yaml",
+      "--sources",
+      "conf/sources",
+      "--source",
+      "s.a",
+      "--batch",
+      "1",
+      "--reason",
+      "its plan cannot be run",
+      "--backfill",
+      "History"
+    )
+    misnamed.exit shouldBe Main.Exit.Usage
+    misnamed.errors.head should startWith("error: --backfill 'History' must be lower-case")
+    usage should include("--batch <n> --reason <text> [--backfill <id>]")
+    usage should include("With --backfill, the chunk of that backfill that is planned, under")
+    usage should include("or the backfill named is not there")
   }
 
   test("reprocess: a batch by its number and a reason, or the command line is not one: 64") {
@@ -579,9 +604,9 @@ final class MainSpec
       "error: --batch '01' is not the number of a batch, from 1"
     reprocess("--batch", "1", "--reason", "fixed", "--keep-watermark").exit shouldBe Main.Exit.Usage
 
-    Main.Usage should include("lakehouse-ingestion reprocess --profile <file>")
-    Main.Usage should include("the batch was given up or reprocessed")
-    Main.Usage should include("or the batch was not reprocessed: it was not committed")
+    usage should include("lakehouse-ingestion reprocess --profile <file>")
+    usage should include("the batch was given up or reprocessed")
+    usage should include("or the batch was not reprocessed: it was not committed")
   }
 
   test("reset-state: one way of the watermark, a moment as start is written, and a reason: 64") {
@@ -628,10 +653,10 @@ final class MainSpec
       include("more than six digits after the second")
     refused(reset("--reason", "moved", "--watermark"), "--watermark has no value after it")
 
-    Main.Usage should include("lakehouse-ingestion reset-state --profile <file>")
-    Main.Usage should include("(--watermark <moment> | --forget-watermark")
-    Main.Usage should include("or the state was reset;")
-    Main.Usage should include("reset: a batch is planned, the source has no state, or no such")
+    usage should include("lakehouse-ingestion reset-state --profile <file>")
+    usage should include("(--watermark <moment> | --forget-watermark")
+    usage should include("or the state was reset;")
+    usage should include("reset: a batch is planned, the source has no state, or no such")
   }
 
   test(
@@ -696,14 +721,14 @@ final class MainSpec
     unreasoned.exit shouldBe Main.Exit.Usage
     unreasoned.errors.head should startWith("error: --reason says nothing")
 
-    Main.Usage should include("lakehouse-ingestion backfill --profile <file>")
-    Main.Usage should include("--to <moment> [--chunk <duration>] --reason <text>")
-    Main.Usage should include("backfill    Reads the range (from, to] of the watermark column")
-    Main.Usage should include("whose watermark is from exactly are not read, and those at to are")
-    Main.Usage should include("and a row whose watermark is from exactly is not read")
-    Main.Usage should include("the backfill ended well (chunks committed, or it is\n")
-    Main.Usage should include("2 another run holds the lease of the source, or of the backfill")
-    Main.Usage should include("or the backfill was refused: its source")
+    usage should include("lakehouse-ingestion backfill --profile <file>")
+    usage should include("--to <moment> [--chunk <duration>] --reason <text>")
+    usage should include("backfill Reads the range (from, to] of the watermark column")
+    usage should include("whose watermark is from exactly are not read, and those at to are")
+    usage should include("and a row whose watermark is from exactly is not read")
+    usage should include("the backfill ended well (chunks committed, or it is complete)")
+    usage should include("2 another run holds the lease of the source, or of the backfill")
+    usage should include("or the backfill was refused: its source")
   }
 
   test("run: a count that a run did not make is said as not known, and not as zero") {
