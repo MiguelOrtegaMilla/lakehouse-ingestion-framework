@@ -182,7 +182,8 @@ object RunCommand {
     }
   }
 
-  private def written(outputs: Seq[lakehouse.ingestion.core.control.BatchOutput]): String =
+  /** The tables that a batch was written to, each at its version, as a line ends with them. */
+  private[cli] def written(outputs: Seq[lakehouse.ingestion.core.control.BatchOutput]): String =
     if (outputs.isEmpty) ", into no table"
     else
       outputs

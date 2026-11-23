@@ -634,6 +634,78 @@ final class MainSpec
     Main.Usage should include("reset: a batch is planned, the source has no state, or no such")
   }
 
+  test(
+    "backfill: an id, a range (from, to], a chunk and a reason, or the command line is not one"
+  ) {
+    val whole = Seq(
+      "--backfill",
+      "history",
+      "--from",
+      "2025-01-01T00:00:00Z",
+      "--to",
+      "2025-02-01T00:00:00Z",
+      "--reason",
+      "the history before go-live"
+    )
+    def backfill(options: Seq[String]): Ran =
+      run(
+        Seq("backfill", "--profile", "p.yaml", "--sources", "conf/sources", "--source", "s.a") ++
+          options: _*
+      )
+    def without(option: String): Seq[String] = whole.patch(whole.indexOf(option), Nil, 2)
+    def replaced(option: String, value: String): Seq[String] =
+      whole.updated(whole.indexOf(option) + 1, value)
+    def refused(ran: Ran, problem: String): Unit = {
+      ran.exit shouldBe Main.Exit.Usage
+      ran.errors.head shouldBe s"error: $problem"
+      ran.out shouldBe empty: Unit
+    }
+
+    Seq("--backfill", "--from", "--to", "--reason").foreach { option =>
+      refused(backfill(without(option)), s"$option must be given")
+    }
+    refused(
+      backfill(replaced("--backfill", "History")),
+      "--backfill 'History' must be lower-case letters, digits, '.', '_' and '-', starting with " +
+        "a letter or a digit, as history-2024"
+    )
+    backfill(replaced("--from", "2025-01-01")).errors.head should startWith(
+      "error: --from '2025-01-01' "
+    )
+    backfill(replaced("--to", "yesterday")).errors.head should startWith("error: --to 'yesterday' ")
+    // A range with no moment in it is no range: from must be before to.
+    refused(
+      backfill(replaced("--to", "2024-12-01T00:00:00Z")),
+      "--from and --to: from, 2025-01-01T00:00:00Z, is not before to, 2024-12-01T00:00:00Z: " +
+        "the range (from, to] holds no moment"
+    )
+    backfill(replaced("--to", "2025-01-01T00:00:00Z")).exit shouldBe Main.Exit.Usage
+    refused(
+      backfill(whole ++ Seq("--chunk", "0s")),
+      "--chunk '0s' is no stretch of time: a chunk is 1ms at least"
+    )
+    refused(
+      backfill(whole ++ Seq("--chunk", "7")),
+      "--chunk '7' has no unit: write it as 500ms, 30s, 10m, 2h or 7d"
+    )
+    refused(
+      backfill(whole ++ Seq("--max-batches", "0")),
+      "--max-batches '0' is not a number of batches, from 1"
+    )
+    val unreasoned = backfill(replaced("--reason", " "))
+    unreasoned.exit shouldBe Main.Exit.Usage
+    unreasoned.errors.head should startWith("error: --reason says nothing")
+
+    Main.Usage should include("lakehouse-ingestion backfill --profile <file>")
+    Main.Usage should include("--to <moment> [--chunk <duration>] --reason <text>")
+    Main.Usage should include("backfill    Reads the range (from, to] of the watermark column")
+    Main.Usage should include("whose watermark is from exactly are not read, and those at to are")
+    Main.Usage should include("and a row whose watermark is from exactly is not read")
+    Main.Usage should include("the backfill ended well (chunks committed, or it is\n")
+    Main.Usage should include("2 another run holds the lease of the source, or of the backfill")
+    Main.Usage should include("or the backfill was refused: its source")
+  }
+
   test("run: a count that a run did not make is said as not known, and not as zero") {
     val run = RunId.generate()
     val source = SourceId.parse("sales.orders").value
