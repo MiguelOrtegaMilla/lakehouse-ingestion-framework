@@ -93,6 +93,7 @@ object Main {
        |                               [--max-batches <n>]
        |       lakehouse-ingestion abandon-batch --profile <file> --sources <directory>
        |                               --source <id> --batch <n> --reason <text>
+       |                               [--backfill <id>]
        |       lakehouse-ingestion reprocess --profile <file> --sources <directory>
        |                               --source <id> --batch <n> --reason <text>
        |       lakehouse-ingestion reset-state --profile <file> --sources <directory>
@@ -117,7 +118,9 @@ object Main {
        |  abandon-batch  Gives up the batch of a source that is planned, if the table it was
        |              planned for does not have it: the next run plans anew from the state of
        |              the source. It is a run of its own, under the lease of the source, that
-       |              records who asked for it (the user of the process) and why.
+       |              records who asked for it (the user of the process) and why. With
+       |              --backfill, the chunk of that backfill that is planned, under its lease:
+       |              the next run of the backfill reads its window again.
        |  reprocess   Reads the files of a committed batch of a source again, into the table
        |              that its configuration names now, as a batch of its own whose run says
        |              who asked and why. The files stay taken by the batch that took them.
@@ -144,7 +147,8 @@ object Main {
        |  --max-batches  the most batches that run commits, or chunks that backfill does;
        |              no limit unless said
        |  --batch     abandon-batch: the number of the batch to give up, the one that is
-       |              planned; reprocess: that of the committed batch whose files are read
+       |              planned, or of the chunk with --backfill; reprocess: that of the
+       |              committed batch whose files are read
        |  --reason    why, in one line: kept with the run and with the batch
        |  --watermark  the moment that the source is taken to be ingested up to, as
        |              load.watermark.start is written: 2026-03-01T00:00:00Z
@@ -152,7 +156,7 @@ object Main {
        |  --keep-watermark  the watermark stays; only what later runs are compared with is
        |              reset. Its risks are warned of
        |  --backfill  the id of the backfill, as history-2024: lower-case letters, digits, '.',
-       |              '_' and '-'
+       |              '_' and '-'. abandon-batch: the backfill whose chunk is given up
        |  --from      where the range starts, as 2025-01-01T00:00:00Z: it is not in the range,
        |              and a row whose watermark is from exactly is not read
        |  --to        where the range ends, which is in it: no later than the clock of the
@@ -171,12 +175,13 @@ object Main {
        |              given up, or a table could not be read, and running again later may do;
        |            4 the configuration is not valid, a database refused, the run failed for a
        |              reason that running again does not mend, the batch was not given up:
-       |              none is planned, another is, or its table has it, or the state was not
-       |              reset: a batch is planned, the source has no state, or no such
-       |              watermark, or the batch was not reprocessed: it was not committed, read
-       |              no files, or another is planned, or the backfill was refused: its source
-       |              reads no range, it has no chunk, to has not settled, its id has another
-       |              range or chunk, or its configuration changed in a way it cannot follow;
+       |              none is planned, another is, or its table has it, or the backfill named
+       |              is not there, or the state was not reset: a batch is planned, the source
+       |              has no state, or no such watermark, or the batch was not reprocessed: it
+       |              was not committed, read no files, or another is planned, or the backfill
+       |              was refused: its source reads no range, it has no chunk, to has not
+       |              settled, its id has another range or chunk, or its configuration changed
+       |              in a way that it cannot follow;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
        |            128 + n run or backfill was stopped by the signal n before its first run:
@@ -249,13 +254,26 @@ object Main {
       }
     case "abandon-batch" :: options =>
       val asked = for {
-        found <- parse(options, Set("--profile", "--sources", "--source", "--batch", "--reason"))
+        found <- parse(
+          options,
+          Set("--profile", "--sources", "--source", "--batch", "--reason"),
+          optional = Set("--backfill")
+        )
         source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
         batch <- batchOf(found("--batch"))
+        backfill <- found.get("--backfill") match {
+          case None => Right(None)
+          case Some(text) =>
+            BackfillId
+              .parse(text)
+              .map(Some(_))
+              .left
+              .map(reason => s"--backfill '${shown(text)}' $reason")
+        }
         request <- OperatorRequest.of(operator, found("--reason"))
-      } yield (found("--profile"), found("--sources"), source, batch, request)
+      } yield (found("--profile"), found("--sources"), source, batch, backfill, request)
       asked match {
-        case Right((profile, sources, source, batch, request)) =>
+        case Right((profile, sources, source, batch, backfill, request)) =>
           AbandonBatchCommand.run(
             Paths.get(profile),
             Paths.get(sources),
@@ -264,7 +282,8 @@ object Main {
             request,
             SecretResolver(environment),
             out,
-            err
+            err,
+            backfill
           )
         case Left(problem) => usage(problem, err)
       }

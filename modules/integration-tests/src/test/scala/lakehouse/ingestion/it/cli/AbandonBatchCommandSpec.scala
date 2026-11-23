@@ -2,13 +2,15 @@ package lakehouse.ingestion.it.cli
 
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, StandardOpenOption}
+import java.time.Instant
 
 import scala.concurrent.duration._
 
+import io.circe.Json
 import lakehouse.ingestion.cli.Main
 import lakehouse.ingestion.core.config.Source
-import lakehouse.ingestion.core.control.{LeaseTiming, OperatorRequest}
-import lakehouse.ingestion.engine.control.LeasedRun
+import lakehouse.ingestion.core.control._
+import lakehouse.ingestion.engine.control.{Batches, LeasedRun}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.DeploymentFiles
 import org.apache.spark.sql.SparkSession
@@ -33,19 +35,26 @@ final class AbandonBatchCommandSpec extends AnyFunSuite with Matchers with RunCo
 
   private def run(of: Source): Ran = command(Map.empty)(arguments(of): _*)
 
-  private def abandon(of: Source, batch: String, reason: String = "its file is malformed"): Ran = {
+  private def abandon(
+      of: Source,
+      batch: String,
+      reason: String = "its file is malformed",
+      backfill: Option[String] = None
+  ): Ran = {
     val ran = command(Map.empty)(
-      "abandon-batch",
-      "--profile",
-      validProfile.toString,
-      "--sources",
-      files.sources.toString,
-      "--source",
-      of.id.value,
-      "--batch",
-      batch,
-      "--reason",
-      reason
+      Seq(
+        "abandon-batch",
+        "--profile",
+        validProfile.toString,
+        "--sources",
+        files.sources.toString,
+        "--source",
+        of.id.value,
+        "--batch",
+        batch,
+        "--reason",
+        reason
+      ) ++ backfill.toSeq.flatMap(id => Seq("--backfill", id)): _*
     )
     // The command leaves the JVM as it found it.
     SparkSession.getDefaultSession shouldBe empty
@@ -139,5 +148,60 @@ final class AbandonBatchCommandSpec extends AnyFunSuite with Matchers with RunCo
     abandon(orders, "1", reason = "two\nlines").exit shouldBe Main.Exit.Usage
     batchesOf(orders) shouldBe Seq("1" -> "PLANNED")
     askedOf(orders) shouldBe empty
+  }
+
+  test("--backfill gives up the chunk of a backfill that is planned: 0; a backfill not there: 4") {
+    // The command does not read the source: its table need not be there.
+    val orders = files.tableSource(
+      newSourceId(),
+      "public.not_read",
+      files.connection("sales_ro", pg.password("sales_ro"), url = pg.jdbcUrl("sales")),
+      load = "{ mode: incremental, watermark: { column: updated_at, safety_margin: 1h } }"
+    )
+    val history = BackfillId.parse("history").toOption.get
+    // A chunk planned by a run of the backfill that died with it, and whose lease ran out.
+    val dead = LeasedRun
+      .open(
+        database,
+        starting(orders).copy(
+          kind = RunKind.Backfill,
+          request = Some(operator),
+          backfill = Some(history)
+        ),
+        versionOf(orders),
+        LeaseTiming(2.minutes)
+      )
+      .value
+    dead.backfill(
+      Instant.parse("2025-01-01T00:00:00Z"),
+      Instant.parse("2025-02-01T00:00:00Z"),
+      1.day
+    ) shouldBe a[LeasedRun.Backfill.Created]
+    val chunk = dead.plan(Json.obj("chunk" -> Json.fromInt(1)))
+    dead.close()
+    asSuperuser { c =>
+      update(
+        c,
+        "UPDATE control.source_lease SET expires_at = now() - interval '1 second' " +
+          "WHERE lease_key = ?",
+        dead.start.leaseKey.value
+      ) shouldBe 1
+    }
+
+    val unknown = abandon(orders, "1", backfill = Some("nope"))
+
+    unknown.exit shouldBe Main.Exit.Permanent
+    said(unknown).head should include(s"${orders.id} has no backfill nope")
+    database.run(Batches.find(_, chunk.id)).value.status shouldBe BatchStatus.Planned
+
+    val ran = abandon(orders, "1", backfill = Some("history"))
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    ran.out should include(s"The batch ${chunk.id} was given up by the run")
+    ran.out should include("the next run of the backfill history plans the next batch")
+    database.run(Batches.find(_, chunk.id)).value.status shouldBe BatchStatus.Abandoned
+    // The run that died with the chunk is ended by the first action that took its lease over.
+    askedOf(orders).map(_.take(2)) shouldBe
+      Seq(Seq("backfill", "ABANDONED"), Seq("abandon", "FAILED"), Seq("abandon", "SUCCEEDED"))
   }
 }
