@@ -4,10 +4,6 @@ import java.io.PrintStream
 import java.net.URI
 import java.nio.file.{Files, Path, Paths}
 
-import scala.annotation.tailrec
-
-import io.circe.Json
-
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.{FailureClass, LeaseTiming}
 import lakehouse.ingestion.engine.IngestionService
@@ -69,14 +65,8 @@ object RunCommand {
         ready.profile.lake.uri,
         LeaseTiming(ready.profile.leases.ttl)
       )
-      runs(service, ready.source, ready.config, Chain(maxBatches, stop), out, err)
+      runs(service, ready.source, ready.config, Chain.Limits(maxBatches, stop), out, err)
     }
-
-  /**
-   * How far an invocation goes: no further than `maxBatches` committed, and no run after
-   * `stop` has asked.
-   */
-  final private case class Chain(maxBatches: Option[Int], stop: Stop)
 
   /**
    * Why a source cannot be run by an application with these connectors, if it has none for the
@@ -115,86 +105,34 @@ object RunCommand {
     }
 
   /**
-   * The runs of an invocation (discovery §17, P6.10): one, and another after it for as long as
-   * the batch that it committed says that the source has more, within the horizon of the first
-   * plan of the invocation. Each is a whole run, with its lease and its batch. The chain stops
-   * at `--max-batches`, and before a run once a signal has asked it to; its code is that of its
-   * last run, or 128 + the signal if it asked before the first.
+   * The runs of an invocation (`Chain`): one, and another after it for as long as the batch that
+   * it committed says that the source has more, within the horizon of the first plan of the
+   * invocation, each said as it ends.
    */
   private def runs(
       service: IngestionService,
       source: Source,
       config: ConfigVersion,
-      chain: Chain,
+      limits: Chain.Limits,
       out: PrintStream,
       err: PrintStream
-  ): Int = {
-    @tailrec
-    def next(horizon: Option[Json], ran: Int, committed: Int, last: Option[Int]): Int =
-      chain.stop.requested match {
-        case Some(signal) =>
-          last match {
-            case Some(code) =>
-              out.println(
-                s"${ofTheInvocation(source, ran, committed)}: ${Stop.name(signal)} asked it to " +
-                  "stop, and no other run was started."
-              )
-              code
-            case None =>
-              err.println(
-                s"error: ${Stop.name(signal)} came before the first run. Nothing was run."
-              )
-              128 + signal
-          }
-        case None =>
-          val outcome = service.run(source, config, horizon)
-          val (stream, line) = report(source.id, outcome)
-          (if (stream == Stream.Out) out else err).println(line)
-          val code = exitOf(outcome)
-          val done = committed + (outcome match {
-            case _: Outcome.Ingested | _: Outcome.RolledForward => 1
-            case _ => 0
-          })
-          // What the next run plans against, if there is one: the horizon of the chain, or
-          // none, for a first plan of the invocation after a batch of another.
-          val more: Option[Option[Json]] = outcome match {
-            case Outcome.Ingested(_, _, _, _, Outcome.Next.Within(within)) => Some(Some(within))
-            case Outcome.Ingested(_, _, _, _, Outcome.Next.Afresh) => Some(None)
-            case _: Outcome.RolledForward => Some(None)
-            case _ => None
-          }
-          more match {
-            case Some(within) if chain.maxBatches.forall(done < _) =>
-              next(within, ran + 1, done, Some(code))
-            case Some(within) =>
-              // The plan of the batch says that there is more. After a batch of another
-              // invocation no plan of this one says anything: the next plans anew, and finds
-              // out.
-              val left =
-                if (within.nonEmpty) "and the source has more."
-                else
-                  "after a batch that a run before this invocation left: whether the source " +
-                    "has more is for the next invocation to plan."
-              out.println(
-                s"${ofTheInvocation(source, ran + 1, done)}: it stopped at --max-batches " +
-                  s"${chain.maxBatches.getOrElse(done)}, $left"
-              )
-              code
-            case None =>
-              if (ran > 0)
-                out.println(s"${ofTheInvocation(source, ran + 1, done)}.")
-              code
-          }
-      }
-    next(horizon = None, ran = 0, committed = 0, last = None)
-  }
-
-  private def ofTheInvocation(source: Source, ran: Int, committed: Int): String =
-    s"The invocation of ${source.id.value} made ${counted(ran, "run")} and committed " +
-      counted(committed, "batch", "batches")
-
-  private def counted(count: Int, one: String, many: String = ""): String =
-    if (count == 1) s"1 $one" else s"$count ${if (many.isEmpty) one + "s" else many}"
+  ): Int =
+    Chain(
+      limits,
+      Chain.Words(
+        invocation = s"The invocation of ${source.id.value}",
+        batch = "batch",
+        batches = "batches",
+        more = "and the source has more.",
+        afterAnother = "after a batch that a run before this invocation left: whether the " +
+          "source has more is for the next invocation to plan."
+      ),
+      out,
+      err
+    ) { outcome =>
+      val (stream, line) = report(source.id, outcome)
+      (if (stream == Stream.Out) out else err).println(line)
+    }(horizon => service.run(source, config, horizon))
 
   /** The code of a run, by how it ended (discovery §14.1). */
   def exitOf(outcome: Outcome): Int = outcome match {
