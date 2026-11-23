@@ -1,11 +1,15 @@
 package lakehouse.ingestion.it.ingestion
 
+import java.time.Instant
+
 import io.circe.Json
 import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
 
 /**
  * What the control plane, the tables of a source and `processed_file` must say of each other
- * once no run of the source is in flight (P7.2).
+ * once no run of the source is in flight (P7.2): of one sequence of the source, its regular one
+ * or that of a backfill, each with its own batches, runs and state, in the tables that they
+ * share (P7.6).
  *
  * Each test of a run checks what it is about. This checks what every one of them stands on,
  * whatever the test did before: a batch that is committed is in its table once, and in no
@@ -16,6 +20,11 @@ import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
  * no run is still running, and the run that committed a batch, or reset the state, succeeded. A
  * test that kills a run, takes its lease over or changes its source asks it of what is left once the
  * next run has finished.
+ *
+ * A backfill is a sequence whose state is its progress, and the same rules hold of it. And two
+ * of its own: its chunks follow each other from the start of its range to its end, each where
+ * the last one committed before it ended, with no gap and nothing read twice; and it is
+ * complete exactly when its chunks have read up to the end of its range.
  *
  * It is plain data and one pure function, so that every rule is tested on facts made by hand
  * (`IngestionLedgerSpec`): a check that cannot fail proves nothing. What reads the facts is
@@ -33,7 +42,7 @@ object IngestionLedger {
   final case class TakenFile(path: String, size: Long, modifiedMillis: Long)
 
   /**
-   * A batch of the regular sequence of the source.
+   * A batch of the sequence.
    *
    * @param target the location of the table that its data was planned for
    * @param outputs the tables that its commit recorded, by location, each with its version or
@@ -41,6 +50,8 @@ object IngestionLedger {
    * @param watermark what its commit moves the watermark to, from its plan
    * @param files the files of its plan, for a batch of files
    * @param reprocessOf the batch whose files it reads again, for a batch of a reprocess
+   * @param window the bounds of its plan, for a chunk of a backfill; none, for a plan that has
+   *   none
    */
   final case class Batch(
       seq: Long,
@@ -50,12 +61,22 @@ object IngestionLedger {
       outputs: Seq[Output] = Nil,
       watermark: Option[Json] = None,
       files: Set[TakenFile] = Set.empty,
-      reprocessOf: Option[Long] = None
+      reprocessOf: Option[Long] = None,
+      window: Option[Window] = None
   )
+
+  /** What a plan of a watermark reads: the rows after `lower`, and not after `upper`. */
+  final case class Window(lower: Option[Instant], upper: Instant)
+
+  /**
+   * A backfill, for the facts of its sequence: its range `(from, to]`, and whether it is
+   * complete. Its progress is the state of the facts.
+   */
+  final case class Backfill(from: Instant, to: Instant, complete: Boolean)
 
   final case class Output(table: String, version: Option[Long])
 
-  /** A run of the source, with the batch that it planned or recovered. */
+  /** A run that acted on the sequence, with the batch that it planned or recovered. */
   final case class Run(
       id: RunId,
       batch: Option[Long],
@@ -69,10 +90,10 @@ object IngestionLedger {
   /** A reset of the state by an operator's run, as `state_change_log` has it (ADR-0021 §3). */
   final case class Reset(run: RunId, before: State, after: State)
 
-  /** A commit of a table, with the `txnVersion`s that it carries under the source's `txnAppId`. */
+  /** A commit of a table, with the `txnVersion`s of the sequence that it carries. */
   final case class Commit(version: Long, txns: Seq[Long])
 
-  /** The rows of the source that a table has under one run and one batch number. */
+  /** The rows of the sequence that a table has under one run and one batch number. */
   final case class Rows(run: String, batch: Long, count: Long)
 
   /**
@@ -81,7 +102,7 @@ object IngestionLedger {
    * @param commits the commits that its log still keeps, read as files
    * @param keptFrom the first version whose commit the log still keeps; none, for a table that
    *   is not there
-   * @param lastTxn the last `txnVersion` of the source that Delta says the table has, which
+   * @param lastTxn the last `txnVersion` of the sequence that Delta says the table has, which
    *   holds what the commits that are no longer kept had
    */
   final case class Table(
@@ -93,9 +114,16 @@ object IngestionLedger {
   )
 
   /**
-   * @param data every table that a batch of the source was planned for, and the one that its
-   *   configuration names
+   * The facts of one sequence of a source.
+   *
+   * @param batches the batches of the sequence
+   * @param runs the runs that acted on it
+   * @param state the state of the source, for its regular sequence; the progress of the
+   *   backfill, for that of a backfill
+   * @param data every table that a batch of the sequence was planned for, and the one that the
+   *   configuration of the source names, with the commits and the rows of the sequence
    * @param resets the resets of the state, in the order they were made
+   * @param backfill the backfill whose sequence it is; none, for the regular sequence
    */
   final case class Facts(
       batches: Seq[Batch],
@@ -104,7 +132,8 @@ object IngestionLedger {
       taken: Set[(TakenFile, Long)],
       data: Seq[Table],
       quarantine: Table,
-      resets: Seq[Reset] = Nil
+      resets: Seq[Reset] = Nil,
+      backfill: Option[Backfill] = None
   )
 
   sealed abstract class Rule(val name: String) {
@@ -132,6 +161,8 @@ object IngestionLedger {
     case object FilesNotAsCommitted extends Rule("FilesNotAsCommitted")
     case object StillRunning extends Rule("StillRunning")
     case object CommitterNotSucceeded extends Rule("CommitterNotSucceeded")
+    case object ChunksNotTiled extends Rule("ChunksNotTiled")
+    case object CompleteNotAsRead extends Rule("CompleteNotAsRead")
   }
 
   final case class Violation(rule: Rule, message: String) {
@@ -141,7 +172,7 @@ object IngestionLedger {
   /** Every way in which the facts disagree; none, for a source that is as it should be. */
   def check(facts: Facts): Seq[Violation] =
     tables(facts) ++ txns(facts) ++ rows(facts) ++ state(facts) ++ resets(facts) ++
-      files(facts) ++ reprocesses(facts) ++ runs(facts)
+      files(facts) ++ reprocesses(facts) ++ runs(facts) ++ backfill(facts)
 
   // -----------------------------------------------------------------------------------------------
   // Batches and the commits of the tables
@@ -493,5 +524,48 @@ object IngestionLedger {
           )
       }
     }
+  }
+
+  // -----------------------------------------------------------------------------------------------
+  // A backfill
+  // -----------------------------------------------------------------------------------------------
+
+  /**
+   * The chunks of a backfill follow each other: each, whatever became of it, starts where the
+   * last chunk committed before it ended, or at the start of the range for the first, and ends
+   * after that and no later than the end of the range. And the backfill is complete exactly
+   * when the chunks committed have read up to the end of its range.
+   */
+  private def backfill(facts: Facts): Seq[Violation] = facts.backfill.toSeq.flatMap { range =>
+    val (reached, untiled) =
+      facts.batches.sortBy(_.seq).foldLeft((Option.empty[Instant], Vector.empty[Violation])) {
+        case ((reached, found), batch) =>
+          val from = reached.getOrElse(range.from)
+          val wrong = batch.window match {
+            case None => Some(s"chunk ${batch.seq} has a plan with no window")
+            case Some(Window(lower, _)) if !lower.contains(from) =>
+              Some(
+                s"chunk ${batch.seq} starts at ${lower.fold("no moment")(_.toString)}, and the " +
+                  s"chunks committed before it read up to $from"
+              )
+            case Some(Window(_, upper)) if !upper.isAfter(from) || upper.isAfter(range.to) =>
+              Some(s"chunk ${batch.seq} ends at $upper, outside ($from, ${range.to}]")
+            case Some(_) => None
+          }
+          val next =
+            if (batch.status == BatchStatus.Committed) batch.window.map(_.upper).orElse(reached)
+            else reached
+          (next, found ++ wrong.map(Violation(Rule.ChunksNotTiled, _)))
+      }
+    val read = reached.contains(range.to)
+    untiled ++ Option.when(range.complete != read)(
+      Violation(
+        Rule.CompleteNotAsRead,
+        if (range.complete)
+          s"the backfill is complete, and its chunks committed read up to " +
+            s"${reached.getOrElse(range.from)}, short of ${range.to}"
+        else s"the chunks committed read up to ${range.to}, and the backfill is not complete"
+      )
+    )
   }
 }

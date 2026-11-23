@@ -6,6 +6,29 @@ import scala.concurrent.duration.FiniteDuration
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.SourceId
+import lakehouse.ingestion.core.watermark.BackfillRange
+
+/**
+ * What an operator asks of a backfill (ADR-0021 §5.3): its id, its range and how long its chunks
+ * are. The first run under the id creates the backfill with them; every run after it resumes
+ * the backfill, and is refused if it asks for another range or another chunk.
+ *
+ * @param chunk how long a chunk is, at most: whole milliseconds, as a duration of a
+ *   configuration is. None takes `max_batch_range` of the source when the backfill is created,
+ *   and the chunk of the backfill when it is resumed
+ */
+final case class BackfillRequest(
+    id: BackfillId,
+    range: BackfillRange,
+    chunk: Option[FiniteDuration]
+) {
+  chunk.foreach { length =>
+    require(
+      length.toNanos > 0 && length.toNanos % 1000000 == 0,
+      s"a chunk of $length is no stretch of whole milliseconds"
+    )
+  }
+}
 
 /**
  * A backfill as the control plane has it (ADR-0021 §5): what it reads, fixed when it was
