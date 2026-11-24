@@ -41,9 +41,11 @@ import org.scalatest.matchers.should.Matchers
  * '''The process of the backfill is killed with -9''' in the middle of a chunk, in the second
  * test, and the backfill is run again by the means a deployment has: at once, and skipped, for
  * the run that died holds its lease; and once that lease has run out, by itself, to the end. A
- * kill that comes between two chunks leaves no lease held, and its round is made again. What the
- * killed run had done of its chunk is the timing's: it is said, and the faults of the engine one
- * at a time are P7.9's.
+ * kill that comes between two chunks leaves no lease held, and an invocation started at once that
+ * asks for the lease after it has run out, on a machine slow to start a JVM, takes it over: by
+ * the clock of the control plane, which decides it. Either round is made again. What the killed
+ * run had done of its chunk is the timing's: it is said, and the faults of the engine one at a
+ * time are P7.9's.
  *
  * Each test ends with the ledger of both sequences, read from the lake of the deployment.
  */
@@ -216,6 +218,25 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
   private def holderOfBackfill(of: Source): Option[Leases.Holder] =
     database.run(Leases.find(_, backfillLease(of))).flatMap(_.holder)
 
+  /**
+   * The holder of the lease of the backfill once a transaction that a kill cut has ended: its
+   * row is read under a lock, which waits for a renewal that was neither committed nor rolled
+   * back yet, and then as it is.
+   */
+  private def settledHolderOfBackfill(of: Source): Option[Leases.Holder] = {
+    asSuperuser { c =>
+      query(
+        c,
+        "SELECT lease_key FROM control.source_lease WHERE lease_key = ? FOR SHARE",
+        backfillLease(of).value
+      )
+    }: Unit
+    holderOfBackfill(of)
+  }
+
+  private def backfillRunsOf(of: Source): Seq[RunRecord] =
+    runsOf(of).filter(sequenceOf(_) == Backfill)
+
   /** Whether the lease of the backfill has run out, by the clock of the control plane. */
   private def leaseExpired(of: Source): Boolean = asSuperuser { c =>
     query(
@@ -293,11 +314,18 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
   /**
    * One round of the kill: `run` and `backfill` of a source of its own started together, and the
    * process of the backfill killed with -9 once two chunks are committed and a run holds the
-   * lease of the backfill. The invocation started at once is skipped; the one started once the
-   * lease has run out takes it over, ends the run that died as `ABANDONED`, recovers what it
-   * left, and reads the rest. The regular sequence goes on all the while, and ends in 0.
+   * lease of the backfill. The invocation started at once asks for that lease while it lives, and
+   * is skipped; the one started once it has run out takes it over, ends the run that died as
+   * `ABANDONED`, recovers what it left, and reads the rest. The regular sequence goes on all the
+   * while, and ends in 0.
    *
-   * @return whether the kill came in the middle of a run of the backfill
+   * Whether the invocation started at once asked in time is the clock of the control plane's,
+   * which decides it, and not the test's: one that asked after the lease ran out, on a machine
+   * slow to start a JVM, took it over and ended the backfill. It is held to everything else all
+   * the same, and its round is made again.
+   *
+   * @return whether the kill came in the middle of a chunk, and the invocation started at once
+   *   asked for the lease before it ran out
    */
   private def killRound(number: Int): Boolean = {
     val at = moments()
@@ -316,7 +344,7 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
     val killedAt = databaseNow()
     val committedAtTheKill = recordOf(of).flatMap(_.progress).fold(0L)(_.lastCommitted.value)
 
-    holderOfBackfill(of) match {
+    settledHolderOfBackfill(of) match {
       case None =>
         val regularEnded = going.await(5.minutes)
         withClue(regularEnded.log)(regularEnded.exit shouldBe Main.Exit.Ok)
@@ -325,29 +353,45 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
 
       case Some(dead) =>
         runOf(dead.run).status shouldBe RunStatus.Running
+        val before = backfillRunsOf(of).map(_.start.id).toSet
 
-        // At once: the lease is the dead run's until it runs out, and the invocation is skipped.
-        val skipped = backfill(of, at, mortal).await(2.minutes)
-        withClue(skipped.log)(skipped.exit shouldBe Main.Exit.SkippedLocked)
-        skipped.log should include(
-          s"the run ${dead.run} holds the lease of the backfill ${History.value}"
-        )
-        holderOfBackfill(of).map(_.run) shouldBe Some(dead.run)
+        // At once. The lease is free once its expires_at is before now(), and the run that asks
+        // is written down in the same transaction, its started_at that now(): whether the lease
+        // of the run that died still lived when it was asked for is read from the two.
+        val atOnce = backfill(of, at, mortal).await(5.minutes)
+        val asked = backfillRunsOf(of)
+          .filterNot(run => before(run.start.id))
+          .minByOption(_.startedAt)
+          .getOrElse(fail(s"the invocation started at once made no run:\n${atOnce.log}"))
+        val inTime = !dead.expiresAt.isBefore(asked.startedAt)
 
-        // Once it has run out, by itself: the next invocation takes it over, and ends the backfill.
-        poll((MortalTtl + 30.seconds).fromNow, "the end of the lease of the run that died") {
-          leaseExpired(of)
+        if (inTime) {
+          withClue(atOnce.log)(atOnce.exit shouldBe Main.Exit.SkippedLocked)
+          atOnce.log should include(
+            s"the run ${dead.run} holds the lease of the backfill ${History.value}"
+          )
+          asked.status shouldBe RunStatus.SkippedLocked
+          holderOfBackfill(of) shouldBe Some(dead)
+
+          // Once it has run out, by itself: the next invocation takes it over, and ends the backfill.
+          poll((MortalTtl + 30.seconds).fromNow, "the end of the lease of the run that died") {
+            leaseExpired(of)
+          }
+          val resumed = backfill(of, at, mortal).await(5.minutes)
+          withClue(resumed.log)(resumed.exit shouldBe Main.Exit.Ok)
+          resumed.log should include(s"The backfill ${History.value} of ${of.id} is complete")
+        } else {
+          // Late: it took the lease over, and ended the backfill itself.
+          withClue(atOnce.log)(atOnce.exit shouldBe Main.Exit.Ok)
+          atOnce.log should include(s"The backfill ${History.value} of ${of.id} is complete")
         }
-        val resumed = backfill(of, at, mortal).await(5.minutes)
-        withClue(resumed.log)(resumed.exit shouldBe Main.Exit.Ok)
-        resumed.log should include(s"The backfill ${History.value} of ${of.id} is complete")
         val regularEnded = going.await(5.minutes)
         withClue(regularEnded.log)(regularEnded.exit shouldBe Main.Exit.Ok)
 
         assertCopies(of, at, stamps)
 
         // The run that died is ended by the one that took its lease over, the invocation started
-        // at once was skipped, and every other run succeeded.
+        // at once was skipped if it asked in time, and every other run succeeded.
         val runs = runsOf(of)
         val (backfillRuns, regularRuns) = runs.partition(sequenceOf(_) == Backfill)
         regularRuns.map(_.status).distinct shouldBe Seq(RunStatus.Succeeded)
@@ -355,7 +399,7 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
         died.status shouldBe RunStatus.Abandoned
         backfillRuns
           .filter(run => run.start.id != dead.run && run.status != RunStatus.Succeeded)
-          .map(_.status) shouldBe Seq(RunStatus.SkippedLocked)
+          .map(_.status) shouldBe (if (inTime) Seq(RunStatus.SkippedLocked) else Nil)
         sequenceOf(runOf(stateOf(of).value.updatedBy)) shouldBe Regular
         assertComplete(of, at.chunks)
         assertLedger(of)
@@ -369,19 +413,22 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
             s"had planned the chunk ${seq.value} and had nothing of it in the table: the run " +
               s"$by read its window again"
         }
-        val skippedRun = backfillRuns.find(_.status == RunStatus.SkippedLocked).value
-        val margin = Duration.between(skippedRun.startedAt, dead.expiresAt)
+        val margin = Duration.between(asked.startedAt, dead.expiresAt).abs.toMillis / 1000.0
+        val atOnceDid =
+          if (inTime) s"asked for the lease ${margin}s before it ran out, and was skipped"
+          else
+            s"asked for the lease ${margin}s after it ran out, took it over and ended the " +
+              "backfill: the round is made again"
         val besides = regularRuns.count { run =>
           run.startedAt.isAfter(killedAt) && died.finishedAt.exists(run.startedAt.isBefore)
         }
         info(
           s"round $number: the run ${dead.run} was killed with $committedAtTheKill chunks " +
-            s"committed, and $left; the invocation started at once was skipped " +
-            s"${margin.toMillis / 1000.0}s before the lease ran out; $besides regular runs " +
-            "started between the kill and the takeover" +
+            s"committed, and $left; the invocation started at once $atOnceDid; $besides " +
+            "regular runs started between the kill and the takeover" +
             (if (regularAtTheKill) "" else "; the regular invocation had ended before the kill")
         )
-        true
+        inTime
     }
   }
 
@@ -394,7 +441,11 @@ final class BackfillBesideRunSpec extends AnyFunSuite with Matchers with JdbcIng
   test(
     "a backfill killed with -9 beside the incremental load: its lease is waited out, and the next invocation ends it"
   ) {
-    rounds(killRound, "did the kill come in the middle of a run of the backfill")
+    rounds(
+      killRound,
+      "did the kill come in the middle of a chunk, and the invocation started at once ask for " +
+        "the lease before it ran out"
+    )
   }
 }
 
@@ -426,7 +477,8 @@ object BackfillBesideRunSpec {
   /**
    * The time to live of a lease, in the test that kills a process: the shortest that the rules
    * of a profile let a control plane of 1 s and 10 s have (33 s), and a renewal every 12 s. The
-   * run that dies leaves 24 s of it at least, for the invocation started at once to be skipped.
+   * run that dies leaves 24 s of it at least, for the invocation started at once to ask while it
+   * lives; one that asks later makes its round again.
    */
   private val MortalTtl = 36.seconds
 
