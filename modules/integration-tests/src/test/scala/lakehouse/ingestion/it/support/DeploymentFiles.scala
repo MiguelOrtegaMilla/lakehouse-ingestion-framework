@@ -59,12 +59,15 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
    * @param coordination that to the coordination database
    * @param retries for how long a step that fails with an error that passes is tried again, as
    *   `retries.budget` says; for as long as by default, unless it is given
+   * @param leases for how long a run holds a lease that it does not renew, as `leases.ttl` says;
+   *   as long as by default, unless it is given
    */
   def profileFile(
       control: String = connection(Engine, pg.password(Engine)),
       coordination: String = connection("ingest_coordination", pg.password("ingest_coordination")),
       lake: Path = lake,
-      retries: Option[String] = None
+      retries: Option[String] = None,
+      leases: Option[String] = None
   ): Path = {
     val file = Files.createTempFile(work, "profile-", ".yaml")
     Files.write(
@@ -78,6 +81,7 @@ final class DeploymentFiles(pg: BootstrappedPostgres, work: Path) extends AutoCl
          |${retries.fold("")(budget =>
           s"retries: { budget: $budget, first_backoff: 200ms, max_backoff: 1s }"
         )}
+         |${leases.fold("")(ttl => s"leases: { ttl: $ttl }")}
          |spark:
          |  master: "local[2]"
          |  settings:
