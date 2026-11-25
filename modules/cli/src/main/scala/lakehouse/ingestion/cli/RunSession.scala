@@ -4,11 +4,12 @@ import java.time.{ZoneId, ZoneOffset}
 import java.util.TimeZone
 
 import scala.collection.immutable.SortedMap
+import scala.concurrent.duration.FiniteDuration
 import scala.util.control.NonFatal
 
 import lakehouse.ingestion.core.config.{Profile, SourceId}
 import lakehouse.ingestion.engine.control.LogStoreSettings
-import lakehouse.ingestion.logstore.{PostgresLogStore, StartupGuard}
+import lakehouse.ingestion.logstore.{FaultHooks, FaultPoint, PostgresLogStore, StartupGuard}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.DeltaLog
 
@@ -65,11 +66,26 @@ object RunSession {
   def appName(source: SourceId): String = s"lakehouse-ingestion ${source.value}"
 
   /** Every setting of the session of a run of `source`, the profile's and the engine's. */
-  def settings(profile: Profile, source: SourceId): SortedMap[String, String] =
-    profile.spark.settings ++ engine(profile, source)
+  def settings(
+      profile: Profile,
+      source: SourceId,
+      waits: LogStoreWaits = NoWaits
+  ): SortedMap[String, String] =
+    profile.spark.settings ++ engine(profile, source, waits)
 
-  /** The settings that the engine gives the session, whatever the profile says. */
-  def engine(profile: Profile, source: SourceId): SortedMap[String, String] = {
+  /**
+   * The settings that the engine gives the session, whatever the profile says.
+   *
+   * @param waits how long a writer of the LogStore waits at each of its points: none, but in a
+   *   launcher of the tests that holds a process inside a commit to kill it there (P7.10). They
+   *   are the engine's to give, and only code gives them: a profile, a system property of the
+   *   JVM, `spark-defaults.conf` or `--conf` that gives one is refused (`foreign`)
+   */
+  def engine(
+      profile: Profile,
+      source: SourceId,
+      waits: LogStoreWaits = NoWaits
+  ): SortedMap[String, String] = {
     val scheme = profile.lake.uri.scheme.name
     SortedMap(
       "spark.master" -> profile.spark.master.value,
@@ -81,8 +97,16 @@ object RunSession {
       StartupGuard.logStoreKey(scheme) -> classOf[PostgresLogStore].getName
     ) ++ LogStoreSettings.hadoop(profile.databases.coordination).map { case (key, value) =>
       s"spark.hadoop.$key" -> value
+    } ++ waits.map { case (point, wait) =>
+      s"spark.hadoop.${FaultHooks.delayKey(point)}" -> wait.toMillis.toString
     }
   }
+
+  /** How long a writer of the LogStore waits at each of its points that it waits at. */
+  type LogStoreWaits = Map[FaultPoint, FiniteDuration]
+
+  /** No wait at any point: what every process but a launcher of the tests has. */
+  val NoWaits: LogStoreWaits = Map.empty
 
   /**
    * The settings that a session has and that neither its profile nor the engine gave it, and

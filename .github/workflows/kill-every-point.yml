@@ -1,0 +1,48 @@
+# The command `run` killed with -9 at every point (discovery §17, P7.10): every cell of
+# KilledRunSpec, each a process held at a point of the engine or of the LogStore, killed there,
+# and a process of its own that runs `run` again.
+#
+# On demand. ci.yml runs a few of the cells on every build, a point before the data and one after
+# it, a run of a table killed with the cursor of its source open, and a commit to Bronze that is
+# durable and not published; the others are reported there as ignored. Before merging a change
+# to how a run is recovered, run this workflow by hand on the branch of the change.
+#
+# Every third-party action is pinned by commit SHA, as in ci.yml (scripts/check-pins.sh).
+name: Kill at every point
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kill-every-point:
+    name: run killed with -9 at every point
+    runs-on: ubuntu-24.04
+    # Seventeen cells of two processes each, a minute at most each on a runner.
+    timeout-minutes: 45
+    env:
+      LAKEHOUSE_IT_KILL_EVERY_POINT: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The JDK, sbt, and the cache that the tests of ci.yml save.
+      - uses: ./.github/actions/setup-build
+      - name: Resolve the build
+        run: scripts/retry-on-429.sh sbt -batch update
+      # PostgreSQL is started by Testcontainers: Docker is on the runner.
+      - run: sbt -batch "integration-tests/testOnly lakehouse.ingestion.it.ingestion.KilledRunSpec"
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports
+          path: modules/*/target/test-reports/
+          retention-days: 7
+          if-no-files-found: ignore
