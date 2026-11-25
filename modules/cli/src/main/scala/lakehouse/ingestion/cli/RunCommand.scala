@@ -46,7 +46,8 @@ object RunCommand {
       err: PrintStream,
       maxBatches: Option[Int] = None,
       stop: Stop = Stop.Never,
-      hooks: FaultHooks = FaultHooks.Off
+      hooks: FaultHooks = FaultHooks.Off,
+      waits: RunSession.LogStoreWaits = RunSession.NoWaits
   ): Int =
     SourceCommand(
       profilePath,
@@ -57,7 +58,8 @@ object RunCommand {
       err,
       reads = true,
       operator = false,
-      done = "run"
+      done = "run",
+      waits = waits
     ) { ready =>
       val service = new IngestionService(
         ready.database,

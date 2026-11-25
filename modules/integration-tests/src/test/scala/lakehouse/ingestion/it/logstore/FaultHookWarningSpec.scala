@@ -9,7 +9,7 @@ import org.scalatest.matchers.should.Matchers
 
 /**
  * A fault hook left on in a configuration cannot go unnoticed: every LogStore says so when it
- * is created. The warnings are read from the logging backend the application runs with, log4j
+ * is created, and a writer says so the first time that it waits at the point. The warnings are read from the logging backend the application runs with, log4j
  * (`CapturedLogs`).
  */
 final class FaultHookWarningSpec extends AnyFunSuite with Matchers {
@@ -34,6 +34,28 @@ final class FaultHookWarningSpec extends AnyFunSuite with Matchers {
 
     // Every LogStore says it again: Delta creates one for each table, and more in tasks.
     logged(new PostgresLogStore(conf): Unit) shouldBe warnings
+  }
+
+  test("a writer that waits at a point says so the first time, and not after") {
+    val conf = new Configuration()
+    conf.setLong(FaultHooks.delayKey(FaultPoint.AfterInsert), 5L)
+    val hooks = FaultHooks.from(conf)
+
+    val said = CapturedLogs
+      .of(classOf[FaultHooks]) {
+        hooks.at(FaultPoint.AfterInsert)
+        hooks.at(FaultPoint.BeforeInsert)
+        hooks.at(FaultPoint.AfterInsert)
+      }
+      ._2
+      .map(line => line.level -> line.message)
+
+    said.map(_._1) shouldBe Seq(Level.WARN)
+    said.head._2 should include("A writer waits 5 ms at afterInsert")
+    said.head._2 should include("lakehouse.logstore.fault.afterInsert.delayMs")
+    // Hooks of their own, as another LogStore has, say it again.
+    CapturedLogs.of(classOf[FaultHooks])(FaultHooks.from(conf).at(FaultPoint.AfterInsert))._2 should
+      have size 1
   }
 
   test("a LogStore created without fault settings says nothing") {

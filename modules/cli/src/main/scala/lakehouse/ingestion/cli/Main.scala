@@ -203,6 +203,9 @@ object Main {
    * @param hooks what a run of the engine does at its fault points: nothing, but in the launcher
    *   of the tests that holds a process at one to kill it (P7.10). No argument of a command line
    *   sets them, and `main` gives none
+   * @param waits how long a writer of the LogStore waits at each of its points: none, but in the
+   *   launcher of the tests that holds a process inside a commit to kill it there (P7.10). Only
+   *   code gives them: a profile or a setting of Spark from outside that gives one is refused
    */
   def run(
       args: Seq[String],
@@ -211,7 +214,8 @@ object Main {
       environment: String => Option[String] = sys.env.get,
       stop: Stop = Stop.Never,
       operator: String = sys.props.getOrElse("user.name", ""),
-      hooks: FaultHooks = FaultHooks.Off
+      hooks: FaultHooks = FaultHooks.Off,
+      waits: RunSession.LogStoreWaits = RunSession.NoWaits
   ): Int = args.toList match {
     case "validate" :: options =>
       parse(options, Set("--profile", "--sources")) match {
@@ -254,7 +258,8 @@ object Main {
             err,
             limit,
             stop,
-            hooks
+            hooks,
+            waits
           )
         case Left(problem) => usage(problem, err)
       }
@@ -311,7 +316,8 @@ object Main {
             SecretResolver(environment),
             out,
             err,
-            hooks
+            hooks,
+            waits
           )
         case Left(problem) => usage(problem, err)
       }
@@ -401,7 +407,8 @@ object Main {
             err,
             limit,
             stop,
-            hooks
+            hooks,
+            waits
           )
         case Left(problem) => usage(problem, err)
       }

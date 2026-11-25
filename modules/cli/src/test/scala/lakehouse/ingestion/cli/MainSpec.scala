@@ -9,6 +9,8 @@ import java.sql.SQLException
 import java.time.Instant
 import java.util.TimeZone
 
+import scala.concurrent.duration._
+
 import lakehouse.ingestion.core.config.{
   ConfigLoader,
   ConnectorKind,
@@ -796,13 +798,29 @@ final class MainSpec
     (engine.keySet - "spark.master").foreach { key =>
       withClue(key)(Profile.refusedSparkSetting(key) should not be empty)
     }
-    // The fault hooks of the LogStore as well, which the engine never sets.
+    // The fault hooks of the LogStore as well, which the engine sets only when code asks it to.
     Profile.refusedSparkSetting(
       s"spark.hadoop.${FaultHooks.delayKey(FaultPoint.AfterInsert)}"
     ) should not be empty
     // The profile's own are kept, under the engine's.
     RunSession.settings(profile, id) shouldBe (profile.spark.settings ++ engine)
     profile.spark.settings should contain("spark.sql.shuffle.partitions" -> "4")
+  }
+
+  test(
+    "run: a wait of the LogStore is the engine's to give, by code alone, and refused from outside"
+  ) {
+    val profile = ConfigLoader.loadProfile(runProfile("waits")).value.value
+    val id = SourceId.parse("sales.returns").value
+    val key = s"spark.hadoop.${FaultHooks.delayKey(FaultPoint.AfterInsert)}"
+    RunSession.engine(profile, id).keySet should not contain key
+
+    val waiting = RunSession.engine(profile, id, Map(FaultPoint.AfterInsert -> 5.seconds))
+    waiting(key) shouldBe "5000"
+    // Given by code, it is the engine's, and the session that has it has nothing from outside.
+    RunSession.foreign(waiting, waiting) shouldBe empty
+    // The same setting from anywhere else is refused, as it was: the guard of a profile holds.
+    RunSession.foreign(waiting, RunSession.engine(profile, id)).map(_._1) shouldBe Seq(key)
   }
 
   test("run: a setting from outside the profile that a profile could not set is found") {

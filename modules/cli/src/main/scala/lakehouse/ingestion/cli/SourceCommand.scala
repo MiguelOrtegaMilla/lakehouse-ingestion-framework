@@ -51,6 +51,8 @@ private[cli] object SourceCommand {
    *   disabled; `run` does nothing with one
    * @param done what the command would have done, as a refusal says that it did not: "run",
    *   "changed"
+   * @param waits the waits of the LogStore that the session is given (`RunSession.engine`): none,
+   *   but in a launcher of the tests
    */
   def apply(
       profilePath: Path,
@@ -61,7 +63,8 @@ private[cli] object SourceCommand {
       err: PrintStream,
       reads: Boolean,
       operator: Boolean,
-      done: String
+      done: String,
+      waits: RunSession.LogStoreWaits = RunSession.NoWaits
   )(body: Ready => Int): Int = {
     val nothing = s"Nothing was $done."
     ConfigLoader.load(profilePath, sourcesPath) match {
@@ -112,7 +115,7 @@ private[cli] object SourceCommand {
                     case _: DatabaseFailure.Refused => Main.Exit.Permanent
                   }
                 case Right(database) =>
-                  try withSession(profile, source, database, err, nothing)(body)
+                  try withSession(profile, source, database, err, nothing, waits)(body)
                   finally database.close()
               }
         }
@@ -125,10 +128,11 @@ private[cli] object SourceCommand {
       source: Source,
       database: ControlDatabase,
       err: PrintStream,
-      nothing: String
+      nothing: String,
+      waits: RunSession.LogStoreWaits
   )(body: Ready => Int): Int = {
-    val engine = RunSession.engine(profile, source.id)
-    val spark = RunSession.open(RunSession.settings(profile, source.id))
+    val engine = RunSession.engine(profile, source.id, waits)
+    val spark = RunSession.open(RunSession.settings(profile, source.id, waits))
     try {
       val effective = spark.sparkContext.getConf.getAll.toMap ++ spark.conf.getAll
       val foreign = RunSession.foreign(effective, engine)

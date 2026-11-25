@@ -32,7 +32,8 @@ object ReprocessCommand {
       secrets: SecretResolver,
       out: PrintStream,
       err: PrintStream,
-      hooks: FaultHooks = FaultHooks.Off
+      hooks: FaultHooks = FaultHooks.Off,
+      waits: RunSession.LogStoreWaits = RunSession.NoWaits
   ): Int =
     SourceCommand(
       profilePath,
@@ -43,7 +44,8 @@ object ReprocessCommand {
       err,
       reads = true,
       operator = true,
-      done = "read"
+      done = "read",
+      waits = waits
     ) { ready =>
       val service = new IngestionService(
         ready.database,

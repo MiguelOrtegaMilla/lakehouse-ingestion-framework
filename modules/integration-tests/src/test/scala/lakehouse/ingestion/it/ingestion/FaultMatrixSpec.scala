@@ -15,6 +15,12 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.{Backfills, Leases}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
+import lakehouse.ingestion.it.ingestion.RecoveryOracle.{
+  recoveryAt,
+  recoveryInside,
+  LogTable,
+  Recovery
+}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.logstore.{FaultPoint => LogPoint, HookedLogStore, SimulatedCrash}
 import org.apache.hadoop.fs.Path
@@ -38,7 +44,7 @@ import org.scalatest.matchers.should.Matchers
  * reaches the points of its column, and no other, is a test of its own.
  *
  * '''What a cell expects''' is said once, from the protocol (ADR-0005, ADR-0021), and not in
- * each test (`recoveryAt`): the table of the data says what the run that takes the lease of
+ * each test (`RecoveryOracle`): the table of the data says what the run that takes the lease of
  * another does with the batch that it left. A batch whose rows are in it is rolled forward, and one whose rows are not is run again
  * under its number, as it was planned; a quarantine that has the records of the batch changes
  * nothing of that.
@@ -620,37 +626,6 @@ object FaultMatrixSpec {
     val All: Seq[Kind] = Seq(Files, Full, Incremental, Reprocess, FirstChunk, ChunkUnderWay)
   }
 
-  /** What the run after one that died does with the batch that it left planned. */
-  sealed abstract class Recovery(val left: String, val taker: String)
-
-  object Recovery {
-
-    /** Its plan is run again, under its number: nothing of it is in the table of its data. */
-    case object Replay
-        extends Recovery(
-          "leaves its batch to be run again under its number",
-          "the run that took it runs the batch again under its number"
-        )
-
-    /** It is committed as it was written: its rows are in the table of its data. */
-    case object RollForward
-        extends Recovery(
-          "leaves its batch to be rolled forward",
-          "the run that took it rolls the batch forward"
-        )
-  }
-
-  /**
-   * The oracle of the columns of a run that dies and of one whose lease is taken over (ADR-0005
-   * §4): what the run that takes the lease does with the batch left planned. The table of the data of the
-   * batch decides. Its rows are in it from `AfterBronzeCommit` on; at `AfterQuarantineWrite`
-   * the quarantine has the rejected records and the data does not.
-   */
-  def recoveryAt(point: FaultPoint): Recovery = point match {
-    case FaultPoint.AfterBronzeCommit | FaultPoint.BeforeStateCommit => Recovery.RollForward
-    case _ => Recovery.Replay
-  }
-
   /** What a batch makes of a change of its source at a point. */
   sealed abstract class Change(val saying: String)
 
@@ -685,29 +660,6 @@ object FaultMatrixSpec {
   /** The points of a run of a table before its rows are asked for. */
   private val BeforeTheWrite =
     Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead, FaultPoint.AfterCounts)
-
-  /** The tables that a batch of files commits to, in the order that it does. */
-  sealed abstract class LogTable(val name: String)
-
-  object LogTable {
-    case object Quarantine extends LogTable("its quarantine")
-    case object Bronze extends LogTable("Bronze")
-
-    val All: Seq[LogTable] = Seq(Quarantine, Bronze)
-  }
-
-  /**
-   * The oracle of a run that dies inside its commit to a table (ADR-0004 §3.8, ADR-0005 §4): the
-   * table of the data decides, as it does at the points of the engine, once a reader has made it
-   * what the LogStore says. Before the insert of its version, the commit is not there; from it
-   * on, it is durable, and the next reader publishes it, if it is not published yet. A commit to
-   * the quarantine, durable or not, leaves the data unwritten.
-   */
-  def recoveryInside(table: LogTable, point: LogPoint): Recovery = (table, point) match {
-    case (LogTable.Bronze, LogPoint.BeforeInsert) => Recovery.Replay
-    case (LogTable.Bronze, _) => Recovery.RollForward
-    case (LogTable.Quarantine, _) => Recovery.Replay
-  }
 
   /** A file with a record of three that cannot be parsed, which its source lets be rejected. */
   private val RejectingCsv = "id,amount\n1,2\n3\n4,5\n"
