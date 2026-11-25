@@ -1,7 +1,7 @@
 package lakehouse.ingestion.core.control
 
 import java.security.SecureRandom
-import java.time.{Clock, Instant}
+import java.time.Clock
 import java.util.UUID
 
 /**
@@ -21,10 +21,6 @@ import java.util.UUID
  * database's (`started_at`, the expiry of a lease).
  */
 final class RunId private (val uuid: UUID) extends AnyVal {
-
-  /** When the id was made, to the millisecond, by the clock of the instance that made it. */
-  def madeAt: Instant = Instant.ofEpochMilli(uuid.getMostSignificantBits >>> 16)
-
   override def toString: String = uuid.toString
 }
 
