@@ -70,3 +70,7 @@ With ADR-0005 alone, that batch stays `PLANNED`. Every run of the source finds i
 - **A batch that the table has** ends the run with an `IllegalStateException`, which nothing classifies. The run is left as a process that died leaves it, and the batch is still `PLANNED`.
 - **Tests** (`IngestionServiceSpec`, `BatchesSpec`, `ProcessedFilesSpec`, `ControlSchemaSpec`, `ControlSchemaUpgradeSpec`): a file written again and one removed between the plan and the read, on disk; a file changed while it is read; the batch written to its table by another writer before the file changes; a lease taken over before the batch is given up; and the run after, which takes the changed file as a new file in the next batch.
 
+## As built (P7, 2026-11-26)
+
+- **The operator's command of point 6 is `abandon-batch`** ([ADR-0021](0021-operator-actions-and-backfills.md) §2, P7.3): a run of its own, under the lease, that gives up the planned batch that it is told if the table that the batch was planned for does not have it.
+- **A table that is away is not one that does not have the batch** (P7.11). The question of point 2 goes to Delta, which lists the log through the LogStore, and the LogStore refuses a table whose registry has a commit that its log does not: a run whose table is on a volume that is not mounted gives no batch up for a file that changed, and the batch is rolled forward once the table is there again (`IngestionServiceSpec`).
