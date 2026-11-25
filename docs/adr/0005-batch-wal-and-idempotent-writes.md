@@ -97,3 +97,10 @@ Silver `MERGE` uses Delta's session-level `spark.databricks.delta.write.txnAppId
 - Exactly-once *effect* per batch under crashes, retries, zombies and concurrent writers.
 - Mirrors Structured Streaming's offset log / commit log + idempotent `foreachBatch`, which keeps the door open to streaming.
 - Depends on Delta internals to read `txn` versions (`Snapshot.transactions`). Isolated behind a small adapter and covered by an upgrade test.
+
+*As built (P7, 2026-11-26):* the protocol under the faults that P7 added.
+
+- **Step 2 at every fault point of the engine, and inside a commit** (`FaultMatrixSpec`): for new files, a table read whole, a window, files read again and the chunks of a backfill, with a run that dies there, a lease that is taken over there and a source that changes there; and at the three points of the LogStore inside the commits of a run, to its quarantine and to Bronze. Each ends with the run after it, which rolls the batch forward or runs it again as the table of its data says.
+- **The same after a real `kill -9` of the command** (`KilledRunSpec`), at points of the engine and inside a commit, and for a backfill beside the regular sequence of its source (`BackfillBesideRunSpec`).
+- **What the control plane and the tables say of each other is held after every recovery** by a ledger of the tests (`IngestionLedger`): each committed batch in its table in one commit, no row of a batch that was given up or is planned and not written, the state at what the plan of the last batch says, and the files taken those of the committed plans.
+- **A sequence is the regular one of a source, or that of a backfill** ([ADR-0021](0021-operator-actions-and-backfills.md) §5): the state that step 7 advances is the progress of the backfill, for a chunk of one, and its last chunk completes it.

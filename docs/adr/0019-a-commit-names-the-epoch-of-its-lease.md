@@ -90,3 +90,9 @@ What makes the problem tractable here is that this project owns the place where 
 ## Erratum (2026-11-20)
 
 The table of alternatives says of `LeasedRun.verify` that it asks the control plane whether the lease is still held. It does not: `verify` asks nobody. It is the count that a run keeps of its own lease (ADR-0006), with no statement to the database. The row is left as it was written, and its verdict stands for the reason it gives: the check comes before the commit and not with it, so it shortens the time a zombie works and proves nothing. What P5.11 built on it is in the discovery, §17 ("As built, P5.11").
+
+## As built (P7.2 and P7.3, 2026-11-22)
+
+- **A later epoch in force has one of two authors, and the control plane tells them apart** (`EpochAnnouncement`). A run of this control plane that took the lease over ended the run that is told so, which has lost its lease (3). An epoch that no run of this control plane announced is one that the coordination store remembers of another, as when a control plane is made anew over it: the run is recorded as failed for good, gives its lease up, and says how the epochs of its key are forgotten (4). Until P7.2 it ended as a run that lost its lease, and every run after it the same, for ever.
+- **An operator's action announces its epoch as a run does**, by the same helper, before it asks a table whether it has a batch ([ADR-0021](0021-operator-actions-and-backfills.md) §1.3): a run that held the lease before, and is stalled, commits nothing after a batch was given up or a state was reset.
+- **The key of an epoch is the key of the lease, for a backfill as well**: `<source_id>/<layer>/backfill/<backfill_id>`. The regular sequence of a source and each of its backfills are fenced apart.
