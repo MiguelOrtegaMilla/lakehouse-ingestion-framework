@@ -47,7 +47,11 @@ import org.scalatest.matchers.should.Matchers
  * asks for the lease, and is refused. The jobs of Spark of the run that took the lease carry the
  * mark of the other as well (`RunJobs`), which would have them stopped if the other found its
  * lease lost by its heartbeat: its first renewal is a third of its time to live away, 40 s, long
- * after a cell is over.
+ * after a cell is over. In those cells the run that lost the lease writes a batch that its table
+ * has, which Delta skips before any commit: the epoch that the run that took the lease announced
+ * to the LogStore is never asked. Cells of their own ask it: a run of files whose lease is taken
+ * where it holds what it read, by a run that finds the file changed and gives the batch up, so
+ * that no table has the batch and the epoch alone refuses the write.
  *
  * '''The lease of a run that died is made to run out in the database''' (`runOut`), at once, and
  * is not waited for: what a cell asks is what the next run does with what the dead one left,
@@ -281,13 +285,29 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
     assertLedger(cell.source)
   }
 
-  /** The run ended as one that lost its lease: a failure that passes, which says so. */
-  private def lostTheLease(outcome: Outcome, lease: LeaseKey): Unit = outcome match {
+  /**
+   * The run ended as one that lost its lease: a failure that passes, which says so.
+   *
+   * @return what it said
+   */
+  private def lostTheLease(outcome: Outcome, lease: LeaseKey): String = outcome match {
     case Outcome.Failed(_, failure, message) =>
       failure shouldBe FailureClass.Transient
-      message should include(s"lost the lease of $lease"): Unit
+      message should include(s"lost the lease of $lease")
+      message
     case other => fail(s"the run did not lose its lease: $other")
   }
+
+  private def givenUp(outcome: Outcome): Outcome.GivenUp = outcome match {
+    case done: Outcome.GivenUp => done
+    case other => fail(s"no batch was given up: $other")
+  }
+
+  private def epochOf(run: RunId): Long = runOf(run).epoch.value.value
+
+  /** The batch after `batch` in its sequence. */
+  private def after(batch: BatchId): BatchId =
+    BatchId(batch.app, BatchSeq.of(batch.seq.value + 1).toOption.get)
 
   // A run that dies at the point: the next takes its lease over, and finishes its batch.
   for (kind <- Kind.All; point <- kind.points) {
@@ -321,8 +341,53 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
         taker = Some(cell.next())
       })
 
-      lostTheLease(taken, cell.lease)
+      lostTheLease(taken, cell.lease): Unit
       assertFinished(cell, recovery, taken.run, taker.value)
+    }
+  }
+
+  // A run whose lease is taken over where it holds what it read, by a run that finds the file of
+  // the batch changed and gives the batch up: no table has the batch, and what keeps the other
+  // from writing it is the epoch that the run that took the lease announced, alone.
+  for (kind <- Seq(Kind.Files, Kind.Reprocess); point <- HoldingWhatItRead) {
+    test(
+      s"${kind.name}: a run whose lease is taken over at $point by a run that gives the batch " +
+        "up is refused its commit by the epoch"
+    ) {
+      val cell = cellOf(kind)
+      var taker = Option.empty[Outcome]
+
+      val taken = cell.run(hookAt(point) { _ =>
+        drop(cell.source, "a.csv", ChangedCsv, at = Now.minusSeconds(1800)): Unit
+        runOut(cell.lease)
+        taker = Some(cell.next())
+      })
+
+      // The file is not what the batch planned, and nothing of the batch is in its table.
+      givenUp(taker.value).batch shouldBe cell.batch
+      val gaveUp = taker.value.run
+      runOf(gaveUp).status shouldBe RunStatus.Failed
+      batchOf(cell.batch).status shouldBe BatchStatus.Abandoned
+      // The run that lost its lease went on to write what it read, and nothing of it is in the
+      // table of the data: the LogStore refused the commit, for its epoch.
+      withClue(s"the commits of ${cell.batch.app} in the table of its data: ") {
+        delta
+          .lastVersion(bronze(cell.source), cell.batch.app)
+          .filter(_ >= cell.batch.seq.value) shouldBe
+          None
+      }
+      val refused = lostTheLease(taken, cell.lease)
+      refused should include(s"the writer commits under epoch ${epochOf(taken.run)} of")
+      refused should include(s"the epoch in force is ${epochOf(gaveUp)}")
+      runOf(taken.run).status shouldBe RunStatus.Abandoned
+      holderOf(cell.lease) shouldBe None
+
+      // The next run takes the file as it is now, a file it has not taken, under the next number.
+      ingested(cell.next()).batch shouldBe after(cell.batch)
+      sequenceOf(cell.batch) shouldBe
+        (1L until cell.batch.seq.value).map(_ -> "COMMITTED") ++
+        Seq(cell.batch.seq.value -> "ABANDONED", cell.batch.seq.value + 1 -> "COMMITTED")
+      assertLedger(cell.source)
     }
   }
 }
@@ -397,6 +462,16 @@ object FaultMatrixSpec {
 
   /** A file with a record of three that cannot be parsed, which its source lets be rejected. */
   private val RejectingCsv = "id,amount\n1,2\n3\n4,5\n"
+
+  /** What the file of a batch is written again with: another size, and another time. */
+  private val ChangedCsv = "id,amount\n10,20\n30,40\n"
+
+  /**
+   * The points where a run of files holds what it read, kept apart from the files, and has
+   * written nothing of it to the table of its data.
+   */
+  private val HoldingWhatItRead =
+    Seq(FaultPoint.AfterRead, FaultPoint.AfterCounts, FaultPoint.AfterQuarantineWrite)
 
   /** The first day of 2026: the first window of a source that reads a day at a time from it. */
   private val Day = Instant.parse("2026-01-01T00:00:00Z")
