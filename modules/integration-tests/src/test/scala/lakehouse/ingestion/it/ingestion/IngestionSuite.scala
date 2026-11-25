@@ -28,7 +28,7 @@ import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.ingestion.IngestionLedger.{Facts, TakenFile, Violation}
-import lakehouse.ingestion.it.stress.LogReader
+import lakehouse.ingestion.it.stress.{LogModel, LogReader}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores, LocalSparkSuite}
 import org.apache.spark.sql.delta.DeltaLog
@@ -472,28 +472,42 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite {
       val lastTxn = delta.lastVersion(location, app)
       val log = LogReader.logView(spark, directory)
       withClue(s"the log of $uri: ")(log.unreadable shouldBe empty)
-      val rows = spark.read
-        .format("delta")
-        .load(uri)
-        .filter(itsRows)
-        .groupBy(col(run), col(batch))
-        .count()
-        .collect()
-        .map(row => IngestionLedger.Rows(row.getString(0), row.getLong(1), row.getLong(2)))
-        .toSeq
-      IngestionLedger.Table(
-        uri,
-        log.commits.map(commit =>
-          IngestionLedger.Commit(
-            commit.version,
-            commit.txns.filter(_.appId == app.value).map(_.version)
-          )
-        ),
-        log.versions.minOption,
-        lastTxn,
-        rows
-      )
+      // A first commit that the LogStore refused leaves the directory of a log with no version
+      // in it, which Delta asked just now: there is no table, as there is none for Delta.
+      if (log.versions.isEmpty) IngestionLedger.Table(uri)
+      else tableOf(uri, app, run, batch, itsRows, lastTxn, log)
     }
+  }
+
+  /** What the ledger reads of a table that has a version at least. */
+  private def tableOf(
+      uri: String,
+      app: TxnAppId,
+      run: String,
+      batch: String,
+      itsRows: Column,
+      lastTxn: Option[Long],
+      log: LogModel.LogView
+  ): IngestionLedger.Table = {
+    val rows = spark.read
+      .format("delta")
+      .load(uri)
+      .filter(itsRows)
+      .groupBy(col(run), col(batch))
+      .count()
+      .collect()
+      .map(row => IngestionLedger.Rows(row.getString(0), row.getLong(1), row.getLong(2)))
+      .toSeq
+    IngestionLedger.Table(
+      uri,
+      log.commits.map(commit =>
+        IngestionLedger
+          .Commit(commit.version, commit.txns.filter(_.appId == app.value).map(_.version))
+      ),
+      log.versions.minOption,
+      lastTxn,
+      rows
+    )
   }
 
   protected val NothingCounted = RunCounts(
