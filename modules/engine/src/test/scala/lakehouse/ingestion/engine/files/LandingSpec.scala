@@ -11,7 +11,7 @@ import scala.util.Using
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, RootUri}
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.{FileName, FilePlan, FilePlanner, LandedFile, Listed}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.{BeforeAndAfterEach, EitherValues}

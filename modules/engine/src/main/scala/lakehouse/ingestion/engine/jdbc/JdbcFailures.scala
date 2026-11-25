@@ -4,7 +4,7 @@ import java.io.IOException
 import java.sql.SQLException
 
 import lakehouse.ingestion.core.config.{DatabaseConnection, Durations}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.control.DatabaseFailure
 import org.apache.spark.SparkThrowable
 

@@ -24,7 +24,7 @@ import lakehouse.ingestion.core.control.{
   TableTransactions,
   TxnAppId
 }
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.delta.{BatchCommit, CommitMetadata, DeltaTableTransactions}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
 import lakehouse.ingestion.logstore.{LakeFixture, LogStores}

@@ -10,7 +10,7 @@ import io.circe.Json
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, LandedFile}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.it.support.LocalSparkSuite

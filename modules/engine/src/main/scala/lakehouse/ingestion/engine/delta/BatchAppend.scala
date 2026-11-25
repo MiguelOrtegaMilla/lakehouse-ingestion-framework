@@ -9,7 +9,7 @@ import io.delta.exceptions.{
 }
 import lakehouse.ingestion.core.config.{SourceId, TableLocation}
 import lakehouse.ingestion.core.control.{BatchId, RunId}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.{AnalysisException, DataFrame}
 

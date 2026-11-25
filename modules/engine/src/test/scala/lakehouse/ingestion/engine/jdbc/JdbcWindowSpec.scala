@@ -6,7 +6,7 @@ import io.circe.Json
 import lakehouse.ingestion.core.config.{JdbcConnectorConfig, Load, Source}
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.state.StoredWatermark
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.{EitherValues, OptionValues}

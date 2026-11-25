@@ -3,6 +3,7 @@ package lakehouse.ingestion.engine
 import java.io.IOException
 
 import lakehouse.ingestion.core.control.RunStart
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.logstore.WriterEpochs
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import org.apache.hadoop.conf.Configuration

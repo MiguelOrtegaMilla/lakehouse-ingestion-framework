@@ -50,7 +50,7 @@ final class QuarantineWriter(lake: Lake, tables: DeltaTableTransactions, context
   /**
    * @param unparsed the records that a read set apart (`ReadResult.unparsed`): the file of
    *   each, and its text
-   * @throws lakehouse.ingestion.engine.RunFailedException as `BatchAppend.append`
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException as `BatchAppend.append`
    */
   def write(table: TableLocation, batch: QuarantineBatch, unparsed: DataFrame): BatchAppend.Result =
     appends.append(

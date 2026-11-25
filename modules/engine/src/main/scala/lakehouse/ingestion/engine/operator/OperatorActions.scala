@@ -26,7 +26,8 @@ import lakehouse.ingestion.engine.control.{
 }
 import lakehouse.ingestion.engine.delta.BatchLookup.Found
 import lakehouse.ingestion.engine.delta.{BatchLookup, DeltaTableTransactions}
-import lakehouse.ingestion.engine.{EpochAnnouncement, RunFailedException}
+import lakehouse.ingestion.engine.EpochAnnouncement
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import org.apache.spark.sql.SparkSession
 import org.slf4j.LoggerFactory

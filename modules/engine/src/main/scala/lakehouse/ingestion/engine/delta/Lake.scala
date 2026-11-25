@@ -1,7 +1,7 @@
 package lakehouse.ingestion.engine.delta
 
 import lakehouse.ingestion.core.config.{RootUri, TableLocation}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.logstore.{TableIdentity, UnsupportedTableLocationException}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path

@@ -1,4 +1,4 @@
-package lakehouse.ingestion.engine
+package lakehouse.ingestion.engine.failure
 
 import lakehouse.ingestion.core.control.FailureClass
 
