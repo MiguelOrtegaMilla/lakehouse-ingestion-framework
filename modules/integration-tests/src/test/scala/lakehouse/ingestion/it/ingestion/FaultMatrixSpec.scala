@@ -5,7 +5,8 @@ import java.time.{Clock, Instant, OffsetDateTime, ZoneOffset}
 
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration._
-import scala.util.Using
+import scala.concurrent.{Await, Promise, TimeoutException}
+import scala.util.{Failure, Success, Try, Using}
 
 import lakehouse.ingestion.core.config.{EngineColumns, Source, SourceId}
 import lakehouse.ingestion.core.control._
@@ -18,6 +19,7 @@ import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.logstore.{FaultPoint => LogPoint, HookedLogStore, SimulatedCrash}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.functions.col
+import org.scalatest.OutcomeOf.outcomeOf
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -71,6 +73,48 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
   import FaultMatrixSpec._
 
   private val asked = OperatorRequest.of("ops.oncall", "the matrix of faults").toOption.get
+
+  /**
+   * Each cell has `CellTimeLimit` to end, on a thread of its own. One that does not, as one
+   * whose commit Delta tries again and again at a version that is taken, fails with its name and
+   * where it was, and the matrix goes on, instead of the job hanging until its own limit.
+   *
+   * Not `TimeLimitedTests`: it interrupts the thread of the test and then waits for the test to
+   * return, which a loop that does not heed an interrupt never does. Here the thread of the cell
+   * is interrupted, its jobs of Spark are stopped, and it is left as it is: nothing in it can be
+   * made to end, and its source is its own, which no other cell touches.
+   */
+  override def withFixture(test: NoArgTest): org.scalatest.Outcome = {
+    val ended = Promise[org.scalatest.Outcome]()
+    val cell = new Thread(() => ended.complete(Try(super.withFixture(test))): Unit)
+    cell.setName(s"cell: ${test.name}")
+    cell.setDaemon(true)
+    cell.start()
+    Try(Await.result(ended.future, CellTimeLimit)) match {
+      case Success(outcome) => outcome
+      case Failure(_: TimeoutException) =>
+        // Where it was: what it was doing at that moment, by the frames at the top, and in
+        // which step of the run and of the cell, by the frames of this application.
+        val frames = cell.getStackTrace.toSeq
+        val where = (frames.take(3) ++ Seq("...") ++
+          frames
+            .drop(3)
+            .filter(frame =>
+              frame.getClassName.startsWith(Application) && !frame.getClassName.contains("$$Lambda")
+            )
+            .take(20))
+          .mkString("\n    at ")
+        cell.interrupt()
+        spark.sparkContext.cancelAllJobs()
+        outcomeOf(
+          fail(
+            s"the cell \"${test.name}\" did not end in $CellTimeLimit: it hung, and was left " +
+              s"as it was. It was at\n    at $where"
+          )
+        )
+      case Failure(other) => throw other
+    }
+  }
 
   // `PostgresLogStore`, behind hooks that stop a commit at a point of the LogStore: the cells of a
   // run that dies inside its commit to a table arm them, and the others go through it untouched.
@@ -531,6 +575,15 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
 }
 
 object FaultMatrixSpec {
+
+  /**
+   * How long a cell may take: some twenty times what one takes, the first of the suite included,
+   * which warms Spark up.
+   */
+  private val CellTimeLimit = 2.minutes
+
+  /** The package whose frames say in which step a cell that hung was. */
+  private val Application = "lakehouse.ingestion."
 
   /** The kinds of batch of the matrix, each with the fault points that its run reaches. */
   sealed abstract class Kind(val name: String, val points: Seq[FaultPoint])
