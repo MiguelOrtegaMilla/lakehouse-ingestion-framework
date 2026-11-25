@@ -18,6 +18,10 @@ final class RunIdSpec extends AnyFunSuite with Matchers with EitherValues {
     override def nextLong(): Long = value
   }
 
+  /** The 48 bits of time of an id: when it was made, by the clock of whoever made it. */
+  private def madeAt(id: RunId): Instant =
+    Instant.ofEpochMilli(id.uuid.getMostSignificantBits >>> 16)
+
   test("an id is a UUID of version 7, with the variant of the RFC") {
     val id = RunId.generate()
 
@@ -29,7 +33,7 @@ final class RunIdSpec extends AnyFunSuite with Matchers with EitherValues {
   test("an id has the time it was made at, to the millisecond, and bits that are random") {
     val id = RunId.generate(at("2026-11-18T09:10:25.123Z"), bits(-1L))
 
-    id.madeAt shouldBe Instant.parse("2026-11-18T09:10:25.123Z")
+    madeAt(id) shouldBe Instant.parse("2026-11-18T09:10:25.123Z")
     // 48 bits of time, the version, 12 bits; the variant, 62 bits. 1794993025123 ms is
     // 0x01a1edebf063.
     id.toString shouldBe "01a1edeb-f063-7fff-bfff-ffffffffffff"
@@ -83,7 +87,7 @@ final class RunIdSpec extends AnyFunSuite with Matchers with EitherValues {
 
     RunId.parse(id.toString).value shouldBe id
     RunId.of(id.uuid).value shouldBe id
-    RunId.of(UUID.fromString(id.toString)).value.madeAt shouldBe id.madeAt
+    RunId.of(UUID.fromString(id.toString)).value shouldBe id
   }
 
   test("what is not a run id is refused: another version, another way to write it") {
