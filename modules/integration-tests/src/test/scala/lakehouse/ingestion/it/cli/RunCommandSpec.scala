@@ -42,9 +42,11 @@ final class RunCommandSpec
     with Matchers
     with Eventually
     with ControlPlaneSuite
-    with RunCommandQueries {
+    with RunCommandQueries
+    with CommandLedger {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("run-command-"))
+  override protected def deployment: DeploymentFiles = files
   import files.{arguments, connection, drop, profileFile, validProfile}
 
   override def afterAll(): Unit =
@@ -98,6 +100,7 @@ final class RunCommandSpec
     commitsOf(returns) shouldBe Seq("00000000000000000000.json")
     runsOf(returns) shouldBe Seq("SUCCEEDED" -> None, "SUCCEEDED" -> None)
     rowsWritten(returns) shouldBe Seq("2", "0")
+    assertLedger(returns)
   }
 
   test("a run takes a table of a database to Bronze, in UTC whatever zone its JVM started in") {
@@ -453,6 +456,7 @@ final class RunCommandSpec
     withClue(rest.err)(rest.exit shouldBe Main.Exit.Ok)
     batchesOf(source).map(_._2).distinct shouldBe Seq("COMMITTED")
     takenFiles(source) shouldBe (1 to 8).map(n => f"f$n%02d.csv")
+    assertLedger(source)
   }
 
   test("a signal before the first run ends the process in 128 + the signal, with nothing run") {

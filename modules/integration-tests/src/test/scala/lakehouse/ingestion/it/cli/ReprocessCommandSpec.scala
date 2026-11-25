@@ -20,9 +20,14 @@ import org.scalatest.matchers.should.Matchers
  * deployment, the real control plane and LogStore, what it says, and the exit code of each of its
  * outcomes (discovery §14.1). `ReprocessSpec` has what it does to a source.
  */
-final class ReprocessCommandSpec extends AnyFunSuite with Matchers with RunCommandQueries {
+final class ReprocessCommandSpec
+    extends AnyFunSuite
+    with Matchers
+    with RunCommandQueries
+    with CommandLedger {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("reprocess-command-"))
+  override protected def deployment: DeploymentFiles = files
   import files.{arguments, drop, validProfile}
 
   override def afterAll(): Unit =
@@ -80,6 +85,7 @@ final class ReprocessCommandSpec extends AnyFunSuite with Matchers with RunComma
     batchesOf(returns) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED")
     reprocessesOf(returns) shouldBe
       Seq(Seq("SUCCEEDED", operator.requestedBy, "the parser was fixed"))
+    assertLedger(returns)
   }
 
   test("an operator reprocesses a source that is disabled") {
@@ -110,6 +116,7 @@ final class ReprocessCommandSpec extends AnyFunSuite with Matchers with RunComma
 
     reprocess(returns, "1").exit shouldBe Main.Exit.DataThreshold
     batchesOf(returns) shouldBe Seq("1" -> "COMMITTED", "2" -> "PLANNED")
+    assertLedger(returns)
   }
 
   test("while a run holds the lease of the source, the command ends in 2 and plans nothing") {

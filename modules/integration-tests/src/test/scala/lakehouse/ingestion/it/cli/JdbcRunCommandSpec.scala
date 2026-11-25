@@ -38,9 +38,14 @@ import org.scalatest.matchers.should.Matchers
  * The sources that are cut are in a PostgreSQL of their own, behind a proxy; the control plane
  * is in the one of the suite, which no test breaks.
  */
-final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommandQueries {
+final class JdbcRunCommandSpec
+    extends AnyFunSuite
+    with Matchers
+    with RunCommandQueries
+    with CommandLedger {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("jdbc-run-command-"))
+  override protected def deployment: DeploymentFiles = files
   import files.{arguments, connection, validProfile}
 
   private var behindAProxy: Option[ProxiedPostgres] = None
@@ -195,6 +200,7 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
     )
     batchesOf(stamped) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED", "3" -> "COMMITTED")
     rowsWritten(stamped) shouldBe Seq("1", "1", "1")
+    assertLedger(stamped)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -276,6 +282,7 @@ final class JdbcRunCommandSpec extends AnyFunSuite with Matchers with RunCommand
         .map(row => row.getLong(0) -> row.getLong(1))
         .toSet
     ) shouldBe Set(1L -> 5000L)
+    assertLedger(wide)
   }
 
   // ---------------------------------------------------------------------------------------------

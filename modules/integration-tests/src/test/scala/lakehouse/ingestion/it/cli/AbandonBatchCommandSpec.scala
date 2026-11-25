@@ -22,9 +22,14 @@ import org.scalatest.matchers.should.Matchers
  * deployment, the real control plane and LogStore, and the exit code of each of its outcomes
  * (discovery §14.1). `AbandonBatchSpec` has what the action does to a source.
  */
-final class AbandonBatchCommandSpec extends AnyFunSuite with Matchers with RunCommandQueries {
+final class AbandonBatchCommandSpec
+    extends AnyFunSuite
+    with Matchers
+    with RunCommandQueries
+    with CommandLedger {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("abandon-command-"))
+  override protected def deployment: DeploymentFiles = files
   import files.{arguments, drop, validProfile}
 
   override def afterAll(): Unit =
@@ -94,6 +99,7 @@ final class AbandonBatchCommandSpec extends AnyFunSuite with Matchers with RunCo
     askedOf(orders) shouldBe Seq(
       Seq("abandon", "SUCCEEDED", operator.requestedBy, "its file is malformed")
     )
+    assertLedger(orders)
   }
 
   test("an operator acts on a source that is disabled: it is how a paused source is mended") {
