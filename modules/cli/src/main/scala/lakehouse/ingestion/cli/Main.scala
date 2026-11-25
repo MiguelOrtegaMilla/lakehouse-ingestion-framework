@@ -20,7 +20,13 @@ import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
  *  - `migrate` brings the schemas of a deployment to the version of this application. It is the
  *    one command that connects as the role that owns them (ADR-0013 §3), and that role's
  *    password is in no profile: the command is told where it is;
- *  - `run` runs one source once into Bronze, as an orchestrator starts it (`RunCommand`).
+ *  - `run` runs one source into Bronze, a batch a run, as an orchestrator starts it
+ *    (`RunCommand`);
+ *  - `abandon-batch`, `reset-state` and `reprocess` are what an operator does to a source that
+ *    is stuck, whose configuration changed, or whose files are to be read again; and `backfill`
+ *    reads a range of the history of a source on a sequence of its own. Each is a run under a
+ *    lease, which says who asked for it and why (ADR-0021; `AbandonBatchCommand`,
+ *    `ResetStateCommand`, `ReprocessCommand`, `BackfillCommand`).
  */
 object Main {
 
