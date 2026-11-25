@@ -20,9 +20,14 @@ import org.scalatest.matchers.should.Matchers
  * deployment, the real control plane and LogStore, what it says, and the exit code of each of its
  * outcomes (discovery §14.1). `ResetStateSpec` has what the action does to a source.
  */
-final class ResetStateCommandSpec extends AnyFunSuite with Matchers with RunCommandQueries {
+final class ResetStateCommandSpec
+    extends AnyFunSuite
+    with Matchers
+    with RunCommandQueries
+    with CommandLedger {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("reset-command-"))
+  override protected def deployment: DeploymentFiles = files
   import files.{arguments, drop, validProfile}
 
   override def afterAll(): Unit =
@@ -99,6 +104,8 @@ final class ResetStateCommandSpec extends AnyFunSuite with Matchers with RunComm
     drop(moved, "b.csv", "id\n2\n")
     run(moved).exit shouldBe Main.Exit.Ok
     batchesOf(moved) shouldBe Seq("1" -> "COMMITTED", "2" -> "COMMITTED")
+    // The first batch was planned for the table that the source had before.
+    assertLedger(moved, returns)
   }
 
   test("an operator resets a source that is disabled") {

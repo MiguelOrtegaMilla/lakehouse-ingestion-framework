@@ -33,9 +33,14 @@ import org.scalatest.matchers.should.Matchers
  * decided by the range and the chunk alone. The sources that are cut are in a PostgreSQL of
  * their own, behind a proxy.
  */
-final class BackfillCommandSpec extends AnyFunSuite with Matchers with RunCommandQueries {
+final class BackfillCommandSpec
+    extends AnyFunSuite
+    with Matchers
+    with RunCommandQueries
+    with CommandLedger {
 
   private lazy val files = new DeploymentFiles(pg, Files.createTempDirectory("backfill-command-"))
+  override protected def deployment: DeploymentFiles = files
   import files.{arguments, connection, validProfile}
 
   private var behindAProxy: Option[ProxiedPostgres] = None
@@ -231,6 +236,7 @@ final class BackfillCommandSpec extends AnyFunSuite with Matchers with RunComman
     stateOf(orders) shouldBe empty
     requestsOf(orders).distinct shouldBe
       Seq(sys.props.getOrElse("user.name", "") -> "the history before go-live")
+    assertLedger(orders)
   }
 
   test(
@@ -470,5 +476,6 @@ final class BackfillCommandSpec extends AnyFunSuite with Matchers with RunComman
         .map(row => row.getLong(0) -> row.getLong(1))
         .toSet
     ) shouldBe Set(1L -> 5000L)
+    assertLedger(wide)
   }
 }
