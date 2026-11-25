@@ -90,9 +90,9 @@ final class PostgresCoordinationStore(
         }
       }(_.getLong("generation"))
       generation match {
-        case Some(given) =>
+        case Some(assigned) =>
           RegisterResult.Registered(
-            Registration(table, registeredVersion, deltaTableId, taintReason = None, given)
+            Registration(table, registeredVersion, deltaTableId, taintReason = None, assigned)
           )
         case None =>
           RegisterResult.AlreadyRegistered(readRegistration(connection, table).getOrElse {

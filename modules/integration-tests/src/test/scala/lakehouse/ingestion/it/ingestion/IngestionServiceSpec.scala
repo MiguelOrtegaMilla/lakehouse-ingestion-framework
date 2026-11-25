@@ -1536,7 +1536,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     val dead = dies(orders, FaultPoint.AfterQuarantineWrite)
     drop(orders, "b.csv", "id,amount\n6,7\n8,9\n", at = Now.minusSeconds(1800))
     val givingUp = launch(orders) match {
-      case given: Outcome.GivenUp => given.run
+      case givenUp: Outcome.GivenUp => givenUp.run
       case other => fail(s"the batch was not given up: $other")
     }
     // The runs that took the batch: the one that planned it and died, and the one that gave it up.
