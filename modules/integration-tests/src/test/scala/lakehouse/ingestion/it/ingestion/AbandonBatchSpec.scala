@@ -383,6 +383,34 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
     assertLedger(orders)
   }
 
+  test("a registered table whose directory is there and whose log is not is not known to: 3") {
+    // As a volume of its own that is not mounted leaves a table: the directory that it is
+    // mounted on is there, with nothing in it. The batch is written to the table that is away.
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    dies(orders, FaultPoint.AfterBronzeCommit)
+    val table = directory(bronze(orders))
+    val away = table.resolveSibling(s"${table.getFileName}.unmounted")
+    Files.move(table, away)
+    Files.createDirectory(table)
+
+    val unknown = abandon(orders, 1)
+
+    failed(unknown, FailureClass.Transient) should include(
+      "is registered in the coordination store, and its log is not there"
+    )
+    batchOf(batchId(orders, 1)).status shouldBe BatchStatus.Planned
+    runOf(unknown.run).status shouldBe RunStatus.Failed
+    holderOf(orders) shouldBe None
+
+    // Once it is there again, it is read: it has the batch, which the next run commits.
+    Files.delete(table)
+    Files.move(away, table)
+    failed(abandon(orders, 1), FailureClass.Permanent) should include("its rows are written")
+    launch(orders) shouldBe a[Outcome.RolledForward]
+    assertLedger(orders)
+  }
+
   test("a table that cannot be read is not known to lack the batch: 3, and nothing given up") {
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")

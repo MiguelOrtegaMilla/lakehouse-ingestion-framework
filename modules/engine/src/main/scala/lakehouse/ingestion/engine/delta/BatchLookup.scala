@@ -25,7 +25,10 @@ import org.apache.hadoop.fs.{Path => HadoopPath}
  *    and its directory, there or not, has no batch;
  *  - a table that is registered is read: its directory must be there and readable, and so must
  *    its log, which Delta then reads. A registered table whose directory is not there may be on
- *    a disk that is not mounted, and is not known to be without the batch.
+ *    a disk that is not mounted, and is not known to be without the batch. Nor is one whose
+ *    directory is there without its log: a registered table had a log when its first commit
+ *    was taken, and a volume of its own that is not mounted leaves the directory it is mounted
+ *    on, empty.
  *
  * Anything that cannot be read is said as such, with why, and not as an answer.
  */
@@ -49,8 +52,15 @@ final class BatchLookup(tables: DeltaTableTransactions, conf: () => Configuratio
       else {
         readable(directory)
         val log = directory.resolve(TableIdentity.LogDirectory)
-        if (Files.notExists(log)) Found.NotWritten
-        else {
+        if (Files.notExists(log)) {
+          if (registered)
+            Found.Unknown(
+              s"the table at ${table.uri} is registered in the coordination store, and its log " +
+                "is not there: its directory may be that of a volume that is not mounted, or " +
+                "its log may have been moved, and whether it has the batch is not known"
+            )
+          else Found.NotWritten
+        } else {
           readable(log)
           if (tables.lastVersion(table, batch.app).exists(_ >= batch.seq.value)) Found.Written
           else Found.NotWritten
