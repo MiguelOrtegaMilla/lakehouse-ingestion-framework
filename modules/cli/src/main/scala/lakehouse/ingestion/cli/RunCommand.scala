@@ -6,7 +6,7 @@ import java.nio.file.{Files, Path, Paths}
 
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.{FailureClass, LeaseTiming}
-import lakehouse.ingestion.engine.IngestionService
+import lakehouse.ingestion.engine.{FaultHooks, IngestionService}
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.control.DatabaseFailure
@@ -45,7 +45,8 @@ object RunCommand {
       out: PrintStream,
       err: PrintStream,
       maxBatches: Option[Int] = None,
-      stop: Stop = Stop.Never
+      stop: Stop = Stop.Never,
+      hooks: FaultHooks = FaultHooks.Off
   ): Int =
     SourceCommand(
       profilePath,
@@ -63,7 +64,8 @@ object RunCommand {
         connectors(ready.profile, secrets),
         ready.spark,
         ready.profile.lake.uri,
-        LeaseTiming(ready.profile.leases.ttl)
+        LeaseTiming(ready.profile.leases.ttl),
+        hooks = hooks
       )
       runs(service, ready.source, ready.config, Chain.Limits(maxBatches, stop), out, err)
     }

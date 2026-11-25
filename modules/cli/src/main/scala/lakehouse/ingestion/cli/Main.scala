@@ -6,6 +6,7 @@ import java.nio.file.Paths
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.{BackfillId, BackfillRequest, BatchSeq, OperatorRequest}
 import lakehouse.ingestion.core.watermark.BackfillRange
+import lakehouse.ingestion.engine.FaultHooks
 import lakehouse.ingestion.engine.control.DatabaseFailure
 import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
 
@@ -199,6 +200,9 @@ object Main {
    *   test says otherwise
    * @param stop whether the process has been asked to stop: its signals, in `main`
    * @param operator who runs the process, as it says: who asked for an operator's action
+   * @param hooks what a run of the engine does at its fault points: nothing, but in the launcher
+   *   of the tests that holds a process at one to kill it (P7.10). No argument of a command line
+   *   sets them, and `main` gives none
    */
   def run(
       args: Seq[String],
@@ -206,7 +210,8 @@ object Main {
       err: PrintStream,
       environment: String => Option[String] = sys.env.get,
       stop: Stop = Stop.Never,
-      operator: String = sys.props.getOrElse("user.name", "")
+      operator: String = sys.props.getOrElse("user.name", ""),
+      hooks: FaultHooks = FaultHooks.Off
   ): Int = args.toList match {
     case "validate" :: options =>
       parse(options, Set("--profile", "--sources")) match {
@@ -248,7 +253,8 @@ object Main {
             out,
             err,
             limit,
-            stop
+            stop,
+            hooks
           )
         case Left(problem) => usage(problem, err)
       }
@@ -304,7 +310,8 @@ object Main {
             request,
             SecretResolver(environment),
             out,
-            err
+            err,
+            hooks
           )
         case Left(problem) => usage(problem, err)
       }
@@ -393,7 +400,8 @@ object Main {
             out,
             err,
             limit,
-            stop
+            stop,
+            hooks
           )
         case Left(problem) => usage(problem, err)
       }
