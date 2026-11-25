@@ -156,6 +156,39 @@ final class AbandonBatchCommandSpec
     askedOf(orders) shouldBe empty
   }
 
+  test("while a run holds the lease of a backfill, --backfill ends in 2 and says whose lease") {
+    val orders = files.tableSource(
+      newSourceId(),
+      "public.not_read",
+      files.connection("sales_ro", pg.password("sales_ro"), url = pg.jdbcUrl("sales")),
+      load = "{ mode: incremental, watermark: { column: updated_at, safety_margin: 1h } }"
+    )
+    val history = BackfillId.parse("history").toOption.get
+    val holder = LeasedRun
+      .open(
+        database,
+        starting(orders).copy(
+          kind = RunKind.Backfill,
+          request = Some(operator),
+          backfill = Some(history)
+        ),
+        versionOf(orders),
+        LeaseTiming(2.minutes)
+      )
+      .value
+
+    val ran =
+      try abandon(orders, "1", backfill = Some("history"))
+      finally holder.close()
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.SkippedLocked)
+    // The lease that is held is the backfill's: no run of the source is to be looked for.
+    ran.out should include(s"the run ${holder.start.id} holds the lease of the backfill history")
+    (ran.out should not).include("the lease of the source")
+    askedOf(orders).map(_.take(2)) shouldBe
+      Seq(Seq("backfill", "RUNNING"), Seq("abandon", "SKIPPED_LOCKED"))
+  }
+
   test("--backfill gives up the chunk of a backfill that is planned: 0; a backfill not there: 4") {
     // The command does not read the source: its table need not be there.
     val orders = files.tableSource(

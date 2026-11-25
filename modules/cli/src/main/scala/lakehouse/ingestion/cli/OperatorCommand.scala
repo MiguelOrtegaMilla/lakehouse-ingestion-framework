@@ -16,13 +16,18 @@ import lakehouse.ingestion.engine.operator.OperatorActions.Outcome
  */
 private[cli] object OperatorCommand {
 
+  /**
+   * @param lease whose lease the action takes, as a line says it of a run that holds it: that
+   *   of the source, or of the backfill whose sequence the action is on
+   */
   def apply(
       profilePath: Path,
       sourcesPath: Path,
       id: SourceId,
       secrets: SecretResolver,
       out: PrintStream,
-      err: PrintStream
+      err: PrintStream,
+      lease: String = "the source"
   )(act: (OperatorActions, SourceCommand.Ready) => Outcome): Int =
     SourceCommand(
       profilePath,
@@ -50,8 +55,8 @@ private[cli] object OperatorCommand {
           warnings.foreach(warning => err.println(s"warning: $warning."))
         case Outcome.Skipped(run, holder, until) =>
           out.println(
-            s"The run $run of ${id.value} was skipped: the run $holder holds the lease of the " +
-              s"source until $until, unless it is renewed. Nothing was changed; ask again once " +
+            s"The run $run of ${id.value} was skipped: the run $holder holds the lease of " +
+              s"$lease until $until, unless it is renewed. Nothing was changed; ask again once " +
               "it has ended."
           )
         case Outcome.Failed(_, _, message) => err.println(s"error: $message")

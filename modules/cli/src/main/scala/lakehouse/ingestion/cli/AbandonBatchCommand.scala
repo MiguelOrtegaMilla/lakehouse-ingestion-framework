@@ -30,7 +30,15 @@ object AbandonBatchCommand {
       err: PrintStream,
       backfill: Option[BackfillId] = None
   ): Int =
-    OperatorCommand(profilePath, sourcesPath, id, secrets, out, err) { (actions, ready) =>
+    OperatorCommand(
+      profilePath,
+      sourcesPath,
+      id,
+      secrets,
+      out,
+      err,
+      lease = backfill.fold("the source")(of => s"the backfill $of")
+    ) { (actions, ready) =>
       actions.abandon(ready.source, ready.config, batch, request, backfill)
     }
 }
