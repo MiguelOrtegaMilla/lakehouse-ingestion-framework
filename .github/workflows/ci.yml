@@ -47,7 +47,7 @@ jobs:
         run: scripts/retry-on-429.sh sbt -batch update
       # Unit and integration tests. The integration tests start PostgreSQL with Testcontainers
       # (Docker is on the runner). Stress runs are tagged and left out (`sbt stress`).
-      - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries Test/compile test
+      - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries checkUnconnected Test/compile test
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

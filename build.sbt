@@ -37,7 +37,9 @@ lazy val root = (project in file("."))
   .aggregate(core, deltaPgLogstore, engine, cli, integrationTests)
   .settings(
     name := "lakehouse-ingestion",
-    publish / skip := true
+    publish / skip := true,
+    // `checkUnconnected`: no code of production that only the tests reach, in any module.
+    Unconnected.rules
   )
 
 /**
