@@ -98,7 +98,6 @@ trait JdbcIngestionSuite extends IngestionSuite {
       .value
       .value
 
-  /** The service, as an application puts it together, with the JDBC connector alone. */
   /** The ledger asks the plans of a table, and those of files of a suite that has both. */
   override protected def connectors: ConnectorRegistry =
     ConnectorRegistry(
@@ -106,6 +105,7 @@ trait JdbcIngestionSuite extends IngestionSuite {
       new JdbcSourceConnector(SecretResolver(passwords.get))
     )
 
+  /** The service, as an application puts it together, with the JDBC connector alone. */
   protected def reading(hooks: FaultHooks = FaultHooks.Off): IngestionService =
     new IngestionService(
       database,
