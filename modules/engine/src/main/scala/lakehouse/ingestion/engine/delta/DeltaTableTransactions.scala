@@ -4,7 +4,7 @@ import scala.annotation.tailrec
 
 import lakehouse.ingestion.core.config.TableLocation
 import lakehouse.ingestion.core.control.{BatchId, TableTransactions, TxnAppId}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.delta.{DeltaLog, Snapshot}

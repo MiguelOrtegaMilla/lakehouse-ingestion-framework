@@ -31,7 +31,7 @@ import lakehouse.ingestion.core.watermark.{
   WatermarkPlan,
   WatermarkPlanner
 }
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
   Progress,

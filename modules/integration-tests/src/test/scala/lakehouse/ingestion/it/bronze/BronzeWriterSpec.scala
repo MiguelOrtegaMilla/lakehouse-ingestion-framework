@@ -19,7 +19,7 @@ import lakehouse.ingestion.core.config.{
   TableLocation
 }
 import lakehouse.ingestion.core.control.{BatchId, BatchSeq, FailureClass, Layer, RunId, TxnAppId}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.delta.BatchAppend.{AlreadyThere, Appended}
 import lakehouse.ingestion.engine.delta.{BatchAppend, CommitMetadata, DeltaTableTransactions, Lake}

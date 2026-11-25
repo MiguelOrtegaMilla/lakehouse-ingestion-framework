@@ -8,7 +8,7 @@ import lakehouse.ingestion.core.config.Read.{Obj, Result}
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.LandedFile
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.it.support.LocalSparkSuite
 import org.scalatest.funsuite.AnyFunSuite

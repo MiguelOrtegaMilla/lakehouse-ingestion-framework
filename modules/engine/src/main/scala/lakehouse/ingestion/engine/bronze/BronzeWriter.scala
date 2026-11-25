@@ -5,7 +5,7 @@ import java.time.Instant
 
 import lakehouse.ingestion.core.config.{EngineColumns, SourceId, TableLocation}
 import lakehouse.ingestion.core.control.{BatchId, RunId}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.DataFrame

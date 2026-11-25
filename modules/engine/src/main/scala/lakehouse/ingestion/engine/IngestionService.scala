@@ -38,6 +38,7 @@ import lakehouse.ingestion.engine.control.{
   SourceStates
 }
 import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.quarantine.{QuarantineBatch, QuarantineWriter}
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import lakehouse.ingestion.logstore.{CommitContext, EpochNotInForceException}

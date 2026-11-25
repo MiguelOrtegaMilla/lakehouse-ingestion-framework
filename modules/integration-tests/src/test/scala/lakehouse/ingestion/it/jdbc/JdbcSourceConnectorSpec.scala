@@ -16,7 +16,7 @@ import lakehouse.ingestion.core.files.LandedFile
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.core.state.StoredWatermark
 import lakehouse.ingestion.core.watermark.{BackfillRange, WatermarkHorizon, WatermarkPlan}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.PostgresJdbc
 import lakehouse.ingestion.engine.jdbc.{

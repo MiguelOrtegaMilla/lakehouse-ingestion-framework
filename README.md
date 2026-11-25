@@ -20,7 +20,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `cli` | Entry point, wiring, exit codes: the commands `validate`, `migrate`, `run`, `abandon-batch`, `reset-state` and `reprocess`. |
 | `integration-tests` | Testcontainers, end-to-end, fault-injection and stress tests |
 
-The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`, which also fails if two packages of `core` depend on each other, directly or through others, by the dependencies that the compiler records between classes (`project/PackageCycles.scala`). `sbt checkUnconnected` fails on code of production that no code of production reaches, what only the tests call and what nothing calls, from the same record (`project/Unconnected.scala`); what is left so on purpose is in `project/unconnected.txt`, each with its reason.
+The dependency rules ([ADR-0012](docs/adr/0012-module-structure.md)) are enforced on the resolved classpath by `sbt checkBoundaries`, which also fails if two packages of `core`, or of `engine`, depend on each other, directly or through others, by the dependencies that the compiler records between classes (`project/PackageCycles.scala`). `sbt checkUnconnected` fails on code of production that no code of production reaches, what only the tests call and what nothing calls, from the same record (`project/Unconnected.scala`); what is left so on purpose is in `project/unconnected.txt`, each with its reason.
 
 ## Configuration
 

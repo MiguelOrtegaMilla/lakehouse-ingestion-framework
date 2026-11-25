@@ -9,7 +9,8 @@ import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector._
-import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService, RunFailedException}
+import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
+import lakehouse.ingestion.engine.failure.RunFailedException
 import org.scalatest.OptionValues
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers

@@ -9,7 +9,7 @@ import io.circe.Json
 import lakehouse.ingestion.core.config.{ConnectorConfig, ConnectorKind, RelativePath, Source}
 import lakehouse.ingestion.core.files.{FilePlan, LandedFile}
 import lakehouse.ingestion.core.watermark.BackfillRange
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import org.apache.spark.sql.{DataFrame, SparkSession}
 
 /**
@@ -82,7 +82,7 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
   /**
    * The rows of a plan that this connector wrote, for this source.
    *
-   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException a permanent failure, if the plan is
    *   not one that this connector reads
    * @throws SourceChangedException if the source no longer has what the plan names, as the plan
    *   names it. Nothing of the plan was given to be written
@@ -93,7 +93,7 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
    * What the commit of a plan records of its source. It reads the plan and nothing else: no
    * file, no table, no clock.
    *
-   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException a permanent failure, if the plan is
    *   not one that this connector reads
    */
   def progress(source: Source, config: C, plan: Json): Progress
@@ -103,7 +103,7 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
    * that the next run of the chain is to plan against; none if the chain ends here. It reads
    * the plan and nothing else, as `progress` does.
    *
-   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException a permanent failure, if the plan is
    *   not one that this connector reads
    */
   def more(source: Source, config: C, plan: Json): Option[Json] = None
@@ -120,7 +120,7 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
    * it is what a plan made anew would read, and reading it again is the source read twice.
    *
    * @return false unless the connector says otherwise: a plan made anew is never wrong
-   * @throws lakehouse.ingestion.engine.RunFailedException a permanent failure, if the plan is
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException a permanent failure, if the plan is
    *   not one that this connector reads
    */
   def wholeWhenRead(source: Source, config: C, plan: Json): Boolean = false
@@ -221,7 +221,7 @@ trait RangePlanner {
    * source less what its rows may still be stamped behind it (`safety_margin`, ADR-0020). The
    * source is asked.
    *
-   * @throws lakehouse.ingestion.engine.RunFailedException with its class, if the source cannot
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException with its class, if the source cannot
    *   be asked, or says a time that no range ends at
    */
   def horizon(): Instant
@@ -234,7 +234,7 @@ trait RangePlanner {
    * @param chunk how long a chunk is, at most
    * @param progress where the last chunk that was committed left the backfill, as this
    *   connector wrote it (`Progress.watermark`); none before the first
-   * @throws lakehouse.ingestion.engine.RunFailedException with its class, if the source cannot
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException with its class, if the source cannot
    *   be asked, has no table that a chunk can be read from, or the progress is not one that
    *   this connector wrote
    */

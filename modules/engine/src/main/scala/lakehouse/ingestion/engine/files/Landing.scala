@@ -11,7 +11,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.core.config.{FileConnectorConfig, RootUri}
 import lakehouse.ingestion.core.files.{FileName, FilePlan, LandedFile, Listed}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 
 /**
  * The landing zone of a profile as it is on disk, and the one rule about it: what a file

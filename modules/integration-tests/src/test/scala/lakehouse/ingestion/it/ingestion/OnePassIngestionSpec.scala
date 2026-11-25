@@ -14,7 +14,8 @@ import lakehouse.ingestion.engine.bronze.{BronzeBatch, BronzeWriter}
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.delta.{BatchAppend, BatchCommit, Lake}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
-import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService, RunFailedException}
+import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.delta.sources.DeltaSQLConf

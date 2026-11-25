@@ -15,13 +15,8 @@ import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.{ControlDatabase, LeasedRun}
-import lakehouse.ingestion.engine.{
-  FaultHooks,
-  FaultPoint,
-  IngestionService,
-  RunFailedException,
-  RunJobs
-}
+import lakehouse.ingestion.engine.failure.RunFailedException
+import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService, RunJobs}
 import lakehouse.ingestion.it.support.CapturedLogs.Logged
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{

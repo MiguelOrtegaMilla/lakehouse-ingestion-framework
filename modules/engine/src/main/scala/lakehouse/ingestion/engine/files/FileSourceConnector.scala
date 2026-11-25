@@ -16,7 +16,7 @@ import lakehouse.ingestion.core.config.{
 }
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
 import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner}
-import lakehouse.ingestion.engine.RunFailedException
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
   Progress,
