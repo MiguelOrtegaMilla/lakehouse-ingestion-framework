@@ -34,7 +34,7 @@ import lakehouse.ingestion.logstore.coordination.{
   PostgresCoordinationStore,
   WriterEpoch
 }
-import lakehouse.ingestion.logstore.{CommitContext, WriterEpochs}
+import lakehouse.ingestion.logstore.{CommitContext, CommitMissingException, WriterEpochs}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
 import org.scalatest.funsuite.AnyFunSuite
@@ -1183,6 +1183,44 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
       .map(row => row.getString(0) -> row.getString(1))
       .toSeq shouldBe Seq("1" -> other.toString)
     Files.size(a) shouldBe 9L
+  }
+
+  test("a batch whose table is away is not given up for a file that changed: the table is asked") {
+    // The run that planned the batch wrote it, and died. Then its table is on a volume of its
+    // own that is not mounted, which leaves the directory that it is mounted on, and a file of
+    // the batch is written again. An empty directory is no table to a file system, and the
+    // batch would be given up with its rows written; a run asks Delta, through the LogStore,
+    // whose registry has the commits of the table.
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    val first = batchId(orders, 1)
+    dies(orders, FaultPoint.AfterBronzeCommit)
+    val table = Paths.get(URI.create(bronze(orders).uri))
+    val away = table.resolveSibling(s"${table.getFileName}.unmounted")
+    Files.move(table, away)
+    Files.createDirectory(table)
+    drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800))
+
+    // Nothing classifies it yet (70, from P8): the run is left as a process that died.
+    val refused = intercept[CommitMissingException](launch(orders))
+
+    refused.getMessage should include(
+      "is committed and acknowledged, and its file is not in the log"
+    )
+    val left = batchOf(first)
+    left.status shouldBe BatchStatus.Planned
+    left.abandoned shouldBe None
+    takenOf(orders) shouldBe empty
+
+    // Once the table is there again it has the batch, which is committed as it was planned;
+    // the file that changed is a new file, of the batch after.
+    Files.delete(table)
+    Files.move(away, table)
+    expire(orders)
+    launch(orders) shouldBe a[Outcome.RolledForward]
+    ingested(launch(orders)).batch shouldBe batchId(orders, 2)
+    rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("10", 2L, "a.csv"), ("11", 2L, "a.csv"))
+    assertLedger(orders)
   }
 
   test("a run that lost its lease gives no batch up: the batch is the other run's") {
