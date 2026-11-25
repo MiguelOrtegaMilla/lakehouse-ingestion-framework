@@ -11,7 +11,7 @@ import lakehouse.ingestion.core.config.{Source, SourceId}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.IngestionService.Outcome
-import lakehouse.ingestion.engine.control.Leases
+import lakehouse.ingestion.engine.control.{Backfills, Leases}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
@@ -25,7 +25,9 @@ import org.scalatest.matchers.should.Matchers
  * ledger of the source, which finds what the cell does not ask.
  *
  * '''The kinds''' are those of the sequences that a batch is in: new files, a table read whole,
- * a window of a table, the files of a committed batch read again, and a chunk of a backfill.
+ * a window of a table, the files of a committed batch read again, and a chunk of a backfill:
+ * the first, which the run that creates the backfill plans, and one of a backfill under way,
+ * which a run plans from the progress that the chunks before it saved.
  * Each is read by its real connector, and a point that a kind never reaches is left out of its
  * column: a table has no record rejected, and so no commit to a quarantine. That a kind
  * reaches the points of its column, and no other, is a test of its own.
@@ -87,7 +89,7 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
     def next(): Outcome = after(engine())
   }
 
-  /** A source of the kind, made ready: its first batch, or its first after one committed. */
+  /** A source of the kind, made ready: its first batch, or its first after those committed. */
   private def cellOf(kind: Kind): Cell = kind match {
     case Kind.Files =>
       val of = fileSource(rejected = Some("0.5"))
@@ -127,29 +129,50 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
         _.run(of, versionOf(of))
       )
 
-    case Kind.Chunk =>
-      val id = newSourceId()
-      val table = tableOf(
-        id,
-        History.plus(12, ChronoUnit.HOURS),
-        History.plus(1, ChronoUnit.DAYS),
-        History.plus(36, ChronoUnit.HOURS)
-      )
-      val of = jdbcSource(table, load = s"load: $WindowOfADay", id = id.value)
-      // The first chunk of (H, H + 2d], which the run creates the backfill to read.
-      val request = BackfillRequest(
-        Backfilled,
-        BackfillRange.of(History, History.plus(2, ChronoUnit.DAYS)).toOption.get,
-        Some(1.day)
-      )
-      val backfill: IngestionService => Outcome = _.backfill(of, versionOf(of), request, asked)
-      new Cell(
-        of,
-        BatchId(TxnAppId.backfill(of.id, Layer.Bronze, Backfilled), BatchSeq.of(1).toOption.get),
-        LeaseKey.backfill(of.id, Layer.Bronze, Backfilled),
-        backfill,
-        backfill
-      )
+    case Kind.FirstChunk => chunk(seq = 1)
+    case Kind.ChunkUnderWay => chunk(seq = 2)
+  }
+
+  /**
+   * A cell of the chunk `seq` of a backfill of `(H, H + 3d]`, a day a chunk, two rows in each.
+   * The first chunk is planned by the run that creates the backfill; each after it, by a run
+   * that resumes the backfill from the progress that the chunks before it saved, which runs
+   * before the cell's committed.
+   */
+  private def chunk(seq: Long): Cell = {
+    val id = newSourceId()
+    val table = tableOf(
+      id,
+      History.plus(12, ChronoUnit.HOURS),
+      History.plus(1, ChronoUnit.DAYS),
+      History.plus(36, ChronoUnit.HOURS),
+      History.plus(2, ChronoUnit.DAYS),
+      History.plus(60, ChronoUnit.HOURS),
+      History.plus(3, ChronoUnit.DAYS)
+    )
+    val of = jdbcSource(table, load = s"load: $WindowOfADay", id = id.value)
+    val request = BackfillRequest(
+      Backfilled,
+      BackfillRange.of(History, History.plus(3, ChronoUnit.DAYS)).toOption.get,
+      Some(1.day)
+    )
+    val backfill: IngestionService => Outcome = _.backfill(of, versionOf(of), request, asked)
+    val app = TxnAppId.backfill(of.id, Layer.Bronze, Backfilled)
+    (1L until seq).foreach { before =>
+      ingested(backfill(engine())).batch shouldBe BatchId(app, BatchSeq.of(before).toOption.get)
+    }
+    // What the run of the cell resumes from: the progress of the chunks before it, if any.
+    database
+      .run(Backfills.find(_, of.id, Layer.Bronze, Backfilled))
+      .flatMap(_.progress)
+      .map(_.lastCommitted.value) shouldBe Option.when(seq > 1)(seq - 1)
+    new Cell(
+      of,
+      BatchId(app, BatchSeq.of(seq).toOption.get),
+      LeaseKey.backfill(of.id, Layer.Bronze, Backfilled),
+      backfill,
+      backfill
+    )
   }
 
   /** A cell of the regular sequence of a source, whose runs are `run`. */
@@ -281,13 +304,21 @@ object FaultMatrixSpec {
 
     case object Reprocess extends Kind("reprocess", FaultPoint.All)
 
-    case object Chunk
+    /** The chunk that the run that creates the backfill plans. */
+    case object FirstChunk
         extends Kind(
-          "backfill chunk",
+          "backfill, first chunk",
           FaultPoint.All.filterNot(_ == FaultPoint.AfterQuarantineWrite)
         )
 
-    val All: Seq[Kind] = Seq(Files, Full, Incremental, Reprocess, Chunk)
+    /** A chunk of a backfill that runs before resumed, from the progress that they saved. */
+    case object ChunkUnderWay
+        extends Kind(
+          "backfill, chunk under way",
+          FaultPoint.All.filterNot(_ == FaultPoint.AfterQuarantineWrite)
+        )
+
+    val All: Seq[Kind] = Seq(Files, Full, Incremental, Reprocess, FirstChunk, ChunkUnderWay)
   }
 
   /** What the run after one that died does with the batch that it left planned. */
