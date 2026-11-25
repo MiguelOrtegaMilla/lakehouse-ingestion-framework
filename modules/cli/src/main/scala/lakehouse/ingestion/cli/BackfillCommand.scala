@@ -9,7 +9,7 @@ import scala.util.Try
 import lakehouse.ingestion.core.config.{Durations, Load, SecretResolver, Source, SourceId}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.watermark.BackfillRange
-import lakehouse.ingestion.engine.IngestionService
+import lakehouse.ingestion.engine.{FaultHooks, IngestionService}
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.Backfills
 
@@ -45,7 +45,8 @@ object BackfillCommand {
       out: PrintStream,
       err: PrintStream,
       maxBatches: Option[Int] = None,
-      stop: Stop = Stop.Never
+      stop: Stop = Stop.Never,
+      hooks: FaultHooks = FaultHooks.Off
   ): Int =
     SourceCommand(
       profilePath,
@@ -63,7 +64,8 @@ object BackfillCommand {
         RunCommand.connectors(ready.profile, secrets),
         ready.spark,
         ready.profile.lake.uri,
-        LeaseTiming(ready.profile.leases.ttl)
+        LeaseTiming(ready.profile.leases.ttl),
+        hooks = hooks
       )
       val backfill = s"the backfill ${request.id} of ${id.value}"
       // What the control plane has of the backfill, to say what it reads. A record that cannot

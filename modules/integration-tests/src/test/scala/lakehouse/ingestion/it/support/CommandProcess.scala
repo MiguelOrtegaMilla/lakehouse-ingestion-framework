@@ -32,7 +32,7 @@ final class CommandProcess private (process: Process, log: Path) {
     CommandProcess.Ended(process.exitValue(), CommandProcess.tail(log))
   }
 
-  /** Sends the process a signal, by its name as `kill` takes it: TERM, INT. */
+  /** Sends the process a signal, by its name as `kill` takes it: TERM, INT, KILL. */
   def signal(name: String): Unit = {
     val kill = new ProcessBuilder("kill", s"-$name", process.pid().toString).inheritIO().start()
     if (!kill.waitFor(10, TimeUnit.SECONDS) || kill.exitValue() != 0)
@@ -60,19 +60,22 @@ object CommandProcess {
    * @param arguments those of the application, the command first
    * @param log the file that takes what the process prints, both streams in one
    * @param jvm options of the JVM besides those that every process has, as system properties
+   * @param main the class whose `main` the process runs: the application's, unless a test has a
+   *   launcher of its own (`HeldMain`)
    */
   def start(
       arguments: Seq[String],
       log: Path,
       heap: String = Heap,
-      jvm: Seq[String] = Nil
+      jvm: Seq[String] = Nil,
+      main: String = Main.getClass.getName.stripSuffix("$")
   ): CommandProcess = {
     val command =
       Seq(Paths.get(sys.props("java.home"), "bin", "java").toString) ++
         JavaModuleOptions.defaultModuleOptionArray().toSeq ++
         Seq(s"-Xmx$heap", "-Duser.timezone=UTC") ++ jvm ++
         Seq("-cp", sys.props("java.class.path")) ++
-        Seq(Main.getClass.getName.stripSuffix("$")) ++
+        Seq(main) ++
         arguments
     val builder = new ProcessBuilder(command.asJava)
       .redirectErrorStream(true)

@@ -5,7 +5,7 @@ import java.nio.file.Path
 
 import lakehouse.ingestion.core.config.{SecretResolver, SourceId}
 import lakehouse.ingestion.core.control.{BatchSeq, LeaseTiming, OperatorRequest}
-import lakehouse.ingestion.engine.IngestionService
+import lakehouse.ingestion.engine.{FaultHooks, IngestionService}
 
 /**
  * The command `reprocess`: an operator has the files of a committed batch of a source read
@@ -31,7 +31,8 @@ object ReprocessCommand {
       request: OperatorRequest,
       secrets: SecretResolver,
       out: PrintStream,
-      err: PrintStream
+      err: PrintStream,
+      hooks: FaultHooks = FaultHooks.Off
   ): Int =
     SourceCommand(
       profilePath,
@@ -49,7 +50,8 @@ object ReprocessCommand {
         RunCommand.connectors(ready.profile, secrets),
         ready.spark,
         ready.profile.lake.uri,
-        LeaseTiming(ready.profile.leases.ttl)
+        LeaseTiming(ready.profile.leases.ttl),
+        hooks = hooks
       )
       val outcome = service.reprocess(ready.source, ready.config, batch, request)
       val (stream, line) = RunCommand.report(ready.source.id, outcome)
