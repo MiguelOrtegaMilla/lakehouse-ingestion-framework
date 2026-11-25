@@ -37,6 +37,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Before anything is downloaded: every class, member and test that the table of decisions of
+      # the discovery names is in the repository (section 22, scripts/check_decisions.py).
+      - name: Table of decisions
+        run: python3 -I scripts/check_decisions.py
       # The JDK, sbt, and the cache of what sbt downloads. This job is the one that saves it.
       - uses: ./.github/actions/setup-build
         with:
