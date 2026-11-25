@@ -33,10 +33,21 @@ import org.scalatest.matchers.should.Matchers
  * reaches the points of its column, and no other, is a test of its own.
  *
  * '''What a cell expects''' is said once, from the protocol (ADR-0005, ADR-0021), and not in
- * each test (`afterDeathAt`): the table of the data says what the run after one that died
- * does. A batch whose rows are in it is rolled forward, and one whose rows are not is run again
+ * each test (`recoveryAt`): the table of the data says what the run that takes the lease of
+ * another does with the batch that it left. A batch whose rows are in it is rolled forward, and one whose rows are not is run again
  * under its number, as it was planned; a quarantine that has the records of the batch changes
  * nothing of that.
+ *
+ * '''The columns.''' A run that dies at the point, as a process that dies: it goes no further,
+ * and tells the control plane nothing. And a run whose lease is taken over at the point: its
+ * lease runs out, and the next run of its sequence takes it and runs to its end, inside the hook,
+ * on the thread of the run that lost it. That one then goes on, and commits nothing: before
+ * each step it asks its heartbeat, which has not renewed yet, and not the database; its write is
+ * of a batch that the table has by then, which Delta skips; and its commit to the control plane
+ * asks for the lease, and is refused. The jobs of Spark of the run that took the lease carry the
+ * mark of the other as well (`RunJobs`), which would have them stopped if the other found its
+ * lease lost by its heartbeat: its first renewal is a third of its time to live away, 40 s, long
+ * after a cell is over.
  *
  * '''The lease of a run that died is made to run out in the database''' (`runOut`), at once, and
  * is not waited for: what a cell asks is what the next run does with what the dead one left,
@@ -249,10 +260,39 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
     }
   }
 
+  /**
+   * The batch that `left` planned was finished by `next` as the oracle says, under its number,
+   * and `left` ends as `ABANDONED`: the run that took its lease over said so.
+   */
+  private def assertFinished(cell: Cell, recovery: Recovery, left: RunId, next: Outcome): Unit = {
+    val finished = recovery match {
+      case Recovery.Replay => ingested(next).batch
+      case Recovery.RollForward => rolledForward(next).batch
+    }
+    finished shouldBe cell.batch
+    runOf(left).status shouldBe RunStatus.Abandoned
+    runOf(next.run).status shouldBe RunStatus.Succeeded
+    val committed = batchOf(cell.batch)
+    committed.plannedBy shouldBe left
+    committed.committedBy shouldBe Some(next.run)
+    // Under its number, and no other: the sequence has no batch after it, nor one given up.
+    sequenceOf(cell.batch) shouldBe (1L to cell.batch.seq.value).map(_ -> "COMMITTED")
+    holderOf(cell.lease) shouldBe None
+    assertLedger(cell.source)
+  }
+
+  /** The run ended as one that lost its lease: a failure that passes, which says so. */
+  private def lostTheLease(outcome: Outcome, lease: LeaseKey): Unit = outcome match {
+    case Outcome.Failed(_, failure, message) =>
+      failure shouldBe FailureClass.Transient
+      message should include(s"lost the lease of $lease"): Unit
+    case other => fail(s"the run did not lose its lease: $other")
+  }
+
   // A run that dies at the point: the next takes its lease over, and finishes its batch.
   for (kind <- Kind.All; point <- kind.points) {
-    val recovery = afterDeathAt(point)
-    test(s"${kind.name}: a run that dies at $point ${recovery.saying}") {
+    val recovery = recoveryAt(point)
+    test(s"${kind.name}: a run that dies at $point ${recovery.left}") {
       val cell = cellOf(kind)
 
       intercept[Died](cell.run(hookAt(point)(_ => throw new Died)))
@@ -264,22 +304,25 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
       batchOf(cell.batch).plannedBy shouldBe dead
 
       runOut(cell.lease)
-      val next = cell.next()
+      assertFinished(cell, recovery, dead, cell.next())
+    }
+  }
 
-      val finished = recovery match {
-        case Recovery.Replay => ingested(next).batch
-        case Recovery.RollForward => rolledForward(next).batch
-      }
-      finished shouldBe cell.batch
-      runOf(dead).status shouldBe RunStatus.Abandoned
-      runOf(next.run).status shouldBe RunStatus.Succeeded
-      val committed = batchOf(cell.batch)
-      committed.plannedBy shouldBe dead
-      committed.committedBy shouldBe Some(next.run)
-      // Under its number, and no other: the sequence has no batch after it, nor one given up.
-      sequenceOf(cell.batch) shouldBe (1L to cell.batch.seq.value).map(_ -> "COMMITTED")
-      holderOf(cell.lease) shouldBe None
-      assertLedger(cell.source)
+  // A run whose lease is taken over at the point, by the next, which finishes its batch: the
+  // one that lost it goes on until it finds so, and commits nothing.
+  for (kind <- Kind.All; point <- kind.points) {
+    val recovery = recoveryAt(point)
+    test(s"${kind.name}: a run whose lease is taken over at $point stops, and ${recovery.taker}") {
+      val cell = cellOf(kind)
+      var taker = Option.empty[Outcome]
+
+      val taken = cell.run(hookAt(point) { _ =>
+        runOut(cell.lease)
+        taker = Some(cell.next())
+      })
+
+      lostTheLease(taken, cell.lease)
+      assertFinished(cell, recovery, taken.run, taker.value)
     }
   }
 }
@@ -322,23 +365,32 @@ object FaultMatrixSpec {
   }
 
   /** What the run after one that died does with the batch that it left planned. */
-  sealed abstract class Recovery(val saying: String)
+  sealed abstract class Recovery(val left: String, val taker: String)
 
   object Recovery {
 
     /** Its plan is run again, under its number: nothing of it is in the table of its data. */
-    case object Replay extends Recovery("leaves its batch to be run again under its number")
+    case object Replay
+        extends Recovery(
+          "leaves its batch to be run again under its number",
+          "the run that took it runs the batch again under its number"
+        )
 
     /** It is committed as it was written: its rows are in the table of its data. */
-    case object RollForward extends Recovery("leaves its batch to be rolled forward")
+    case object RollForward
+        extends Recovery(
+          "leaves its batch to be rolled forward",
+          "the run that took it rolls the batch forward"
+        )
   }
 
   /**
-   * The oracle of the column of a run that dies (ADR-0005 §4): the table of the data of the
+   * The oracle of the columns of a run that dies and of one whose lease is taken over (ADR-0005
+   * §4): what the run that takes the lease does with the batch left planned. The table of the data of the
    * batch decides. Its rows are in it from `AfterBronzeCommit` on; at `AfterQuarantineWrite`
    * the quarantine has the rejected records and the data does not.
    */
-  def afterDeathAt(point: FaultPoint): Recovery = point match {
+  def recoveryAt(point: FaultPoint): Recovery = point match {
     case FaultPoint.AfterBronzeCommit | FaultPoint.BeforeStateCommit => Recovery.RollForward
     case _ => Recovery.Replay
   }
