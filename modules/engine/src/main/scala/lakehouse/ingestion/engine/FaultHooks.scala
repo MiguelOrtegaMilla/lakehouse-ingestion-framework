@@ -24,8 +24,8 @@ object FaultPoint {
   /**
    * The plan was read, and what was read is kept apart from the source. Nothing is written:
    * what a run that dies here leaves is what one that dies after its plan leaves. For rows
-   * that are read as they are written (`ReadResult.OnePass`), the query of them is made, and
-   * the source was not asked for a row.
+   * that are read as they are written (`ReadResult.OnePass`), the query of them is made, not
+   * run: the source was not asked for a row, and is asked for them as they are written.
    */
   case object AfterRead extends FaultPoint("AfterRead")
 
