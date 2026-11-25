@@ -405,7 +405,7 @@ object Main {
   }
 
   /** How many batches an invocation commits at most, from 1: none, for no limit. */
-  private def maxBatchesOf(given: Option[String]): Either[String, Option[Int]] = given match {
+  private def maxBatchesOf(option: Option[String]): Either[String, Option[Int]] = option match {
     case None => Right(None)
     case Some(text) =>
       text.toIntOption
