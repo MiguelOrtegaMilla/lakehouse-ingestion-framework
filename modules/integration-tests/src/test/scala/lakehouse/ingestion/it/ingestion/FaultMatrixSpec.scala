@@ -15,6 +15,8 @@ import lakehouse.ingestion.engine.control.{Backfills, Leases}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.logstore.{FaultPoint => LogPoint, HookedLogStore, SimulatedCrash}
+import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.functions.col
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -40,7 +42,10 @@ import org.scalatest.matchers.should.Matchers
  * nothing of that.
  *
  * '''The columns.''' A run that dies at the point, as a process that dies: it goes no further,
- * and tells the control plane nothing. A source that changes at the point, as one of its kind
+ * and tells the control plane nothing. It dies too at each point of the LogStore inside its
+ * commits, to its quarantine and to Bronze, for a batch of files: the session commits through
+ * `PostgresLogStore` behind hooks of the tests (`HookedLogStore`), which those cells arm, and the
+ * crash goes through Delta and the engine as a death does, unclassified (`SimulatedCrash`). A source that changes at the point, as one of its kind
  * can, and a run that goes on to its end, and then the next (`changeAt`). And a run whose lease is taken over at the point: its
  * lease runs out, and the next run of its sequence takes it and runs to its end, inside the hook,
  * on the thread of the run that lost it. That one then goes on, and commits nothing: before
@@ -66,6 +71,11 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
   import FaultMatrixSpec._
 
   private val asked = OperatorRequest.of("ops.oncall", "the matrix of faults").toOption.get
+
+  // `PostgresLogStore`, behind hooks that stop a commit at a point of the LogStore: the cells of a
+  // run that dies inside its commit to a table arm them, and the others go through it untouched.
+  override protected def sparkConf: Map[String, String] =
+    super.sparkConf.updated("spark.delta.logStore.file.impl", classOf[HookedLogStore].getName)
 
   /** The service, as an application puts it together, with both connectors and these hooks. */
   private def engine(hooks: FaultHooks = FaultHooks.Off): IngestionService =
@@ -484,6 +494,40 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
       assertLedger(cell.source)
     }
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // A run that dies inside its commit to a table, at a point of the LogStore
+  // ---------------------------------------------------------------------------------------------
+
+  /** Whether a file is of the log of the table at `uri`. */
+  private def inTheLogOf(uri: String)(file: Path): Boolean =
+    file.toUri.getPath.startsWith(new Path(uri).toUri.getPath + "/_delta_log/")
+
+  // A run of files that dies at a point of the LogStore, inside its commit to its quarantine or
+  // to Bronze: the next takes its lease over, and finishes its batch as the table of the data
+  // says, once a reader has published what the LogStore has of it.
+  for (table <- LogTable.All; point <- LogPoint.All) {
+    val recovery = recoveryInside(table, point)
+    test(s"files: a run that dies at $point of its commit to ${table.name} ${recovery.left}") {
+      val cell = cellOf(Kind.Files)
+      val target = table match {
+        case LogTable.Quarantine => quarantine(cell.source)
+        case LogTable.Bronze => bronze(cell.source)
+      }
+
+      HookedLogStore.crashAt(point)(inTheLogOf(target.uri))
+      try intercept[SimulatedCrash](cell.run(FaultHooks.Off)).point shouldBe point
+      finally HookedLogStore.disarm()
+
+      // As a process that died leaves it: its run running, its lease held, its batch planned.
+      val dead = holderOf(cell.lease).value
+      runOf(dead).status shouldBe RunStatus.Running
+      batchOf(cell.batch).status shouldBe BatchStatus.Planned
+
+      runOut(cell.lease)
+      assertFinished(cell, recovery, dead, cell.next())
+    }
+  }
 }
 
 object FaultMatrixSpec {
@@ -588,6 +632,29 @@ object FaultMatrixSpec {
   /** The points of a run of a table before its rows are asked for. */
   private val BeforeTheWrite =
     Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead, FaultPoint.AfterCounts)
+
+  /** The tables that a batch of files commits to, in the order that it does. */
+  sealed abstract class LogTable(val name: String)
+
+  object LogTable {
+    case object Quarantine extends LogTable("its quarantine")
+    case object Bronze extends LogTable("Bronze")
+
+    val All: Seq[LogTable] = Seq(Quarantine, Bronze)
+  }
+
+  /**
+   * The oracle of a run that dies inside its commit to a table (ADR-0004 §3.8, ADR-0005 §4): the
+   * table of the data decides, as it does at the points of the engine, once a reader has made it
+   * what the LogStore says. Before the insert of its version, the commit is not there; from it
+   * on, it is durable, and the next reader publishes it, if it is not published yet. A commit to
+   * the quarantine, durable or not, leaves the data unwritten.
+   */
+  def recoveryInside(table: LogTable, point: LogPoint): Recovery = (table, point) match {
+    case (LogTable.Bronze, LogPoint.BeforeInsert) => Recovery.Replay
+    case (LogTable.Bronze, _) => Recovery.RollForward
+    case (LogTable.Quarantine, _) => Recovery.Replay
+  }
 
   /** A file with a record of three that cannot be parsed, which its source lets be rejected. */
   private val RejectingCsv = "id,amount\n1,2\n3\n4,5\n"
