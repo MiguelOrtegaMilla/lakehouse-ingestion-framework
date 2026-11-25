@@ -7,7 +7,7 @@ import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration._
 import scala.util.Using
 
-import lakehouse.ingestion.core.config.{Source, SourceId}
+import lakehouse.ingestion.core.config.{EngineColumns, Source, SourceId}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.IngestionService.Outcome
@@ -15,6 +15,7 @@ import lakehouse.ingestion.engine.control.{Backfills, Leases}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import org.apache.spark.sql.functions.col
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -39,7 +40,8 @@ import org.scalatest.matchers.should.Matchers
  * nothing of that.
  *
  * '''The columns.''' A run that dies at the point, as a process that dies: it goes no further,
- * and tells the control plane nothing. And a run whose lease is taken over at the point: its
+ * and tells the control plane nothing. A source that changes at the point, as one of its kind
+ * can, and a run that goes on to its end, and then the next (`changeAt`). And a run whose lease is taken over at the point: its
  * lease runs out, and the next run of its sequence takes it and runs to its end, inside the hook,
  * on the thread of the run that lost it. That one then goes on, and commits nothing: before
  * each step it asks its heartbeat, which has not renewed yet, and not the database; its write is
@@ -390,6 +392,98 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
       assertLedger(cell.source)
     }
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // A source that changes at the point
+  // ---------------------------------------------------------------------------------------------
+
+  /** The source of a cell changes at the point, as one of its kind can (`changeAt`). */
+  private def change(kind: Kind, of: Source): Unit = kind match {
+    case Kind.Files | Kind.Reprocess =>
+      // The file of the batch is written again: another size, and another time.
+      drop(of, "a.csv", ChangedCsv, at = Now.minusSeconds(1800)): Unit
+    case Kind.Full =>
+      // A row comes, and one goes.
+      asOwner { c =>
+        execute(c, s"INSERT INTO ${tableNameOf(of)} VALUES (3, '${Day.plus(3, ChronoUnit.HOURS)}')")
+        execute(c, s"DELETE FROM ${tableNameOf(of)} WHERE id = 1")
+      }
+    // A row of the window, or of the chunk, changes to a time of the next one.
+    case Kind.Incremental => moved(of, row = 2, to = Day.plus(30, ChronoUnit.HOURS))
+    case Kind.FirstChunk => moved(of, row = 1, to = History.plus(40, ChronoUnit.HOURS))
+    case Kind.ChunkUnderWay => moved(of, row = 3, to = History.plus(64, ChronoUnit.HOURS))
+  }
+
+  private def tableNameOf(of: Source): String = of.id.value.replace('.', '_')
+
+  private def moved(of: Source, row: Int, to: Instant): Unit = asOwner { c =>
+    execute(c, s"UPDATE ${tableNameOf(of)} SET updated_at = '$to' WHERE id = $row")
+  }
+
+  /**
+   * What Bronze has of the source once the run of the cell and the next have run, as the oracle
+   * says: each row by its id, with the number of the batch that wrote it.
+   */
+  private def bronzeAfter(kind: Kind, seen: Change): Seq[(String, Long)] = {
+    val rows: Seq[(String, Long)] = (kind, seen) match {
+      // The first batch has the file as it was read, or is given up; the next, the file now.
+      case (Kind.Files, Change.GivenUp) => Seq("10" -> 2, "30" -> 2)
+      case (Kind.Files, Change.Unseen) => Seq("1" -> 1, "4" -> 1, "10" -> 2, "30" -> 2)
+      case (Kind.Reprocess, Change.GivenUp) => Seq("1" -> 1, "4" -> 1, "10" -> 3, "30" -> 3)
+      case (Kind.Reprocess, Change.Unseen) =>
+        Seq("1" -> 1, "4" -> 1, "1" -> 2, "4" -> 2, "10" -> 3, "30" -> 3)
+      // The table whole, without row 1 and with row 3 once it changed; the next has it so.
+      case (Kind.Full, Change.Read) => Seq("2" -> 1, "3" -> 1, "2" -> 2, "3" -> 2)
+      case (Kind.Full, Change.Unseen) => Seq("1" -> 1, "2" -> 1, "2" -> 2, "3" -> 2)
+      // The row that moved is in the next window or chunk, and in its own if it was read there.
+      case (Kind.Incremental, Change.Read) => Seq("1" -> 1, "2" -> 2, "3" -> 2)
+      case (Kind.Incremental, Change.Unseen) => Seq("1" -> 1, "2" -> 1, "2" -> 2, "3" -> 2)
+      case (Kind.FirstChunk, Change.Read) => Seq("2" -> 1, "1" -> 2, "3" -> 2, "4" -> 2)
+      case (Kind.FirstChunk, Change.Unseen) =>
+        Seq("1" -> 1, "2" -> 1, "1" -> 2, "3" -> 2, "4" -> 2)
+      case (Kind.ChunkUnderWay, Change.Read) =>
+        Seq("1" -> 1, "2" -> 1, "4" -> 2, "3" -> 3, "5" -> 3, "6" -> 3)
+      case (Kind.ChunkUnderWay, Change.Unseen) =>
+        Seq("1" -> 1, "2" -> 1, "3" -> 2, "4" -> 2, "3" -> 3, "5" -> 3, "6" -> 3)
+      case (other, change) => fail(s"the oracle has no change $change for $other")
+    }
+    rows.sorted
+  }
+
+  /** The rows of the source in its table of Bronze: each by its id, with its batch. */
+  private def rowsIn(of: Source): Seq[(String, Long)] =
+    spark.read
+      .format("delta")
+      .load(bronze(of).uri)
+      .select(col("id").cast("string"), col(EngineColumns.BatchSeq))
+      .collect()
+      .map(row => (row.getString(0), row.getLong(1)))
+      .toSeq
+      .sorted
+
+  // The source changes at the point, and the run goes on to its end; then the next run.
+  for (kind <- Kind.All; point <- kind.points) {
+    val seen = changeAt(kind, point)
+    test(s"${kind.name}: a source that changes at $point ${seen.saying}") {
+      val cell = cellOf(kind)
+
+      val outcome = cell.run(hookAt(point)(_ => change(kind, cell.source)))
+
+      seen match {
+        case Change.GivenUp =>
+          givenUp(outcome).batch shouldBe cell.batch
+          runOf(outcome.run).status shouldBe RunStatus.Failed
+          batchOf(cell.batch).status shouldBe BatchStatus.Abandoned
+        case Change.Read | Change.Unseen =>
+          ingested(outcome).batch shouldBe cell.batch
+          runOf(outcome.run).status shouldBe RunStatus.Succeeded
+      }
+      // The next run reads the source as it is now, under the next number.
+      ingested(cell.next()).batch shouldBe after(cell.batch)
+      rowsIn(cell.source) shouldBe bronzeAfter(kind, seen)
+      assertLedger(cell.source)
+    }
+  }
 }
 
 object FaultMatrixSpec {
@@ -459,6 +553,41 @@ object FaultMatrixSpec {
     case FaultPoint.AfterBronzeCommit | FaultPoint.BeforeStateCommit => Recovery.RollForward
     case _ => Recovery.Replay
   }
+
+  /** What a batch makes of a change of its source at a point. */
+  sealed abstract class Change(val saying: String)
+
+  object Change {
+
+    /** The batch is given up, with nothing of it in its tables (ADR-0018). */
+    case object GivenUp
+        extends Change("has its batch given up, and the next run reads it as it is now")
+
+    /** The batch reads the source as it is once it changed. */
+    case object Read extends Change("is read by the batch as it is by then")
+
+    /** The batch has what was read before the change, and the next run reads the change. */
+    case object Unseen
+        extends Change("is not seen by the batch, which has what it read; the next run reads it")
+  }
+
+  /**
+   * The oracle of the column of a source that changes (P5.7, ADR-0018, P6). A batch of files is
+   * read once, kept apart from the files, and its files are confirmed just before the read and
+   * just after it, both inside the read and so before `AfterRead`: a change before the read has
+   * the batch given up, and one after it is not seen. A batch of a table is read as it is written,
+   * in one pass: the rows are asked for at the write, after `AfterCounts`, and a change before the
+   * write is read, while one after it is not.
+   */
+  def changeAt(kind: Kind, point: FaultPoint): Change = kind match {
+    case Kind.Files | Kind.Reprocess =>
+      if (point == FaultPoint.AfterPlan) Change.GivenUp else Change.Unseen
+    case _ => if (BeforeTheWrite.contains(point)) Change.Read else Change.Unseen
+  }
+
+  /** The points of a run of a table before its rows are asked for. */
+  private val BeforeTheWrite =
+    Seq(FaultPoint.AfterPlan, FaultPoint.AfterRead, FaultPoint.AfterCounts)
 
   /** A file with a record of three that cannot be parsed, which its source lets be rejected. */
   private val RejectingCsv = "id,amount\n1,2\n3\n4,5\n"
