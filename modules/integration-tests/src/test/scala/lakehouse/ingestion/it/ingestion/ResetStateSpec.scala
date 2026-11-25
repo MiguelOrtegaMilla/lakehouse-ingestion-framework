@@ -148,27 +148,27 @@ final class ResetStateSpec extends AnyFunSuite with Matchers with JdbcIngestionS
     val first = stateOf(orders).get
     val back = now.minus(4, ChronoUnit.HOURS)
 
-    val given = done(reset(orders, WatermarkReset.At(back)))
+    val action = done(reset(orders, WatermarkReset.At(back)))
 
     // The state: the watermark set, the sequence where it was, and moved by the reset's run.
     val state = stateOf(orders).get
     state.watermark shouldBe Some(StoredWatermark(back).toJson)
     state.lastCommitted shouldBe BatchSeq.of(1).toOption.get
-    state.updatedBy shouldBe given.run
-    given.message should include(s"the last batch committed is still 1, and the next one is 2")
-    given.message should include("it lets no breaking change through")
-    given.warnings shouldBe empty
+    state.updatedBy shouldBe action.run
+    action.message should include(s"the last batch committed is still 1, and the next one is 2")
+    action.message should include("it lets no breaking change through")
+    action.warnings shouldBe empty
     // The run says who asked and why, and the log has the state before and after.
-    val run = runOf(given.run)
+    val run = runOf(action.run)
     run.start.kind shouldBe RunKind.Reset
     run.status shouldBe RunStatus.Succeeded
     run.start.request shouldBe Some(asked)
     holderOf(orders) shouldBe None
     changesOf(orders).map { case (r, b, a) => (r, asJson(b), asJson(a)) } shouldBe Seq(
       (
-        given.run.toString,
+        action.run.toString,
         StateChanges.document(first),
-        StateChanges.document(state.watermark, first.lastCommitted, given.run)
+        StateChanges.document(state.watermark, first.lastCommitted, action.run)
       )
     )
 
@@ -227,12 +227,12 @@ final class ResetStateSpec extends AnyFunSuite with Matchers with JdbcIngestionS
     }
 
     val from = now.minus(150, ChronoUnit.MINUTES)
-    val given = done(reset(byModified, WatermarkReset.At(from)))
+    val action = done(reset(byModified, WatermarkReset.At(from)))
 
-    given.message should include(
+    action.message should include(
       "it lets through: load.watermark.column of the source was updated_at and is modified_at"
     )
-    given.warnings shouldBe empty
+    action.warnings shouldBe empty
     // Row 2 was modified two hours ago, after the watermark: the next batch reads it again.
     val next = ingested(launch(byModified, reading()))
     next.batch shouldBe batchId(byModified, 2)
@@ -252,10 +252,10 @@ final class ResetStateSpec extends AnyFunSuite with Matchers with JdbcIngestionS
     ingested(launch(byUpdated, reading()))
     val kept = stateOf(byUpdated).get.watermark
 
-    val given = done(reset(byModified, WatermarkReset.Keep))
+    val action = done(reset(byModified, WatermarkReset.Keep))
 
     stateOf(byModified).get.watermark shouldBe kept
-    given.warnings shouldBe Seq(
+    action.warnings shouldBe Seq(
       "the watermark was kept, and it was a value of updated_at: it is taken now as a value of " +
         "modified_at. If modified_at does not mean what updated_at did, rows whose modified_at " +
         "is at or before the watermark are skipped without a word. Keeping it is right for a " +
@@ -283,11 +283,11 @@ final class ResetStateSpec extends AnyFunSuite with Matchers with JdbcIngestionS
       case other => fail(s"the run was not refused: $other")
     }
 
-    val given = done(reset(moved, WatermarkReset.Keep))
+    val action = done(reset(moved, WatermarkReset.Keep))
 
-    given.message should include("it lets through: targets.bronze.table of the source was")
-    given.warnings should have size 1
-    given.warnings.head should include(
+    action.message should include("it lets through: targets.bronze.table of the source was")
+    action.warnings should have size 1
+    action.warnings.head should include(
       "the history of the source stays in the table that it was ingested to, and the new one " +
         "receives only what is ingested from now on"
     )

@@ -536,7 +536,7 @@ final class BackfillSpec extends AnyFunSuite with Matchers with JdbcIngestionSui
       connector.changed = true
       try
         run match {
-          case given: Outcome.GivenUp => given.run
+          case givenUp: Outcome.GivenUp => givenUp.run
           case other => fail(s"the batch was not given up: $other")
         }
       finally connector.changed = false

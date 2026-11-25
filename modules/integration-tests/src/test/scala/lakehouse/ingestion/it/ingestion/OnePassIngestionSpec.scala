@@ -452,12 +452,12 @@ object OnePassIngestionSpec {
        * no column would count nothing, since Spark computes no column that nothing reads.
        */
       def asked(key: String): DataFrame = {
-        val given = udf { (id: Long) =>
+        val present = udf { (id: Long) =>
           val has = Lost.has(name, id)
           if (has) Tally.count(key)
           has
         }.asNondeterministic()
-        context.spark.range(from, to).toDF("id").filter(given(col("id")))
+        context.spark.range(from, to).toDF("id").filter(present(col("id")))
       }
 
       val rows = asked(rowsKey(source.id))

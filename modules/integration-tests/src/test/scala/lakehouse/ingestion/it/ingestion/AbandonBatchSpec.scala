@@ -52,7 +52,7 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
 
   private def done(outcome: OperatorActions.Outcome): OperatorActions.Outcome.Done =
     outcome match {
-      case given: OperatorActions.Outcome.Done => given
+      case abandoned: OperatorActions.Outcome.Done => abandoned
       case other => fail(s"the batch was not given up: $other")
     }
 
@@ -77,17 +77,17 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
     val first = batchId(orders, 1)
     val dead = dies(orders, FaultPoint.AfterPlan)
 
-    val given = done(abandon(orders, 1))
+    val action = done(abandon(orders, 1))
 
-    given.message should include(s"the batch $first was given up by the run ${given.run}")
+    action.message should include(s"the batch $first was given up by the run ${action.run}")
     // The batch says who gave it up and why; the run says who asked for it, and is the end of
     // the dead run's lease, as any run that takes it over is.
     val batch = batchOf(first)
     batch.status shouldBe BatchStatus.Abandoned
-    batch.abandoned.value.by shouldBe Some(given.run)
+    batch.abandoned.value.by shouldBe Some(action.run)
     batch.abandoned.value.reason shouldBe "the plan cannot be run"
     batch.abandoned.value.detail shouldBe None
-    val run = runOf(given.run)
+    val run = runOf(action.run)
     run.status shouldBe RunStatus.Succeeded
     run.start.kind shouldBe RunKind.Abandon
     run.start.request shouldBe Some(asked)
@@ -237,16 +237,16 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
     val chunk = BatchId(TxnAppId.backfill(changes.id, Layer.Bronze, history), BatchSeq.of(1).value)
     val window = WatermarkPlan.fromJson(batchOf(chunk).plan).toOption.get
 
-    val given = done(abandon(changes, 1, Some(history)))
+    val action = done(abandon(changes, 1, Some(history)))
 
-    given.message should include(s"the batch $chunk was given up by the run ${given.run}")
-    given.message should include(
+    action.message should include(s"the batch $chunk was given up by the run ${action.run}")
+    action.message should include(
       "the next run of the backfill history plans the next batch from its progress as it is: " +
         "the window of this one, again"
     )
     batchOf(chunk).status shouldBe BatchStatus.Abandoned
-    runOf(given.run).start.backfill shouldBe Some(history)
-    runOf(given.run).start.kind shouldBe RunKind.Abandon
+    runOf(action.run).start.backfill shouldBe Some(history)
+    runOf(action.run).start.kind shouldBe RunKind.Abandon
     batchOf(batchId(changes, 1)).status shouldBe BatchStatus.Planned
     // Asked again, the backfill has no chunk planned; and one that is not there has none.
     failed(abandon(changes, 1, Some(history)), FailureClass.Permanent) should include(
@@ -415,17 +415,17 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
   test("a run that lost its lease to the action writes nothing of the batch it gave up") {
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")
-    var given: Option[OperatorActions.Outcome] = None
+    var action: Option[OperatorActions.Outcome] = None
     // The run is stalled after its counts, its lease runs out, and an operator gives its batch
     // up meanwhile: the run then goes on to write, under an epoch that is no longer in force.
     val stalled = service(hookAt(FaultPoint.AfterCounts) { batch =>
       expire(orders)
-      given = Some(abandon(orders, batch.id.seq.value))
+      action = Some(abandon(orders, batch.id.seq.value))
     })
 
     val outcome = launch(orders, stalled)
 
-    done(given.value)
+    done(action.value)
     outcome match {
       case Outcome.Failed(_, failure, message) =>
         failure shouldBe FailureClass.Transient
