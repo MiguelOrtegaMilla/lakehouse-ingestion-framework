@@ -11,6 +11,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.engine.failure.RunFailedException
+import lakehouse.ingestion.it.support.Died
 import org.scalatest.OptionValues
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -223,8 +224,6 @@ final class BreakingChangeSpec
 }
 
 object BreakingChangeSpec {
-
-  final class Died extends RuntimeException("the run died here")
 
   /** How many numbers a batch of a counter has. */
   val PerBatch = 2L

@@ -74,6 +74,21 @@ object Failures {
   }
 
   /**
+   * What is said of a failure that nothing classified, where a person reads it: the audit trail
+   * of its run, and the error of its process (ADR-0022 §3). Its type and where it was thrown,
+   * and not what it says: its message was written for nobody in particular, and may hold what
+   * it was handed, a value of a row among it. The failure is in the log of the instance, whole.
+   */
+  def unclassified(error: Throwable): String = {
+    val where = error.getStackTrace.headOption.fold("no frame") { frame =>
+      val file = Option(frame.getFileName).fold("")(name => s"($name:${frame.getLineNumber})")
+      s"${frame.getClassName}.${frame.getMethodName}$file"
+    }
+    s"nothing classified the failure, a mistake of the application: ${error.getClass.getName} " +
+      s"at $where. The log of the instance has it whole"
+  }
+
+  /**
    * A failure that something knows the class of, as a pattern of a `catch`: one that says its
    * class, or one that the classifier knows. A fatal error of the JVM is never one.
    */

@@ -30,7 +30,7 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 ```
 
 ```text
-control: version 7, 7 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+control: version 8, 8 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 delta_coordination: version 4, 4 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 
@@ -66,6 +66,7 @@ Run it again and it finds nothing new. A source with more than one batch takes (
 | 5 | More records were rejected than the source allows: nothing was committed, and they are in quarantine |
 | 128 + n | The signal n came before the first run: nothing was run. A run stopped after one ends in the code of its last run |
 | 64 | The command line is not one |
+| 70 | A mistake of the application, which nothing classified: the run is recorded as failed with the class `internal`, and its lease is free. The log has the failure whole. Alert |
 
 The whole contract is in [discovery §14.1](../architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them; `JdbcRunCommandSpec`, with a table of a database, cut for real by a proxy.
 
@@ -86,6 +87,7 @@ It is a run of its own under the lease of the source, and records who asked (the
 | 3 | A database did not answer, the table could not be read, or the action lost its lease |
 | 4 | Refused, with nothing changed: no batch is planned, another is, or its table has it |
 | 64 | The command line is not one: `--reason` and `--batch` are required |
+| 70 | A mistake of the application, which nothing classified: the log has it whole. Alert |
 
 ### When a source's configuration changed: `reset-state`
 
@@ -115,6 +117,7 @@ A watermark kept across a change has two risks, and the command warns of each on
 | 3 | A database did not answer, or the action lost its lease |
 | 4 | Refused, with nothing changed: a batch is planned (it is the next run's, or `abandon-batch`'s), the source has no state, or it keeps no watermark of the kind asked for, or the moment cannot be one |
 | 64 | The command line is not one: `--reason` and exactly one of the three options are required |
+| 70 | A mistake of the application, which nothing classified: the log has it whole. Alert |
 
 ### Reading files again: `reprocess`
 

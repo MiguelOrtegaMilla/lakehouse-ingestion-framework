@@ -49,7 +49,7 @@ A run of a source is one process, started by whatever schedules it, and its exit
 4. It **reads** what the plan says and **writes** it to Delta under the number of the batch: a second write of the same batch adds nothing.
 5. It **commits**, in one transaction of PostgreSQL: the state of the source, the batch, the run and the lease.
 
-The whole design, with the alternatives that were weighed, is in the [discovery document](docs/architecture/00-architecture-discovery.md) and in 21 [decision records](docs/adr/README.md).
+The whole design, with the alternatives that were weighed, is in the [discovery document](docs/architecture/00-architecture-discovery.md) and in 22 [decision records](docs/adr/README.md).
 
 ## A source is a file
 
@@ -94,7 +94,7 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 ```
 
 ```text
-control: version 7, 7 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+control: version 8, 8 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 delta_coordination: version 4, 4 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 

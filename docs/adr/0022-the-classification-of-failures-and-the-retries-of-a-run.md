@@ -110,3 +110,9 @@ The read is retried within the budget too. A budget that runs out ends the run i
 - **The classifier is `Failures`, in the root of the engine**, beside the service that ends a run, and not in the package of `RunFailedException`: it reads `DatabaseFailure`, whose package depends on the connectors, which raise the failures of that package, and the build refuses a cycle among the packages of a module.
 - **What the LogStore says, by its types.** Permanent: `TableTaintedException`, `TableNotRegisteredException`, `StaleRegistrationException`, `UncoordinatedWriteException`, `CommitMissingException`, `UnpublishableCommitException` and `CoordinationSchemaException`. Transient: `RegistrationChangedException` and `CommitPublicationPendingException`. A commit refused for its epoch (`EpochNotInForceException`) is the loss of the lease, as before (§2, point 1). Any other failure of I/O has no class.
 - **The lease that cannot be taken** is classified too. Such a run has no row, and nothing is told; if the database took the lease and its answer was lost, the lease runs out, and the run that takes it over ends this one.
+
+## As built (P8.3, 2026-11-26)
+
+- **What a run that nothing classified records** is the type of the exception and where it was thrown, and not its message (`Failures.unclassified`), and the process says the same on its error: a message that nobody wrote for a person may hold what it was handed. The log of the instance has the exception whole. `internal` is a name of `error_class` from migration V8 of `control`.
+- **`Main` ends in 70** for what nothing classified in any command, after it logs it whole; a fatal error of the JVM is caught by nothing.
+- **A test that has a run die at a point of the engine** throws a `ControlThrowable` (`Died`), which nothing of the engine catches: a death that the engine could catch would end the run as `internal`, and not as a process that is killed.

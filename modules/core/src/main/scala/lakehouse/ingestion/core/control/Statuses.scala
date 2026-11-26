@@ -150,7 +150,13 @@ object FailureClass {
   /** More rows were rejected than the source allows. */
   case object Data extends FailureClass("data")
 
-  val All: Seq[FailureClass] = Seq(Transient, Conflict, Permanent, Data)
+  /**
+   * Nothing knew what the failure was: a mistake of the application (ADR-0022 §3). The process
+   * ends in 70, and the failure is in the log of its instance, whole.
+   */
+  case object Internal extends FailureClass("internal")
+
+  val All: Seq[FailureClass] = Seq(Transient, Conflict, Permanent, Data, Internal)
 
   def parse(name: String): Either[String, FailureClass] =
     All.find(_.name == name).toRight(s"must be one of ${All.map(_.name).mkString(", ")}")

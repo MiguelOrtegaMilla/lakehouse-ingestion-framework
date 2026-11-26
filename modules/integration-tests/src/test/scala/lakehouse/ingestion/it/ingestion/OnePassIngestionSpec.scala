@@ -16,6 +16,7 @@ import lakehouse.ingestion.engine.delta.{BatchAppend, BatchCommit, Lake}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.engine.failure.RunFailedException
+import lakehouse.ingestion.it.support.Died
 import lakehouse.ingestion.logstore.CommitContext
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.delta.sources.DeltaSQLConf
@@ -369,8 +370,6 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
 object OnePassIngestionSpec {
 
   private val MetricsEnabled = DeltaSQLConf.DELTA_HISTORY_METRICS_ENABLED.key
-
-  final class Died extends RuntimeException("the run died here")
 
   def rowsKey(source: SourceId): String = s"${source.value}/rows"
   def probeKey(source: SourceId): String = s"${source.value}/probe"

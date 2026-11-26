@@ -15,6 +15,7 @@ import lakehouse.ingestion.cli.{Main, RunSession, Stop}
 import lakehouse.ingestion.core.config.{Profile, Source}
 import lakehouse.ingestion.core.control.{Layer, LeaseKey, LeaseTiming}
 import lakehouse.ingestion.engine.control.LeasedRun
+import lakehouse.ingestion.engine.{FaultHooks, FaultPoint}
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CommandProcess, DeploymentFiles, LocalSparkSuite}
@@ -306,6 +307,41 @@ final class RunCommandSpec
   // ---------------------------------------------------------------------------------------------
   // A chain of runs, and what stops it (discovery §17, P6.10)
   // ---------------------------------------------------------------------------------------------
+
+  test(
+    "a run that fails with what nothing classified ends in 70, as internal, its lease given up"
+  ) {
+    val returns = fileSource()
+    drop(returns, "a.csv", "id,amount\n1,10\n")
+    // A mistake of the application, after the batch is planned: nothing classifies it.
+    val mistaken: FaultHooks = (point, _) =>
+      if (point == FaultPoint.AfterPlan)
+        throw new IllegalStateException("a mistake that holds what it was handed: s3cr3t")
+    val (out, err) = (new ByteArrayOutputStream, new ByteArrayOutputStream)
+    val exit = Main.run(
+      arguments(returns),
+      new PrintStream(out, true, "UTF-8"),
+      new PrintStream(err, true, "UTF-8"),
+      Map.empty[String, String].get,
+      hooks = mistaken
+    )
+    val ran = Ran(exit, out.toString("UTF-8"), err.toString("UTF-8"))
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Internal)
+    said(ran).head should (include("failed (internal)") and include(
+      "java.lang.IllegalStateException at "
+    ))
+    ran.err should not include "s3cr3t"
+    runsOf(returns) shouldBe Seq("FAILED" -> Some("internal"))
+    holderOf(returns) shouldBe None
+    batchesOf(returns) shouldBe Seq("1" -> "PLANNED")
+
+    // The lease is free: the next invocation runs the batch that was left, at once.
+    val next = launch(returns)
+    withClue(next.err)(next.exit shouldBe Main.Exit.Ok)
+    batchesOf(returns) shouldBe Seq("1" -> "COMMITTED")
+    assertLedger(returns)
+  }
 
   /** A source of files of one record each, of which one batch takes one. */
   private def oneAtATime(count: Int): Source = {

@@ -17,7 +17,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.engine.operator.OperatorActions
 import lakehouse.ingestion.engine.quarantine.QuarantineReader
-import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
+import lakehouse.ingestion.it.support.Died
 import lakehouse.ingestion.it.support.ControlPlaneSchema.update
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers

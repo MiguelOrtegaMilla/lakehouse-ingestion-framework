@@ -22,8 +22,9 @@ import lakehouse.ingestion.logstore.StartupRefusedException
  * batch that it committed says that the source has more, up to `--max-batches` and until a
  * signal asks it to stop (`runs`). The code is that of the last run (`exitOf`, discovery §14.1).
  *
- * An exception that nothing classified is let through, after the session and the control plane
- * are closed: the process ends with the JVM's 1 until `Main` catches it (P8, 70).
+ * A run that failed with what nothing classified ends in 70, as `internal` (ADR-0022 §3). An
+ * exception that nothing classified outside a run is let through, after the session and the
+ * control plane are closed, and `Main` ends the process in 70.
  */
 object RunCommand {
 
@@ -148,6 +149,7 @@ object RunCommand {
         case FailureClass.Transient | FailureClass.Conflict => Main.Exit.Transient
         case FailureClass.Permanent => Main.Exit.Permanent
         case FailureClass.Data => Main.Exit.DataThreshold
+        case FailureClass.Internal => Main.Exit.Internal
       }
   }
 

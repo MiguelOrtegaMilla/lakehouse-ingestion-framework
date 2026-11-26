@@ -173,7 +173,11 @@ import org.slf4j.LoggerFactory
  *    Delta, a database by its SQLState) ends the run as `FAILED` with its class, as one that
  *    said its class does (ADR-0022 §2). So does a failure to take the lease, which leaves no
  *    run to tell.
- *  - What nothing classified is let through, and nothing is said to the control plane: the
+ *  - What nothing classified ends the run as `FAILED`, with the class `internal`, and gives
+ *    the lease up (ADR-0022 §3). What the run records of it is its type and where it was
+ *    thrown; the log has it whole. A failure to take the lease that nothing classified is let
+ *    through, with no run to tell.
+ *  - A fatal error of the JVM is let through, and nothing is said to the control plane: the
  *    lease is no longer renewed, and what is left is what a process that died leaves. The run
  *    that takes the lease over marks this one `ABANDONED`.
  *
@@ -213,8 +217,9 @@ final class IngestionService(
    *   source. Nothing was started
    * @param horizon how far the invocation reads, as the batch before this run in its chain said
    *   (`Outcome.Next.Within`); none for the first run of an invocation, whose plan fixes it
-   * @throws java.lang.Exception what nothing classified (`Failures`). The run is left as a
-   *   process that died leaves it
+   * @throws java.lang.Exception what nothing classified as the lease was taken (`Failures`),
+   *   with no run to tell; and a fatal error of the JVM, which leaves the run as a process that
+   *   died leaves it
    */
   def run(source: Source, config: ConfigVersion, horizon: Option[Json] = None): Outcome = {
     val bound = connectors.bind(source)
@@ -343,10 +348,20 @@ final class IngestionService(
           case failure @ Failures.Known(classed) =>
             log.error(s"the run ${start.id} of ${source.id} failed (${classed.failure})", failure)
             ended(leased, RunEnd.Failed(classed.failure, classed.getMessage))
-          case unclassified: Throwable =>
-            // Nothing is said of it: the lease runs out, as that of a process that died.
+          // What nothing classified: a mistake of the application (ADR-0022 §3). The run says
+          // so, and gives its lease up; the log has the failure whole.
+          case NonFatal(unclassified) =>
+            log.error(
+              s"the run ${start.id} of ${source.id} failed with what nothing classified, a " +
+                "mistake of the application",
+              unclassified
+            )
+            ended(leased, RunEnd.Failed(FailureClass.Internal, Failures.unclassified(unclassified)))
+          case fatal: Throwable =>
+            // A fatal error of the JVM: nothing is said of it, and the lease runs out, as that of
+            // a process that died.
             leased.close()
-            throw unclassified
+            throw fatal
         }
     }
   }

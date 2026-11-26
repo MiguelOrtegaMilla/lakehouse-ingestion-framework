@@ -207,22 +207,31 @@ final class PostgresCoordinationStore(
   /**
    * As `transaction`, for a change that `body` may call off once it has looked: `Right` keeps
    * what it changed, `Left` takes all of it back.
+   *
+   * What broke the transaction is what is reported. A connection that was lost fails its
+   * rollback and the return to auto-commit as well, and those are said with it, as suppressed:
+   * thrown from a `finally`, the last would have taken the place of the first.
    */
   private[coordination] def transactionUnless[T](
       action: String
   )(body: Connection => Either[T, T]): T =
     run(action) { connection =>
       connection.setAutoCommit(false)
-      try {
-        val outcome = body(connection)
-        if (outcome.isRight) connection.commit() else connection.rollback()
-        outcome.merge
-      } catch {
-        case failure: Throwable =>
-          try connection.rollback()
-          catch { case rollback: SQLException => failure.addSuppressed(rollback) }
-          throw failure
-      } finally connection.setAutoCommit(true)
+      val outcome =
+        try {
+          val outcome = body(connection)
+          if (outcome.isRight) connection.commit() else connection.rollback()
+          outcome.merge
+        } catch {
+          case failure: Throwable =>
+            try connection.rollback()
+            catch { case rollback: SQLException => failure.addSuppressed(rollback) }
+            try connection.setAutoCommit(true)
+            catch { case restore: SQLException => failure.addSuppressed(restore) }
+            throw failure
+        }
+      connection.setAutoCommit(true)
+      outcome
     }
 
   private def connect(): Connection = {

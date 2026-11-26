@@ -72,12 +72,16 @@ final class StatusesSpec extends AnyFunSuite with Matchers with EitherValues {
     RunKind.All.filterNot(kind => kind.ofRegular || kind.ofBackfills) shouldBe empty
   }
 
-  test("a failure has one of the four classes of the requirements") {
-    // RF-14: transient, permanent, data, conflict. They are a column of the audit trail.
-    FailureClass.All.map(_.name) shouldBe Seq("transient", "conflict", "permanent", "data")
+  test(
+    "a failure has one of the four classes of the requirements, or is a mistake of the application"
+  ) {
+    // RF-14: transient, permanent, data, conflict; and what nothing classified (ADR-0022 §3).
+    // They are a column of the audit trail.
+    FailureClass.All.map(_.name) shouldBe
+      Seq("transient", "conflict", "permanent", "data", "internal")
     FailureClass.All.foreach(failure => FailureClass.parse(failure.name).value shouldBe failure)
     FailureClass.parse("TRANSIENT").left.value shouldBe
-      "must be one of transient, conflict, permanent, data"
+      "must be one of transient, conflict, permanent, data, internal"
   }
 
   test("the statuses of a batch have the names of the contract") {
