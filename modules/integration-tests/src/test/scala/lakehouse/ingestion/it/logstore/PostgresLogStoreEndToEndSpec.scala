@@ -11,7 +11,7 @@ import scala.util.Using
 import io.delta.tables.DeltaTable
 import lakehouse.ingestion.it.support.LocalSparkSuite
 import lakehouse.ingestion.logstore._
-import lakehouse.ingestion.logstore.coordination.Registration
+import lakehouse.ingestion.logstore.coordination.{MaintenanceRequest, Registration}
 import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.delta.actions.Metadata
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations, OptimisticTransaction}
@@ -37,6 +37,8 @@ final class PostgresLogStoreEndToEndSpec
   import PostgresLogStoreEndToEndSpec._
 
   private def table(path: String): DeltaTable = DeltaTable.forPath(spark, path)
+
+  private val asked = MaintenanceRequest("ops.oncall", "its log was looked at, and it is right")
 
   /** Every version up to the table's latest has a complete entry: no commit of another kind. */
   private def everyCommitIsCoordinated(path: String): Unit = {
@@ -213,7 +215,7 @@ final class PostgresLogStoreEndToEndSpec
 
     // The temporary files of the commits that Delta expired go the same way: they are below
     // the checkpoint that Delta's pointer names, and are not taken for commits that were lost.
-    val fates = maintenance.collectTemps(new Path(path), fs)
+    val fates = maintenance.collectTemps(new Path(path), fs, asked)
     def fateOf(version: Long): TempFate = fates(entry(path, version).tempPath.stripPrefix(".tmp/"))
     (0L to 3L).map(fateOf) shouldBe Seq.fill(4)(TempFate.RemovedExpired)
     (4L to 5L).map(fateOf) shouldBe Seq.fill(2)(TempFate.RemovedPublished)
@@ -261,7 +263,7 @@ final class PostgresLogStoreEndToEndSpec
     causesOf(refused).map(_.getMessage).mkString should include("reset its registry")
     Files.exists(commitFile(path, 0)) shouldBe false
 
-    maintenance.reset(new Path(path), fs)
+    maintenance.reset(new Path(path), fs, asked)
 
     DeltaLog.clearCache()
     rows(100L, 105L).write.format("delta").save(path)

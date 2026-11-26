@@ -26,6 +26,13 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
   /** The operator's view of the same registry. */
   protected def maintenance: RegistryMaintenance
 
+  /** What the maintenance log holds of `table`, oldest first: each operation and its request. */
+  protected def logged(table: TableUri): Seq[(String, MaintenanceRequest)]
+
+  /** Who asked for an operation, and why, as a test asks for it. */
+  protected val asked: MaintenanceRequest =
+    MaintenanceRequest("ops.oncall", "its log was looked at, and it is right")
+
   /** A table with complete entries for `versions`, created through the commit path. */
   private def tableWith(versions: Long*): TableUri = {
     val table = newTable()
@@ -48,11 +55,17 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
       version: Long,
       deltaTableId: Option[String]
   ): RegistryChange[Readoption] =
-    maintenance.readopt(table, version, deltaTableId, maintenance.contradicted(table, version))
+    maintenance.readopt(
+      table,
+      version,
+      deltaTableId,
+      maintenance.contradicted(table, version),
+      asked
+    )
 
   /** Forgets `table` as an operator who has just examined its unfinished entries. */
   private def forget(table: TableUri): RegistryChange[Unit] =
-    maintenance.forget(table, maintenance.unfinished(table))
+    maintenance.forget(table, maintenance.unfinished(table), asked)
 
   /** What the registration says, without the generation the registry gave it. */
   private def saidBy(
@@ -63,12 +76,12 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
   test("a table that was never coordinated is adopted at the version given, once") {
     val table = newTable()
 
-    maintenance.adopt(table, 41L, Some("its-id")) shouldBe true
+    maintenance.adopt(table, 41L, Some("its-id"), asked) shouldBe true
     val adopted = maintenance.registration(table)
     saidBy(adopted) shouldBe Some((41L, Some("its-id"), None))
 
     // A table that is registered is not adopted: its registration is not an operator's slip away.
-    maintenance.adopt(table, 99L, Some("another-id")) shouldBe false
+    maintenance.adopt(table, 99L, Some("another-id"), asked) shouldBe false
     store.registration(table) shouldBe adopted
 
     // From then on its commits are coordinated.
@@ -122,9 +135,9 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
   }
 
   test("a table is adopted at a version it has: not below zero") {
-    an[IllegalArgumentException] should be thrownBy maintenance.adopt(newTable(), -1L, None)
+    an[IllegalArgumentException] should be thrownBy maintenance.adopt(newTable(), -1L, None, asked)
     an[IllegalArgumentException] should be thrownBy
-      maintenance.readopt(tableWith(0L), -1L, None, Nil)
+      maintenance.readopt(tableWith(0L), -1L, None, Nil, asked)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -183,11 +196,13 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
     val taken = claim(table, 2L)
     store.take(taken) shouldBe Taken
 
-    val called = maintenance.readopt(table, 1L, None, examined)
+    val called = maintenance.readopt(table, 1L, None, examined, asked)
 
     called shouldBe EntriesChanged(store.entry(table, 2L).toSeq)
-    // Nothing was changed: not the registration, its generation or its taint, nor the entry.
+    // Nothing was changed: not the registration, its generation or its taint, nor the entry;
+    // and nothing is in the log.
     store.registration(table) shouldBe before
+    logged(table) shouldBe empty
     store.complete(table, 2L, taken.tempPath) shouldBe true
   }
 
@@ -198,9 +213,11 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
     val taken = claim(table, 1L)
     store.take(taken) shouldBe Taken
 
-    maintenance.forget(table, examined) shouldBe EntriesChanged(store.entry(table, 1L).toSeq)
+    maintenance.forget(table, examined, asked) shouldBe
+      EntriesChanged(store.entry(table, 1L).toSeq)
 
     store.registration(table) shouldBe before
+    logged(table) shouldBe empty
     store.entry(table, 0L).map(_.complete) shouldBe Some(true)
     store.complete(table, 1L, taken.tempPath) shouldBe true
   }
@@ -245,6 +262,44 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
     forget(table) shouldBe NotRegistered
     store.register(table, Registration.NotYetCreated, None) shouldBe a[Registered]
     store.take(claim(table, 0L)) shouldBe Taken
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The maintenance log
+  // ---------------------------------------------------------------------------------------------
+
+  test("each change to the registry is recorded with who asked and why, and no other") {
+    val table = newTable()
+    val again = MaintenanceRequest("ops.second", "the taint was a false alarm")
+    val gone = MaintenanceRequest("ops.third", "the table was dropped")
+
+    maintenance.adopt(table, 0L, Some("its-id"), asked) shouldBe true
+    logged(table) shouldBe Seq("adopt" -> asked)
+    // A table that is registered is not adopted, and nothing is recorded.
+    maintenance.adopt(table, 0L, Some("its-id"), again) shouldBe false
+    logged(table) shouldBe Seq("adopt" -> asked)
+
+    maintenance.readopt(table, 0L, None, maintenance.contradicted(table, 0L), again) shouldBe
+      Applied(Readoption(None, Nil))
+    maintenance.forget(table, maintenance.unfinished(table), gone) shouldBe Applied(())
+    // What was done to a table is kept once the table is forgotten.
+    logged(table) shouldBe Seq("adopt" -> asked, "readopt" -> again, "reset" -> gone)
+
+    // What finds nothing to change records nothing.
+    maintenance.forget(table, Nil, gone) shouldBe NotRegistered
+    maintenance.readopt(table, 0L, None, Nil, again) shouldBe NotRegistered
+    logged(table) should have size 3
+  }
+
+  test("the temporary files that were collected are recorded, whatever their table is") {
+    val registered = tableWith(0L)
+    val dropped = newTable()
+
+    maintenance.collected(registered, asked, Seq("0.json.a" -> "removed_published"))
+    maintenance.collected(dropped, asked, Nil)
+
+    logged(registered) shouldBe Seq("collect_temps" -> asked)
+    logged(dropped) shouldBe Seq("collect_temps" -> asked)
   }
 
   implicit private class Defined[A](option: Option[A]) {

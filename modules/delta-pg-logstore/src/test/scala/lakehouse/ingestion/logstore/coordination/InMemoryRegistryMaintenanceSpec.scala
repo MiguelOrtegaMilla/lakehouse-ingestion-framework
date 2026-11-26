@@ -7,4 +7,6 @@ final class InMemoryRegistryMaintenanceSpec extends RegistryMaintenanceContract 
 
   override protected def store: CoordinationStore = registry
   override protected def maintenance: RegistryMaintenance = registry
+  override protected def logged(table: TableUri): Seq[(String, MaintenanceRequest)] =
+    registry.logged(table)
 }

@@ -31,7 +31,7 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 
 ```text
 control: version 8, 8 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
-delta_coordination: version 4, 4 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+delta_coordination: version 5, 5 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 
 It can be run again at any time: a schema that is at its version is left as it is. The engine and the LogStore run no DDL. Each checks the version of its schema before it touches a table, and refuses to work on another.

@@ -95,7 +95,7 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 
 ```text
 control: version 8, 8 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
-delta_coordination: version 4, 4 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+delta_coordination: version 5, 5 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 
 **A table, loaded incrementally.** The source [`sales.orders`](conf/sources/sales.orders.yaml) reads `public.orders` by its column `updated_at`, four weeks a batch. A demo makes the table, as the source system would, and `run` loads it:

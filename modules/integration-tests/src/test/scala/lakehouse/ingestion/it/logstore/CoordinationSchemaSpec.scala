@@ -50,11 +50,11 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
     """INSERT INTO delta_coordination.table_taint (table_uri, reason) VALUES (?, ?)
       |ON CONFLICT DO NOTHING""".stripMargin
 
-  test("the migrations build version 4 of the schema, and applying them again changes nothing") {
+  test("the migrations build version 5 of the schema, and applying them again changes nothing") {
     CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 0
 
     as(CommitPath) { c =>
-      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("4"))
+      query(c, "SELECT version FROM delta_coordination.schema_version") shouldBe Seq(Seq("5"))
     }
     Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
       val owners = query(
@@ -66,6 +66,7 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
         "commit_entry",
         "coordinated_table",
         "flyway_schema_history",
+        "maintenance_log",
         "schema_version",
         "table_taint",
         "writer_epoch"
@@ -333,6 +334,9 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       "CREATE TABLE delta_coordination.scratch (id int)",
       "ALTER TABLE delta_coordination.commit_entry ADD COLUMN extra text",
       "DROP TABLE delta_coordination.commit_entry",
+      // What operators did is theirs to write, and an audit's to read (since V5).
+      "SELECT * FROM delta_coordination.maintenance_log",
+      logRow("'adopt'", "'{}'"),
       // Nothing outside its own tables: not the migration history, not the control plane.
       "SELECT * FROM delta_coordination.flyway_schema_history",
       "SELECT * FROM control.run",
@@ -390,6 +394,9 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
         table
       ) shouldBe 1
 
+      // Since V5: what it did is written to the log.
+      update(c, logRow("'readopt'", "'{\"version\": 50}'")) shouldBe 1
+
       Seq(
         // A table is never renamed in the registry.
         "UPDATE delta_coordination.coordinated_table SET table_uri = 'file:/lake/elsewhere'",
@@ -399,7 +406,16 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
         "INSERT INTO delta_coordination.table_taint (table_uri, reason) " +
           "VALUES ('file:/lake/reset', 'by hand')",
         "UPDATE delta_coordination.commit_entry SET complete = true, completed_at = now()",
-        "UPDATE delta_coordination.schema_version SET version = 4",
+        "UPDATE delta_coordination.schema_version SET version = 5",
+        // Since V5: a row of the log is written, and is not read, changed or deleted by the
+        // role that writes it; nor is the moment it was made said by it.
+        "SELECT * FROM delta_coordination.maintenance_log",
+        "UPDATE delta_coordination.maintenance_log SET reason = 'nothing happened'",
+        "DELETE FROM delta_coordination.maintenance_log",
+        "TRUNCATE delta_coordination.maintenance_log",
+        "INSERT INTO delta_coordination.maintenance_log " +
+          "(table_uri, operation, requested_by, reason, detail, made_at) " +
+          "VALUES ('file:/lake/reset', 'reset', 'ops', 'why', '{}', '2020-01-01')",
         // An epoch is announced by the writers that it numbers, and by nobody else.
         "INSERT INTO delta_coordination.writer_epoch (epoch_key, epoch) VALUES ('by.hand/bronze', 1)",
         "UPDATE delta_coordination.writer_epoch SET epoch = 99",
@@ -411,6 +427,52 @@ final class CoordinationSchemaSpec extends AnyFunSuite with Matchers with Before
       }
     }
   }
+
+  test("a row of the log says what was done, by whom and why, in a document") {
+    as(Maintenance) { c =>
+      Seq(
+        logRow("'drop'", "'{}'"),
+        logRow("'adopt'", "'{}'", by = "' '"),
+        logRow("'adopt'", "'{}'", why = "''"),
+        logRow("'adopt'", "'{}'", why = "repeat('x', 1001)"),
+        logRow("'adopt'", "'[]'"),
+        logRow("'adopt'", "'{}'", table = "''")
+      ).foreach { statement =>
+        withClue(s"$statement: ") { sqlState(update(c, statement)) shouldBe CheckViolation }
+      }
+      // An id is the database's to give.
+      sqlState(
+        update(
+          c,
+          "INSERT INTO delta_coordination.maintenance_log " +
+            "(entry_id, table_uri, operation, requested_by, reason, detail) " +
+            "VALUES (1, 'file:/lake/x', 'adopt', 'ops', 'why', '{}')"
+        )
+      ) shouldBe GeneratedAlways
+    }
+    Using.resource(pg.connectAsSuperuser(CoordinationSchema.Database)) { c =>
+      update(c, logRow("'collect_temps'", "'{}'", table = "'file:/lake/made-at'")) shouldBe 1
+      // The moment is the database's.
+      query(
+        c,
+        "SELECT made_at > now() - interval '1 minute' FROM delta_coordination.maintenance_log " +
+          "WHERE table_uri = ?",
+        "file:/lake/made-at"
+      ) shouldBe Seq(Seq("t"))
+    }
+  }
+
+  /** A row of the maintenance log, as SQL, with each value given as a literal. */
+  private def logRow(
+      operation: String,
+      detail: String,
+      table: String = "'file:/lake/reset'",
+      by: String = "'ops.oncall'",
+      why: String = "'its log was looked at'"
+  ): String =
+    "INSERT INTO delta_coordination.maintenance_log " +
+      "(table_uri, operation, requested_by, reason, detail) " +
+      s"VALUES ($table, $operation, $by, $why, $detail::jsonb)"
 
   private def as[T](role: String)(body: Connection => T): T =
     Using.resource(pg.connect(role, CoordinationSchema.Database))(body)

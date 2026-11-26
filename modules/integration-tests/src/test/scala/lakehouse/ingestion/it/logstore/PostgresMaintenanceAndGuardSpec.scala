@@ -16,6 +16,7 @@ import lakehouse.ingestion.it.support.{BootstrappedPostgres, CoordinationSchema,
 import lakehouse.ingestion.logstore._
 import lakehouse.ingestion.logstore.coordination.{
   CoordinationSettings,
+  MaintenanceRequest,
   PostgresCoordinationStore,
   PostgresRegistryMaintenance,
   Registration,
@@ -54,6 +55,8 @@ final class PostgresMaintenanceAndGuardSpec
     )
   )
   private lazy val maintenance = new TableMaintenance(registry)
+
+  private val asked = MaintenanceRequest("ops.oncall", "its log was looked at, and it is right")
 
   private val conf = new Configuration()
   private val fs = FileSystem.getLocal(conf)
@@ -99,7 +102,10 @@ final class PostgresMaintenanceAndGuardSpec
     val lake = new Lake
     (0L to 1L).foreach(lake.foreignCommit)
 
-    maintenance.adopt(hadoop(lake.directory), fs, Some("its-id")) shouldBe Adoption(lake.table, 1L)
+    maintenance.adopt(hadoop(lake.directory), fs, Some("its-id"), asked) shouldBe Adoption(
+      lake.table,
+      1L
+    )
 
     store
       .registration(lake.table)
@@ -118,7 +124,7 @@ final class PostgresMaintenanceAndGuardSpec
     an[UncoordinatedWriteException] should be thrownBy lake.list()
     val ours = store.entry(lake.table, 1L)
 
-    val readopted = maintenance.readopt(hadoop(lake.directory), fs, None)
+    val readopted = maintenance.readopt(hadoop(lake.directory), fs, None, asked)
 
     readopted.version shouldBe 1L
     readopted.removed.clearedTaint.getOrElse("") should include("version 1")
@@ -138,7 +144,7 @@ final class PostgresMaintenanceAndGuardSpec
     }
     a[StaleRegistrationException] should be thrownBy lake.commit(0)(Creation)
 
-    maintenance.reset(hadoop(lake.directory), fs)
+    maintenance.reset(hadoop(lake.directory), fs, asked)
 
     store.registration(lake.table) shouldBe None
     lake.commit(0)(Creation)
@@ -153,7 +159,7 @@ final class PostgresMaintenanceAndGuardSpec
     lake.commit(1)(append(1))
     // The operator's change commits between the writer's checks and its INSERT.
     val whileAdopted = LogStores.at(FaultPoint.BeforeInsert) {
-      maintenance.readopt(hadoop(lake.directory), fs, None).version shouldBe 1L: Unit
+      maintenance.readopt(hadoop(lake.directory), fs, None, asked).version shouldBe 1L: Unit
     }
 
     a[RegistrationChangedException] should be thrownBy lake.commit(2, whileAdopted)(append(2))
@@ -175,7 +181,7 @@ final class PostgresMaintenanceAndGuardSpec
       Using.resource(Files.walk(lake.log)) {
         _.iterator.asScala.filter(Files.isRegularFile(_)).toList.foreach(Files.delete)
       }
-      maintenance.reset(hadoop(lake.directory), fs)
+      maintenance.reset(hadoop(lake.directory), fs, asked)
       lake.commit(0)(Creation)
       lake.commit(1)(append(1))
     }
@@ -198,7 +204,7 @@ final class PostgresMaintenanceAndGuardSpec
     val orphan = lake.temps.diff(published).head
     Files.setLastModifiedTime(orphan, FileTime.from(Instant.now().minus(2, ChronoUnit.DAYS)))
 
-    val fates = maintenance.collectTemps(hadoop(lake.directory), fs)
+    val fates = maintenance.collectTemps(hadoop(lake.directory), fs, asked)
 
     fates shouldBe Map(
       orphan.getFileName.toString -> TempFate.RemovedOrphan,

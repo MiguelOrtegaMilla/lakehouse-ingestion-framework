@@ -17,6 +17,12 @@ import java.io.IOException
  * at the entries again, and is called off if they are not those. Applied, it leaves the table
  * with another generation of registration or with none, so a writer that had looked at the
  * registry before gets no version afterwards (`CoordinationStore.take`).
+ *
+ * '''A change is recorded with it.''' Each operation that changes the registry writes who asked
+ * for it, why, and what it found and changed to the maintenance log, as part of the change: a
+ * change that is made is in the log, and one that is called off or refused is not. Collecting the
+ * temporary files of a table changes nothing of the registry, and is recorded once it is done
+ * (`collected`).
  */
 trait RegistryMaintenance {
 
@@ -38,17 +44,24 @@ trait RegistryMaintenance {
   def contradicted(table: TableUri, version: Long): Seq[CommitEntry]
 
   /**
-   * Registers a table that exists and was never coordinated, at the version its log is at.
+   * Registers a table that exists and was never coordinated, at the version its log is at, and
+   * records it.
    *
    * @return whether it was registered; `false` if it already was, and nothing changed
    */
   @throws[IOException]
-  def adopt(table: TableUri, version: Long, deltaTableId: Option[String]): Boolean
+  def adopt(
+      table: TableUri,
+      version: Long,
+      deltaTableId: Option[String],
+      request: MaintenanceRequest
+  ): Boolean
 
   /**
    * Makes the table's log, as it is at `version`, the table: the registration moves to
    * `version` and gets a new generation, the taint is cleared, and the entries that contradict
-   * the log are removed (`contradicted`).
+   * the log are removed (`contradicted`). It is recorded, with the version it moved from, the
+   * taint and the entries it removed.
    *
    * @param deltaTableId the table's id, if it is to be recorded anew
    * @param examined the contradicted entries the caller looked at; the change is made only if
@@ -60,18 +73,33 @@ trait RegistryMaintenance {
       table: TableUri,
       version: Long,
       deltaTableId: Option[String],
-      examined: Seq[CommitEntry]
+      examined: Seq[CommitEntry],
+      request: MaintenanceRequest
   ): RegistryChange[Readoption]
 
   /**
    * Removes everything the registry holds about `table`: its taint, its entries, its
-   * registration.
+   * registration. It is recorded, with what the registration was, its taint, how many entries
+   * it had and those of them that were not complete.
    *
    * @param examined the unfinished entries the caller looked at; the change is made only if
    *   they are still the unfinished entries
    */
   @throws[IOException]
-  def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit]
+  def forget(
+      table: TableUri,
+      examined: Seq[CommitEntry],
+      request: MaintenanceRequest
+  ): RegistryChange[Unit]
+
+  /**
+   * Records that the temporary files of `table` were collected (`TableMaintenance.collectTemps`),
+   * once they are: nothing of the registry changes, so the record is a change of its own.
+   *
+   * @param temps each file by its name, with what became of it, as the log names it
+   */
+  @throws[IOException]
+  def collected(table: TableUri, request: MaintenanceRequest, temps: Seq[(String, String)]): Unit
 }
 
 /** What became of a change that an operator asked for after examining a table's entries. */

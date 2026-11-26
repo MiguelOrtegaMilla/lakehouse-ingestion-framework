@@ -16,6 +16,7 @@ import lakehouse.ingestion.logstore.coordination.FaultyCoordinationStore.{
 }
 import lakehouse.ingestion.logstore.coordination.{
   CommitEntry,
+  MaintenanceRequest,
   Readoption,
   Registration,
   RegistryChange,
@@ -40,6 +41,12 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
   import TableMaintenanceSpec._
 
   private def maintenanceOf(lake: Lake) = new TableMaintenance(lake.memory)
+
+  private val asked = MaintenanceRequest("ops.oncall", "its log was looked at, and it is right")
+
+  /** What the maintenance log holds of the table of `lake`: each operation and its request. */
+  private def loggedOf(lake: Lake): Seq[(String, MaintenanceRequest)] =
+    lake.memory.logged(lake.table)
 
   /** Commits `version` as a process without this LogStore does. */
   private def foreignCommit(lake: Lake, version: Long): Unit =
@@ -76,23 +83,39 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
         registry.contradicted(table, version)
       }
 
-      override def adopt(table: TableUri, version: Long, id: Option[String]): Boolean =
-        registry.adopt(table, version, id)
+      override def adopt(
+          table: TableUri,
+          version: Long,
+          id: Option[String],
+          request: MaintenanceRequest
+      ): Boolean =
+        registry.adopt(table, version, id, request)
 
       override def readopt(
           table: TableUri,
           version: Long,
           id: Option[String],
-          examined: Seq[CommitEntry]
+          examined: Seq[CommitEntry],
+          request: MaintenanceRequest
       ): RegistryChange[Readoption] = {
         beforeChanging()
-        registry.readopt(table, version, id, examined)
+        registry.readopt(table, version, id, examined, request)
       }
 
-      override def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit] = {
+      override def forget(
+          table: TableUri,
+          examined: Seq[CommitEntry],
+          request: MaintenanceRequest
+      ): RegistryChange[Unit] = {
         beforeChanging()
-        registry.forget(table, examined)
+        registry.forget(table, examined, request)
       }
+
+      override def collected(
+          table: TableUri,
+          request: MaintenanceRequest,
+          temps: Seq[(String, String)]
+      ): Unit = registry.collected(table, request, temps)
     }
 
   /** `effect`, the first time it is asked for and never again. */
@@ -121,7 +144,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     // Not coordinated: a write through the LogStore is refused.
     a[TableNotRegisteredException] should be thrownBy lake.commit(3)(append(3))
 
-    val adopted = maintenanceOf(lake).adopt(hadoop(lake.directory), fs, Some(TableId))
+    val adopted = maintenanceOf(lake).adopt(hadoop(lake.directory), fs, Some(TableId), asked)
 
     adopted shouldBe Adoption(lake.table, version = 2L)
     saidBy(registrationOf(lake)) shouldBe Some((2L, Some(TableId), None))
@@ -134,14 +157,14 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
   test("a table is not adopted if it has no commit, or if it is registered already") {
     val empty = new Lake
     val nothing = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(empty).adopt(hadoop(empty.directory), fs, None)
+      maintenanceOf(empty).adopt(hadoop(empty.directory), fs, None, asked)
     nothing.getMessage should include("no commit")
     registrationOf(empty) shouldBe None
 
     val coordinated = new Lake().withCommits(last = 1)
     val before = registrationOf(coordinated)
     val already = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(coordinated).adopt(hadoop(coordinated.directory), fs, Some("another-id"))
+      maintenanceOf(coordinated).adopt(hadoop(coordinated.directory), fs, Some("another-id"), asked)
     already.getMessage should include("registered already")
     registrationOf(coordinated) shouldBe before
   }
@@ -156,7 +179,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     lake.list() shouldBe (0L to 2L).map(commit)
     val reason = registrationOf(lake).value.taintReason.value
 
-    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked)
 
     readopted shouldBe Readopted(lake.table, 2L, Readoption(Some(reason), Nil))
     saidBy(registrationOf(lake)) shouldBe Some((2L, Some(TableId), None))
@@ -175,7 +198,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val ours = lake.entry(1).value
     an[UncoordinatedWriteException] should be thrownBy lake.list()
 
-    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked)
 
     // The entry of the commit that lost its name is returned: its bytes are still in its file.
     readopted.removed.removedEntries shouldBe Seq(ours)
@@ -194,7 +217,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     Files.delete(lake.tempOf(unfinished))
     an[UnpublishableCommitException] should be thrownBy lake.list()
 
-    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked)
 
     readopted shouldBe Readopted(lake.table, 0L, Readoption(None, Seq(unfinished)))
     lake.list() shouldBe Seq(commit(0))
@@ -208,7 +231,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     Files.delete(lake.commitFile(2))
     a[CommitMissingException] should be thrownBy lake.list()
 
-    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+    val readopted = maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked)
 
     readopted shouldBe Readopted(lake.table, 1L, Readoption(None, Seq(gone)))
     lake.list() shouldBe Seq(commit(0), commit(1))
@@ -221,7 +244,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val unfinished = lake.crashedAt(FaultPoint.AfterInsert, version = 1)
 
     val refused = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None)
+      maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked)
 
     refused.getMessage should include("version 1")
     refused.getMessage should include(unfinished.tempPath)
@@ -229,7 +252,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
 
     // A read publishes it, as the refusal says; then there is nothing left to discard.
     lake.list() shouldBe Seq(commit(0), commit(1))
-    maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None) shouldBe
+    maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked) shouldBe
       Readopted(lake.table, 1L, Readoption(None, Nil))
     lake.entry(1).value.complete shouldBe true
   }
@@ -241,7 +264,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     // the entries that log contradicts, a reader publishes version 2 and acknowledges it.
     val registry = registryWhere(lake)(beforeExamining = once(lake.list(): Unit))
 
-    val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
+    val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None, asked)
 
     // The table is adopted as its log is now, and version 2 is still a commit of ours.
     readopted shouldBe Readopted(lake.table, 2L, Readoption(None, Nil))
@@ -255,16 +278,73 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val foreign = new Lake
     foreignCommit(foreign, 0)
     val unknown = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(foreign).readopt(hadoop(foreign.directory), fs, None)
+      maintenanceOf(foreign).readopt(hadoop(foreign.directory), fs, None, asked)
     unknown.getMessage should include("not registered")
 
     val dropped = new Lake().withCommits(last = 1)
     val before = registrationOf(dropped)
     (0L to 1L).foreach(version => Files.delete(dropped.commitFile(version)))
     val noLog = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(dropped).readopt(hadoop(dropped.directory), fs, None)
+      maintenanceOf(dropped).readopt(hadoop(dropped.directory), fs, None, asked)
     noLog.getMessage should include("reset its registry")
     registrationOf(dropped) shouldBe before
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The maintenance log
+  // ---------------------------------------------------------------------------------------------
+
+  test("each operation is recorded with who asked and why, and one that is refused is not") {
+    // Adopted, made without the LogStore.
+    val made = new Lake
+    (0L to 1L).foreach(foreignCommit(made, _))
+    maintenanceOf(made).adopt(hadoop(made.directory), fs, Some(TableId), asked)
+    loggedOf(made) shouldBe Seq("adopt" -> asked)
+    // Registered already: refused, and nothing more is recorded.
+    a[MaintenanceRefusedException] should be thrownBy
+      maintenanceOf(made).adopt(hadoop(made.directory), fs, Some(TableId), asked)
+    loggedOf(made) shouldBe Seq("adopt" -> asked)
+
+    // Adopted again after F10.
+    val tainted = new Lake().withCommits(last = 1)
+    foreignCommit(tainted, 2)
+    // A read finds the foreign commit, and taints the table.
+    tainted.list(): Unit
+    val again = MaintenanceRequest("ops.second", "the foreign commit is the backfill of 2026")
+    maintenanceOf(tainted).readopt(hadoop(tainted.directory), fs, None, again)
+    loggedOf(tainted) shouldBe Seq("readopt" -> again)
+
+    // Refused for a commit that can still be published: nothing is recorded.
+    val publishable = new Lake().withCommits(last = 0)
+    publishable.crashedAt(FaultPoint.AfterInsert, version = 1): Unit
+    a[MaintenanceRefusedException] should be thrownBy
+      maintenanceOf(publishable).readopt(hadoop(publishable.directory), fs, None, asked)
+    loggedOf(publishable) shouldBe empty
+
+    // Reset once dropped; refused while it has a log.
+    val dropped = new Lake().withCommits(last = 1)
+    a[MaintenanceRefusedException] should be thrownBy
+      maintenanceOf(dropped).reset(hadoop(dropped.directory), fs, asked)
+    loggedOf(dropped) shouldBe empty
+    (0L to 1L).foreach(version => Files.delete(dropped.commitFile(version)))
+    dropped.temps.foreach(Files.delete)
+    maintenanceOf(dropped).reset(hadoop(dropped.directory), fs, asked)
+    loggedOf(dropped) shouldBe Seq("reset" -> asked)
+  }
+
+  test("the temporary files are recorded once they are collected, each with its fate") {
+    val lake = new Lake().withCommits(last = 1)
+    val tempsBefore = lake.temps
+    lake.crashAt(FaultPoint.BeforeInsert, version = 2)
+    val orphan = lake.temps.diff(tempsBefore).head
+    age(orphan, by = 2.days)
+
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
+
+    loggedOf(lake) shouldBe Seq("collect_temps" -> asked)
+    lake.memory.collectedTemps(lake.table).map(_.toMap) shouldBe
+      Seq(fates.map { case (name, fate) => name -> fate.name })
+    fates.get(orphan.getFileName.toString) shouldBe Some(TempFate.RemovedOrphan)
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -279,7 +359,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     lake.temps.foreach(Files.delete)
     a[StaleRegistrationException] should be thrownBy lake.commit(0)(Creation)
 
-    maintenanceOf(lake).reset(hadoop(lake.directory), fs)
+    maintenanceOf(lake).reset(hadoop(lake.directory), fs, asked)
 
     registrationOf(lake) shouldBe None
     (0L to 2L).foreach(lake.entry(_) shouldBe None)
@@ -293,13 +373,13 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val live = new Lake().withCommits(last = 1)
     val before = (registrationOf(live), lake0(live))
     val exists = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(live).reset(hadoop(live.directory), fs)
+      maintenanceOf(live).reset(hadoop(live.directory), fs, asked)
     exists.getMessage should include("up to version 1")
     (registrationOf(live), lake0(live)) shouldBe before
 
     val unknown = new Lake
     val nothing = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(unknown).reset(hadoop(unknown.directory), fs)
+      maintenanceOf(unknown).reset(hadoop(unknown.directory), fs, asked)
     nothing.getMessage should include("not registered")
   }
 
@@ -313,7 +393,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val latest = lake.memory.latestEntry(lake.table).value.version
     (0L to latest).foreach(version => Files.deleteIfExists(lake.commitFile(version)))
     lake.temps.foreach(Files.delete)
-    maintenanceOf(lake).reset(hadoop(lake.directory), fs)
+    maintenanceOf(lake).reset(hadoop(lake.directory), fs, asked)
     lake.commit(0)(Creation)
     (1L to upTo).foreach(version => lake.commit(version)(append(version)))
   }
@@ -367,7 +447,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
   test("a writer stalled before its INSERT while its table is adopted again gets no version") {
     val lake = new Lake().withCommits(last = 1)
     val whileAdopted = LogStores.at(FaultPoint.BeforeInsert) {
-      maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None): Unit
+      maintenanceOf(lake).readopt(hadoop(lake.directory), fs, None, asked): Unit
     }
     val tempsBefore = lake.temps
 
@@ -387,7 +467,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     // changed, a writer that was not stopped commits version 2.
     val registry = registryWhere(lake)(beforeChanging = once(lake.commit(2)(append(2))))
 
-    val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
+    val readopted = new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None, asked)
 
     readopted shouldBe Readopted(lake.table, 2L, Readoption(None, Nil))
     lake.entry(2).value.complete shouldBe true
@@ -403,7 +483,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val before = registrationOf(lake)
 
     val refused = the[MaintenanceRefusedException] thrownBy
-      new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None)
+      new TableMaintenance(registry).readopt(hadoop(lake.directory), fs, None, asked)
 
     refused.getMessage should include("version 2")
     refused.getMessage should include("can still be published")
@@ -423,7 +503,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val before = registrationOf(lake)
 
     val refused = the[MaintenanceRefusedException] thrownBy
-      new TableMaintenance(busy).readopt(hadoop(lake.directory), fs, None)
+      new TableMaintenance(busy).readopt(hadoop(lake.directory), fs, None, asked)
 
     refused.getMessage should include("is being written")
     registrationOf(lake) shouldBe before
@@ -447,7 +527,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val before = registrationOf(lake)
 
     val refused = the[MaintenanceRefusedException] thrownBy
-      maintenanceOf(lake).reset(hadoop(lake.directory), fs)
+      maintenanceOf(lake).reset(hadoop(lake.directory), fs, asked)
 
     refused.getMessage should include("version 2")
     refused.getMessage should include("still running")
@@ -466,7 +546,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val before = registrationOf(lake)
 
     val refused = the[MaintenanceRefusedException] thrownBy
-      new TableMaintenance(registry).reset(hadoop(lake.directory), fs)
+      new TableMaintenance(registry).reset(hadoop(lake.directory), fs, asked)
 
     refused.getMessage should include("still running")
     registrationOf(lake) shouldBe before
@@ -485,7 +565,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val published = tempsBefore.head
 
     // Young, it may belong to a writer that is about to take a version: it is left alone.
-    val first = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    val first = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
     first shouldBe Map(
       orphan.getFileName.toString -> TempFate.KeptRecent,
       published.getFileName.toString -> TempFate.RemovedPublished
@@ -493,7 +573,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     Files.exists(orphan) shouldBe true
 
     age(orphan, by = 2.days)
-    maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs) shouldBe
+    maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked) shouldBe
       Map(orphan.getFileName.toString -> TempFate.RemovedOrphan)
 
     lake.temps shouldBe empty
@@ -508,7 +588,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     val unfinished = lake.crashedAt(FaultPoint.AfterInsert, version = 1)
     age(lake.tempOf(unfinished), by = 30.days)
 
-    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
 
     fates(lake.tempOf(unfinished).getFileName.toString) shouldBe TempFate.KeptUnfinished
     // It is the commit: the next reader publishes it from there.
@@ -525,7 +605,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     Files.write(lake.commitFile(1), ForeignActions.asJava)
     Files.delete(lake.commitFile(2))
 
-    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, 0.seconds)
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked, 0.seconds)
 
     fates(replaced.getFileName.toString) shouldBe TempFate.KeptOnlyCopy
     fates(gone.getFileName.toString) shouldBe TempFate.KeptOnlyCopy
@@ -552,7 +632,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     lake.temps.foreach(age(_, by = 40.days))
     (0L to 2L).foreach(version => Files.delete(lake.commitFile(version)))
 
-    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    val fates = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
 
     temps.map(fates) shouldBe
       Seq.fill(3)(TempFate.RemovedExpired) ++ Seq.fill(2)(TempFate.RemovedPublished)
@@ -568,7 +648,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     lake.temps.foreach(age(_, by = 40.days))
     (1L to 3L).foreach(version => Files.delete(lake.commitFile(version)))
     def fates(): Map[String, TempFate] =
-      maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+      maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
 
     // No checkpoint: nothing explains a commit that is missing.
     temps.drop(1).map(fates()) shouldBe Seq.fill(3)(TempFate.KeptOnlyCopy)
@@ -593,12 +673,12 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     Files.delete(lake.commitFile(2))
     Files.write(lake.commitFile(2), ForeignActions.asJava)
 
-    val young = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    val young = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
     Seq(temps(1), temps(2)).map(young) shouldBe Seq.fill(2)(TempFate.KeptOnlyCopy)
 
     // A month later the first could be the cleanup's, and its bytes are in the checkpoint.
     lake.temps.foreach(age(_, by = 40.days))
-    val old = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs)
+    val old = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked)
     Seq(temps(1), temps(2)).map(old) shouldBe
       Seq(TempFate.RemovedExpired, TempFate.KeptOnlyCopy)
   }
@@ -610,7 +690,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     var collected = Set.empty[TempFate]
     val whileStopped = LogStores.at(FaultPoint.AfterInsert) {
       lake.list(): Unit
-      collected = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs).values.toSet
+      collected = maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked).values.toSet
     }
 
     // The commit is done, and its writer is told so: nothing was lost.
@@ -629,7 +709,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     // reader does, and the temporary files are collected.
     lake.store.afterNext(ReadLatestEntry) {
       lake.list(): Unit
-      maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs): Unit
+      maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked): Unit
     }
 
     lake.list() shouldBe Seq(commit(0), commit(1))
@@ -640,7 +720,7 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
 
   test("a table without temporary files has nothing to collect") {
     val lake = new Lake
-    maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs) shouldBe empty
+    maintenanceOf(lake).collectTemps(hadoop(lake.directory), fs, asked) shouldBe empty
   }
 
   /** The entry of version 0, as a sign that nothing of the registry was touched. */

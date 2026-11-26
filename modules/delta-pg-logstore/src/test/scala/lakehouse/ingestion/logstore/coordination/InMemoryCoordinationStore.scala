@@ -16,6 +16,18 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
   private var entries = Map.empty[(TableUri, Long), CommitEntry]
   private var epochs = Map.empty[String, Long]
   private var lastGeneration = 0L
+  private var log = Vector.empty[(TableUri, String, MaintenanceRequest)]
+  private var collections = Vector.empty[(TableUri, Seq[(String, String)])]
+
+  /** What the maintenance log holds of `table`, oldest first: each operation and its request. */
+  def logged(table: TableUri): Seq[(String, MaintenanceRequest)] = synchronized {
+    log.collect { case (`table`, operation, request) => (operation, request) }
+  }
+
+  /** The files of each collection of the temporary files of `table`, with their fates. */
+  def collectedTemps(table: TableUri): Seq[Seq[(String, String)]] = synchronized {
+    collections.collect { case (`table`, temps) => temps }
+  }
 
   /** A generation that no registration of this registry has had. Called under the lock. */
   private def nextGeneration(): Long = {
@@ -120,13 +132,20 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
       .sortBy(_.version)
   }
 
-  override def adopt(table: TableUri, version: Long, deltaTableId: Option[String]): Boolean = {
+  override def adopt(
+      table: TableUri,
+      version: Long,
+      deltaTableId: Option[String],
+      request: MaintenanceRequest
+  ): Boolean = {
     require(version >= 0, s"a table is adopted at a version it has, not at $version")
     synchronized {
       val isNew = !registrations.contains(table)
-      if (isNew)
+      if (isNew) {
         registrations += table ->
           Registration(table, version, deltaTableId, taintReason = None, nextGeneration())
+        log :+= ((table, "adopt", request))
+      }
       isNew
     }
   }
@@ -135,7 +154,8 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
       table: TableUri,
       version: Long,
       deltaTableId: Option[String],
-      examined: Seq[CommitEntry]
+      examined: Seq[CommitEntry],
+      request: MaintenanceRequest
   ): RegistryChange[Readoption] = {
     require(version >= 0, s"a table is adopted at a version it has, not at $version")
     synchronized {
@@ -153,13 +173,18 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
               taintReason = None,
               nextGeneration()
             )
+            log :+= ((table, "readopt", request))
             RegistryChange.Applied(Readoption(registered.taintReason, now))
           }
       }
     }
   }
 
-  override def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit] =
+  override def forget(
+      table: TableUri,
+      examined: Seq[CommitEntry],
+      request: MaintenanceRequest
+  ): RegistryChange[Unit] =
     synchronized {
       if (!registrations.contains(table)) RegistryChange.NotRegistered
       else {
@@ -168,8 +193,18 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
         else {
           registrations -= table
           entries = entries.filterNot { case ((owner, _), _) => owner == table }
+          log :+= ((table, "reset", request))
           RegistryChange.Applied(())
         }
       }
     }
+
+  override def collected(
+      table: TableUri,
+      request: MaintenanceRequest,
+      temps: Seq[(String, String)]
+  ): Unit = synchronized {
+    log :+= ((table, "collect_temps", request))
+    collections :+= ((table, temps))
+  }
 }

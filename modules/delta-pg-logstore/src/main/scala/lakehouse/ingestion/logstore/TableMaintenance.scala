@@ -10,6 +10,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.logstore.coordination.{
   CommitEntry,
+  MaintenanceRequest,
   Readoption,
   RegistryChange,
   RegistryMaintenance,
@@ -38,35 +39,56 @@ final case class Readopted(table: TableUri, version: Long, removed: Readoption)
 /** What became of a temporary file when the temporary files of a table were collected. */
 sealed trait TempFate {
   def removed: Boolean
+
+  /** As the maintenance log names it. */
+  def name: String
 }
 
 object TempFate {
 
   /** Removed: its commit is published, so the file had a second name it no longer needs. */
-  case object RemovedPublished extends TempFate { val removed = true }
+  case object RemovedPublished extends TempFate {
+    val removed = true
+    val name = "removed_published"
+  }
 
   /**
    * Removed: its commit is recorded as published, is below the table's last checkpoint, and is
    * no longer in the log. Delta's log cleanup removed the commit, and the checkpoint holds
    * everything it said.
    */
-  case object RemovedExpired extends TempFate { val removed = true }
+  case object RemovedExpired extends TempFate {
+    val removed = true
+    val name = "removed_expired"
+  }
 
   /** Removed: no entry points at it, and it is older than any commit could take. */
-  case object RemovedOrphan extends TempFate { val removed = true }
+  case object RemovedOrphan extends TempFate {
+    val removed = true
+    val name = "removed_orphan"
+  }
 
   /** Kept: its commit is taken and not published yet. These are the commit's bytes. */
-  case object KeptUnfinished extends TempFate { val removed = false }
+  case object KeptUnfinished extends TempFate {
+    val removed = false
+    val name = "kept_unfinished"
+  }
 
   /**
    * Kept: its entry is complete, and the commit file is another file, or is missing where
    * Delta's log cleanup does not explain it. It is the only copy of a commit that was lost, and
    * somebody will want to see it.
    */
-  case object KeptOnlyCopy extends TempFate { val removed = false }
+  case object KeptOnlyCopy extends TempFate {
+    val removed = false
+    val name = "kept_only_copy"
+  }
 
   /** Kept: no entry points at it, and a writer may be about to take a version for it. */
-  case object KeptRecent extends TempFate { val removed = false }
+  case object KeptRecent extends TempFate {
+    val removed = false
+    val name = "kept_recent"
+  }
 }
 
 /**
@@ -84,6 +106,10 @@ object TempFate {
  * change is made, a writer that had looked at the registry before it gets no version
  * (`RegistrationChangedException`).
  *
+ * Each operation is recorded in the maintenance log, with who asked for it and why
+ * (`MaintenanceRequest`): in the change that it makes to the registry, so that one that is
+ * refused or called off leaves no record; and, for the temporary files, once they are collected.
+ *
  * @param registry the registry, reached with an operator's privileges
  */
 final class TableMaintenance(
@@ -100,12 +126,17 @@ final class TableMaintenance(
    * @param deltaTableId the table's `metaData.id`, which the caller reads with Delta
    */
   @throws[IOException]
-  def adopt(tablePath: Path, fs: FileSystem, deltaTableId: Option[String]): Adoption = {
+  def adopt(
+      tablePath: Path,
+      fs: FileSystem,
+      deltaTableId: Option[String],
+      request: MaintenanceRequest
+  ): Adoption = {
     val target = new Target(tablePath, fs)
     val latest = target.latestCommit.getOrElse {
       refuse(s"there is no table to adopt at ${target.table}: its log holds no commit")
     }
-    if (!registry.adopt(target.table, latest, deltaTableId))
+    if (!registry.adopt(target.table, latest, deltaTableId, request))
       refuse(s"${target.table} is registered already. A registered table is adopted again")
     Adoption(target.table, latest)
   }
@@ -119,7 +150,12 @@ final class TableMaintenance(
    * request is refused, and a read of the table publishes it.
    */
   @throws[IOException]
-  def readopt(tablePath: Path, fs: FileSystem, deltaTableId: Option[String]): Readopted = {
+  def readopt(
+      tablePath: Path,
+      fs: FileSystem,
+      deltaTableId: Option[String],
+      request: MaintenanceRequest
+  ): Readopted = {
     val target = new Target(tablePath, fs)
     val table = target.table
     val noTable = s"there is no table to adopt at $table: its log holds no commit. " +
@@ -146,7 +182,7 @@ final class TableMaintenance(
       val logGrew = contradicted.exists(entry => entry.complete && target.isInLog(entry))
       val change =
         if (logGrew) RegistryChange.EntriesChanged(contradicted)
-        else registry.readopt(table, latest, deltaTableId, examined = contradicted)
+        else registry.readopt(table, latest, deltaTableId, examined = contradicted, request)
       change match {
         case RegistryChange.Applied(removed) => Readopted(table, latest, removed)
         case RegistryChange.NotRegistered =>
@@ -163,7 +199,7 @@ final class TableMaintenance(
    * can be created at its path again (scenario F9).
    */
   @throws[IOException]
-  def reset(tablePath: Path, fs: FileSystem): Unit = {
+  def reset(tablePath: Path, fs: FileSystem, request: MaintenanceRequest): Unit = {
     val target = new Target(tablePath, fs)
     val table = target.table
 
@@ -184,7 +220,7 @@ final class TableMaintenance(
             s"(${entry.tempPath}): the table is not gone, or one of its writers is still running"
         )
       }
-      registry.forget(table, examined = unfinished) match {
+      registry.forget(table, examined = unfinished, request) match {
         case RegistryChange.Applied(_) => ()
         case RegistryChange.NotRegistered =>
           refuse(s"$table is not registered: there is nothing to reset")
@@ -209,6 +245,9 @@ final class TableMaintenance(
    *    left when it died before taking its version (scenario F1), or when it was writing a file
    *    that is not a commit.
    *
+   * What became of each file is recorded once the files are removed: a collection that fails
+   * halfway has no record, and what it removed is what nobody needed.
+   *
    * @param orphansOlderThan far longer than a commit can take between writing its temporary
    *   file and taking its version: a younger file may belong to a writer that is doing so now
    * @return what became of every temporary file, by its name
@@ -217,6 +256,7 @@ final class TableMaintenance(
   def collectTemps(
       tablePath: Path,
       fs: FileSystem,
+      request: MaintenanceRequest,
       orphansOlderThan: FiniteDuration = DefaultOrphanAge
   ): Map[String, TempFate] = {
     val target = new Target(tablePath, fs)
@@ -226,7 +266,7 @@ final class TableMaintenance(
     // Read once, before the files: a checkpoint written meanwhile only makes this cautious.
     val lastCheckpoint = target.lastCheckpoint
 
-    target.temps.map { temp =>
+    val fates = target.temps.map { temp =>
       val name = temp.getPath.getName
       val fate = target.entryPointingAt(name) match {
         case Some(entry) if !entry.complete => TempFate.KeptUnfinished
@@ -241,7 +281,9 @@ final class TableMaintenance(
       }
       if (fate.removed) target.storage.discard(temp.getPath)
       name -> fate
-    }.toMap
+    }
+    registry.collected(target.table, request, fates.map { case (name, fate) => name -> fate.name })
+    fates.toMap
   }
 
   /** A table as an operation looks at it: its key, and its log on the storage. */
