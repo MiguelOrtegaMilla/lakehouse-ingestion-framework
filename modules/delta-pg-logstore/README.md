@@ -81,6 +81,8 @@ A commit made in such a context takes its version only while its epoch is the on
 
 The states that call for each are in ADR-0004 §3.5 and §3.8.
 
+Each operation is given who asked for it and why (`MaintenanceRequest`), and is recorded in `delta_coordination.maintenance_log` with what it found and changed: `adopt`, `readopt` and `reset` in the transaction that changes the registry, so an operation that is refused or called off leaves no row; `collectTemps`, once the files are removed. The maintenance role may insert a row and do nothing else to the log; an audit reads it as the owner of the schema.
+
 ## Scenarios and their tests
 
 The fault scenarios are F1 to F17 of ADR-0004 §7.1. Each is tested up to three ways:

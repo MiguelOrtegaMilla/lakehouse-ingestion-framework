@@ -7,6 +7,7 @@ import scala.util.Using
 import lakehouse.ingestion.it.support.{BootstrappedPostgres, CoordinationSchema, CoordinationStores}
 import lakehouse.ingestion.logstore.coordination.CoordinationStoreContract.{claim, newTable}
 import lakehouse.ingestion.logstore.coordination.{
+  MaintenanceRequest,
   PostgresCoordinationStore,
   PostgresRegistryMaintenance,
   Readoption,
@@ -28,6 +29,8 @@ import org.scalatest.matchers.should.Matchers
 final class CoordinationSchemaUpgradeSpec extends AnyFunSuite with Matchers with BeforeAndAfterAll {
 
   private lazy val pg = BootstrappedPostgres.start()
+
+  private val asked = MaintenanceRequest("ops.oncall", "its log was looked at, and it is right")
 
   override def afterAll(): Unit = pg.stop()
 
@@ -72,8 +75,8 @@ final class CoordinationSchemaUpgradeSpec extends AnyFunSuite with Matchers with
     CoordinationSchema.migrate(pg, upTo = "2").migrationsExecuted shouldBe 2
     val (one, other) = asCommitPath(c => (tableOfVersion2(c), tableOfVersion2(c)))
 
-    // V3, and V4 on top of it: the store works with the schema that it was built for.
-    CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 2
+    // V3, and V4 and V5 on top of it: the store works with the schema that it was built for.
+    CoordinationSchema.migrate(pg).migrationsExecuted shouldBe 3
 
     val commitPath = CoordinationStores.settings(pg.jdbcUrl(CoordinationSchema.Database), pg)
     val operator = CoordinationStores.settings(
@@ -101,7 +104,7 @@ final class CoordinationSchemaUpgradeSpec extends AnyFunSuite with Matchers with
 
       // An operator's change holds a writer of that registry to what it read, like any other.
       val stalled = claim(store, one, 4L)
-      maintenance.readopt(one, 3L, None, maintenance.contradicted(one, 3L)) shouldBe
+      maintenance.readopt(one, 3L, None, maintenance.contradicted(one, 3L), asked) shouldBe
         RegistryChange.Applied(Readoption(None, Nil))
       store.take(stalled) shouldBe TakeResult.RegistrationChanged
       store.take(claim(store, other, 4L)) shouldBe TakeResult.Taken

@@ -333,8 +333,8 @@ final class PostgresCoordinationStore(
 
 object PostgresCoordinationStore {
 
-  /** The version of schema `delta_coordination` this code works with: its migrations up to V4. */
-  val SchemaVersion = 4
+  /** The version of schema `delta_coordination` this code works with: its migrations up to V5. */
+  val SchemaVersion = 5
 
   /** How far a claim that names an epoch got, in its transaction. */
   sealed private trait Attempt

@@ -109,7 +109,7 @@ final class MigrateCommandSpec
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
     ran.lines shouldBe Seq(
       s"control: version 8, 8 migrations applied (${pg.jdbcUrl(Database)})",
-      s"delta_coordination: version 4, 4 migrations applied (${pg.jdbcUrl(Database)})"
+      s"delta_coordination: version 5, 5 migrations applied (${pg.jdbcUrl(Database)})"
     )
     (ran.out + ran.err) should not include pg.password(Migrator)
 
@@ -152,7 +152,7 @@ final class MigrateCommandSpec
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
     ran.lines shouldBe Seq(
       s"control: version 8, nothing to apply (${pg.jdbcUrl(Database)})",
-      s"delta_coordination: version 4, nothing to apply (${pg.jdbcUrl(Database)})"
+      s"delta_coordination: version 5, nothing to apply (${pg.jdbcUrl(Database)})"
     )
   }
 

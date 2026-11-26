@@ -1,5 +1,6 @@
 package lakehouse.ingestion.logstore.coordination
 
+import java.io.IOException
 import java.sql.{Connection, PreparedStatement, Types}
 
 /**
@@ -16,6 +17,11 @@ import java.sql.{Connection, PreparedStatement, Types}
  * waits: the entries cannot grow while the change compares them with the ones the operator
  * examined. When the change commits, the waiting `INSERT` is refused, and so is every later one
  * that names the generation the writer read before.
+ *
+ * '''A change writes its row of the maintenance log''' (`delta_coordination.maintenance_log`) in
+ * its own transaction, once it has compared the entries and before it removes anything. What the
+ * row says the change found is read by the database from the rows themselves, and not from what
+ * this process believes of them.
  *
  * @param settings how to reach the coordination database as the maintenance role
  */
@@ -43,14 +49,21 @@ final class PostgresRegistryMaintenance(
       readContradicted(_, table, version)
     }
 
-  override def adopt(table: TableUri, version: Long, deltaTableId: Option[String]): Boolean = {
+  override def adopt(
+      table: TableUri,
+      version: Long,
+      deltaTableId: Option[String],
+      request: MaintenanceRequest
+  ): Boolean = {
     require(version >= 0, s"a table is adopted at a version it has, not at $version")
     database.transaction(s"adopt $table") { connection =>
-      update(connection, Adopt) { statement =>
+      val adopted = update(connection, Adopt) { statement =>
         statement.setString(1, table.value)
         statement.setLong(2, version)
         setId(statement, 3, deltaTableId)
       } == 1
+      if (adopted) record(connection, LogAdoption, request, table)(_ => ())
+      adopted
     }
   }
 
@@ -58,42 +71,53 @@ final class PostgresRegistryMaintenance(
       table: TableUri,
       version: Long,
       deltaTableId: Option[String],
-      examined: Seq[CommitEntry]
+      examined: Seq[CommitEntry],
+      request: MaintenanceRequest
   ): RegistryChange[Readoption] = {
     require(version >= 0, s"a table is adopted at a version it has, not at $version")
     database.transactionUnless[RegistryChange[Readoption]](s"adopt $table again") { connection =>
-      // First: it takes the registration's row, and gives the table its new generation.
-      val moved = update(connection, MoveRegistration) { statement =>
-        statement.setLong(1, version)
-        setId(statement, 2, deltaTableId)
-        statement.setString(3, table.value)
-      }
-      if (moved == 0) Right(RegistryChange.NotRegistered)
-      else {
-        val now = readContradicted(connection, table, version)
-        if (now.toSet != examined.toSet) Left(RegistryChange.EntriesChanged(now))
-        else {
-          val taint = query(connection, ClearTaint)(_.setString(1, table.value))(_.getString(1))
-          update(connection, RemoveContradicted) { statement =>
-            statement.setString(1, table.value)
-            statement.setLong(2, version)
+      // First: it takes the registration's row, with the version it is registered at.
+      query(connection, LockRegistration)(_.setString(1, table.value))(_.getLong(1)) match {
+        case None => Right(RegistryChange.NotRegistered)
+        case Some(before) =>
+          // The table gets its new generation.
+          update(connection, MoveRegistration) { statement =>
+            statement.setLong(1, version)
+            setId(statement, 2, deltaTableId)
+            statement.setString(3, table.value)
           }: Unit
-          Right(RegistryChange.Applied(Readoption(taint, now)))
-        }
+          val now = readContradicted(connection, table, version)
+          if (now.toSet != examined.toSet) Left(RegistryChange.EntriesChanged(now))
+          else {
+            // Before the taint and the entries go: the row says what they were.
+            record(connection, LogReadoption, request, table)(_.setLong(4, before))
+            val taint = query(connection, ClearTaint)(_.setString(1, table.value))(_.getString(1))
+            update(connection, RemoveContradicted) { statement =>
+              statement.setString(1, table.value)
+              statement.setLong(2, version)
+            }: Unit
+            Right(RegistryChange.Applied(Readoption(taint, now)))
+          }
       }
     }
   }
 
-  override def forget(table: TableUri, examined: Seq[CommitEntry]): RegistryChange[Unit] =
+  override def forget(
+      table: TableUri,
+      examined: Seq[CommitEntry],
+      request: MaintenanceRequest
+  ): RegistryChange[Unit] =
     database.transactionUnless[RegistryChange[Unit]](s"forget $table") { connection =>
       // First: it takes the registration's row, which the last statement deletes.
       val registered =
-        query(connection, LockRegistration)(_.setString(1, table.value))(_ => ()).isDefined
+        query(connection, LockRegistration)(_.setString(1, table.value))(_.getLong(1)).isDefined
       if (!registered) Right(RegistryChange.NotRegistered)
       else {
         val now = readUnfinished(connection, table)
         if (now.toSet != examined.toSet) Left(RegistryChange.EntriesChanged(now))
         else {
+          // Before anything goes: the row says what was there.
+          record(connection, LogReset, request, table)(_ => ())
           // The registration last: the taint and the entries refer to it.
           Seq(ForgetTaint, ForgetEntries, ForgetRegistration).foreach {
             update(connection, _)(_.setString(1, table.value))
@@ -102,6 +126,39 @@ final class PostgresRegistryMaintenance(
         }
       }
     }
+
+  override def collected(
+      table: TableUri,
+      request: MaintenanceRequest,
+      temps: Seq[(String, String)]
+  ): Unit =
+    database.transaction(s"record the temporary files of $table that were collected") {
+      connection =>
+        record(connection, LogCollection, request, table) { statement =>
+          statement.setArray(4, connection.createArrayOf("text", temps.map(_._1).toArray[AnyRef]))
+          statement.setArray(5, connection.createArrayOf("text", temps.map(_._2).toArray[AnyRef]))
+        }
+    }
+
+  /**
+   * Writes the row of the log of an operation on `table`: each statement of the log takes who
+   * asked, why and the table first; `bind` sets what it takes after them, from 4.
+   */
+  private def record(
+      connection: Connection,
+      statement: String,
+      request: MaintenanceRequest,
+      table: TableUri
+  )(bind: PreparedStatement => Unit): Unit = {
+    val written = update(connection, statement) { prepared =>
+      prepared.setString(1, request.requestedBy)
+      prepared.setString(2, request.reason)
+      prepared.setString(3, table.value)
+      bind(prepared)
+    }
+    if (written != 1)
+      throw new IOException(s"the maintenance log has no row for what was done to $table")
+  }
 
   private def readUnfinished(connection: Connection, table: TableUri): Seq[CommitEntry] =
     queryAll(connection, Unfinished)(_.setString(1, table.value))(toEntry(table, _))
@@ -152,7 +209,8 @@ object PostgresRegistryMaintenance {
       |WHERE table_uri = ?""".stripMargin
 
   private val LockRegistration =
-    "SELECT 1 FROM delta_coordination.coordinated_table WHERE table_uri = ? FOR UPDATE"
+    """SELECT registered_version FROM delta_coordination.coordinated_table
+      |WHERE table_uri = ? FOR UPDATE""".stripMargin
 
   private val ClearTaint =
     "DELETE FROM delta_coordination.table_taint WHERE table_uri = ? RETURNING reason"
@@ -166,4 +224,68 @@ object PostgresRegistryMaintenance {
 
   private val ForgetRegistration =
     "DELETE FROM delta_coordination.coordinated_table WHERE table_uri = ?"
+
+  // The rows of the maintenance log (V5). Each takes who asked, why and the table first (`asked`),
+  // and says what it found as the database reads it from the rows of the table, in the
+  // transaction of the change, before anything of them is removed.
+  private val EntryAsJson =
+    """jsonb_build_object('version', e.version, 'temp_path', e.temp_path,
+      |  'complete', e.complete, 'writer_instance', e.writer_instance, 'run_id', e.run_id)""".stripMargin
+
+  private val TaintOf =
+    """(SELECT t.reason FROM delta_coordination.table_taint t WHERE t.table_uri = c.table_uri)"""
+
+  private val Logged =
+    """INSERT INTO delta_coordination.maintenance_log
+      |  (table_uri, operation, requested_by, reason, detail)""".stripMargin
+
+  private val LogAdoption =
+    s"""WITH asked (requested_by, reason, table_uri) AS (VALUES (?::text, ?::text, ?::text))
+       |$Logged
+       |SELECT c.table_uri, 'adopt', a.requested_by, a.reason,
+       |  jsonb_build_object('version', c.registered_version, 'delta_table_id', c.delta_table_id)
+       |FROM asked a JOIN delta_coordination.coordinated_table c ON c.table_uri = a.table_uri""".stripMargin
+
+  // After the registration moved, before the taint and the entries go: the entries are those
+  // that RemoveContradicted removes.
+  private val LogReadoption =
+    s"""WITH asked (requested_by, reason, table_uri, version_before) AS
+       |  (VALUES (?::text, ?::text, ?::text, ?::bigint))
+       |$Logged
+       |SELECT c.table_uri, 'readopt', a.requested_by, a.reason, jsonb_build_object(
+       |  'version_before', a.version_before,
+       |  'version', c.registered_version,
+       |  'delta_table_id', c.delta_table_id,
+       |  'cleared_taint', $TaintOf,
+       |  'removed_entries', (
+       |    SELECT COALESCE(jsonb_agg($EntryAsJson ORDER BY e.version), '[]'::jsonb)
+       |    FROM delta_coordination.commit_entry e
+       |    WHERE e.table_uri = c.table_uri
+       |      AND (e.version > c.registered_version OR NOT e.complete)))
+       |FROM asked a JOIN delta_coordination.coordinated_table c ON c.table_uri = a.table_uri""".stripMargin
+
+  // Every entry goes; the complete ones are counted, and the unfinished ones said.
+  private val LogReset =
+    s"""WITH asked (requested_by, reason, table_uri) AS (VALUES (?::text, ?::text, ?::text))
+       |$Logged
+       |SELECT c.table_uri, 'reset', a.requested_by, a.reason, jsonb_build_object(
+       |  'version', c.registered_version,
+       |  'delta_table_id', c.delta_table_id,
+       |  'cleared_taint', $TaintOf,
+       |  'entries', (
+       |    SELECT count(*) FROM delta_coordination.commit_entry e WHERE e.table_uri = c.table_uri),
+       |  'unfinished_entries', (
+       |    SELECT COALESCE(jsonb_agg($EntryAsJson ORDER BY e.version), '[]'::jsonb)
+       |    FROM delta_coordination.commit_entry e
+       |    WHERE e.table_uri = c.table_uri AND NOT e.complete))
+       |FROM asked a JOIN delta_coordination.coordinated_table c ON c.table_uri = a.table_uri""".stripMargin
+
+  // Each file by its name, with its fate.
+  private val LogCollection =
+    s"""WITH asked (requested_by, reason, table_uri, names, fates) AS
+       |  (VALUES (?::text, ?::text, ?::text, ?::text[], ?::text[]))
+       |$Logged
+       |SELECT a.table_uri, 'collect_temps', a.requested_by, a.reason,
+       |  jsonb_build_object('temps', jsonb_object(a.names, a.fates))
+       |FROM asked a""".stripMargin
 }
