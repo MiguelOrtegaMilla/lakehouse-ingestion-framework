@@ -83,6 +83,7 @@ final class OnePassIngestionSpec extends AnyFunSuite with Matchers with Ingestio
       spark,
       lakeRoot,
       timing,
+      retries,
       Clock.fixed(Now, ZoneOffset.UTC),
       hooks
     )

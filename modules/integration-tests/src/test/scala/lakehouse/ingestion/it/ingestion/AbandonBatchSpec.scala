@@ -31,7 +31,7 @@ import org.scalatest.matchers.should.Matchers
 final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestionSuite {
 
   private lazy val actions =
-    new OperatorActions(database, spark, lakeRoot, timing, ConnectorKind.BuiltIn)
+    new OperatorActions(database, spark, lakeRoot, timing, retries, ConnectorKind.BuiltIn)
 
   private val asked = OperatorRequest.of("ops.oncall", "the plan cannot be run").toOption.get
 

@@ -4,11 +4,12 @@ import java.sql.Timestamp
 import java.time.temporal.ChronoUnit
 import java.time.{Instant, OffsetDateTime, ZoneOffset}
 
+import scala.concurrent.duration._
 import scala.util.Using
 
 import eu.rekawek.toxiproxy.model.ToxicDirection
 import io.circe.Json
-import lakehouse.ingestion.core.config.{QualifiedName, Source}
+import lakehouse.ingestion.core.config.{Profile, QualifiedName, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.core.watermark.WatermarkPlan
@@ -958,6 +959,48 @@ final class JdbcIngestionSpec
     done.counts.rowsWritten shouldBe Some(5000)
     spark.read.format("delta").load(bronze(wide).uri).count() shouldBe 5000L
     assertLedger(wide)
+  }
+
+  test("a connection that is cut while the rows are read is tried again, and the batch written") {
+    val server = proxied
+    Using.resource(server.observe("sales_owner", "sales")) { c =>
+      execute(
+        c,
+        "CREATE TABLE wider AS SELECT g AS id, repeat('x', 200) AS name " +
+          "FROM generate_series(1, 5000) g"
+      )
+    }
+    val wider = tableSource(
+      "public.wider",
+      url = server.faultyJdbcUrl("sales"),
+      password = "env:PROXIED_PASSWORD"
+    )
+    // The connection of the rows is closed by the proxy, once, as in the test before; by the
+    // time the run tries again, the source is whole.
+    var asked = 0
+    val cutOnce = reading(
+      hookAt(FaultPoint.AfterCounts) { _ =>
+        asked += 1
+        if (asked == 1)
+          server.faulty.toxics().limitData(Cut, ToxicDirection.DOWNSTREAM, 100000L): Unit
+        else server.faulty.toxics().get(Cut).remove()
+      },
+      tries = Profile.Retries(budget = 30.seconds, firstBackoff = 200.millis, maxBackoff = 1.second)
+    )
+
+    val done =
+      try ingested(launch(wider, cutOnce))
+      finally server.faulty.toxics().getAll.forEach(_.remove())
+
+    asked shouldBe 2
+    // One run, which read its window again from the start: the batch is in Bronze once, whole.
+    done.batch shouldBe batchId(wider, 1)
+    done.counts.retries shouldBe Some(1)
+    runOf(done.run).counts.retries shouldBe Some(1)
+    done.counts.rowsWritten shouldBe Some(5000)
+    spark.read.format("delta").load(bronze(wider).uri).count() shouldBe 5000L
+    batchesOf(wider) shouldBe Seq((1L, "COMMITTED"))
+    assertLedger(wider)
   }
 
   test("a row that Bronze cannot keep fails its batch for good, and none of its rows is written") {

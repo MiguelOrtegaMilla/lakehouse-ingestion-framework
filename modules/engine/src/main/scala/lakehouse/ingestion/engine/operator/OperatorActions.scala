@@ -10,6 +10,7 @@ import lakehouse.ingestion.core.config.{
   ConfigVersion,
   ConnectorKind,
   PathTableLocator,
+  Profile,
   RootUri,
   Source,
   TableLocation
@@ -26,7 +27,7 @@ import lakehouse.ingestion.engine.control.{
 }
 import lakehouse.ingestion.engine.delta.BatchLookup.Found
 import lakehouse.ingestion.engine.delta.{BatchLookup, DeltaTableTransactions}
-import lakehouse.ingestion.engine.{EpochAnnouncement, Failures}
+import lakehouse.ingestion.engine.{EpochAnnouncement, Failures, RunRetries}
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import org.apache.spark.sql.SparkSession
 import org.slf4j.LoggerFactory
@@ -40,6 +41,8 @@ import org.slf4j.LoggerFactory
  *
  * @param lake the root of the lake of the profile, where the configuration of a source names its
  *   table
+ * @param retries for how long an action tries again after a failure that may pass, before the
+ *   transaction that ends it, and how far apart (ADR-0022 §5): those of the profile
  * @param kinds the kinds of source of the application: what makes a moment into the watermark
  *   of a source
  */
@@ -48,6 +51,7 @@ final class OperatorActions(
     spark: SparkSession,
     lake: RootUri,
     timing: LeaseTiming,
+    retries: Profile.Retries,
     kinds: Seq[ConnectorKind]
 ) {
   import OperatorActions._
@@ -84,7 +88,7 @@ final class OperatorActions(
     // What runs next on the sequence: it commits a batch that its table has, or plans anew.
     val next =
       backfill.fold("the next run of the source")(id => s"the next run of the backfill $id")
-    held(start, config) { leased =>
+    held(start, config) { (leased, retried) =>
       val missing =
         backfill.filter(id => database.run(Backfills.find(_, source.id, start.layer, id)).isEmpty)
       missing match {
@@ -92,9 +96,10 @@ final class OperatorActions(
           refuse(
             leased,
             s"${source.id} has no backfill $id: there is no batch $seq of ${start.txnAppId} to " +
-              "give up, and nothing was changed"
+              "give up, and nothing was changed",
+            retried
           )
-        case None => givenUp(leased, source, seq, request, next)
+        case None => givenUp(leased, retried, source, seq, request, next)
       }
     }
   }
@@ -102,6 +107,7 @@ final class OperatorActions(
   /** The planned batch of the sequence of the run, given up if it is `seq` and not written. */
   private def givenUp(
       leased: LeasedRun,
+      retried: RunRetries,
       source: Source,
       seq: BatchSeq,
       request: OperatorRequest,
@@ -113,13 +119,15 @@ final class OperatorActions(
         refuse(
           leased,
           s"no batch of ${start.txnAppId} is planned: there is no batch $seq to give up, " +
-            "and nothing was changed"
+            "and nothing was changed",
+          retried
         )
       case Some(planned) if planned.id.seq != seq =>
         refuse(
           leased,
           s"the batch of ${start.txnAppId} that is planned is ${planned.id.seq}, and not " +
-            s"$seq: an operator gives up the batch that was looked at, and nothing was changed"
+            s"$seq: an operator gives up the batch that was looked at, and nothing was changed",
+          retried
         )
       case Some(planned) =>
         val table = planned.target.fold(locator.locate(source.targets.bronze.table)) { uri =>
@@ -137,17 +145,20 @@ final class OperatorActions(
               s"the batch ${planned.id} is in ${table.uri}, which it was planned for: its " +
                 "rows are written, and a batch whose rows are written is committed, never " +
                 s"given up. Nothing was changed: $next commits it, with nothing read " +
-                "(ADR-0005)"
+                "(ADR-0005)",
+              retried
             )
           case Found.Unknown(why) =>
             fail(
               leased,
               FailureClass.Transient,
               s"$why. The batch ${planned.id} was not given up, since its rows may be " +
-                "there: once the table can be read, ask again"
+                "there: once the table can be read, ask again",
+              retried
             )
           case Found.NotWritten =>
-            if (leased.abandon(planned.id, request.reason, None, RunEnd.Succeeded())) {
+            val end = RunEnd.Succeeded(retried.into(RunCounts.Nothing))
+            if (leased.abandon(planned.id, request.reason, None, end)) {
               val done = s"the batch ${planned.id} was given up by the run ${start.id}, " +
                 s"asked by ${request.requestedBy}: ${request.reason}. ${table.uri} does " +
                 s"not have it, and $next plans the next batch from its " +
@@ -181,7 +192,7 @@ final class OperatorActions(
       request: OperatorRequest
   ): Outcome = {
     val start = starting(source, config, RunKind.Reset, request)
-    held(start, config) { leased =>
+    held(start, config) { (leased, retried) =>
       leased.planned() match {
         case Some(planned) =>
           refuse(
@@ -189,7 +200,8 @@ final class OperatorActions(
             s"the batch ${planned.id} is planned: the state of a source is not reset while a " +
               "batch is, since that batch is the next run's to finish under the configuration " +
               "it was planned under, or an operator's to give up first (abandon-batch). " +
-              "Nothing was changed"
+              "Nothing was changed",
+            retried
           )
         case None =>
           database.run(SourceStates.find(_, source.id, start.layer)) match {
@@ -198,18 +210,19 @@ final class OperatorActions(
                 leased,
                 s"${source.id} has no state in ${start.layer.name}: no batch of it was ever " +
                   "committed, and there is nothing to reset. Where its first batch starts is " +
-                  "load.watermark.start. Nothing was changed"
+                  "load.watermark.start. Nothing was changed",
+                retried
               )
             case Some(before) =>
               watermarkOf(source, before.watermark, to) match {
-                case Left(why) => refuse(leased, s"$why. Nothing was changed")
+                case Left(why) => refuse(leased, s"$why. Nothing was changed", retried)
                 case Right(watermark) =>
                   val through = database
                     .run(ConfigSnapshots.ofState(_, source.id, start.layer))
                     .toSeq
                     .flatMap(last => ConfigVersion.breakingChanges(last.content, config))
                     .filter(_.breaksBronze)
-                  if (leased.reset(before, watermark)) {
+                  if (leased.reset(before, watermark, retried.into(RunCounts.Nothing))) {
                     val done = s"the state of ${start.txnAppId} was reset by the run " +
                       s"${start.id}, asked by ${request.requestedBy}: ${request.reason}. Its " +
                       s"watermark was ${shown(before.watermark)} and is ${shown(watermark)}; " +
@@ -277,25 +290,33 @@ final class OperatorActions(
     )
 
   /**
-   * Takes the lease of the run, announces its epoch, and does `body` with it. A failure that
-   * nothing knows the class of ends the run as `internal`, with its lease given up (ADR-0022
-   * §3); a fatal error of the JVM is let through, with the lease left to run out.
+   * Takes the lease of the run, announces its epoch, and does `body` with it. A failure that may
+   * pass has it all done again, after a wait, within the budget of the profile, until the action
+   * starts the transaction that ends it (ADR-0022 §4, §5): what comes before it changes nothing.
+   * A failure that nothing knows the class of ends the run as `internal`, with its lease given
+   * up (ADR-0022 §3); a fatal error of the JVM is let through, with the lease left to run out.
    */
-  private def held(start: RunStart, config: ConfigVersion)(body: LeasedRun => Outcome): Outcome =
-    opened(start, config) match {
+  private def held(start: RunStart, config: ConfigVersion)(
+      body: (LeasedRun, RunRetries) => Outcome
+  ): Outcome = {
+    val retried = new RunRetries(retries, s"the run ${start.id} of ${start.source}")
+    opened(start, config, retried) match {
       case Left(notOpened) => notOpened
       case Right(leased) =>
-        try {
-          val turn = WriterEpoch(start.leaseKey.value, leased.epoch.value)
-          EpochAnnouncement.announce(hadoop, start, turn) match {
-            case Left(refused) => refuse(leased, refused)
-            case Right(()) => body(leased)
+        try
+          retried(leased.lost.isEmpty && !leased.ending) {
+            val turn = WriterEpoch(start.leaseKey.value, leased.epoch.value)
+            EpochAnnouncement.announce(hadoop, start, turn) match {
+              case Left(refused) => refuse(leased, refused, retried)
+              case Right(()) => body(leased, retried)
+            }
           }
-        } catch {
-          case gone: LeaseLostException => stopped(leased, gone.loss)
-          case NonFatal(_) if leased.lost.nonEmpty => stopped(leased, leased.lost.get)
+        catch {
+          case gone: LeaseLostException => stopped(leased, gone.loss, retried)
+          case NonFatal(_) if leased.lost.nonEmpty => stopped(leased, leased.lost.get, retried)
           // One that says its class, or one that the classifier knows.
-          case Failures.Known(classed) => fail(leased, classed.failure, classed.getMessage)
+          case Failures.Known(classed) =>
+            fail(leased, classed.failure, classed.getMessage, retried)
           // What nothing classified: a mistake of the application (ADR-0022 §3).
           case NonFatal(unclassified) =>
             log.error(
@@ -303,23 +324,29 @@ final class OperatorActions(
                 "mistake of the application",
               unclassified
             )
-            fail(leased, FailureClass.Internal, Failures.unclassified(unclassified))
+            fail(leased, FailureClass.Internal, Failures.unclassified(unclassified), retried)
           case fatal: Throwable =>
             // A fatal error of the JVM: the lease runs out, as that of a process that died.
             leased.close()
             throw fatal
         }
     }
+  }
 
   /**
    * The lease for `start`, or how the action ended without it: skipped, for a lease that a run
    * holds; failed with its class, for a control plane that could not be asked. Such an action
    * has no row, and nothing is told; unless the database took the lease and its answer was lost,
-   * and then the lease runs out, and the run that takes it over ends this one.
+   * and then the lease runs out, and the run that takes it over ends this one. A failure that may
+   * pass is tried again, within the budget of the action (`retried`).
    */
-  private def opened(start: RunStart, config: ConfigVersion): Either[Outcome, LeasedRun] =
+  private def opened(
+      start: RunStart,
+      config: ConfigVersion,
+      retried: RunRetries
+  ): Either[Outcome, LeasedRun] =
     try
-      LeasedRun.open(database, start, config, timing).left.map { skipped =>
+      retried(may = true)(LeasedRun.open(database, start, config, timing)).left.map { skipped =>
         Outcome.Skipped(start.id, skipped.holder, skipped.until)
       }
     catch {
@@ -333,17 +360,22 @@ final class OperatorActions(
     }
 
   /** Refused, with nothing changed: running it again as it is does not mend it. */
-  private def refuse(leased: LeasedRun, message: String): Outcome =
-    fail(leased, FailureClass.Permanent, message)
+  private def refuse(leased: LeasedRun, message: String, retried: RunRetries): Outcome =
+    fail(leased, FailureClass.Permanent, message, retried)
 
   /**
    * Ends the run as failed, with its lease given up, and says so. A control plane that has the
    * run ended already ended it for a run that took the lease over: the action lost its lease.
    */
-  private def fail(leased: LeasedRun, failure: FailureClass, message: String): Outcome = {
+  private def fail(
+      leased: LeasedRun,
+      failure: FailureClass,
+      message: String,
+      retried: RunRetries
+  ): Outcome = {
     val start = leased.start
     val told =
-      try Right(leased.finish(RunEnd.Failed(failure, message)))
+      try Right(leased.finish(RunEnd.Failed(failure, message, retried.into(RunCounts.Nothing))))
       catch { case NonFatal(untold) => Left(untold) }
     told match {
       case Right(false) => lost(start, LeaseLoss.TakenOver)
@@ -362,11 +394,13 @@ final class OperatorActions(
   }
 
   /** Ends a run that lost its lease: it changed nothing, and running again later may do. */
-  private def stopped(leased: LeasedRun, loss: LeaseLoss): Outcome = {
+  private def stopped(leased: LeasedRun, loss: LeaseLoss, retried: RunRetries): Outcome = {
     loss match {
       case LeaseLoss.TakenOver => leased.close()
       case _: LeaseLoss.NotRenewed =>
-        try leased.finish(RunEnd.Failed(FailureClass.Transient, loss.reason)): Unit
+        val end =
+          RunEnd.Failed(FailureClass.Transient, loss.reason, retried.into(RunCounts.Nothing))
+        try leased.finish(end): Unit
         catch { case NonFatal(_) => () }
     }
     lost(leased.start, loss)

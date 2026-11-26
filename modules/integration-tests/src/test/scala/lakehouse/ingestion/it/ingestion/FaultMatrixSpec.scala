@@ -135,6 +135,7 @@ final class FaultMatrixSpec extends AnyFunSuite with Matchers with JdbcIngestion
       spark,
       lakeRoot,
       timing,
+      retries,
       Clock.fixed(Now, ZoneOffset.UTC),
       hooks
     )

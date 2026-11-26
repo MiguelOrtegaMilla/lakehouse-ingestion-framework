@@ -5,7 +5,7 @@ import java.time.{Clock, Instant, ZoneOffset}
 
 import scala.util.Using
 
-import lakehouse.ingestion.core.config.{SecretResolver, Source}
+import lakehouse.ingestion.core.config.{Profile, SecretResolver, Source}
 import lakehouse.ingestion.core.state.StoredWatermark
 import lakehouse.ingestion.engine.connector.ConnectorRegistry
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
@@ -105,14 +105,22 @@ trait JdbcIngestionSuite extends IngestionSuite {
       new JdbcSourceConnector(SecretResolver(passwords.get))
     )
 
-  /** The service, as an application puts it together, with the JDBC connector alone. */
-  protected def reading(hooks: FaultHooks = FaultHooks.Off): IngestionService =
+  /**
+   * The service, as an application puts it together, with the JDBC connector alone.
+   *
+   * @param tries for how long its runs try again: as the suite says, unless a test says otherwise
+   */
+  protected def reading(
+      hooks: FaultHooks = FaultHooks.Off,
+      tries: Profile.Retries = retries
+  ): IngestionService =
     new IngestionService(
       database,
       ConnectorRegistry(new JdbcSourceConnector(SecretResolver(passwords.get))),
       spark,
       lakeRoot,
       timing,
+      tries,
       Clock.fixed(Now, ZoneOffset.UTC),
       hooks
     )

@@ -67,9 +67,9 @@ spark:
 | `landing.root` | The [root](#a-root) that the paths of file sources are relative to | required |
 | `databases.control` | The [connection](#a-connection-to-a-database) to the control plane: runs, batches, leases, state | required |
 | `databases.coordination` | The [connection](#a-connection-to-a-database) to the database that the LogStore claims the versions of a table in | required |
-| `retries.budget` | For how long the engine goes on with a step that fails with an error that passes. A [duration](#a-duration), `1s` to `1d` | `2m` |
-| `retries.first_backoff` | The wait before the second attempt. `100ms` to `1h` | `1s` |
-| `retries.max_backoff` | The longest wait between two attempts. `100ms` to `1h` | `30s` |
+| `retries.budget` | For how long a run tries again after a failure that may pass, counted from its first failure: a database that does not answer, a connection lost, a conflict that Delta asks to be retried. No attempt starts once it is spent, and the one in course may finish, so a run ends within the budget plus the length of one attempt from its first failure. A [duration](#a-duration), `1s` to `1d` | `2m` |
+| `retries.first_backoff` | The ceiling of the wait before the first retry. The ceiling doubles at each retry, up to `max_backoff`, and each wait is drawn from nothing to its ceiling, so that runs that failed together do not come back together. `100ms` to `1h` | `1s` |
+| `retries.max_backoff` | The highest ceiling of a wait between two attempts. `100ms` to `1h` | `30s` |
 | `leases.ttl` | For how long a run holds the lease of its source without renewing it. A run renews it every third of this, so a run that dies leaves its source taken for this long before another may have it. A [duration](#a-duration), `10s` to `1d` | `2m` |
 | `spark.master` | `local`, `local[N]`, `local[*]`, or `spark://host:port` for a Spark Standalone cluster | required |
 | `spark.settings` | Spark settings to add, by their key. A value is text, a number or a boolean | none |

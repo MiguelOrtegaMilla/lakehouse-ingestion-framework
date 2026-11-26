@@ -69,6 +69,7 @@ final class BreakingChangeSpec
       spark,
       lakeRoot,
       timing,
+      retries,
       Clock.fixed(Now, ZoneOffset.UTC),
       hooks
     )

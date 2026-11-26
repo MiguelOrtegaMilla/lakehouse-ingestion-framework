@@ -44,6 +44,23 @@ final class LeasedRun private (
   /** What to do the moment the lease is lost: stop what the run is in the middle of. */
   def onLost(callback: LeaseLoss => Unit): Unit = heartbeat.onLost(callback)
 
+  @volatile private var endingStarted = false
+
+  /**
+   * Whether the run has started the transaction that ends it: the commit of its batch, the
+   * batch given up, the state reset, or how it ended said (`commit`, `abandon`, `reset`,
+   * `finish`). Each stops renewing the lease first. From then on the run is not tried again
+   * where it is durable (ADR-0022 §4): a transaction whose answer is lost may have been
+   * committed, and only what the control plane has says so (§6).
+   */
+  def ending: Boolean = endingStarted
+
+  /** The transaction that ends the run starts: the lease is no longer renewed. */
+  private def toEnd(): Unit = {
+    endingStarted = true
+    heartbeat.close()
+  }
+
   /**
    * The batch that a run before this one planned and did not commit, if there is one (ADR-0005
    * §3, step 2). It is this run's to finish: to run again, or only to account for, as the
@@ -158,7 +175,7 @@ final class LeasedRun private (
       s"the chunk $batch of a backfill records where the next one starts"
     )
     require(!completes || start.backfill.nonEmpty, "only a backfill is complete")
-    heartbeat.close()
+    toEnd()
     database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
         // Each says whether it did. One that did not is a state that is not what this run
@@ -247,7 +264,7 @@ final class LeasedRun private (
     // Before the lease stops being renewed, as the watermark of a commit: what cannot be
     // stored is a mistake of whoever gave it, and no reason to let the lease go.
     Batches.abandonable(reason, detail)
-    heartbeat.close()
+    toEnd()
     database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
         def must(done: Boolean, what: String): Unit =
@@ -278,6 +295,7 @@ final class LeasedRun private (
    * transaction, as `finish` asks it.
    *
    * @param before the state that the reset is of, as it was read under this lease
+   * @param counts what the run counted: the retries that it made before, if any
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed
    * @throws java.lang.IllegalStateException if the lease is this run's and the state is not
@@ -286,13 +304,17 @@ final class LeasedRun private (
    *   was changed, and the lease is still renewed
    */
   @throws[SQLException]
-  def reset(before: SourceState, watermark: Option[Json]): Boolean = {
+  def reset(
+      before: SourceState,
+      watermark: Option[Json],
+      counts: RunCounts = RunCounts.Nothing
+  ): Boolean = {
     require(
       before.source == start.source && before.layer == start.layer,
       s"the state of ${before.source}/${before.layer} is not of ${start.leaseKey}"
     )
     watermark.foreach(Batches.readable("watermark", _))
-    heartbeat.close()
+    toEnd()
     database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
         def must(done: Boolean, what: String): Unit =
@@ -313,7 +335,7 @@ final class LeasedRun private (
           StateChanges.document(watermark, before.lastCommitted, start.id)
         )
         must(
-          Runs.end(connection, start.id, RunEnd.Succeeded()),
+          Runs.end(connection, start.id, RunEnd.Succeeded(counts)),
           s"the run ${start.id} is not running"
         )
         must(
@@ -356,7 +378,7 @@ final class LeasedRun private (
    */
   @throws[SQLException]
   def finish(end: RunEnd): Boolean = {
-    heartbeat.close()
+    toEnd()
     database.transaction { connection =>
       // The lease first, as in every transaction that touches both it and the run. A run that
       // takes the lease over locks the lease and then ends this run; this one, ending itself

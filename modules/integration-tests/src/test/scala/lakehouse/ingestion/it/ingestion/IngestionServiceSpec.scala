@@ -284,6 +284,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
       spark,
       lakeRoot,
       timing,
+      retries,
       Clock.fixed(Now, ZoneOffset.UTC)
     )
     def ids: Seq[Long] =
@@ -883,6 +884,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
       cutOff,
       lakeRoot,
       timing,
+      retries,
       Clock.fixed(Now, ZoneOffset.UTC)
     )
 
