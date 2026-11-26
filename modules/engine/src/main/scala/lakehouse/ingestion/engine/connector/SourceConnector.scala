@@ -57,9 +57,9 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
  *    one transaction with the batch (ADR-0005). What a connector needs of them is given to it,
  *    to read (`PlanContext`).
  *  - '''A failure whose class is known is said with it''' (`RunFailedException`): a directory
- *    or a table that is not there is permanent. One that is not known is let through, for the
- *    classification of errors (P8). Rows that are read as they are written fail in the hands
- *    of the engine, and the engine asks their connector what the failure is (`failure`).
+ *    or a table that is not there is permanent. One that is not known is let through, to where
+ *    the run ends (`Failures`, ADR-0022 §2). Rows that are read as they are written fail in the
+ *    hands of the engine, and the engine asks their connector what the failure is (`failure`).
  *
  * What a connector needs that is not in the configuration of a source, as the root of the
  * landing zone or a way to resolve secrets, it is given when it is made.

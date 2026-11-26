@@ -7,9 +7,9 @@ import javax.net.ssl.SSLException
 /**
  * Why a database could not be worked with, as far as what to do next goes (discovery §14).
  *
- * The classification of errors is its own work, with retries and their budget (P8). This is the
- * least of it, and what a process that is starting needs: to tell a database that is not there,
- * which running again may find, from one that answered and said no, which it will not.
+ * It is how a failure of a database is classified wherever one is met: by a process that is
+ * starting, to tell a database that is not there, which running again may find, from one that
+ * answered and said no, which it will not; and where a run ends (`Failures`, ADR-0022 §2).
  */
 sealed trait DatabaseFailure {
   def message: String
