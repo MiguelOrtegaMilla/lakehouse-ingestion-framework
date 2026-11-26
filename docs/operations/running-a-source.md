@@ -177,7 +177,7 @@ sbt "cli/run maintain-table readopt --profile conf/app/local.yaml --password env
 | `adopt` | A table made without the LogStore: it is registered at the version its log is at, with the id of its first commit |
 | `readopt` | A tainted table, or one whose registry and log disagree, once its log has been looked at and is right |
 | `reset` | A table that was dropped: its registry is removed, so that one can be created at its path again |
-| `collect-temps` | Any table: removes the temporary files that nothing needs, and keeps, with a warning for each, those that something may |
+| `collect-temps` | Any table: removes the temporary files that nothing needs, and keeps, with a warning for each, those that something may. A role that cannot write the maintenance log removes nothing |
 
 It runs as `ingest_maintenance`, whose password, as the migrator's, is in no profile, takes no lease and is no run. Each operation looks at the log of the table first and refuses what the log does not bear out, and is recorded in `delta_coordination.maintenance_log` with who asked (the user of the process), why, when, and what it found and changed; an operation that is refused leaves no row. The table must be in the lake of the profile.
 

@@ -262,6 +262,41 @@ final class MaintainTableCommandSpec
     wrong.err should not include "not-its-password"
   }
 
+  test("collect-temps as a role that cannot write the log ends in 4, and removes nothing") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    run(orders).exit shouldBe Main.Exit.Ok
+    val bronze = bronzeOf(orders)
+    val uri = keyOf(bronze)
+    val temps = bronze.resolve("_delta_log/.tmp")
+    val before = Using.resource(Files.list(temps))(_.iterator.asScala.toVector.sorted)
+    before should not be empty
+
+    // The role of the commit path reads the registry, and may not write the maintenance log.
+    val refused = command(
+      Map("COMMIT_PASSWORD" -> pg.password(CoordinationSchema.CommitPathRole))
+    )(
+      "maintain-table",
+      "collect-temps",
+      "--profile",
+      validProfile.toString,
+      "--password",
+      "env:COMMIT_PASSWORD",
+      "--user",
+      CoordinationSchema.CommitPathRole,
+      "--table",
+      uri,
+      "--reason",
+      "the weekly clean"
+    )
+
+    refused.exit shouldBe Main.Exit.Permanent
+    said(refused).head should include("cannot write the maintenance log")
+    said(refused).head should include("Nothing was removed")
+    Using.resource(Files.list(temps))(_.iterator.asScala.toVector.sorted) shouldBe before
+    loggedOf(uri, "temps") shouldBe empty
+  }
+
   test("the command acts as the role of maintenance, and the commit path's role cannot") {
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")

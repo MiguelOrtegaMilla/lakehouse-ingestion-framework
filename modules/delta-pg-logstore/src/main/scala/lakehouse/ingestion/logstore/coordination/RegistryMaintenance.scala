@@ -93,6 +93,14 @@ trait RegistryMaintenance {
   ): RegistryChange[Unit]
 
   /**
+   * Whether the maintenance log may be written as the role that this registry is reached as:
+   * what an operation that changes nothing of the registry, and is recorded after it is made,
+   * asks before it does anything (`TableMaintenance.collectTemps`). It changes nothing.
+   */
+  @throws[IOException]
+  def mayRecord(): Boolean
+
+  /**
    * Records that the temporary files of `table` were collected (`TableMaintenance.collectTemps`),
    * once they are: nothing of the registry changes, so the record is a change of its own.
    *

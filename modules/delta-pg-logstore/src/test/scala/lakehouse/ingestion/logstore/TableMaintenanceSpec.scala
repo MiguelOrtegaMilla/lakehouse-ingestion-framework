@@ -60,10 +60,14 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
    * The registry of `lake`, where other processes act at the two moments an operator's
    * operation leaves them: just before it examines the entries, and just before it changes the
    * registry on what it examined.
+   *
+   * @param records whether the maintenance log may be written, as the role that reaches it
    */
-  private def registryWhere(
-      lake: Lake
-  )(beforeExamining: () => Unit = () => (), beforeChanging: () => Unit = () => ()) =
+  private def registryWhere(lake: Lake)(
+      beforeExamining: () => Unit = () => (),
+      beforeChanging: () => Unit = () => (),
+      records: Boolean = true
+  ) =
     new RegistryMaintenance {
       private val registry = lake.memory
 
@@ -110,6 +114,8 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
         beforeChanging()
         registry.forget(table, examined, request)
       }
+
+      override def mayRecord(): Boolean = records
 
       override def collected(
           table: TableUri,
@@ -330,6 +336,25 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     dropped.temps.foreach(Files.delete)
     maintenanceOf(dropped).reset(hadoop(dropped.directory), fs, asked)
     loggedOf(dropped) shouldBe Seq("reset" -> asked)
+  }
+
+  test("a collection that could not be recorded is not made: no file is removed") {
+    val lake = new Lake().withCommits(last = 1)
+    val tempsBefore = lake.temps
+    lake.crashAt(FaultPoint.BeforeInsert, version = 2)
+    val orphan = lake.temps.diff(tempsBefore).head
+    age(orphan, by = 2.days)
+    val all = lake.temps
+
+    val refused = the[MaintenanceRefusedException] thrownBy
+      new TableMaintenance(registryWhere(lake)(records = false))
+        .collectTemps(hadoop(lake.directory), fs, asked)
+
+    refused.getMessage should include("cannot write the maintenance log")
+    refused.getMessage should endWith("Nothing was removed")
+    // The published commits' files and the orphan are all still there.
+    lake.temps shouldBe all
+    loggedOf(lake) shouldBe empty
   }
 
   test("the temporary files are recorded once they are collected, each with its fate") {

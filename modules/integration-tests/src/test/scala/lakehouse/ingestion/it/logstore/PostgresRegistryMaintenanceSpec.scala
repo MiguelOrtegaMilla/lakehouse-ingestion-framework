@@ -92,6 +92,8 @@ final class PostgresRegistryMaintenanceSpec
       an[IOException] should be thrownBy asCommitPath.readopt(table, 0L, None, examined, asked)
       an[IOException] should be thrownBy asCommitPath.forget(table, examined, asked)
       an[IOException] should be thrownBy asCommitPath.collected(table, asked, Nil)
+      // And it is told so before it tries: the privileges of a row of the log are not its own.
+      asCommitPath.mayRecord() shouldBe false
     }
 
     // And nothing of what it tried was done, not even in part.

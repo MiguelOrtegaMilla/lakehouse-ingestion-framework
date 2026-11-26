@@ -81,7 +81,7 @@ A commit made in such a context takes its version only while its epoch is the on
 
 The states that call for each are in ADR-0004 §3.5 and §3.8.
 
-Each operation is given who asked for it and why (`MaintenanceRequest`), and is recorded in `delta_coordination.maintenance_log` with what it found and changed: `adopt`, `readopt` and `reset` in the transaction that changes the registry, so an operation that is refused or called off leaves no row; `collectTemps`, once the files are removed. The maintenance role may insert a row and do nothing else to the log; an audit reads it as the owner of the schema. The application runs these operations with its command `maintain-table`.
+Each operation is given who asked for it and why (`MaintenanceRequest`), and is recorded in `delta_coordination.maintenance_log` with what it found and changed: `adopt`, `readopt` and `reset` in the transaction that changes the registry, so an operation that is refused or called off leaves no row; `collectTemps`, once the files are removed, and only by a role that may write the log: one that may not is refused before a file is looked at (`RegistryMaintenance.mayRecord`). The maintenance role may insert a row and do nothing else to the log; an audit reads it as the owner of the schema. The application runs these operations with its command `maintain-table`.
 
 ## Scenarios and their tests
 

@@ -271,7 +271,9 @@ final class TableMaintenance(
    *    that is not a commit.
    *
    * What became of each file is recorded once the files are removed: a collection that fails
-   * halfway has no record, and what it removed is what nobody needed.
+   * halfway has no record, and what it removed is what nobody needed. A role that may not write
+   * the record is refused before a file is looked at: a collection that could not be recorded
+   * is not made.
    *
    * @param orphansOlderThan far longer than a commit can take between writing its temporary
    *   file and taking its version: a younger file may belong to a writer that is doing so now
@@ -285,6 +287,11 @@ final class TableMaintenance(
       orphansOlderThan: FiniteDuration = DefaultOrphanAge
   ): Map[String, TempFate] = {
     val target = new Target(tablePath, fs)
+    if (!registry.mayRecord())
+      refuse(
+        s"the temporary files of ${target.table} are not collected: the role that this runs as " +
+          "cannot write the maintenance log, and a collection is recorded. Nothing was removed"
+      )
     val now = System.currentTimeMillis()
     def isOld(temp: FileStatus): Boolean =
       now - temp.getModificationTime >= orphansOlderThan.toMillis
