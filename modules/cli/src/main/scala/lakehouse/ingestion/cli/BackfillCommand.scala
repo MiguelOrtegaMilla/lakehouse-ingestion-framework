@@ -67,6 +67,7 @@ object BackfillCommand {
         ready.spark,
         ready.profile.lake.uri,
         LeaseTiming(ready.profile.leases.ttl),
+        ready.profile.retries,
         hooks = hooks
       )
       val backfill = s"the backfill ${request.id} of ${id.value}"

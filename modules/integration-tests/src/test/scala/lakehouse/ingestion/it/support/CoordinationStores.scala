@@ -20,7 +20,11 @@ object CoordinationStores {
     "spark.delta.logStore.file.impl" -> classOf[PostgresLogStore].getName,
     s"spark.hadoop.${CoordinationSettings.JdbcUrl}" -> settings.jdbcUrl,
     s"spark.hadoop.${CoordinationSettings.User}" -> settings.user,
-    s"spark.hadoop.${CoordinationSettings.PasswordRef}" -> settings.password.toString
+    s"spark.hadoop.${CoordinationSettings.PasswordRef}" -> settings.password.toString,
+    s"spark.hadoop.${CoordinationSettings.ConnectTimeoutMs}" ->
+      settings.connectTimeout.toMillis.toString,
+    s"spark.hadoop.${CoordinationSettings.StatementTimeoutMs}" ->
+      settings.statementTimeout.toMillis.toString
   )
 
   /**

@@ -36,6 +36,14 @@ trait ControlPlaneSuite extends BeforeAndAfterAll with EitherValues with OptionV
 
   protected lazy val pg: BootstrappedPostgres = BootstrappedPostgres.start()
   protected lazy val profile: Profile = loaded(pg)
+
+  /**
+   * For how long a run of a test tries again after a failure that may pass: not at all, unless
+   * a suite of the retries says otherwise. A run then ends as it did before the engine tried
+   * anything again, and a test of a failure is not held up by a budget of minutes.
+   */
+  protected def retries: Profile.Retries =
+    Profile.Retries(budget = Duration.Zero, firstBackoff = 100.millis, maxBackoff = 100.millis)
   protected lazy val database: ControlDatabase =
     ControlDatabase.open(profile.databases.control, SecretResolver(environment(pg).get)).value
 

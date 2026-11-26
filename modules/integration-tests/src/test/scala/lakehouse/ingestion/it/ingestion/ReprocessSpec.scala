@@ -107,7 +107,8 @@ final class ReprocessSpec extends AnyFunSuite with Matchers with JdbcIngestionSu
       id = orders.id.value,
       table = Some(s"bronze/moved/${orders.id.value.replace('.', '_')}")
     )
-    val actions = new OperatorActions(database, spark, lakeRoot, timing, ConnectorKind.BuiltIn)
+    val actions =
+      new OperatorActions(database, spark, lakeRoot, timing, retries, ConnectorKind.BuiltIn)
     actions.reset(moved, versionOf(moved), WatermarkReset.Keep, asked) shouldBe
       a[OperatorActions.Outcome.Done]
 

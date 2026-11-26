@@ -116,3 +116,10 @@ The read is retried within the budget too. A budget that runs out ends the run i
 - **What a run that nothing classified records** is the type of the exception and where it was thrown, and not its message (`Failures.unclassified`), and the process says the same on its error: a message that nobody wrote for a person may hold what it was handed. The log of the instance has the exception whole. `internal` is a name of `error_class` from migration V8 of `control`.
 - **`Main` ends in 70** for what nothing classified in any command, after it logs it whole; a fatal error of the JVM is caught by nothing.
 - **A test that has a run die at a point of the engine** throws a `ControlThrowable` (`Died`), which nothing of the engine catches: a death that the engine could catch would end the run as `internal`, and not as a process that is killed.
+
+## As built (P8.4, 2026-11-26)
+
+- **The loop is `RunRetries`, one for each run**, with the waits of `Backoff` (in `core`, with no clock nor randomness of its own). Both services take the retries of the profile. A run tries again by doing its body again: the body finds the batch that the run planned and recovers it, a reprocess included.
+- **The transaction that ends a run is told by the run's handle on its lease** (`LeasedRun.ending`): `commit`, `abandon`, `reset` and `finish` set it before anything else, as they stop renewing the lease. Nothing is tried again from then on (§4, §6).
+- **What was tried again is recorded only when there was something**: `retries` and `write_conflicts` are none for a run that tried nothing again, as they were for every run before.
+- **The LogStore's wait is the longest outage that it may ride out, not one that it always does**: its pool of connections makes a new one on its own schedule, which grows while the database is away (§5).

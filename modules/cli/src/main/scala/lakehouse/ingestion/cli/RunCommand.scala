@@ -68,6 +68,7 @@ object RunCommand {
         ready.spark,
         ready.profile.lake.uri,
         LeaseTiming(ready.profile.leases.ttl),
+        ready.profile.retries,
         hooks = hooks
       )
       runs(service, ready.source, ready.config, Chain.Limits(maxBatches, stop), out, err)

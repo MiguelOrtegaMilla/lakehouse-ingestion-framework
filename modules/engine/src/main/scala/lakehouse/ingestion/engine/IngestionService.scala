@@ -10,6 +10,7 @@ import lakehouse.ingestion.core.config.{
   Durations,
   Load,
   PathTableLocator,
+  Profile,
   RootUri,
   Source,
   TableLocation
@@ -152,6 +153,15 @@ import org.slf4j.LoggerFactory
  *    out with its data written, and that the control plane still has as the holder of its
  *    lease, commits its batch.
  *
+ * '''A failure that may pass is tried again where the run is durable''' (ADR-0022 §4, §5): a
+ * failure of the class `transient`, or a conflict that Delta asks to be retried, has the run
+ * wait and run its body again, under its lease and with its id, within the budget of the
+ * profile. The body recovers what the run planned before it failed, as it recovers what a run
+ * before it left (ADR-0005, step 2). Nothing is tried again once the run has lost its lease,
+ * nor once it has started the transaction that ends it (`LeasedRun.ending`), whose answer may
+ * be lost with the transaction committed. Taking the lease is tried again the same way. What
+ * was tried again is counted in the run (`retries`, `write_conflicts`).
+ *
  * '''How a run ends.'''
  *  - A failure that says its class (`RunFailedException`) ends the run as `FAILED` with it, and
  *    gives the lease up. The batch, if one was planned, stays planned. If the control plane
@@ -188,8 +198,11 @@ import org.slf4j.LoggerFactory
  * between, the read, the writes and recovery, is that of any batch.
  *
  * @param lake the root of the lake of the profile: every table of a source is under it
+ * @param retries for how long a run tries again after a failure that may pass, and how far
+ *   apart (ADR-0022 §5): those of the profile
  * @param clock what "now" is for a plan, and when the rows of a batch were read
  * @param hooks what a run does at each fault point: nothing, outside tests
+ * @param draw how the wait before a retry is drawn, from 0 to the bound given
  */
 final class IngestionService(
     database: ControlDatabase,
@@ -197,8 +210,10 @@ final class IngestionService(
     spark: SparkSession,
     lake: RootUri,
     timing: LeaseTiming,
+    retries: Profile.Retries,
     clock: Clock = Clock.systemUTC(),
-    hooks: FaultHooks = FaultHooks.Off
+    hooks: FaultHooks = FaultHooks.Off,
+    draw: Long => Long = RunRetries.Uniform
 ) {
   import IngestionService._
 
@@ -326,7 +341,8 @@ final class IngestionService(
       body: Attempt => Outcome
   ): Outcome = {
     val source = bound.source
-    opened(start, config) match {
+    val retried = new RunRetries(retries, s"the run ${start.id} of ${source.id}", draw)
+    opened(start, config, retried) match {
       case Left(notOpened) => notOpened
       case Right(leased) =>
         val jobs = new RunJobs(spark, start.id)
@@ -334,20 +350,23 @@ final class IngestionService(
         leased.onLost { loss =>
           jobs.stop(s"the run ${start.id} lost the lease of ${start.leaseKey}: ${loss.reason}")
         }
-        try jobs.during(body(new Attempt(leased, bound, config, horizon)))
+        val attempt = new Attempt(leased, bound, config, horizon, retried)
+        // Tried again where the run is durable: its body, which recovers what it planned.
+        try jobs.during(retried(leased.lost.isEmpty && !leased.ending)(body(attempt)))
         catch {
           // Before anything else: whatever it is wrapped in, it says that the lease is lost.
           case refused: Throwable if outOfTurn(refused).nonEmpty =>
             leased.close()
             fenced(start, outOfTurn(refused).fold("")(_.getMessage))
-          case lost: LeaseLostException => stopped(leased, lost.loss, failedWith = None)
+          case lost: LeaseLostException =>
+            stopped(leased, lost.loss, failedWith = None, retried)
           // Whatever it is, it is of a run that is over: a job that was stopped, most often.
           case NonFatal(failure) if leased.lost.nonEmpty =>
-            stopped(leased, leased.lost.get, failedWith = Some(failure))
+            stopped(leased, leased.lost.get, failedWith = Some(failure), retried)
           // One that says its class, or one that the classifier knows (ADR-0022 §2).
           case failure @ Failures.Known(classed) =>
             log.error(s"the run ${start.id} of ${source.id} failed (${classed.failure})", failure)
-            ended(leased, RunEnd.Failed(classed.failure, classed.getMessage))
+            ended(leased, RunEnd.Failed(classed.failure, classed.getMessage), retried)
           // What nothing classified: a mistake of the application (ADR-0022 §3). The run says
           // so, and gives its lease up; the log has the failure whole.
           case NonFatal(unclassified) =>
@@ -356,7 +375,11 @@ final class IngestionService(
                 "mistake of the application",
               unclassified
             )
-            ended(leased, RunEnd.Failed(FailureClass.Internal, Failures.unclassified(unclassified)))
+            ended(
+              leased,
+              RunEnd.Failed(FailureClass.Internal, Failures.unclassified(unclassified)),
+              retried
+            )
           case fatal: Throwable =>
             // A fatal error of the JVM: nothing is said of it, and the lease runs out, as that of
             // a process that died.
@@ -372,11 +395,18 @@ final class IngestionService(
    * failed so has no row, and nothing is told; unless the database took the lease and its answer
    * was lost, and then the lease runs out, and the run that takes it over ends this one.
    *
+   * A failure that may pass is tried again, within the budget of the run (`retried`), which
+   * counts it: the run records it once it has a row.
+   *
    * @throws java.lang.Exception what nothing classified
    */
-  private def opened(start: RunStart, config: ConfigVersion): Either[Outcome, LeasedRun] =
+  private def opened(
+      start: RunStart,
+      config: ConfigVersion,
+      retried: RunRetries
+  ): Either[Outcome, LeasedRun] =
     try
-      LeasedRun.open(database, start, config, timing).left.map { skipped =>
+      retried(may = true)(LeasedRun.open(database, start, config, timing)).left.map { skipped =>
         Outcome.Skipped(start.id, skipped.holder, skipped.until)
       }
     catch {
@@ -407,7 +437,8 @@ final class IngestionService(
   private def stopped(
       leased: LeasedRun,
       loss: LeaseLoss,
-      failedWith: Option[Throwable]
+      failedWith: Option[Throwable],
+      retried: RunRetries
   ): Outcome = {
     val start = leased.start
     failedWith.foreach { failure =>
@@ -429,7 +460,12 @@ final class IngestionService(
           "finished by the next run of the source"
         log.error(message)
         val told =
-          try Right(leased.finish(RunEnd.Failed(FailureClass.Transient, message)))
+          try
+            Right(
+              leased.finish(
+                RunEnd.Failed(FailureClass.Transient, message, retried.into(RunCounts.Nothing))
+              )
+            )
           catch { case NonFatal(untold) => Left(untold) }
         told match {
           case Right(true) =>
@@ -458,10 +494,10 @@ final class IngestionService(
    * leaves it: its lease is no longer renewed, and the run that takes it over marks this one
    * `ABANDONED`, and finds what this one found.
    */
-  private def ended(leased: LeasedRun, end: RunEnd.Failed): Outcome = {
+  private def ended(leased: LeasedRun, end: RunEnd.Failed, retried: RunRetries): Outcome = {
     val start = leased.start
     val told =
-      try Right(leased.finish(end))
+      try Right(leased.finish(end.copy(counts = retried.into(end.counts))))
       catch { case NonFatal(untold) => Left(untold) }
     told match {
       case Right(true) => Outcome.Failed(start.id, end.failure, end.message)
@@ -494,7 +530,8 @@ final class IngestionService(
       leased: LeasedRun,
       bound: BoundSource,
       config: ConfigVersion,
-      horizon: Option[Json]
+      horizon: Option[Json],
+      retried: RunRetries
   ) {
     private val start = leased.start
     private val source = bound.source
@@ -521,6 +558,8 @@ final class IngestionService(
     def reprocess(of: BatchSeq): Outcome =
       prepared(heldToWhatWasIngested()) { _ =>
         leased.planned() match {
+          // Planned by this run, which failed after and is tried again: it is finished.
+          case Some(left) if left.plannedBy == start.id => recover(left)
           case Some(left) =>
             throw RunFailedException.permanent(
               s"the batch ${left.id} is planned: no batch is reprocessed while one is, since " +
@@ -714,7 +753,7 @@ final class IngestionService(
         s"the backfill ${start.txnAppId} is complete: it has read (${backfill.from}, " +
           s"${backfill.to}], and the run ${start.id} has nothing to read"
       )
-      if (leased.finish(RunEnd.Succeeded(Idle))) Outcome.NothingNew(start.id)
+      if (leased.finish(RunEnd.Succeeded(retried.into(Idle)))) Outcome.NothingNew(start.id)
       else fenced(start, "another run ended it")
     }
 
@@ -778,7 +817,7 @@ final class IngestionService(
      */
     private def announce(): Option[Outcome] =
       EpochAnnouncement.announce(hadoop, start, turn).left.toOption.map { message =>
-        ended(leased, RunEnd.Failed(FailureClass.Permanent, message)) match {
+        ended(leased, RunEnd.Failed(FailureClass.Permanent, message), retried) match {
           case refused @ Outcome.Failed(_, FailureClass.Permanent, _) =>
             log.error(s"the run ${start.id} of ${source.id} failed: $message")
             refused
@@ -794,7 +833,7 @@ final class IngestionService(
       bound.plan(context) match {
         case None =>
           log.info(s"the run ${start.id} found nothing new in ${source.id}, and has no batch")
-          if (leased.finish(RunEnd.Succeeded(Idle))) Outcome.NothingNew(start.id)
+          if (leased.finish(RunEnd.Succeeded(retried.into(Idle)))) Outcome.NothingNew(start.id)
           else fenced(start, "another run ended it")
         case Some(plan) =>
           // The write-ahead step: from here on, the plan is what is read, and the table is
@@ -854,7 +893,7 @@ final class IngestionService(
         BatchOutput(source.targets.bronze.table, versionOf(table, batch))
       // This run read nothing, which it knows. What the batch wrote, and what of it was
       // rejected, were counted by the run that did, if it got to say so: not by this one.
-      val counts = RunCounts(rowsRead = Some(0L), bytesRead = Some(0L))
+      val counts = retried.into(RunCounts(rowsRead = Some(0L), bytesRead = Some(0L)))
 
       hooks.at(FaultPoint.BeforeStateCommit, batch)
       val last = completes(batch)
@@ -982,9 +1021,10 @@ final class IngestionService(
         batch: PlannedBatch,
         progress: Progress,
         outputs: Vector[BatchOutput],
-        counts: RunCounts,
+        written: RunCounts,
         readByThisRun: Boolean
     ): Outcome = {
+      val counts = retried.into(written)
       hooks.at(FaultPoint.BeforeStateCommit, batch)
       val last = completes(batch)
       if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files, last)) {
@@ -1129,7 +1169,8 @@ final class IngestionService(
             s"written to Bronze: it stays planned. The records are in quarantine, at " +
             quarantine.uri,
           counts
-        )
+        ),
+        retried
       )
     }
 
@@ -1153,7 +1194,7 @@ final class IngestionService(
           val end = RunEnd.Failed(
             FailureClass.Transient,
             message,
-            RunCounts(rowsWritten = Some(0L))
+            retried.into(RunCounts(rowsWritten = Some(0L)))
           )
           if (leased.abandon(batch.id, changed.summary, Some(changedDetail(changed)), end))
             Outcome.GivenUp(start.id, batch.id, changed.summary)

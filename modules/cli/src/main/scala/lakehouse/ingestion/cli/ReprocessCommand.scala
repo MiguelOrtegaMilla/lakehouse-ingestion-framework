@@ -53,6 +53,7 @@ object ReprocessCommand {
         ready.spark,
         ready.profile.lake.uri,
         LeaseTiming(ready.profile.leases.ttl),
+        ready.profile.retries,
         hooks = hooks
       )
       val outcome = service.reprocess(ready.source, ready.config, batch, request)

@@ -45,6 +45,7 @@ private[cli] object OperatorCommand {
         ready.spark,
         ready.profile.lake.uri,
         LeaseTiming(ready.profile.leases.ttl),
+        ready.profile.retries,
         // The kinds that the configuration was read with.
         ConnectorKind.BuiltIn
       )

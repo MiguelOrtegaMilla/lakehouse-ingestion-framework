@@ -136,6 +136,7 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
       spark,
       lakeRoot,
       timing,
+      retries,
       Clock.fixed(Now, ZoneOffset.UTC)
     )
 

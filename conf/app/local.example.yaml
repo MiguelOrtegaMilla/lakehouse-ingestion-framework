@@ -36,8 +36,8 @@ databases:
     # How long a commit waits for this database before it fails. The LogStore tries three times.
     timeouts: { connect: 5s, statement: 10s }
 
-# For how long the engine goes on with a step that fails with an error that passes. It must be
-# longer than the LogStore itself waits for the coordination database: 3 x 5s here.
+# For how long a run tries again after a failure that may pass, from its first failure. It must
+# be longer than the LogStore itself waits for the coordination database: 3 x 5s here.
 retries:
   budget: 2m
   first_backoff: 1s

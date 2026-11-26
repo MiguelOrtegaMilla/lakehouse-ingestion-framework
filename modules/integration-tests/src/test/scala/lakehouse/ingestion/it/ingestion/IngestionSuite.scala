@@ -11,6 +11,7 @@ import scala.concurrent.duration._
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
   PathTableLocator,
+  Profile,
   RelativePath,
   RootUri,
   Source,
@@ -114,12 +115,14 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite with LedgerF
    *   them again
    * @param on how it reaches the control plane: as the suite does, unless a test has a way of
    *   its own, to break
+   * @param tries for how long its runs try again: as the suite says, unless a test says otherwise
    */
   protected def service(
       hooks: FaultHooks = FaultHooks.Off,
       at: Instant = Now,
       afterRead: () => Unit = () => (),
-      on: ControlDatabase = database
+      on: ControlDatabase = database,
+      tries: Profile.Retries = retries
   ): IngestionService =
     new IngestionService(
       on,
@@ -127,6 +130,7 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite with LedgerF
       spark,
       lakeRoot,
       timing,
+      tries,
       Clock.fixed(at, ZoneOffset.UTC),
       hooks
     )

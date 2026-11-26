@@ -264,7 +264,8 @@ final class FailureClassesSpec
 
     val (run, action) = throughTheProxy { control =>
       proxied.faulty.disable()
-      val actions = new OperatorActions(control, spark, lakeRoot, timing, ConnectorKind.BuiltIn)
+      val actions =
+        new OperatorActions(control, spark, lakeRoot, timing, retries, ConnectorKind.BuiltIn)
       (
         launch(orders, service(on = control)),
         actions.abandon(orders, versionOf(orders), BatchSeq.of(1).toOption.get, asked, None)
