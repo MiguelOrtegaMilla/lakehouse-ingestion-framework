@@ -199,6 +199,8 @@ final class InMemoryCoordinationStore extends CoordinationStore with RegistryMai
       }
     }
 
+  override def mayRecord(): Boolean = true
+
   override def collected(
       table: TableUri,
       request: MaintenanceRequest,

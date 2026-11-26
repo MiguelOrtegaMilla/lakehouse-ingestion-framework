@@ -291,6 +291,10 @@ abstract class RegistryMaintenanceContract extends AnyFunSuite with Matchers {
     logged(table) should have size 3
   }
 
+  test("the role of maintenance may write the maintenance log") {
+    maintenance.mayRecord() shouldBe true
+  }
+
   test("the temporary files that were collected are recorded, whatever their table is") {
     val registered = tableWith(0L)
     val dropped = newTable()

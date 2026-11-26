@@ -127,6 +127,13 @@ final class PostgresRegistryMaintenance(
       }
     }
 
+  // The privilege that a row of the log takes, column by column, as V5 grants it: and nothing
+  // is written to find out.
+  override def mayRecord(): Boolean =
+    database.transaction("ask whether the maintenance log may be written") { connection =>
+      query(connection, MayRecord)(_ => ())(_.getBoolean(1)).contains(true)
+    }
+
   override def collected(
       table: TableUri,
       request: MaintenanceRequest,
@@ -279,6 +286,10 @@ object PostgresRegistryMaintenance {
        |    FROM delta_coordination.commit_entry e
        |    WHERE e.table_uri = c.table_uri AND NOT e.complete))
        |FROM asked a JOIN delta_coordination.coordinated_table c ON c.table_uri = a.table_uri""".stripMargin
+
+  private val MayRecord =
+    """SELECT bool_and(has_column_privilege('delta_coordination.maintenance_log', c, 'INSERT'))
+      |FROM unnest(ARRAY['table_uri', 'operation', 'requested_by', 'reason', 'detail']) AS c""".stripMargin
 
   // Each file by its name, with its fate.
   private val LogCollection =
