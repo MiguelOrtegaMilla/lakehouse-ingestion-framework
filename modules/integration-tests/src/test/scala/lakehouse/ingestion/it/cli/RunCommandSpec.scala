@@ -18,7 +18,12 @@ import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint}
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.{CommandProcess, DeploymentFiles, LocalSparkSuite}
+import lakehouse.ingestion.it.support.{
+  CommandProcess,
+  DeploymentFiles,
+  LocalSparkSuite,
+  TakenAtItsWord
+}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
@@ -161,7 +166,15 @@ final class RunCommandSpec
     val returns = fileSource()
     drop(returns, "a.csv", "id\n1\n")
     val holder =
-      LeasedRun.open(database, starting(returns), versionOf(returns), LeaseTiming(2.minutes)).value
+      LeasedRun
+        .open(
+          database,
+          starting(returns),
+          versionOf(returns),
+          LeaseTiming(2.minutes),
+          TakenAtItsWord
+        )
+        .value
 
     val ran =
       try launch(returns)

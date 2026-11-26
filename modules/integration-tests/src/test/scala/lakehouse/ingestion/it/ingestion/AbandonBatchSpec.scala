@@ -17,7 +17,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.engine.operator.OperatorActions
 import lakehouse.ingestion.engine.quarantine.QuarantineReader
-import lakehouse.ingestion.it.support.Died
+import lakehouse.ingestion.it.support.{Died, TakenAtItsWord}
 import lakehouse.ingestion.it.support.ControlPlaneSchema.update
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -337,7 +337,10 @@ final class AbandonBatchSpec extends AnyFunSuite with Matchers with JdbcIngestio
   test("while a run holds the lease, the action is skipped, recorded with why, and does nothing") {
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")
-    val holder = LeasedRun.open(database, starting(orders), versionOf(orders), timing).toOption.get
+    val holder = LeasedRun
+      .open(database, starting(orders), versionOf(orders), timing, TakenAtItsWord)
+      .toOption
+      .get
 
     val skipped = abandon(orders, 1)
 

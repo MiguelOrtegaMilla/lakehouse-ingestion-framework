@@ -217,9 +217,14 @@ final class FailureClassesSpec
       launch(orders, service(cutOff, on = control))
     }
 
-    failed(outcome, FailureClass.Transient) should startWith(
-      "the run could not go on with its control plane: "
+    // The commit of its state gave no answer, and the run could not learn how it went (P8.5):
+    // what it ends with says so, and says the failure of the control plane, with its class.
+    val said = failed(outcome, FailureClass.Transient)
+    said should startWith(
+      s"the run ${outcome.run} could not learn whether the transaction that ends it was " +
+        "committed: "
     )
+    said should include("the run could not go on with its control plane: ")
     // Nothing reached the control plane: the run is as a process that died left it.
     runOf(outcome.run).status shouldBe RunStatus.Running
     batchOf(batchId(orders, 1)).status shouldBe BatchStatus.Planned

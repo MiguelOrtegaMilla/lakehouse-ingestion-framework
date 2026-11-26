@@ -13,6 +13,7 @@ import lakehouse.ingestion.engine.control.{
   Runs
 }
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.it.support.TakenAtItsWord
 import lakehouse.ingestion.logstore.Concurrently
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -41,7 +42,7 @@ final class LeasesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite 
       timing: LeaseTiming = Long,
       on: ControlDatabase = database
   ): Either[LeasedRun.Skipped, LeasedRun] =
-    LeasedRun.open(on, starting(of, layer), versionOf(of), timing)
+    LeasedRun.open(on, starting(of, layer), versionOf(of), timing, TakenAtItsWord)
 
   private def lease(of: Source, layer: Layer = Layer.Bronze): Leases.Lease =
     database.run(Leases.find(_, LeaseKey.of(of.id, layer))).value

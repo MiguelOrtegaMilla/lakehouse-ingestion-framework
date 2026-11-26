@@ -17,7 +17,12 @@ import lakehouse.ingestion.core.config.{EngineColumns, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control.{Backfills, LeasedRun}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.{DeploymentFiles, LocalSparkSuite, ProxiedPostgres}
+import lakehouse.ingestion.it.support.{
+  DeploymentFiles,
+  LocalSparkSuite,
+  ProxiedPostgres,
+  TakenAtItsWord
+}
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -373,7 +378,8 @@ final class BackfillCommandSpec
           backfill = Some(backfillId("history"))
         ),
         versionOf(orders),
-        LeaseTiming(2.minutes)
+        LeaseTiming(2.minutes),
+        TakenAtItsWord
       )
       .value
 
@@ -393,7 +399,9 @@ final class BackfillCommandSpec
   test("a run that holds the lease of the source does not stop a backfill of it: 0") {
     val orders = changes()
     val regular =
-      LeasedRun.open(database, starting(orders), versionOf(orders), LeaseTiming(2.minutes)).value
+      LeasedRun
+        .open(database, starting(orders), versionOf(orders), LeaseTiming(2.minutes), TakenAtItsWord)
+        .value
 
     val ran =
       try backfill(orders)

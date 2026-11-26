@@ -13,6 +13,7 @@ import lakehouse.ingestion.core.config.{PathTableLocator, Source}
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.it.support.TakenAtItsWord
 import lakehouse.ingestion.logstore.Concurrently
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -136,7 +137,7 @@ final class ProtocolInvariantsSpec extends AnyFunSuite with Matchers with Contro
               wakes(zombies.head, random)
               zombies = zombies.tail
             }
-            LeasedRun.open(instance, start(), version, timing) match {
+            LeasedRun.open(instance, start(), version, timing, TakenAtItsWord) match {
               case Left(_) => Thread.sleep(random.nextInt(15).toLong)
               case Right(leased) =>
                 val found = leased.planned()
@@ -177,7 +178,7 @@ final class ProtocolInvariantsSpec extends AnyFunSuite with Matchers with Contro
         key.value
       ): Unit
     }
-    val last = LeasedRun.open(database, start(), version, timing).value
+    val last = LeasedRun.open(database, start(), version, timing, TakenAtItsWord).value
     last.planned() match {
       case Some(batch) => writeAndCommit(last, batch) shouldBe true
       case None => last.finish(RunEnd.Succeeded()) shouldBe true

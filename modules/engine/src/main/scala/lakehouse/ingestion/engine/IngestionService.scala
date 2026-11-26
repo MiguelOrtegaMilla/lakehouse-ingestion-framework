@@ -159,8 +159,10 @@ import org.slf4j.LoggerFactory
  * profile. The body recovers what the run planned before it failed, as it recovers what a run
  * before it left (ADR-0005, step 2). Nothing is tried again once the run has lost its lease,
  * nor once it has started the transaction that ends it (`LeasedRun.ending`), whose answer may
- * be lost with the transaction committed. Taking the lease is tried again the same way. What
- * was tried again is counted in the run (`retries`, `write_conflicts`).
+ * be lost with the transaction committed: that transaction is settled instead (ADR-0022 §6,
+ * `Settling`), and the run reads its own row before it makes it again. Taking the lease is
+ * tried again the same way. What was tried again is counted in the run (`retries`,
+ * `write_conflicts`).
  *
  * '''How a run ends.'''
  *  - A failure that says its class (`RunFailedException`) ends the run as `FAILED` with it, and
@@ -179,6 +181,9 @@ import org.slf4j.LoggerFactory
  *    the error of a job that was stopped, in whatever Spark wrapped it, and any other. A run
  *    without its lease has nothing else to say of its source that counts, and what it failed
  *    with is logged whole, as the cause, for the mistake that it may be.
+ *  - A run whose last transaction gave no answer, and that could not learn within its budget
+ *    whether it was committed, says nothing more to the control plane, and reports a transient
+ *    failure: its row is what that transaction left, and the next run finds it.
  *  - Any other failure that the classifier knows (`Failures`: the LogStore, the conflicts of
  *    Delta, a database by its SQLState) ends the run as `FAILED` with its class, as one that
  *    said its class does (ADR-0022 §2). So does a failure to take the lease, which leaves no
@@ -363,6 +368,11 @@ final class IngestionService(
           // Whatever it is, it is of a run that is over: a job that was stopped, most often.
           case NonFatal(failure) if leased.lost.nonEmpty =>
             stopped(leased, leased.lost.get, failedWith = Some(failure), retried)
+          // The transaction that ends the run gave no answer, and the run could not learn within
+          // its budget whether it was committed (ADR-0022 §6).
+          case failure @ Failures.Known(classed)
+              if leased.ending && RunRetries.mayPass(classed.failure) =>
+            unsettled(leased, classed, failure)
           // One that says its class, or one that the classifier knows (ADR-0022 §2).
           case failure @ Failures.Known(classed) =>
             log.error(s"the run ${start.id} of ${source.id} failed (${classed.failure})", failure)
@@ -406,8 +416,9 @@ final class IngestionService(
       retried: RunRetries
   ): Either[Outcome, LeasedRun] =
     try
-      retried(may = true)(LeasedRun.open(database, start, config, timing)).left.map { skipped =>
-        Outcome.Skipped(start.id, skipped.holder, skipped.until)
+      retried(may = true)(LeasedRun.open(database, start, config, timing, retried)).left.map {
+        skipped =>
+          Outcome.Skipped(start.id, skipped.holder, skipped.until)
       }
     catch {
       case failure @ Failures.Known(classed) =>
@@ -511,6 +522,26 @@ final class IngestionService(
         )
         Outcome.Failed(start.id, end.failure, end.message)
     }
+  }
+
+  /**
+   * A run that could not learn, within its budget, whether the transaction that ends it was
+   * committed (ADR-0022 §6). Nothing more is said to the control plane: the row of the run is
+   * what that transaction left, `RUNNING` with its lease running out, or ended, and the next run
+   * of the source finds it, as it finds what a process that died left. It may pass.
+   */
+  private def unsettled(
+      leased: LeasedRun,
+      classed: RunFailedException,
+      failure: Throwable
+  ): Outcome = {
+    val start = leased.start
+    leased.close()
+    val message = s"the run ${start.id} could not learn whether the transaction that ends it " +
+      s"was committed: ${classed.getMessage}. What happened is in the control plane, and the " +
+      s"next run of ${start.source} finds it"
+    log.error(message, failure)
+    Outcome.Failed(start.id, classed.failure, message)
   }
 
   /**
@@ -893,13 +924,24 @@ final class IngestionService(
         BatchOutput(source.targets.bronze.table, versionOf(table, batch))
       // This run read nothing, which it knows. What the batch wrote, and what of it was
       // rejected, were counted by the run that did, if it got to say so: not by this one.
-      val counts = retried.into(RunCounts(rowsRead = Some(0L), bytesRead = Some(0L)))
+      val read = RunCounts(rowsRead = Some(0L), bytesRead = Some(0L))
 
       hooks.at(FaultPoint.BeforeStateCommit, batch)
       val last = completes(batch)
-      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files, last)) {
+      // The counts with the retries, for each time the commit is made, and once it is: what the
+      // run says is what its row has.
+      if (
+        leased.commit(
+          batch.id,
+          progress.watermark,
+          outputs,
+          retried.into(read),
+          progress.files,
+          last
+        )
+      ) {
         log.info(s"the run ${start.id} committed ${batch.id}, rolled forward${completed(last)}")
-        Outcome.RolledForward(start.id, batch.id, outputs, counts)
+        Outcome.RolledForward(start.id, batch.id, outputs, retried.into(read))
       } else fenced(start, "another run holds it")
     }
 
@@ -1024,11 +1066,21 @@ final class IngestionService(
         written: RunCounts,
         readByThisRun: Boolean
     ): Outcome = {
-      val counts = retried.into(written)
       hooks.at(FaultPoint.BeforeStateCommit, batch)
       val last = completes(batch)
-      if (leased.commit(batch.id, progress.watermark, outputs, counts, progress.files, last)) {
+      // As in `rollForward`: the counts are made for each time the commit is, and once it is.
+      if (
+        leased.commit(
+          batch.id,
+          progress.watermark,
+          outputs,
+          retried.into(written),
+          progress.files,
+          last
+        )
+      ) {
         log.info(s"the run ${start.id} committed ${batch.id}${completed(last)}")
+        val counts = retried.into(written)
         // What comes after: what the plan says, for a plan of this run's, and for a chunk of a
         // backfill, whose range is the same whoever planned it. For a batch that a run before
         // this one planned, under a horizon that was not this invocation's, a plan made anew;
@@ -1191,7 +1243,8 @@ final class IngestionService(
           val message = s"${batch.id} was given up, and the next run plans anew: " +
             changed.summary
           log.warn(message)
-          val end = RunEnd.Failed(
+          // Made for each time the transaction is, with the retries made by then.
+          def end = RunEnd.Failed(
             FailureClass.Transient,
             message,
             retried.into(RunCounts(rowsWritten = Some(0L)))

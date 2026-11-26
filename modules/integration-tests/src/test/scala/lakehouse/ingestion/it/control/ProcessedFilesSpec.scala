@@ -10,6 +10,7 @@ import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
 import lakehouse.ingestion.core.files.{FileName, FilePlan, FilePlanner, LandedFile, Listed}
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.it.support.TakenAtItsWord
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -43,7 +44,7 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     of.connector.asInstanceOf[FileConnectorConfig]
 
   private def open(of: Source): LeasedRun =
-    LeasedRun.open(database, starting(of), versionOf(of), timing).value
+    LeasedRun.open(database, starting(of), versionOf(of), timing, TakenAtItsWord).value
 
   private def listed(name: String, size: Long = 10, at: String = "2026-11-18T10:00:00.123Z") =
     Listed(name, size, Instant.parse(at))

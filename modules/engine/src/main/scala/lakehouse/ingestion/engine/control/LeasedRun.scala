@@ -24,13 +24,16 @@ import org.slf4j.LoggerFactory
  *   source names, so that a run whose lease was taken changes nothing
  * @param tookOver the run whose lease this one took after it expired, if there was one: it is
  *   marked `ABANDONED`, and what it left halfway is this run's to recover
+ * @param settling how a transaction that ends the run is settled when it gives no answer
+ *   (ADR-0022 §6): `commit`, `abandon`, `reset`, and `finish` of a run that succeeds
  */
 final class LeasedRun private (
     database: ControlDatabase,
     val start: RunStart,
     val epoch: Epoch,
     val tookOver: Option[RunId],
-    heartbeat: LeaseHeartbeat
+    heartbeat: LeaseHeartbeat,
+    settling: Settling
 ) extends AutoCloseable
     with FileRegistry {
 
@@ -60,6 +63,22 @@ final class LeasedRun private (
     endingStarted = true
     heartbeat.close()
   }
+
+  /**
+   * `transaction`, settled: when it gives no answer, the row of the run says whether it was
+   * committed, and it is made again only if it was not (`Settling`). The run ends as `ends` once
+   * it is committed.
+   */
+  private def settled(ends: RunStatus)(transaction: => Boolean): Boolean =
+    settling.settle(ends, standing())(transaction)
+
+  /** How the run stands in the control plane: its own row, read now. */
+  @throws[SQLException]
+  private def standing(): RunStatus =
+    database
+      .run(Runs.find(_, start.id))
+      .getOrElse(throw new IllegalStateException(s"the run ${start.id} has no row"))
+      .status
 
   /**
    * The batch that a run before this one planned and did not commit, if there is one (ADR-0005
@@ -148,6 +167,8 @@ final class LeasedRun private (
    * @param files the plan of the batch, for a file source: its files are recorded as taken,
    *   unless the batch reads again those of another. It must be the plan that was written down
    *   for the batch
+   * @param counts what the run counted, made anew for each time the transaction is made, so
+   *   that it has the retries made settling it (`Settling`)
    * @param completes whether the batch is the last chunk of a backfill, which is then complete;
    *   false for the regular sequence, which is never complete
    * @return false if the lease is another run's: this process was a zombie, and nothing was
@@ -156,13 +177,15 @@ final class LeasedRun private (
    * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
    *   committed: it is not the planned one, the state is past it, `files` is not its plan, or a
    *   file of it was taken already. Nothing was changed
+   * @throws java.lang.Exception a failure that may pass, once the run could not learn within its
+   *   budget whether the transaction was committed
    */
   @throws[SQLException]
   def commit(
       batch: BatchId,
       watermark: Option[Json],
       outputs: Seq[BatchOutput],
-      counts: RunCounts = RunCounts.Nothing,
+      counts: => RunCounts = RunCounts.Nothing,
       files: Option[FilePlan] = None,
       completes: Boolean = false
   ): Boolean = {
@@ -176,7 +199,7 @@ final class LeasedRun private (
     )
     require(!completes || start.backfill.nonEmpty, "only a backfill is complete")
     toEnd()
-    database.transaction { connection =>
+    settled(RunStatus.Succeeded)(database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
         // Each says whether it did. One that did not is a state that is not what this run
         // took it for, and the transaction ends with nothing done.
@@ -224,7 +247,7 @@ final class LeasedRun private (
         )
         true
       }
-    }
+    })
   }
 
   /**
@@ -244,7 +267,8 @@ final class LeasedRun private (
    * @param detail what of the plan could not be run, in a form of the engine's own
    * @param end how the run ends. A run that was to ingest the batch did not do what it was
    *   asked, and does not succeed; an operator's run that was asked to give it up does
-   *   (ADR-0021 §2)
+   *   (ADR-0021 §2). It is made anew for each time the transaction is made, as the counts of
+   *   `commit` are
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed. The batch is the other run's, to finish or to give up
    * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
@@ -252,20 +276,23 @@ final class LeasedRun private (
    *   renewed
    * @throws java.lang.IllegalArgumentException if the reason says nothing, or the detail could
    *   not be stored. Nothing was changed, and the lease is still renewed
+   * @throws java.lang.Exception a failure that may pass, once the run could not learn within its
+   *   budget whether the transaction was committed
    */
   @throws[SQLException]
   def abandon(
       batch: BatchId,
       reason: String,
       detail: Option[Json],
-      end: RunEnd
+      end: => RunEnd
   ): Boolean = {
     require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
     // Before the lease stops being renewed, as the watermark of a commit: what cannot be
     // stored is a mistake of whoever gave it, and no reason to let the lease go.
     Batches.abandonable(reason, detail)
+    val ends = end.status
     toEnd()
-    database.transaction { connection =>
+    settled(ends)(database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
         def must(done: Boolean, what: String): Unit =
           if (!done) throw new IllegalStateException(s"the batch $batch was not given up: $what")
@@ -281,7 +308,7 @@ final class LeasedRun private (
         )
         true
       }
-    }
+    })
   }
 
   /**
@@ -295,19 +322,22 @@ final class LeasedRun private (
    * transaction, as `finish` asks it.
    *
    * @param before the state that the reset is of, as it was read under this lease
-   * @param counts what the run counted: the retries that it made before, if any
+   * @param counts what the run counted: the retries that it made before, if any. Made anew for
+   *   each time the transaction is made, as those of `commit` are
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed
    * @throws java.lang.IllegalStateException if the lease is this run's and the state is not
    *   `before`, or a batch is planned. Nothing was changed, and the lease is no longer renewed
    * @throws java.lang.IllegalArgumentException if the watermark could not be stored. Nothing
    *   was changed, and the lease is still renewed
+   * @throws java.lang.Exception a failure that may pass, once the run could not learn within its
+   *   budget whether the transaction was committed
    */
   @throws[SQLException]
   def reset(
       before: SourceState,
       watermark: Option[Json],
-      counts: RunCounts = RunCounts.Nothing
+      counts: => RunCounts = RunCounts.Nothing
   ): Boolean = {
     require(
       before.source == start.source && before.layer == start.layer,
@@ -315,7 +345,7 @@ final class LeasedRun private (
     )
     watermark.foreach(Batches.readable("watermark", _))
     toEnd()
-    database.transaction { connection =>
+    settled(RunStatus.Succeeded)(database.transaction { connection =>
       Leases.holds(connection, start.leaseKey, start.id, epoch) && {
         def must(done: Boolean, what: String): Unit =
           if (!done)
@@ -344,7 +374,7 @@ final class LeasedRun private (
         )
         true
       }
-    }
+    })
   }
 
   /**
@@ -368,17 +398,30 @@ final class LeasedRun private (
    * What decides is the database, not what this process believes of its lease: the run is
    * ended only if it is still `RUNNING`, which it is not once another run has taken its lease.
    *
+   * A run that ends as succeeded is settled (`Settling`): what it reports depends on whether it
+   * did. One that ends as failed is told once, and reports its failure whatever the answer, so
+   * a control plane that is away costs it no wait.
+   *
+   * @param end made anew for each time the transaction is made, as the counts of `commit` are
    * @return false if another run ended this one, as `ABANDONED`: this process was a zombie,
    *   and nothing was changed
-   * @throws java.sql.SQLException if the control plane could not be told. The run stays
-   *   `RUNNING` and its lease expires: the next run of the source takes it over
+   * @throws java.sql.SQLException if the control plane could not be told that the run failed.
+   *   The run stays `RUNNING` and its lease expires: the next run of the source takes it over
    * @throws java.lang.IllegalStateException if it is to end as succeeded with a batch of its
    *   sequence planned and not committed: the only way past a batch is `commit`. Nothing was
    *   changed, and the lease is no longer renewed
+   * @throws java.lang.Exception a failure that may pass, once a run that succeeds could not
+   *   learn within its budget whether the transaction was committed
    */
   @throws[SQLException]
-  def finish(end: RunEnd): Boolean = {
+  def finish(end: => RunEnd): Boolean = {
+    val ends = end.status
     toEnd()
+    if (ends == RunStatus.Succeeded) settled(ends)(ended(end)) else ended(end)
+  }
+
+  /** The transaction of `finish`. */
+  private def ended(end: RunEnd): Boolean =
     database.transaction { connection =>
       // The lease first, as in every transaction that touches both it and the run. A run that
       // takes the lease over locks the lease and then ends this run; this one, ending itself
@@ -391,11 +434,10 @@ final class LeasedRun private (
               "not committed. A run succeeds past a batch by committing it"
           )
         }
-      val ended = Runs.end(connection, start.id, end)
+      val done = Runs.end(connection, start.id, end)
       if (held) Leases.release(connection, start.leaseKey, start.id, epoch): Unit
-      ended
+      done
     }
-  }
 
   /**
    * Stops renewing the lease, and tells the control plane nothing: what is left of a process
@@ -436,13 +478,16 @@ object LeasedRun {
    * running.
    *
    * @param config the configuration that `start` names by its hash
+   * @param settling how the run settles a transaction that ends it and gives no answer: its
+   *   retries, within their budget
    */
   @throws[SQLException]
   def open(
       database: ControlDatabase,
       start: RunStart,
       config: ConfigVersion,
-      timing: LeaseTiming
+      timing: LeaseTiming,
+      settling: Settling
   ): Either[Skipped, LeasedRun] = {
     require(
       start.configHash == config.hash,
@@ -490,7 +535,7 @@ object LeasedRun {
         askedAt,
         () => database.run(Leases.renew(_, start.leaseKey, start.id, acquired.epoch, timing.ttl))
       )
-      new LeasedRun(database, start, acquired.epoch, acquired.tookOver, heartbeat)
+      new LeasedRun(database, start, acquired.epoch, acquired.tookOver, heartbeat, settling)
     }
   }
 }

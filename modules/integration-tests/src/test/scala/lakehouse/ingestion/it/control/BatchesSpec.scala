@@ -11,6 +11,7 @@ import lakehouse.ingestion.core.config.{PathTableLocator, RelativePath, Source, 
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.it.support.TakenAtItsWord
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -38,7 +39,7 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
       layer: Layer = Layer.Bronze,
       on: ControlDatabase = database
   ): LeasedRun =
-    LeasedRun.open(on, starting(of, layer), versionOf(of), timing).value
+    LeasedRun.open(on, starting(of, layer), versionOf(of), timing, TakenAtItsWord).value
 
   /** The process of a run dies: nothing renews its lease, and the lease runs out. */
   private def dies(leased: LeasedRun): Unit = {
@@ -233,7 +234,8 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
           backfill = Some(history)
         ),
         versionOf(orders),
-        timing
+        timing,
+        TakenAtItsWord
       )
       .value
     leftOut(orders) shouldBe empty

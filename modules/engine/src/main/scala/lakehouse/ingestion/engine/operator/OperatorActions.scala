@@ -27,6 +27,7 @@ import lakehouse.ingestion.engine.control.{
 }
 import lakehouse.ingestion.engine.delta.BatchLookup.Found
 import lakehouse.ingestion.engine.delta.{BatchLookup, DeltaTableTransactions}
+import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.{EpochAnnouncement, Failures, RunRetries}
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import org.apache.spark.sql.SparkSession
@@ -157,7 +158,8 @@ final class OperatorActions(
               retried
             )
           case Found.NotWritten =>
-            val end = RunEnd.Succeeded(retried.into(RunCounts.Nothing))
+            // Made for each time the transaction is, with the retries made by then.
+            def end = RunEnd.Succeeded(retried.into(RunCounts.Nothing))
             if (leased.abandon(planned.id, request.reason, None, end)) {
               val done = s"the batch ${planned.id} was given up by the run ${start.id}, " +
                 s"asked by ${request.requestedBy}: ${request.reason}. ${table.uri} does " +
@@ -293,6 +295,8 @@ final class OperatorActions(
    * Takes the lease of the run, announces its epoch, and does `body` with it. A failure that may
    * pass has it all done again, after a wait, within the budget of the profile, until the action
    * starts the transaction that ends it (ADR-0022 §4, §5): what comes before it changes nothing.
+   * That transaction is settled when it gives no answer (§6): the action reads its own row
+   * before it makes it again, within the same budget.
    * A failure that nothing knows the class of ends the run as `internal`, with its lease given
    * up (ADR-0022 §3); a fatal error of the JVM is let through, with the lease left to run out.
    */
@@ -314,6 +318,11 @@ final class OperatorActions(
         catch {
           case gone: LeaseLostException => stopped(leased, gone.loss, retried)
           case NonFatal(_) if leased.lost.nonEmpty => stopped(leased, leased.lost.get, retried)
+          // The transaction that ends the action gave no answer, and it could not learn within
+          // its budget whether it was committed (ADR-0022 §6).
+          case failure @ Failures.Known(classed)
+              if leased.ending && RunRetries.mayPass(classed.failure) =>
+            unsettled(leased, classed, failure)
           // One that says its class, or one that the classifier knows.
           case Failures.Known(classed) =>
             fail(leased, classed.failure, classed.getMessage, retried)
@@ -346,8 +355,9 @@ final class OperatorActions(
       retried: RunRetries
   ): Either[Outcome, LeasedRun] =
     try
-      retried(may = true)(LeasedRun.open(database, start, config, timing)).left.map { skipped =>
-        Outcome.Skipped(start.id, skipped.holder, skipped.until)
+      retried(may = true)(LeasedRun.open(database, start, config, timing, retried)).left.map {
+        skipped =>
+          Outcome.Skipped(start.id, skipped.holder, skipped.until)
       }
     catch {
       case failure @ Failures.Known(classed) =>
@@ -358,6 +368,26 @@ final class OperatorActions(
         )
         Left(Outcome.Failed(start.id, classed.failure, classed.getMessage))
     }
+
+  /**
+   * An action that could not learn, within its budget, whether the transaction that ends it was
+   * committed (ADR-0022 §6): what it did, or did not, is in the control plane, which is told
+   * nothing more. Its row is `RUNNING`, with its lease running out, or ended. It may pass: asked
+   * again, it is refused for what is done, or does it.
+   */
+  private def unsettled(
+      leased: LeasedRun,
+      classed: RunFailedException,
+      failure: Throwable
+  ): Outcome = {
+    val start = leased.start
+    leased.close()
+    val message = s"the run ${start.id} could not learn whether the transaction that ends it " +
+      s"was committed: ${classed.getMessage}. What happened is in the control plane: its run " +
+      "is either ended, or running with its lease running out"
+    log.error(message, failure)
+    Outcome.Failed(start.id, classed.failure, message)
+  }
 
   /** Refused, with nothing changed: running it again as it is does not mend it. */
   private def refuse(leased: LeasedRun, message: String, retried: RunRetries): Outcome =

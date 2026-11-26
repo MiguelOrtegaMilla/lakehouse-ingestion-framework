@@ -6,14 +6,15 @@ import scala.concurrent.duration._
 
 import io.delta.exceptions.ConcurrentAppendException
 import lakehouse.ingestion.core.config.Profile
-import lakehouse.ingestion.core.control.{FailureClass, RunCounts}
+import lakehouse.ingestion.core.control.{FailureClass, RunCounts, RunStatus}
 import lakehouse.ingestion.engine.failure.RunFailedException
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 /**
- * The loop of the retries of a run, with attempts that fail as a test says, and waits drawn at
- * their ceiling, so that how long it waits is known.
+ * The loop of the retries of a run, and how it settles the transaction that ends it, with
+ * attempts and rows that fail or answer as a test says, and waits drawn at their ceiling, so
+ * that how long it waits is known.
  */
 final class RunRetriesSpec extends AnyFunSuite with Matchers {
 
@@ -124,5 +125,156 @@ final class RunRetriesSpec extends AnyFunSuite with Matchers {
     val failure = RunFailedException.transient("the database went away")
     the[Throwable] thrownBy retries(none)(may = true)(throw failure) shouldBe
       theSameInstanceAs(failure)
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The transaction that ends a run, settled (ADR-0022 §6)
+
+  /** What `settle` is given, each answering or failing as a test says, and how often it was. */
+  final private class Ending(answers: Either[Throwable, Boolean]*) {
+    private val left = scala.collection.mutable.Queue(answers: _*)
+    var made = 0
+    def apply(): Boolean = {
+      made += 1
+      left.dequeue().fold(failure => throw failure, identity)
+    }
+  }
+
+  final private class Row(answers: Either[Throwable, RunStatus]*) {
+    private val left = scala.collection.mutable.Queue(answers: _*)
+    var read = 0
+    def apply(): RunStatus = {
+      read += 1
+      left.dequeue().fold(failure => throw failure, identity)
+    }
+  }
+
+  private def lostAnswer =
+    new SQLException("An I/O error occurred while sending to the backend", "08006")
+
+  test("a transaction that answers is taken at its word, and the row is not read") {
+    Seq(true, false).foreach { answer =>
+      val run = retries()
+      val row = new Row()
+      run.settle(RunStatus.Succeeded, row())(answer) shouldBe answer
+      row.read shouldBe 0
+    }
+    // The database said no: it rolled the transaction back.
+    Seq(new SQLException("permission denied", "42501"), new IllegalStateException("not planned"))
+      .foreach { refused =>
+        val run = retries()
+        val row = new Row()
+        val end = new Ending(Left(refused))
+        the[Throwable] thrownBy run.settle(RunStatus.Succeeded, row())(end()) shouldBe
+          theSameInstanceAs(refused)
+        row.read shouldBe 0
+        end.made shouldBe 1
+      }
+  }
+
+  test("a transaction whose answer is lost and whose row says it ended was committed") {
+    Seq(RunStatus.Succeeded, RunStatus.Failed).foreach { ends =>
+      withClue(ends) {
+        val run = retries()
+        val end = new Ending(Left(lostAnswer))
+        val row = new Row(Right(ends))
+        run.settle(ends, row())(end()) shouldBe true
+        end.made shouldBe 1
+        row.read shouldBe 1
+        // Nothing was done again.
+        run.into(RunCounts.Nothing) shouldBe RunCounts.Nothing
+      }
+    }
+  }
+
+  test("one whose row says RUNNING was not committed, and is made again as a retry") {
+    val run = retries()
+    val end = new Ending(Left(lostAnswer), Right(true))
+    val row = new Row(Right(RunStatus.Running))
+    run.settle(RunStatus.Succeeded, row())(end()) shouldBe true
+    end.made shouldBe 2
+    run.into(RunCounts.Nothing) shouldBe RunCounts(retries = Some(1))
+  }
+
+  test("one whose row says another run ended this one was not committed") {
+    val run = retries()
+    val end = new Ending(Left(lostAnswer))
+    val row = new Row(Right(RunStatus.Abandoned))
+    run.settle(RunStatus.Succeeded, row())(end()) shouldBe false
+    end.made shouldBe 1
+  }
+
+  test("a row that cannot be read is read again within the budget, and that is no retry") {
+    val run = retries()
+    val end = new Ending(Left(lostAnswer))
+    val row = new Row(Left(lostAnswer), Left(lostAnswer), Right(RunStatus.Succeeded))
+    run.settle(RunStatus.Succeeded, row())(end()) shouldBe true
+    row.read shouldBe 3
+    end.made shouldBe 1
+    run.into(RunCounts.Nothing) shouldBe RunCounts.Nothing
+  }
+
+  test("a transaction made again that is refused is believed only once the row agrees") {
+    // The first was still being committed as the row was read: the one made again waited for
+    // it on the lock of the lease, and was refused once it was committed.
+    val late = new Row(Right(RunStatus.Running), Right(RunStatus.Succeeded))
+    val refused = new Ending(Left(lostAnswer), Right(false))
+    retries().settle(RunStatus.Succeeded, late())(refused()) shouldBe true
+    late.read shouldBe 2
+
+    // Refused, and still running: it was refused for its lease.
+    val stale = new Row(Right(RunStatus.Running), Right(RunStatus.Running))
+    val refusedAgain = new Ending(Left(lostAnswer), Right(false))
+    retries().settle(RunStatus.Succeeded, stale())(refusedAgain()) shouldBe false
+
+    // Failed for good, and still running: what it failed with is let through.
+    val mistake = new IllegalStateException("the state is past the batch")
+    val running = new Row(Right(RunStatus.Running), Right(RunStatus.Running))
+    val failing = new Ending(Left(lostAnswer), Left(mistake))
+    the[Throwable] thrownBy retries().settle(RunStatus.Succeeded, running())(failing()) shouldBe
+      theSameInstanceAs(mistake)
+  }
+
+  test("one made again whose answer is lost again is settled again") {
+    val run = retries()
+    val end = new Ending(Left(lostAnswer), Left(lostAnswer))
+    val row = new Row(Right(RunStatus.Running), Right(RunStatus.Succeeded))
+    run.settle(RunStatus.Succeeded, row())(end()) shouldBe true
+    end.made shouldBe 2
+    run.into(RunCounts.Nothing) shouldBe RunCounts(retries = Some(1))
+  }
+
+  test("a row that cannot be read within the budget leaves how the run ended unknown") {
+    val short =
+      Profile.Retries(budget = 300.millis, firstBackoff = 100.millis, maxBackoff = 100.millis)
+    val run = retries(short)
+    val unreadable = RunFailedException.transient("the control plane went away")
+    val spent = the[RunFailedException] thrownBy run.settle(RunStatus.Succeeded, throw unreadable)(
+      throw lostAnswer
+    )
+
+    spent.failure shouldBe FailureClass.Transient
+    spent.getCause shouldBe theSameInstanceAs(unreadable)
+    spent.getMessage should endWith(
+      "and its budget of retries (retries.budget, 300ms) is spent"
+    )
+    // Nothing was made again: only the row was asked for.
+    run.into(RunCounts.Nothing) shouldBe RunCounts.Nothing
+  }
+
+  test("the budget of settling is that of the run, counted from its first failure") {
+    val short =
+      Profile.Retries(budget = 300.millis, firstBackoff = 100.millis, maxBackoff = 100.millis)
+    val run = retries(short)
+    val attempt = new Failing(RunFailedException.transient("a"))
+    run(may = true)(attempt()) shouldBe "done"
+    Thread.sleep(400)
+
+    // Spent already: the row is asked for once, and not again.
+    val row = new Row(Left(lostAnswer))
+    the[Throwable] thrownBy run.settle(RunStatus.Succeeded, row())(throw lostAnswer) shouldBe a[
+      RunFailedException
+    ]
+    row.read shouldBe 1
   }
 }
