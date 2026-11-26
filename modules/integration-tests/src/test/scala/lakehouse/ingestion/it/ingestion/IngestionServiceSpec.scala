@@ -28,7 +28,7 @@ import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.{CapturedLogs, CoordinationSchema, Died}
+import lakehouse.ingestion.it.support.{CapturedLogs, CoordinationSchema, Died, TakenAtItsWord}
 import lakehouse.ingestion.logstore.coordination.{
   CoordinationSettings,
   PostgresCoordinationStore,
@@ -239,7 +239,8 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
   test("while another run holds the lease of the source, a run is skipped and does nothing") {
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")
-    val holder = LeasedRun.open(database, starting(orders), versionOf(orders), timing).value
+    val holder =
+      LeasedRun.open(database, starting(orders), versionOf(orders), timing, TakenAtItsWord).value
 
     val skipped = launch(orders)
 
@@ -967,7 +968,8 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
 
       // The lease runs out and is taken, in the control plane, as a run that took over takes it.
       expire(orders)
-      val taker = LeasedRun.open(database, starting(orders), versionOf(orders), timing).value
+      val taker =
+        LeasedRun.open(database, starting(orders), versionOf(orders), timing, TakenAtItsWord).value
       taker.epoch.value shouldBe 2L
       announcer.commit()
 
@@ -1244,7 +1246,9 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     // read; and the file is written again.
     val fenced = service(hookAt(FaultPoint.AfterPlan) { _ =>
       expire(orders)
-      successor = Some(LeasedRun.open(database, starting(orders), versionOf(orders), timing).value)
+      successor = Some(
+        LeasedRun.open(database, starting(orders), versionOf(orders), timing, TakenAtItsWord).value
+      )
       drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800)): Unit
     })
 

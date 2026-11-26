@@ -9,7 +9,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.engine.operator.OperatorActions
 import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
-import lakehouse.ingestion.it.support.Died
+import lakehouse.ingestion.it.support.{Died, TakenAtItsWord}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -239,7 +239,10 @@ final class ReprocessSpec extends AnyFunSuite with Matchers with JdbcIngestionSu
 
   test("while a run holds the lease, the reprocess is skipped, and plans nothing") {
     val orders = twoBatches()
-    val holder = LeasedRun.open(database, starting(orders), versionOf(orders), timing).toOption.get
+    val holder = LeasedRun
+      .open(database, starting(orders), versionOf(orders), timing, TakenAtItsWord)
+      .toOption
+      .get
 
     val skipped =
       try reprocess(orders, 1)

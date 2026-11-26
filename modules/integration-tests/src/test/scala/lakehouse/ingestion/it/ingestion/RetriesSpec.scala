@@ -1,25 +1,13 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
-
 import scala.concurrent.duration._
-import scala.concurrent.{ExecutionContext, Future}
-import scala.util.Using
 
 import io.delta.exceptions.ConcurrentAppendException
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.FaultPoint
-import lakehouse.ingestion.engine.control.ControlDatabase
-import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.{
-  BootstrappedPostgres,
-  CoordinationSchema,
-  CoordinationStores,
-  ProxiedPostgres
-}
+import lakehouse.ingestion.it.support.{CoordinationSchema, CoordinationStores}
 import lakehouse.ingestion.logstore.{FaultPoint => LogPoint, HookedLogStore}
 import org.apache.hadoop.fs.Path
 import org.scalatest.OptionValues
@@ -37,11 +25,11 @@ import org.scalatest.matchers.should.Matchers
  * test says so. A lease lives 12 s here, so that a run that cannot renew it stops by its own
  * count within a test.
  */
-final class RetriesSpec extends AnyFunSuite with Matchers with OptionValues with IngestionSuite {
-
-  private lazy val proxied = ProxiedPostgres.start()
-  override protected lazy val pg: BootstrappedPostgres = proxied.postgres
-  override protected def stopServers(): Unit = proxied.stop()
+final class RetriesSpec
+    extends AnyFunSuite
+    with Matchers
+    with OptionValues
+    with ProxiedIngestionSuite {
 
   // The LogStore waits about 3.3 s for its database: three attempts of the INSERT that takes a
   // version, a second each to connect, 100 ms and 200 ms apart.
@@ -61,63 +49,11 @@ final class RetriesSpec extends AnyFunSuite with Matchers with OptionValues with
   override protected def retries: Profile.Retries =
     Profile.Retries(budget = 30.seconds, firstBackoff = 200.millis, maxBackoff = 1.second)
 
-  private val threads = Executors.newCachedThreadPool()
-  implicit private val onThreads: ExecutionContext = ExecutionContext.fromExecutor(threads)
-
-  override def afterAll(): Unit =
-    try threads.shutdownNow(): Unit
-    finally super.afterAll()
-
-  // Each cut of the proxy, so that what is to make it whole again is for that cut alone: a
-  // thread of an earlier test that wakes up late leaves a later cut as it is.
-  private val cuts = new AtomicInteger
-
-  /** The proxy is cut now, until it is made whole. */
-  private def cut(): Unit = {
-    cuts.incrementAndGet()
-    proxied.faulty.disable()
-  }
-
-  /** The proxy is cut now, and whole again `after` that, in a thread of its own. */
-  private def cutFor(after: FiniteDuration): Unit = {
-    cut()
-    val thisCut = cuts.get
-    Future {
-      Thread.sleep(after.toMillis)
-      if (cuts.get == thisCut) proxied.faulty.enable()
-    }: Unit
-  }
-
-  /** The proxy whole again, whatever cut it. */
-  private def whole(): Unit = {
-    cuts.incrementAndGet()
-    proxied.faulty.enable()
-  }
-
   /** At the moment the next commit to Bronze of `of` is about to take its version. */
   private def beforeItsVersion(of: Source)(action: => Unit): Unit =
     HookedLogStore.runAt(LogPoint.BeforeInsert, times = 1) { file =>
       file.toUri.getPath.startsWith(new Path(bronze(of).uri).toUri.getPath + "/_delta_log/")
     }(_ => action)
-
-  /**
-   * An instance that reaches the control plane through the proxy as well, and gives up on a
-   * call to it within a second. The proxy is whole again afterwards.
-   */
-  private def throughTheProxy[T](body: ControlDatabase => T): T = {
-    val control = ControlDatabase
-      .open(
-        profile.databases.control.copy(
-          url = PostgresUrl.parse(proxied.faultyJdbcUrl(Database)).toOption.get,
-          timeouts = Timeouts(connect = 1.second, statement = 1.second)
-        ),
-        SecretResolver(environment(pg).get)
-      )
-      .toOption
-      .get
-    try Using.resource(control)(body)
-    finally whole()
-  }
 
   private def retriesOf(outcome: Outcome): Option[Int] = runOf(outcome.run).counts.retries
 
@@ -197,7 +133,7 @@ final class RetriesSpec extends AnyFunSuite with Matchers with OptionValues with
     val orders = fileSource()
     drop(orders, "a.csv", "id\n1\n")
 
-    val done = throughTheProxy { control =>
+    val done = throughTheProxy() { control =>
       cutFor(2.seconds)
       ingested(launch(orders, service(on = control)))
     }
@@ -214,7 +150,7 @@ final class RetriesSpec extends AnyFunSuite with Matchers with OptionValues with
     // The control plane and the coordination database go before Bronze is written, and stay
     // away: the run tries again until it stops by its own count of its lease, 10 s on.
     val started = System.nanoTime()
-    val outcome = throughTheProxy { control =>
+    val outcome = throughTheProxy() { control =>
       val cutOff = hookAt(FaultPoint.AfterCounts)(_ => cut())
       launch(orders, service(cutOff, on = control))
     }
@@ -231,33 +167,6 @@ final class RetriesSpec extends AnyFunSuite with Matchers with OptionValues with
     batchOf(batchId(orders, 1)).status shouldBe BatchStatus.Planned
     expire(orders)
     ingested(launch(orders)).batch shouldBe batchId(orders, 1)
-    assertLedger(orders)
-  }
-
-  test("a failure in the transaction that ends a run is not tried again: its answer is P8.5's") {
-    val orders = fileSource()
-    drop(orders, "a.csv", "id\n1\n")
-
-    // The rows are in Bronze, and the commit of the state cannot reach the control plane.
-    val started = System.nanoTime()
-    val outcome = throughTheProxy { control =>
-      val cutOff = hookAt(FaultPoint.BeforeStateCommit)(_ => cut())
-      launch(orders, service(cutOff, on = control))
-    }
-    val took = (System.nanoTime() - started).nanos
-
-    outcome match {
-      case Outcome.Failed(_, FailureClass.Transient, message) =>
-        message should startWith("the run could not go on with its control plane: ")
-      case other => fail(s"the run did not fail as transient: $other")
-    }
-    // Once: the transaction may have been committed with its answer lost.
-    took should be < 10.seconds
-    runOf(outcome.run).status shouldBe RunStatus.Running
-    batchOf(batchId(orders, 1)).status shouldBe BatchStatus.Planned
-
-    expire(orders)
-    launch(orders) shouldBe a[Outcome.RolledForward]
     assertLedger(orders)
   }
 

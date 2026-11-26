@@ -16,6 +16,7 @@ import lakehouse.ingestion.engine.control.{LeasedRun, StateChanges, StoredJson}
 import lakehouse.ingestion.engine.operator.OperatorActions
 import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.it.support.TakenAtItsWord
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -368,7 +369,10 @@ final class ResetStateSpec extends AnyFunSuite with Matchers with JdbcIngestionS
     drop(orders, "a.csv", "id\n1\n")
     ingested(launch(orders))
     val state = stateOf(orders)
-    val holder = LeasedRun.open(database, starting(orders), versionOf(orders), timing).toOption.get
+    val holder = LeasedRun
+      .open(database, starting(orders), versionOf(orders), timing, TakenAtItsWord)
+      .toOption
+      .get
 
     val skipped =
       try reset(orders, WatermarkReset.Keep)
@@ -395,7 +399,8 @@ final class ResetStateSpec extends AnyFunSuite with Matchers with JdbcIngestionS
         database,
         starting(orders).copy(kind = RunKind.Reset, request = Some(asked)),
         versionOf(orders),
-        timing
+        timing,
+        TakenAtItsWord
       )
       .toOption
       .get

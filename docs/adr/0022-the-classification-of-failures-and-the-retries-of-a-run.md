@@ -123,3 +123,10 @@ The read is retried within the budget too. A budget that runs out ends the run i
 - **The transaction that ends a run is told by the run's handle on its lease** (`LeasedRun.ending`): `commit`, `abandon`, `reset` and `finish` set it before anything else, as they stop renewing the lease. Nothing is tried again from then on (§4, §6).
 - **What was tried again is recorded only when there was something**: `retries` and `write_conflicts` are none for a run that tried nothing again, as they were for every run before.
 - **The LogStore's wait is the longest outage that it may ride out, not one that it always does**: its pool of connections makes a new one on its own schedule, which grows while the database is away (§5).
+
+## As built (P8.5, 2026-11-26)
+
+- **The settling is part of the retries of the run, which the run that holds the lease is given as it is opened** (`Settling`, `RunRetries.settle`, `LeasedRun.open`). `commit`, `abandon`, `reset` and the `finish` of a run that succeeds are settled where they are made, so that no caller forgets one. The `finish` of a run that fails is told once, as before: what it reports does not depend on the answer.
+- **A transaction made again is a retry of the run, and a read of its row is not.** Both wait, and draw on the budget. The counts of a transaction that ends a run are made for each attempt, so that the row has the retry, and what the run reports is what its row has.
+- **A refusal of a transaction made again is believed only once the row agrees** (§6, point 2). The one before it may still be finishing in the database when the row is read as `RUNNING`, and the one made again waits for it on the lock of the lease, and is refused once it is committed.
+- **A budget spent while the run settles ends it in 3, and nothing more is said to the control plane**: its row is what the transaction left, and the next run of the source finds it.

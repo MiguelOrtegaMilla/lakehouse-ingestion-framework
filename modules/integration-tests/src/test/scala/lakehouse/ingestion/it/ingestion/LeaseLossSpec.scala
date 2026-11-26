@@ -24,7 +24,8 @@ import lakehouse.ingestion.it.support.{
   CapturedLogs,
   HeardJobs,
   Pace,
-  ProxiedPostgres
+  ProxiedPostgres,
+  TakenAtItsWord
 }
 import org.apache.logging.log4j.Level
 import org.apache.spark.{SparkException, SparkThrowable}
@@ -290,7 +291,8 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
 
     val hooks: FaultHooks = hookAt(point) { _ =>
       expire(of)
-      taker = Some(LeasedRun.open(database, starting(of), versionOf(of), timing).value)
+      taker =
+        Some(LeasedRun.open(database, starting(of), versionOf(of), timing, TakenAtItsWord).value)
       stoppedWith = workUntilStopped()
       andThen()
     }

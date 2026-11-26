@@ -10,7 +10,7 @@ import lakehouse.ingestion.core.config.Source
 import lakehouse.ingestion.core.control.{LeaseTiming, OperatorRequest}
 import lakehouse.ingestion.engine.control.LeasedRun
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.DeploymentFiles
+import lakehouse.ingestion.it.support.{DeploymentFiles, TakenAtItsWord}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -122,7 +122,15 @@ final class ReprocessCommandSpec
   test("while a run holds the lease of the source, the command ends in 2 and plans nothing") {
     val returns = ingested()
     val holder =
-      LeasedRun.open(database, starting(returns), versionOf(returns), LeaseTiming(2.minutes)).value
+      LeasedRun
+        .open(
+          database,
+          starting(returns),
+          versionOf(returns),
+          LeaseTiming(2.minutes),
+          TakenAtItsWord
+        )
+        .value
 
     val ran =
       try reprocess(returns, "1")

@@ -15,7 +15,7 @@ import lakehouse.ingestion.engine.control.{
   Leases,
   Runs
 }
-import lakehouse.ingestion.it.support.{BootstrappedPostgres, ProxiedPostgres}
+import lakehouse.ingestion.it.support.{BootstrappedPostgres, ProxiedPostgres, TakenAtItsWord}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
@@ -72,7 +72,7 @@ final class LeaseFencingSpec
   private def newSource(): Source = source(newSourceId().value)
 
   private def open(of: Source, on: ControlDatabase): LeasedRun =
-    LeasedRun.open(on, starting(of), versionOf(of), timing).value
+    LeasedRun.open(on, starting(of), versionOf(of), timing, TakenAtItsWord).value
 
   private def lease(of: Source): Leases.Lease =
     database.run(Leases.find(_, LeaseKey.of(of.id, Layer.Bronze))).value

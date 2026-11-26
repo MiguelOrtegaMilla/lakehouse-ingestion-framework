@@ -12,7 +12,7 @@ import lakehouse.ingestion.core.config.Source
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control.{Batches, LeasedRun}
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.DeploymentFiles
+import lakehouse.ingestion.it.support.{DeploymentFiles, TakenAtItsWord}
 import org.apache.spark.sql.SparkSession
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -133,7 +133,9 @@ final class AbandonBatchCommandSpec
   test("while a run holds the lease of the source, the command ends in 2 and changes nothing") {
     val orders = stuck()
     val holder =
-      LeasedRun.open(database, starting(orders), versionOf(orders), LeaseTiming(2.minutes)).value
+      LeasedRun
+        .open(database, starting(orders), versionOf(orders), LeaseTiming(2.minutes), TakenAtItsWord)
+        .value
 
     val ran =
       try abandon(orders, "1")
@@ -173,7 +175,8 @@ final class AbandonBatchCommandSpec
           backfill = Some(history)
         ),
         versionOf(orders),
-        LeaseTiming(2.minutes)
+        LeaseTiming(2.minutes),
+        TakenAtItsWord
       )
       .value
 
@@ -208,7 +211,8 @@ final class AbandonBatchCommandSpec
           backfill = Some(history)
         ),
         versionOf(orders),
-        LeaseTiming(2.minutes)
+        LeaseTiming(2.minutes),
+        TakenAtItsWord
       )
       .value
     dead.backfill(

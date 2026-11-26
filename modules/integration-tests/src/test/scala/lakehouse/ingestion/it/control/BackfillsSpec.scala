@@ -9,6 +9,7 @@ import lakehouse.ingestion.core.config.Source
 import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.control._
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
+import lakehouse.ingestion.it.support.TakenAtItsWord
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -37,10 +38,10 @@ final class BackfillsSpec extends AnyFunSuite with Matchers with ControlPlaneSui
     starting(of).copy(kind = RunKind.Backfill, request = Some(Asked), backfill = Some(id))
 
   private def openBackfill(of: Source, id: BackfillId = History): LeasedRun =
-    LeasedRun.open(database, startingBackfill(of, id), versionOf(of), timing).value
+    LeasedRun.open(database, startingBackfill(of, id), versionOf(of), timing, TakenAtItsWord).value
 
   private def openRegular(of: Source): LeasedRun =
-    LeasedRun.open(database, starting(of), versionOf(of), timing).value
+    LeasedRun.open(database, starting(of), versionOf(of), timing, TakenAtItsWord).value
 
   private def found(of: Source, id: BackfillId = History): Option[BackfillRecord] =
     database.run(Backfills.find(_, of.id, Layer.Bronze, id))
@@ -289,7 +290,7 @@ final class BackfillsSpec extends AnyFunSuite with Matchers with ControlPlaneSui
     val changed = source(orders.id.value, _.replace("lookback: 0s", "lookback: 1s"))
     versionOf(changed).hash should not be createdWith.hash
     LeasedRun
-      .open(database, startingBackfill(changed), versionOf(changed), timing)
+      .open(database, startingBackfill(changed), versionOf(changed), timing, TakenAtItsWord)
       .value
       .finish(RunEnd.Succeeded()) shouldBe true
     val regular = openRegular(orders)
