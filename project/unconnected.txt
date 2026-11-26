@@ -10,8 +10,6 @@ lakehouse.ingestion.cli.Main  The command line: the JVM starts it.
 
 # Built and tested, and connected by a later phase (discovery §20 has each as an open item).
 lakehouse.ingestion.engine.quarantine.QuarantineReader  No command reads a quarantine yet: the technical validations (P8) and observability (P11) do.
-lakehouse.ingestion.logstore.TableMaintenance  What an operator does to a table (adopt, readopt, reset, the temporary files it left) has no command yet (P8).
-lakehouse.ingestion.logstore.coordination.PostgresRegistryMaintenance  The registry that TableMaintenance works on, in PostgreSQL: whatever runs the one makes the other.
 
 # The model of the contract, where production goes by something else.
 lakehouse.ingestion.core.control.RunStatus#mayBecome  The statuses that a run may come to. Production goes by the type of its end (RunEnd), the condition of each statement and the trigger of the schema; the tests of core hold RunEnd to this.

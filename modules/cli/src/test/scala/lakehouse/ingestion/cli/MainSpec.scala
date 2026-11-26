@@ -375,6 +375,67 @@ final class MainSpec
     noFile.out shouldBe empty
   }
 
+  // What `maintain-table` does is tested against a database and a lake (MaintainTableCommandSpec,
+  // in the integration tests). Here is what it refuses before it opens a connection.
+
+  private def maintain(operation: String*)(more: String*): Ran =
+    run(
+      Seq("maintain-table") ++ operation ++ Seq(
+        "--profile",
+        exampleProfile,
+        "--password",
+        "env:MAINTENANCE_PASSWORD"
+      ) ++ more: _*
+    )
+
+  test("maintain-table: a command line that is not one ends in 64, before anything is read") {
+    val table = Seq("--table", "file:/data/lake/bronze/sales_orders")
+    val reason = Seq("--reason", "its log was looked at")
+    val wrong = Seq(
+      run("maintain-table") ->
+        "error: maintain-table needs its operation first: adopt, readopt, reset, collect-temps",
+      maintain()(table ++ reason: _*) ->
+        "error: maintain-table needs its operation first: adopt, readopt, reset, collect-temps",
+      maintain("drop")(table ++ reason: _*) ->
+        "error: 'drop' is not an operation on a table: adopt, readopt, reset, collect-temps",
+      maintain("readopt")(table: _*) -> "error: --reason must be given",
+      maintain("readopt")(reason: _*) -> "error: --table must be given",
+      maintain("readopt")(table ++ reason ++ Seq("--source", "sales.orders"): _*) ->
+        "error: '--source' is not an option of this command",
+      maintain("readopt")(Seq("--table", "bronze/sales_orders") ++ reason: _*) ->
+        ("error: --table 'bronze/sales_orders' is not the location of a table: an absolute " +
+          "URI with a path, as the error of a run names it"),
+      maintain("readopt")(table ++ Seq("--reason", "  "): _*) ->
+        "error: --reason says nothing: an operator's action says why it was asked for"
+    )
+
+    wrong.foreach { case (ran, problem) =>
+      withClue(problem) {
+        ran.exit shouldBe Main.Exit.Usage
+        ran.errors.head shouldBe problem
+        ran.out shouldBe empty
+      }
+    }
+  }
+
+  test("maintain-table: a password that is not where the command was told ends in 4") {
+    val unset =
+      maintain("reset")("--table", "file:/data/lake/bronze/sales_orders", "--reason", "dropped")
+
+    unset.exit shouldBe Main.Exit.Permanent
+    unset.errors.last shouldBe
+      "error: --password cannot read the secret env:MAINTENANCE_PASSWORD: the variable is not set"
+    unset.out shouldBe empty
+  }
+
+  test("maintain-table: a failure ends in the code of its class, as a run does") {
+    MaintainTableCommand.exitOf(FailureClass.Transient) shouldBe Main.Exit.Transient
+    MaintainTableCommand.exitOf(FailureClass.Conflict) shouldBe Main.Exit.Transient
+    MaintainTableCommand.exitOf(FailureClass.Permanent) shouldBe Main.Exit.Permanent
+    MaintainTableCommand.exitOf(FailureClass.Internal) shouldBe Main.Exit.Internal
+    usage should include("maintain-table (adopt | readopt | reset | collect-temps)")
+  }
+
   // What `run` does is tested against a database and a lake (RunCommandSpec, in the integration
   // tests). Here is what it refuses, or ends, before it opens a connection or a session.
 
@@ -594,8 +655,8 @@ final class MainSpec
 
     usage should include("lakehouse-ingestion abandon-batch --profile <file>")
     usage should include("--batch <n> --reason <text>")
-    usage should include("the batch was given up or reprocessed, or the state was reset;")
-    usage should include("or a table could not be read")
+    usage should include("the batch was given up or reprocessed, the state was reset,")
+    usage should include("a table could not be read")
     usage should include("none is planned, another is, or its table has it")
 
     // The chunk of a backfill, by the id of the backfill: one out of its grammar is no id.
@@ -684,7 +745,7 @@ final class MainSpec
 
     usage should include("lakehouse-ingestion reset-state --profile <file>")
     usage should include("(--watermark <moment> | --forget-watermark")
-    usage should include("or the state was reset;")
+    usage should include("the state was reset, or the table was maintained;")
     usage should include("reset: a batch is planned, the source has no state, or no such")
   }
 

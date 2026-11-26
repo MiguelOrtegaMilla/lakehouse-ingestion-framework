@@ -26,7 +26,7 @@ import lakehouse.ingestion.logstore.{
   UncoordinatedWriteException,
   UnpublishableCommitException
 }
-import lakehouse.ingestion.logstore.coordination.CoordinationSchemaException
+import lakehouse.ingestion.logstore.coordination.{CoordinationSchemaException, TableUri}
 
 /**
  * What a failure that reached the end of a run is, if anything knows (ADR-0022 §2): the one
@@ -107,14 +107,14 @@ object Failures {
         )
       )
     cause match {
-      case _: TableTaintedException | _: TableNotRegisteredException |
-          _: StaleRegistrationException | _: CommitMissingException |
-          _: UnpublishableCommitException =>
+      case tainted: TableTaintedException => refused(readoptIt(tainted.table))
+      case _: TableNotRegisteredException | _: StaleRegistrationException |
+          _: CommitMissingException | _: UnpublishableCommitException =>
         refused()
-      case _: UncoordinatedWriteException =>
+      case foreign: UncoordinatedWriteException =>
         refused(
           ". The table is tainted by it, and refuses every commit until an operator has looked " +
-            "at its log and adopted it again (ADR-0004 §3.5)"
+            s"at its log and adopted it again (ADR-0004 §3.5)${readoptIt(foreign.table)}"
         )
       case _: CoordinationSchemaException =>
         refused(". The schema is brought to its version by the command migrate")
@@ -189,6 +189,12 @@ object Failures {
 
   /** As deep as `DatabaseFailure` reads a failure of a database. */
   private val MaxCauses = 16
+
+  /** How an operator adopts a tainted table again, once its log is right: the command whole. */
+  private def readoptIt(table: TableUri): String =
+    s". Once its log has been looked at and is right, it is adopted again with: " +
+      s"lakehouse-ingestion maintain-table readopt --table ${table.value} --profile <file> " +
+      "--password <reference> --reason <text>"
 
   private def firstLine(message: String): String =
     Option(message).flatMap(_.linesIterator.map(_.trim).find(_.nonEmpty)).getOrElse("no message")

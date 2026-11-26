@@ -502,7 +502,8 @@ final class TableMaintenanceSpec extends AnyFunSuite with Matchers with LakeFixt
     })
     val before = registrationOf(lake)
 
-    val refused = the[MaintenanceRefusedException] thrownBy
+    // A refusal of its own: stopping the writers and asking again mends it (3, P8.6b).
+    val refused = the[TableBeingWrittenException] thrownBy
       new TableMaintenance(busy).readopt(hadoop(lake.directory), fs, None, asked)
 
     refused.getMessage should include("is being written")

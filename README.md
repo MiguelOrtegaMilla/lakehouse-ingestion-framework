@@ -191,7 +191,7 @@ Java 17 · Scala 2.13.17 · Apache Spark 4.1.4 · Delta Lake 4.4.1 · sbt 1.13.1
 | `core` | The configuration and its validation, the planning of a batch, the model of the control plane and the decision of recovery. No Spark, no JDBC |
 | [`delta-pg-logstore`](modules/delta-pg-logstore/README.md) | The PostgreSQL-coordinated Delta `LogStore`. It depends on no other module, and can be taken out as a library |
 | `engine` | The connectors (files, JDBC), the writers of Bronze and of the quarantine, the repositories of the control plane, and one run of one source |
-| `cli` | The commands: `validate`, `migrate`, `run`, `backfill`, `abandon-batch`, `reset-state`, `reprocess`, and their exit codes |
+| `cli` | The commands: `validate`, `migrate`, `run`, `backfill`, `abandon-batch`, `reset-state`, `reprocess`, `maintain-table`, and their exit codes |
 | `integration-tests` | The tests against real services, the fault injection, the stress harness and its verifier |
 
 What a module may depend on is enforced by the build ([ADR-0012](docs/adr/0012-module-structure.md)): `sbt checkBoundaries` reads the classpath as it is resolved, and fails as well on two packages of `core` or of `engine` that depend on each other. `sbt checkUnconnected` fails on code of production that no code of production reaches; what is left so on purpose is in [`project/unconnected.txt`](project/unconnected.txt), each with its reason.
