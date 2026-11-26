@@ -29,7 +29,11 @@ import org.slf4j.LoggerFactory
  *    is stuck, whose configuration changed, or whose files are to be read again; and `backfill`
  *    reads a range of the history of a source on a sequence of its own. Each is a run under a
  *    lease, which says who asked for it and why (ADR-0021; `AbandonBatchCommand`,
- *    `ResetStateCommand`, `ReprocessCommand`, `BackfillCommand`).
+ *    `ResetStateCommand`, `ReprocessCommand`, `BackfillCommand`);
+ *  - `maintain-table` is what an operator does to a table that the LogStore refuses, or whose
+ *    temporary files are to be cleaned. It acts on a table, takes no lease and is no run, and
+ *    connects as the role of maintenance, whose password, as the migrator's, is in no profile
+ *    (`MaintainTableCommand`).
  */
 object Main {
 
@@ -100,6 +104,9 @@ object Main {
   /** The role that owns the schemas, unless the command is told another (ADR-0013 §3). */
   val Migrator = "ingest_migrator"
 
+  /** The role that changes the registry of the LogStore, unless the command is told another. */
+  val Maintainer = "ingest_maintenance"
+
   val Usage: String =
     s"""usage: lakehouse-ingestion validate --profile <file> --sources <directory>
        |       lakehouse-ingestion migrate --profile <file> --password <reference> [--user <role>]
@@ -118,6 +125,9 @@ object Main {
        |                               --source <id> --backfill <id> --from <moment>
        |                               --to <moment> [--chunk <duration>] --reason <text>
        |                               [--max-batches <n>]
+       |       lakehouse-ingestion maintain-table (adopt | readopt | reset | collect-temps)
+       |                               --profile <file> --password <reference>
+       |                               --table <uri> --reason <text> [--user <role>]
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
@@ -151,19 +161,31 @@ object Main {
        |              arguments, resumes it, until it is complete. What the regular runs read
        |              of the range too is in Bronze twice, and is warned of. Its runs say who
        |              asked and why, and are chained and stopped as those of run are.
+       |  maintain-table  What an operator does to a table of the lake that the LogStore
+       |              refuses, or whose temporary files are to be cleaned, as the role of
+       |              maintenance: adopt one made without the LogStore; readopt a tainted one,
+       |              once its log has been looked at and is right; reset the registry of one
+       |              that was dropped; collect-temps removes the temporary files that nothing
+       |              needs. Each looks at the log of the table first and refuses what it does
+       |              not bear out, and is recorded with who asked for it and why. It takes no
+       |              lease: stop the writers of the table first.
        |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
        |  --source    the id of the source to run, as sales.returns
        |  --password  where the password of that role is, and never the password itself:
        |              env:NAME or file:/run/secrets/name
-       |  --user      the role that owns the schemas; $Migrator unless said
+       |  --user      migrate: the role that owns the schemas, $Migrator unless said;
+       |              maintain-table: the role of maintenance, $Maintainer unless said
+       |  --table     maintain-table: the table, as the error of a run names it, in the lake:
+       |              file:/data/lake/bronze/sales_orders
        |  --max-batches  the most batches that run commits, or chunks that backfill does;
        |              no limit unless said
        |  --batch     abandon-batch: the number of the batch to give up, the one that is
        |              planned, or of the chunk with --backfill; reprocess: that of the
        |              committed batch whose files are read
-       |  --reason    why, in one line: kept with the run and with the batch
+       |  --reason    why, in one line: kept with the run and with the batch, or in the
+       |              maintenance log
        |  --watermark  the moment that the source is taken to be ingested up to, as
        |              load.watermark.start is written: 2026-03-01T00:00:00Z
        |  --forget-watermark  the next run plans as a source with no watermark does
@@ -182,11 +204,13 @@ object Main {
        |exit codes: 0 the configuration is valid, the schemas are at their version, the run
        |              ended well (a batch committed, nothing new, or a source that is
        |              disabled), the backfill ended well (chunks committed, or it is
-       |              complete), the batch was given up or reprocessed, or the state was reset;
+       |              complete), the batch was given up or reprocessed, the state was reset, or
+       |              the table was maintained;
        |            2 another run holds the lease of the source, or of the backfill: nothing
        |              was done;
        |            3 a database could not be reached, the run lost its lease, its batch was
-       |              given up, or a table could not be read, and running again later may do;
+       |              given up, a table could not be read, or a table is being written while it
+       |              is maintained, and running again later may do;
        |            4 the configuration is not valid, a database refused, the run failed for a
        |              reason that running again does not mend, the batch was not given up:
        |              none is planned, another is, or its table has it, or the backfill named
@@ -195,7 +219,9 @@ object Main {
        |              was not committed, read no files, or another is planned, or the backfill
        |              was refused: its source reads no range, it has no chunk, to has not
        |              settled, its id has another range or chunk, or its configuration changed
-       |              in a way that it cannot follow;
+       |              in a way that it cannot follow, or the table was not maintained: its log
+       |              or its registry is not in the state that the operation is for, or it is
+       |              not in the lake;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
        |            70 a failure that nothing classified, a mistake of the application: the log
@@ -450,6 +476,56 @@ object Main {
           )
         case Left(problem) => usage(problem, err)
       }
+    case "maintain-table" :: named :: options if !named.startsWith("--") =>
+      val asked = for {
+        operation <- MaintainTableCommand.Operation
+          .of(named)
+          .toRight(
+            s"'${shown(named)}' is not an operation on a table: " +
+              MaintainTableCommand.Operation.All.map(_.name).mkString(", ")
+          )
+        found <- parse(
+          options,
+          Set("--profile", "--password", "--table", "--reason"),
+          optional = Set("--user")
+        )
+        // What is wrong is said, and what was typed is not: it may be the password itself.
+        password <- SecretRef.parse(found("--password")).left.map(reason => s"--password $reason")
+        user <- SqlIdentifier
+          .parse(found.getOrElse("--user", Maintainer))
+          .left
+          .map(reason => s"--user $reason")
+        table <- TableLocation
+          .stored(found("--table"))
+          .left
+          .map(_ =>
+            s"--table '${shown(found("--table"))}' is not the location of a table: an " +
+              "absolute URI with a path, as the error of a run names it"
+          )
+        request <- OperatorRequest.of(operator, found("--reason"))
+      } yield (operation, found("--profile"), table, user, password, request)
+      asked match {
+        case Right((operation, profile, table, user, password, request)) =>
+          MaintainTableCommand.run(
+            operation,
+            Paths.get(profile),
+            table,
+            user,
+            password,
+            request,
+            SecretResolver(environment),
+            environment,
+            out,
+            err
+          )
+        case Left(problem) => usage(problem, err)
+      }
+    case "maintain-table" :: _ =>
+      usage(
+        "maintain-table needs its operation first: " +
+          MaintainTableCommand.Operation.All.map(_.name).mkString(", "),
+        err
+      )
     case ("--help" | "-h" | "help") :: Nil =>
       out.println(Usage)
       Exit.Ok

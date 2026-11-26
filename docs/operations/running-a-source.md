@@ -157,6 +157,38 @@ The invocation of the backfill march-again of sales.orders made 2 runs and commi
 
 Its codes are those of `run`, with 2 for the lease of the backfill, which no regular run ever holds: 0 chunks were committed, or the backfill is complete; 3 a database did not answer or the lease was lost; 4 refused, with nothing created or planned (a source that is not loaded by a watermark, no chunk, a `to` that has not settled, another range or chunk under the id, a configuration that the backfill cannot follow); 64 the command line is not one, an id out of its grammar or a `from` that is not before `to` among them.
 
+### When the LogStore refuses a table: `maintain-table`
+
+The LogStore refuses to commit to a table whose log it cannot vouch for: one that a writer without it committed to (tainted), one that was made without it, or one that was dropped and whose registry still knows it. A run that meets one fails for good (4), and names the command that mends it, with the table:
+
+```text
+error: the LogStore refused a table of the run, and running again does not mend it: file:/…/bronze/sales/returns is tainted and refuses writes until an operator verifies and re-adopts it: … Once its log has been looked at and is right, it is adopted again with: lakehouse-ingestion maintain-table readopt --table file:/…/bronze/sales/returns --profile <file> --password <reference> --reason <text>
+```
+
+Stop the writers of the table, look at its log, and once it is right:
+
+```bash
+export INGEST_MAINTENANCE_PASSWORD="$(cat docker/secrets/ingest_maintenance_password)"
+sbt "cli/run maintain-table readopt --profile conf/app/local.yaml --password env:INGEST_MAINTENANCE_PASSWORD --table file:/…/bronze/sales/returns --reason 'the foreign commit was the backfill of the team, and is right'"
+```
+
+| Operation | For |
+|---|---|
+| `adopt` | A table made without the LogStore: it is registered at the version its log is at, with the id of its first commit |
+| `readopt` | A tainted table, or one whose registry and log disagree, once its log has been looked at and is right |
+| `reset` | A table that was dropped: its registry is removed, so that one can be created at its path again |
+| `collect-temps` | Any table: removes the temporary files that nothing needs, and keeps, with a warning for each, those that something may |
+
+It runs as `ingest_maintenance`, whose password, as the migrator's, is in no profile, takes no lease and is no run. Each operation looks at the log of the table first and refuses what the log does not bear out, and is recorded in `delta_coordination.maintenance_log` with who asked (the user of the process), why, when, and what it found and changed; an operation that is refused leaves no row. The table must be in the lake of the profile.
+
+| Code | Meaning |
+|---|---|
+| 0 | The operation was made, and recorded |
+| 3 | The coordination database did not answer, or the table is being written while it is maintained: stop its writers, and ask again |
+| 4 | Refused, with nothing changed: the log or the registry of the table is not in the state the operation is for, the table is not in the lake, or the database refused the role |
+| 64 | The command line is not one: the operation first, and `--table` and `--reason` are required |
+| 70 | A mistake of the application, which nothing classified: the log has it whole. Alert |
+
 ### A table of a database: `sales.orders`
 
 The example source [`sales.orders`](../../conf/sources/sales.orders.yaml) reads `public.orders` of the database `sales` by `updated_at`, four weeks of changes a batch. The table is the source system's, and the engine makes none: a demo makes it and changes it as the source's applications would, as `sales_owner`. It is test code (`it.demo.SalesOrders`, with the generator of the tests), and is in no artifact of the application.

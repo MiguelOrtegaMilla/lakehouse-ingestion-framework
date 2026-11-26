@@ -23,7 +23,14 @@ import org.apache.hadoop.fs.{FileStatus, FileSystem, Path}
  * An operator's request does not fit the table: its log or its registration is not in the state
  * the operation is for. Nothing was changed.
  */
-final class MaintenanceRefusedException(message: String) extends IOException(message)
+class MaintenanceRefusedException(message: String) extends IOException(message)
+
+/**
+ * The table is being written while an operator changes its registry: its entries changed each
+ * time they were examined. Nothing was changed, and asked again once its writers are stopped, the
+ * operation may be made.
+ */
+final class TableBeingWrittenException(message: String) extends MaintenanceRefusedException(message)
 
 /** A table that was adopted: its key, and the version of its log it is registered at. */
 final case class Adoption(table: TableUri, version: Long)
@@ -120,6 +127,22 @@ final class TableMaintenance(
   import TableMaintenance._
 
   /**
+   * The id of the table (`metaData.id`) as its first commit says it, read as the LogStore reads
+   * it when a table is created through it: what `adopt` records, for a caller that has no Delta
+   * to ask. None when the first commit is no longer in the log, as once Delta's log cleanup has
+   * removed it, or says no id in the form that Delta writes it in; the registry allows none.
+   */
+  @throws[IOException]
+  def firstCommitId(tablePath: Path, fs: FileSystem): Option[String] = {
+    val first = new Target(tablePath, fs).commitFile(0L)
+    try
+      Using.resource(fs.open(first)) { in =>
+        DeltaTableId.in(new String(in.readAllBytes(), UTF_8).linesIterator.toSeq)
+      }
+    catch { case _: FileNotFoundException => None }
+  }
+
+  /**
    * Registers a table that exists and is not coordinated, at the version its log is at, so that
    * it can be written through the LogStore from the next version on.
    *
@@ -188,7 +211,8 @@ final class TableMaintenance(
         case RegistryChange.NotRegistered =>
           refuse(s"$table stopped being registered while it was being adopted again")
         case RegistryChange.EntriesChanged(_) if attemptsLeft > 1 => examine(attemptsLeft - 1)
-        case RegistryChange.EntriesChanged(_) => refuse(beingWritten(table, "adopted again"))
+        case RegistryChange.EntriesChanged(_) =>
+          throw new TableBeingWrittenException(beingWritten(table, "adopted again"))
       }
     }
     examine(Examinations)
@@ -225,7 +249,8 @@ final class TableMaintenance(
         case RegistryChange.NotRegistered =>
           refuse(s"$table is not registered: there is nothing to reset")
         case RegistryChange.EntriesChanged(_) if attemptsLeft > 1 => examine(attemptsLeft - 1)
-        case RegistryChange.EntriesChanged(_) => refuse(beingWritten(table, "reset"))
+        case RegistryChange.EntriesChanged(_) =>
+          throw new TableBeingWrittenException(beingWritten(table, "reset"))
       }
     }
     examine(Examinations)

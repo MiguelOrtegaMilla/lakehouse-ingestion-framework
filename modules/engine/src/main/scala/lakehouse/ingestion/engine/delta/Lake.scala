@@ -46,12 +46,21 @@ final class Lake(root: RootUri, conf: Configuration) {
             e
           )
       }
-    if (!real.startsWith(if (lake.endsWith("/")) lake else s"$lake/"))
+    if (!real.startsWith(under(lake))) {
+      // A location that a source names is under the lake by its text, and is out of it only
+      // through a link; one that an operator gives may be anywhere (`maintain-table`).
+      val named =
+        new Path(table.uri).toUri.getPath.startsWith(under(new Path(root.value).toUri.getPath))
       throw RunFailedException.permanent(
-        s"the table at ${table.uri} is not in the lake: it is at $real, through a symbolic " +
-          s"link, and the lake is $lake. Nothing was written"
+        s"the table at ${table.uri} is not in the lake: it is at $real" +
+          (if (named) ", through a symbolic link" else "") +
+          s", and the lake is $lake. Nothing was written"
       )
+    }
   }
+
+  private def under(directory: String): String =
+    if (directory.endsWith("/")) directory else s"$directory/"
 
   /** A location with its symbolic links resolved, as the LogStore keys a table by it. */
   private def resolved(uri: String): String = {
