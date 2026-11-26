@@ -405,8 +405,9 @@ final class LeasedRun private (
    * @param end made anew for each time the transaction is made, as the counts of `commit` are
    * @return false if another run ended this one, as `ABANDONED`: this process was a zombie,
    *   and nothing was changed
-   * @throws java.sql.SQLException if the control plane could not be told that the run failed.
-   *   The run stays `RUNNING` and its lease expires: the next run of the source takes it over
+   * @throws java.sql.SQLException if the control plane gave no answer to a run that fails: it
+   *   may not have been told, or may have been with its answer lost. If it was not, the run
+   *   stays `RUNNING` and its lease expires: the next run of the source takes it over
    * @throws java.lang.IllegalStateException if it is to end as succeeded with a batch of its
    *   sequence planned and not committed: the only way past a batch is `commit`. Nothing was
    *   changed, and the lease is no longer renewed

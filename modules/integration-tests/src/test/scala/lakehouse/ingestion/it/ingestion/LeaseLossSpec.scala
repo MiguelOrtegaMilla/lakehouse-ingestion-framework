@@ -224,8 +224,15 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
       said.map(_.level) shouldBe Seq(Level.ERROR)
       said.head.message should include(s"the run ${outcome.run} failed after it lost the lease")
 
-      // Nothing was written. The control plane could not be told: the run is as a process
-      // that died leaves it, with its batch planned and a lease that is still to expire.
+      // What the run says of its end is what it knows: it asked, and had no answer.
+      logged.map(_.message) should contain(
+        s"the control plane gave no answer, and may not have been told that the run " +
+          s"${outcome.run} stopped. If it was not, the lease of the run expires, and the run " +
+          "that takes it over ends this one"
+      )
+
+      // Nothing was written. The control plane was not told: the run is as a process that
+      // died leaves it, with its batch planned and a lease that is still to expire.
       isThere(bronze(numbers)) shouldBe false
       batchOf(first).status shouldBe BatchStatus.Planned
       runOf(outcome.run).status shouldBe RunStatus.Running

@@ -414,9 +414,10 @@ final class OperatorActions(
         Outcome.Failed(start.id, failure, message)
       case Left(untold) =>
         log.warn(
-          s"the control plane could not be told that the run ${start.id} failed ($failure). " +
-            "It is reported as it failed all the same. Its lease expires, and the run that " +
-            "takes it over ends this one",
+          s"the control plane gave no answer, and may not have been told that the run " +
+            s"${start.id} failed ($failure). It is reported as it failed all the same. If it " +
+            "was not told, the lease of the run expires, and the run that takes it over ends " +
+            "this one",
           untold
         )
         Outcome.Failed(start.id, failure, message)
