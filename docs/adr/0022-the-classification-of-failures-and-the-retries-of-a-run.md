@@ -40,12 +40,15 @@ What knows the class of a failure where it raises it keeps raising it with its c
 
 1. the loss of the lease, and a commit that the LogStore refused for its epoch, whatever they are wrapped in, as up to P7;
 2. a failure that has its class;
-3. the classifier:
-   - an error of a database, by its SQLState (`DatabaseFailure`, discovery §14);
-   - the LogStore. The coordination database not answering may pass. A table that the LogStore refuses to commit to for what it knows of the table (tainted, not registered, a commit that its registry has and its log does not, a write that it did not coordinate), or of itself (a coordination schema of another version), does not: the message names the table, and the command that mends it;
+3. the classifier¹:
+   - the LogStore. The coordination database not answering may pass, and so does what passes once the transaction starts again from the table as it is now: a registration that an operator changed under the commit, and a commit that took its version and whose publication is pending, which the next look at the table publishes. A table that the LogStore refuses to commit to for what it knows of the table (tainted, not registered, a commit that its registry has and its log does not, a write that it did not coordinate), or of itself (a coordination schema of another version), does not: the message names the table, and the command that mends it;
    - the conflicts of Delta, by ADR-0010 §1;
-   - what the connector of the source says is its source's (`SourceConnector.failure`);
+   - an error of a database, by its SQLState (`DatabaseFailure`, discovery §14): of the coordination database when the LogStore has wrapped it in a failure of I/O, and of the control plane otherwise;
 4. otherwise, `internal`.
+
+The connector of a source is not asked here. It says what a failure of its source is where its source is read: inside its plan and its read, and over the rows that are read as they are written (`SourceConnector.failure`), as up to P7. Where a run ends it would take a failure of the control plane for its source's, since the JDBC connector takes a failure of SQL that nothing of I/O wraps for its database's.
+
+¹ *Corrected in P8.2 (2026-11-26).* This list first had the connector of the source among what the classifier asks (`SourceConnector.failure`), had the errors of a database before the LogStore, and had of the LogStore only a database that does not answer and the refusals of a table. The connector is asked where its source is read, as it was; a failure of SQL is told from the LogStore's by what wraps it, so the LogStore is looked at first; and two failures of the LogStore pass once the transaction starts again. The decision is unchanged: one classifier where the run ends, for what nothing classified where it was raised.
 
 ### 3. A failure that nothing classified
 
