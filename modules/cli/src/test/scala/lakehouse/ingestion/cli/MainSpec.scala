@@ -336,6 +336,31 @@ final class MainSpec
     wrong.out shouldBe empty
   }
 
+  test(
+    "what nothing classified, in any command, ends in 70: its type and where, not what it said"
+  ) {
+    // A lookup of the environment that fails as nothing expects: the command reads the password
+    // of migrate through it, before it opens a connection.
+    val (out, err) = (new ByteArrayOutputStream, new ByteArrayOutputStream)
+    val exit = Main.run(
+      Seq("migrate", "--profile", exampleProfile, "--password", "env:MIGRATOR_PASSWORD"),
+      new PrintStream(out, true, "UTF-8"),
+      new PrintStream(err, true, "UTF-8"),
+      _ => throw new IllegalStateException("a mistake that holds what it was handed: s3cr3t")
+    )
+    val errors = err.toString("UTF-8")
+
+    exit shouldBe Main.Exit.Internal
+    errors.linesIterator.toSeq.last should startWith(
+      "error: nothing classified the failure, a mistake of the application: " +
+        "java.lang.IllegalStateException at lakehouse.ingestion.cli.MainSpec"
+    )
+    errors should endWith("The log of the instance has it whole\n")
+    errors should not include "s3cr3t"
+    out.toString("UTF-8") shouldBe empty
+    usage should include("70 a failure that nothing classified, a mistake of the application")
+  }
+
   test("migrate: a password that is not where the command was told ends in 4") {
     val unset = run("migrate", "--profile", exampleProfile, "--password", "env:MIGRATOR_PASSWORD")
     unset.exit shouldBe Main.Exit.Permanent
@@ -554,6 +579,7 @@ final class MainSpec
     RunCommand.exitOf(failed(FailureClass.Conflict)) shouldBe 3
     RunCommand.exitOf(failed(FailureClass.Permanent)) shouldBe 4
     RunCommand.exitOf(failed(FailureClass.Data)) shouldBe 5
+    RunCommand.exitOf(failed(FailureClass.Internal)) shouldBe 70
   }
 
   test("abandon-batch: each way an operator's action ends has its code, and the usage says it") {
@@ -564,6 +590,7 @@ final class MainSpec
     OperatorCommand.exitOf(Action.Skipped(run, RunId.generate(), Instant.EPOCH)) shouldBe 2
     OperatorCommand.exitOf(Action.Failed(run, FailureClass.Transient, "why")) shouldBe 3
     OperatorCommand.exitOf(Action.Failed(run, FailureClass.Permanent, "why")) shouldBe 4
+    OperatorCommand.exitOf(Action.Failed(run, FailureClass.Internal, "why")) shouldBe 70
 
     usage should include("lakehouse-ingestion abandon-batch --profile <file>")
     usage should include("--batch <n> --reason <text>")

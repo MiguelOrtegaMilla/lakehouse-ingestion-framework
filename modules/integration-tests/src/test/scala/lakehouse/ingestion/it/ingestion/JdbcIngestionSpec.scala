@@ -14,7 +14,7 @@ import lakehouse.ingestion.core.jdbc.FullLoadPlan
 import lakehouse.ingestion.core.watermark.WatermarkPlan
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.FaultPoint
-import lakehouse.ingestion.it.support.ProxiedPostgres
+import lakehouse.ingestion.it.support.{Died, ProxiedPostgres}
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -1054,8 +1054,6 @@ final class JdbcIngestionSpec
 }
 
 object JdbcIngestionSpec {
-
-  final class Died extends RuntimeException("the run died here")
 
   /** The name of the toxic that cuts a connection of the proxy. */
   private val Cut = "cut"

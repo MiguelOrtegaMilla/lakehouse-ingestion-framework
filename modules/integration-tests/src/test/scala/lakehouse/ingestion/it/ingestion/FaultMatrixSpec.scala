@@ -14,7 +14,7 @@ import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.control.{Backfills, Leases}
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
-import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
+import lakehouse.ingestion.it.support.Died
 import lakehouse.ingestion.it.ingestion.RecoveryOracle.{
   recoveryAt,
   recoveryInside,

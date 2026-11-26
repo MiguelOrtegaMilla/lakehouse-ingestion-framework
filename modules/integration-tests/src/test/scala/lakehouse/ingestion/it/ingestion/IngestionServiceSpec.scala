@@ -28,7 +28,7 @@ import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.it.connector.AConnectorOfItsOwnSpec.CountingConnector
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
-import lakehouse.ingestion.it.support.CoordinationSchema
+import lakehouse.ingestion.it.support.{CapturedLogs, CoordinationSchema, Died}
 import lakehouse.ingestion.logstore.coordination.{
   CoordinationSettings,
   PostgresCoordinationStore,
@@ -55,8 +55,6 @@ import org.scalatest.matchers.should.Matchers
  * is complete does not depend on how long a test takes.
  */
 final class IngestionServiceSpec extends AnyFunSuite with Matchers with IngestionSuite {
-
-  import IngestionServiceSpec._
 
   // ---------------------------------------------------------------------------------------------
   // The path where nothing fails
@@ -191,11 +189,8 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     val orders = fileSource(options = ", max_files_per_batch: 1")
     drop(orders, "a.csv", "id\n1\n")
     drop(orders, "b.csv", "id\n2\n")
-    intercept[RuntimeException](
-      launch(
-        orders,
-        service(hooks = hookAt(FaultPoint.AfterPlan)(_ => throw new RuntimeException("died")))
-      )
+    intercept[Died](
+      launch(orders, service(hooks = hookAt(FaultPoint.AfterPlan)(_ => throw new Died)))
     )
     expire(orders)
 
@@ -1154,8 +1149,20 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
       drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800)): Unit
     })
 
-    val stopped = intercept[IllegalStateException](launch(orders, overtaken))
-
+    // What the run stops with is a mistake of the application by its own word, which nothing
+    // classifies: the run ends as `internal`, saying its type and where it was thrown, and the
+    // log has what it said.
+    val (outcome, logged) = CapturedLogs.of(classOf[IngestionService])(launch(orders, overtaken))
+    val recorded = outcome match {
+      case Outcome.Failed(_, FailureClass.Internal, message) => message
+      case ended => fail(s"the run did not end as internal: $ended")
+    }
+    recorded should startWith(
+      "nothing classified the failure, a mistake of the application: " +
+        "java.lang.IllegalStateException at "
+    )
+    recorded should not include "changed after the batch was planned"
+    val stopped = logged.flatMap(_.thrown).collectFirst { case e: IllegalStateException => e }.value
     stopped.getMessage should include(s"the source of $first changed after the batch was planned")
     stopped.getMessage should include("has the batch")
     stopped.getMessage should include("Nothing was given up, and nothing was changed")
@@ -1166,11 +1173,11 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     left.status shouldBe BatchStatus.Planned
     left.abandoned shouldBe None
     FilePlan.fromJson(left.plan).value.files.map(_.size) shouldBe Vector(5L)
-    // The run is as one whose process died: nothing classified its error (70, from P8).
+    // The run says that it failed as `internal`, with what it recorded, and gives its lease up.
     val run1 = runOf(left.plannedBy)
-    run1.status shouldBe RunStatus.Running
-    run1.failure shouldBe None
-    holderOf(orders) shouldBe Some(left.plannedBy)
+    run1.status shouldBe RunStatus.Failed
+    run1.failure.value shouldBe RunFailure(FailureClass.Internal, recorded)
+    holderOf(orders) shouldBe None
     // Nothing is accounted for, and the table has what the other writer wrote, and no more.
     takenOf(orders) shouldBe empty
     stateOf(orders) shouldBe None
@@ -1625,10 +1632,4 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     Recovery.of(Some(planned), bronze(orders), delta) shouldBe Recovery.Replay(planned)
     Recovery.of(Some(planned), quarantine(orders), delta) shouldBe Recovery.RollForward(planned)
   }
-}
-
-object IngestionServiceSpec {
-
-  /** What a test throws at a fault point, for a run that goes no further. */
-  final class Died extends RuntimeException("the run died here")
 }

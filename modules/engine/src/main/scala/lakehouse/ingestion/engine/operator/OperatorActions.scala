@@ -278,7 +278,8 @@ final class OperatorActions(
 
   /**
    * Takes the lease of the run, announces its epoch, and does `body` with it. A failure that
-   * nothing knows the class of is let through (ADR-0022 §2), with the lease left to run out.
+   * nothing knows the class of ends the run as `internal`, with its lease given up (ADR-0022
+   * §3); a fatal error of the JVM is let through, with the lease left to run out.
    */
   private def held(start: RunStart, config: ConfigVersion)(body: LeasedRun => Outcome): Outcome =
     opened(start, config) match {
@@ -295,10 +296,18 @@ final class OperatorActions(
           case NonFatal(_) if leased.lost.nonEmpty => stopped(leased, leased.lost.get)
           // One that says its class, or one that the classifier knows.
           case Failures.Known(classed) => fail(leased, classed.failure, classed.getMessage)
-          case unclassified: Throwable =>
-            // Nothing is said of it: the lease runs out, as that of a process that died.
+          // What nothing classified: a mistake of the application (ADR-0022 §3).
+          case NonFatal(unclassified) =>
+            log.error(
+              s"the run ${start.id} of ${start.source} failed with what nothing classified, a " +
+                "mistake of the application",
+              unclassified
+            )
+            fail(leased, FailureClass.Internal, Failures.unclassified(unclassified))
+          case fatal: Throwable =>
+            // A fatal error of the JVM: the lease runs out, as that of a process that died.
             leased.close()
-            throw unclassified
+            throw fatal
         }
     }
 

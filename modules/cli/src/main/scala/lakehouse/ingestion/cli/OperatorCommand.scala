@@ -73,6 +73,7 @@ private[cli] object OperatorCommand {
         case FailureClass.Transient | FailureClass.Conflict => Main.Exit.Transient
         case FailureClass.Permanent => Main.Exit.Permanent
         case FailureClass.Data => Main.Exit.DataThreshold
+        case FailureClass.Internal => Main.Exit.Internal
       }
   }
 

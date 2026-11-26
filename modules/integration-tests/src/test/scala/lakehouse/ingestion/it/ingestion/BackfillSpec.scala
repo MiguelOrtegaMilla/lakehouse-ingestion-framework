@@ -19,7 +19,7 @@ import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
 import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.it.ingestion.BackfillSpec.Rejecting
-import lakehouse.ingestion.it.ingestion.IngestionServiceSpec.Died
+import lakehouse.ingestion.it.support.Died
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers

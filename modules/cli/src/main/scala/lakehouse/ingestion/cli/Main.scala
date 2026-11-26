@@ -3,12 +3,15 @@ package lakehouse.ingestion.cli
 import java.io.PrintStream
 import java.nio.file.Paths
 
+import scala.util.control.NonFatal
+
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control.{BackfillId, BackfillRequest, BatchSeq, OperatorRequest}
 import lakehouse.ingestion.core.watermark.BackfillRange
-import lakehouse.ingestion.engine.FaultHooks
+import lakehouse.ingestion.engine.{Failures, FaultHooks}
 import lakehouse.ingestion.engine.control.DatabaseFailure
 import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
+import org.slf4j.LoggerFactory
 
 /**
  * The entry point of the application: a command and its options.
@@ -29,6 +32,8 @@ import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
  *    `ResetStateCommand`, `ReprocessCommand`, `BackfillCommand`).
  */
 object Main {
+
+  private val log = LoggerFactory.getLogger(getClass)
 
   /**
    * How a command ended, for whoever started the process: the contract with the orchestrator
@@ -73,8 +78,10 @@ object Main {
 
     /**
      * An exception that nothing classified: a mistake in the application itself. `EX_SOFTWARE`
-     * of `sysexits.h`. Nothing gives it yet: until `Main` catches what nothing else did (P8),
-     * such an exception ends the process with the JVM's own 1.
+     * of `sysexits.h`, next to the 64 of a usage error and far from the codes of a run. A run
+     * that fails so is recorded as `internal`, with its lease given up; `Main` gives it for what
+     * nothing classified in any command (ADR-0022 §3). A fatal error of the JVM is not caught,
+     * and ends the process as the JVM ends it.
      */
     val Internal = 70
 
@@ -191,6 +198,8 @@ object Main {
        |              in a way that it cannot follow;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
+       |            70 a failure that nothing classified, a mistake of the application: the log
+       |              has it whole;
        |            128 + n run or backfill was stopped by the signal n before its first run:
        |              nothing was run. One stopped after a run ends in the code of its last""".stripMargin
 
@@ -222,6 +231,29 @@ object Main {
       operator: String = sys.props.getOrElse("user.name", ""),
       hooks: FaultHooks = FaultHooks.Off,
       waits: RunSession.LogStoreWaits = RunSession.NoWaits
+  ): Int =
+    try command(args, out, err, environment, stop, operator, hooks, waits)
+    catch {
+      // What nothing classified, in any command: a mistake of the application (ADR-0022 §3).
+      // The error says its type and where it was thrown; the log has it whole.
+      case NonFatal(unclassified) =>
+        log.error(
+          "the command ended with a failure that nothing classified, a mistake of the application",
+          unclassified
+        )
+        err.println(s"error: ${Failures.unclassified(unclassified)}")
+        Exit.Internal
+    }
+
+  private def command(
+      args: Seq[String],
+      out: PrintStream,
+      err: PrintStream,
+      environment: String => Option[String],
+      stop: Stop,
+      operator: String,
+      hooks: FaultHooks,
+      waits: RunSession.LogStoreWaits
   ): Int = args.toList match {
     case "validate" :: options =>
       parse(options, Set("--profile", "--sources")) match {
