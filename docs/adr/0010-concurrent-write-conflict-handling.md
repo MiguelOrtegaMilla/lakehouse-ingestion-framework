@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Accepted (consequence of D3, 2026-09-25) |
 | **Related** | [ADR-0004](0004-postgresql-coordinated-delta-logstore.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0008](0008-layer-responsibilities.md) |
+| **Superseded in part** | [ADR-0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) (P8.1, 2026-11-26) replaces §2, the retry policy: a budget of time from the profile, in place of a count of attempts. §2 keeps its original text and points to it. |
 
 ## Context
 
@@ -42,6 +43,8 @@ Blind appends (Bronze) have no read set, so under Delta's default `WriteSerializ
 - Bounded attempts (default 5), exponential backoff with **full jitter** (base 500 ms, cap 30 s), so that colliding writers do not retry in lockstep.
 - A retry re-executes the **whole Delta operation**, re-reading the snapshot and recomputing the `MERGE` source. This is safe because every operation is idempotent: `txnAppId`/`txnVersion` for appends and `MERGE` (ADR-0005), and the plan is immutable.
 - On exhaustion: transient failure (exit 3); the state is untouched (WAL batch stays `PLANNED`), so the next run replays it.
+
+> **Superseded by [ADR-0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md)** (P8.1, 2026-11-26): the budget of a run is one of time, from the profile (`retries.budget`, `first_backoff` and `max_backoff`), and not a count of attempts. It is shared with the failures that pass, and a retry resumes the run where it is durable: until its batch is committed, at step 2 of ADR-0005, which runs the whole Delta operation again on a fresh snapshot as this section has it.
 
 ### 3. Reducing `MERGE` conflicts in Silver fan-in tables
 
