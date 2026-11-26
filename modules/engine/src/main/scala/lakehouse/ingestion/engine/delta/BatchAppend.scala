@@ -44,8 +44,8 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
    *   again if the write is tried again
    * @throws RunFailedException a permanent failure: a table outside the lake, or one that
    *   forgets its transactions; rows that the table does not take as they are; a batch that
-   *   another writer of the same sequence got ahead of without writing it. A conflict: a table
-   *   that others kept changing
+   *   another writer of the same sequence got ahead of without writing it; a table whose
+   *   schema or protocol others kept changing
    */
   def append(table: TableLocation, batch: Written, rows: DataFrame): Result = {
     require(
@@ -102,10 +102,14 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
         case Some(_) if conflicts < Retries =>
           attempts(table, batch, rows, conflicts + 1)
 
+        // A conflict that asks for a re-plan is a permanent failure once its one retry is spent
+        // (ADR-0010 §1, ADR-0022 §1): what changed is the table, and a write that the table as it
+        // is now does not take is somebody's to look at. P9 adds the policy of the schema.
         case Some(e) =>
-          throw RunFailedException.conflict(
-            s"the table at ${table.uri} was changed by another writer under ${batch.id}, " +
-              s"${conflicts + 1} times in a row: ${firstLine(e.getMessage)}",
+          throw RunFailedException.permanent(
+            s"the schema or the protocol of the table at ${table.uri} was changed by another " +
+              s"writer under ${batch.id}, ${conflicts + 1} times in a row, and nothing of the " +
+              s"batch was written: ${firstLine(e.getMessage)}",
             e
           )
       }
@@ -177,9 +181,9 @@ object BatchAppend {
   final case class AlreadyThere(version: Option[Long]) extends Result
 
   /**
-   * How many times a write is made again on a table that changed under it. Once is what two
-   * sources that make one table at the same moment need (ADR-0010); a budget of retries is the
-   * classification of errors (P8).
+   * How many times a write is made again on a table whose schema or protocol changed under it.
+   * Once is what two sources that make one table at the same moment need (ADR-0010 §1); the
+   * conflicts that are retried within the budget of a run are the classifier's (ADR-0022).
    */
   val Retries = 1
 

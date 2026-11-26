@@ -34,7 +34,7 @@ import lakehouse.ingestion.logstore.coordination.{
   PostgresCoordinationStore,
   WriterEpoch
 }
-import lakehouse.ingestion.logstore.{CommitContext, CommitMissingException, WriterEpochs}
+import lakehouse.ingestion.logstore.{CommitContext, WriterEpochs}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.delta.{DeltaLog, DeltaOperations}
 import org.scalatest.funsuite.AnyFunSuite
@@ -1201,12 +1201,16 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     Files.createDirectory(table)
     drop(orders, "a.csv", "id\n10\n11\n", at = Now.minusSeconds(1800))
 
-    // Nothing classifies it yet (70, from P8): the run is left as a process that died.
-    val refused = intercept[CommitMissingException](launch(orders))
-
-    refused.getMessage should include(
-      "is committed and acknowledged, and its file is not in the log"
-    )
+    // A table that the LogStore refuses is a permanent failure (ADR-0022 §2): the run ends with
+    // it, and gives its lease up.
+    val refused = launch(orders)
+    refused match {
+      case Outcome.Failed(_, FailureClass.Permanent, message) =>
+        message should include("is committed and acknowledged, and its file is not in the log")
+      case other => fail(s"the run did not fail for good: $other")
+    }
+    runOf(refused.run).failure.value.failure shouldBe FailureClass.Permanent
+    holderOf(orders) shouldBe None
     val left = batchOf(first)
     left.status shouldBe BatchStatus.Planned
     left.abandoned shouldBe None
@@ -1216,7 +1220,6 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     // the file that changed is a new file, of the batch after.
     Files.delete(table)
     Files.move(away, table)
-    expire(orders)
     launch(orders) shouldBe a[Outcome.RolledForward]
     ingested(launch(orders)).batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"), ("10", 2L, "a.csv"), ("11", 2L, "a.csv"))

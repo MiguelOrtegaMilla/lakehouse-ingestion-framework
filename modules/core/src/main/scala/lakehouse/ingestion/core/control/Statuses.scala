@@ -129,8 +129,8 @@ object RunKind {
 
 /**
  * Why a run failed, as far as what to do next goes (discovery §14). The names are those of
- * `error_class` in the audit trail. Telling an error of one class from one of another, and the
- * kinds of conflict apart, is the classification of errors (P8).
+ * `error_class` in the audit trail. Which failure is of which class is said where it is raised,
+ * or where the run ends, by the engine (ADR-0022 §2).
  */
 sealed abstract class FailureClass(val name: String) {
   override def toString: String = name

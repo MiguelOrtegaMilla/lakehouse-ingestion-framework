@@ -104,3 +104,9 @@ The read is retried within the budget too. A budget that runs out ends the run i
 - `retries` and `write_conflicts` are counted by the engine, and are real metrics of a run.
 - 70 is an alert for a mistake of the application, and the run that ended in it is recorded as such.
 - An orchestrator that bounds a run gives it more than `retries.budget` plus one attempt beyond its first failure, or it stops a run that would have ended well.
+
+## As built (P8.2, 2026-11-26)
+
+- **The classifier is `Failures`, in the root of the engine**, beside the service that ends a run, and not in the package of `RunFailedException`: it reads `DatabaseFailure`, whose package depends on the connectors, which raise the failures of that package, and the build refuses a cycle among the packages of a module.
+- **What the LogStore says, by its types.** Permanent: `TableTaintedException`, `TableNotRegisteredException`, `StaleRegistrationException`, `UncoordinatedWriteException`, `CommitMissingException`, `UnpublishableCommitException` and `CoordinationSchemaException`. Transient: `RegistrationChangedException` and `CommitPublicationPendingException`. A commit refused for its epoch (`EpochNotInForceException`) is the loss of the lease, as before (§2, point 1). Any other failure of I/O has no class.
+- **The lease that cannot be taken** is classified too. Such a run has no row, and nothing is told; if the database took the lease and its answer was lost, the lease runs out, and the run that takes it over ends this one.

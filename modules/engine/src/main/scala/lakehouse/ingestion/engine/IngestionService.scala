@@ -169,10 +169,13 @@ import org.slf4j.LoggerFactory
  *    the error of a job that was stopped, in whatever Spark wrapped it, and any other. A run
  *    without its lease has nothing else to say of its source that counts, and what it failed
  *    with is logged whole, as the cause, for the mistake that it may be.
- *  - Any other exception is let through, and nothing is said to the control plane: the lease is
- *    no longer renewed, and what is left is what a process that died leaves. The run that takes
- *    the lease over marks this one `ABANDONED`. Telling such errors apart is the classification
- *    of errors (P8).
+ *  - Any other failure that the classifier knows (`Failures`: the LogStore, the conflicts of
+ *    Delta, a database by its SQLState) ends the run as `FAILED` with its class, as one that
+ *    said its class does (ADR-0022 §2). So does a failure to take the lease, which leaves no
+ *    run to tell.
+ *  - What nothing classified is let through, and nothing is said to the control plane: the
+ *    lease is no longer renewed, and what is left is what a process that died leaves. The run
+ *    that takes the lease over marks this one `ABANDONED`.
  *
  * '''A backfill is a sequence of its own''' (ADR-0021 §5). Its runs hold its lease, announce its
  * epoch and number its chunks, apart from the regular sequence of the source, which they
@@ -210,8 +213,8 @@ final class IngestionService(
    *   source. Nothing was started
    * @param horizon how far the invocation reads, as the batch before this run in its chain said
    *   (`Outcome.Next.Within`); none for the first run of an invocation, whose plan fixes it
-   * @throws java.lang.Exception what nothing classified. The run is left as a process that died
-   *   leaves it
+   * @throws java.lang.Exception what nothing classified (`Failures`). The run is left as a
+   *   process that died leaves it
    */
   def run(source: Source, config: ConfigVersion, horizon: Option[Json] = None): Outcome = {
     val bound = connectors.bind(source)
@@ -318,8 +321,8 @@ final class IngestionService(
       body: Attempt => Outcome
   ): Outcome = {
     val source = bound.source
-    LeasedRun.open(database, start, config, timing) match {
-      case Left(skipped) => Outcome.Skipped(start.id, skipped.holder, skipped.until)
+    opened(start, config) match {
+      case Left(notOpened) => notOpened
       case Right(leased) =>
         val jobs = new RunJobs(spark, start.id)
         // Before the first job of the run: what is running when the lease is lost is stopped.
@@ -336,9 +339,10 @@ final class IngestionService(
           // Whatever it is, it is of a run that is over: a job that was stopped, most often.
           case NonFatal(failure) if leased.lost.nonEmpty =>
             stopped(leased, leased.lost.get, failedWith = Some(failure))
-          case failed: RunFailedException =>
-            log.error(s"the run ${start.id} of ${source.id} failed (${failed.failure})", failed)
-            ended(leased, RunEnd.Failed(failed.failure, failed.getMessage))
+          // One that says its class, or one that the classifier knows (ADR-0022 §2).
+          case failure @ Failures.Known(classed) =>
+            log.error(s"the run ${start.id} of ${source.id} failed (${classed.failure})", failure)
+            ended(leased, RunEnd.Failed(classed.failure, classed.getMessage))
           case unclassified: Throwable =>
             // Nothing is said of it: the lease runs out, as that of a process that died.
             leased.close()
@@ -346,6 +350,29 @@ final class IngestionService(
         }
     }
   }
+
+  /**
+   * The lease for `start`, or how the run ended without it: skipped, for a lease that another
+   * run holds; failed with its class, for a control plane that could not be asked. A run that
+   * failed so has no row, and nothing is told; unless the database took the lease and its answer
+   * was lost, and then the lease runs out, and the run that takes it over ends this one.
+   *
+   * @throws java.lang.Exception what nothing classified
+   */
+  private def opened(start: RunStart, config: ConfigVersion): Either[Outcome, LeasedRun] =
+    try
+      LeasedRun.open(database, start, config, timing).left.map { skipped =>
+        Outcome.Skipped(start.id, skipped.holder, skipped.until)
+      }
+    catch {
+      case failure @ Failures.Known(classed) =>
+        log.error(
+          s"the run ${start.id} of ${start.source} could not take the lease of " +
+            s"${start.leaseKey} (${classed.failure})",
+          failure
+        )
+        Left(Outcome.Failed(start.id, classed.failure, classed.getMessage))
+    }
 
   /**
    * Ends a run that has lost its lease, as its heartbeat or the control plane told it. It may

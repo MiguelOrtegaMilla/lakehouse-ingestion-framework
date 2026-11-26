@@ -26,8 +26,7 @@ import lakehouse.ingestion.engine.control.{
 }
 import lakehouse.ingestion.engine.delta.BatchLookup.Found
 import lakehouse.ingestion.engine.delta.{BatchLookup, DeltaTableTransactions}
-import lakehouse.ingestion.engine.EpochAnnouncement
-import lakehouse.ingestion.engine.failure.RunFailedException
+import lakehouse.ingestion.engine.{EpochAnnouncement, Failures}
 import lakehouse.ingestion.logstore.coordination.WriterEpoch
 import org.apache.spark.sql.SparkSession
 import org.slf4j.LoggerFactory
@@ -277,10 +276,13 @@ final class OperatorActions(
       Some(request)
     )
 
-  /** Takes the lease of the run, announces its epoch, and does `body` with it. */
+  /**
+   * Takes the lease of the run, announces its epoch, and does `body` with it. A failure that
+   * nothing knows the class of is let through (ADR-0022 §2), with the lease left to run out.
+   */
   private def held(start: RunStart, config: ConfigVersion)(body: LeasedRun => Outcome): Outcome =
-    LeasedRun.open(database, start, config, timing) match {
-      case Left(skipped) => Outcome.Skipped(start.id, skipped.holder, skipped.until)
+    opened(start, config) match {
+      case Left(notOpened) => notOpened
       case Right(leased) =>
         try {
           val turn = WriterEpoch(start.leaseKey.value, leased.epoch.value)
@@ -291,12 +293,34 @@ final class OperatorActions(
         } catch {
           case gone: LeaseLostException => stopped(leased, gone.loss)
           case NonFatal(_) if leased.lost.nonEmpty => stopped(leased, leased.lost.get)
-          case failed: RunFailedException => fail(leased, failed.failure, failed.getMessage)
+          // One that says its class, or one that the classifier knows.
+          case Failures.Known(classed) => fail(leased, classed.failure, classed.getMessage)
           case unclassified: Throwable =>
             // Nothing is said of it: the lease runs out, as that of a process that died.
             leased.close()
             throw unclassified
         }
+    }
+
+  /**
+   * The lease for `start`, or how the action ended without it: skipped, for a lease that a run
+   * holds; failed with its class, for a control plane that could not be asked. Such an action
+   * has no row, and nothing is told; unless the database took the lease and its answer was lost,
+   * and then the lease runs out, and the run that takes it over ends this one.
+   */
+  private def opened(start: RunStart, config: ConfigVersion): Either[Outcome, LeasedRun] =
+    try
+      LeasedRun.open(database, start, config, timing).left.map { skipped =>
+        Outcome.Skipped(start.id, skipped.holder, skipped.until)
+      }
+    catch {
+      case failure @ Failures.Known(classed) =>
+        log.error(
+          s"the run ${start.id} of ${start.source} could not take the lease of " +
+            s"${start.leaseKey} (${classed.failure})",
+          failure
+        )
+        Left(Outcome.Failed(start.id, classed.failure, classed.getMessage))
     }
 
   /** Refused, with nothing changed: running it again as it is does not mend it. */

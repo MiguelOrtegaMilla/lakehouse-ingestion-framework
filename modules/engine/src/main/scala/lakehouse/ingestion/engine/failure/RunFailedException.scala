@@ -7,8 +7,8 @@ import lakehouse.ingestion.core.control.FailureClass
  * recorded to have failed by, and what its exit code says to whoever started it (§14.1).
  *
  * It is raised where a failure can be told for what it is, and by nothing that only guesses.
- * Telling the errors of a database, of a file system and of Delta apart is the classification
- * of errors (P8); an exception that is not one of these is not classified yet.
+ * What is raised without a class, from inside a library, is given one where the run ends, if
+ * anything knows it (`Failures`, ADR-0022 §2).
  *
  * @param message what went wrong, for a person. Never a secret, nor a value of a row
  */
