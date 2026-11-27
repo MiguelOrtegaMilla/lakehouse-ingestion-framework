@@ -275,6 +275,44 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     leftOut(orders) should contain theSameElementsAs Seq(dead.start.id, next.start.id, third, chunk)
     leftOut(other) shouldBe Vector(elsewhere)
     leftOut(orders, Layer.Silver) shouldBe Vector(silver)
+
+    // The runs that took a batch, in the order they started: a number says a batch with its
+    // sequence, and the batch 2 and the chunk 2 are two. None, for a batch that there is not.
+    def tookIt(batch: BatchId): Vector[RunId] = database.run(Batches.takenBy(_, batch))
+    def regular(seq: Long): BatchId = BatchId(first.id.app, BatchSeq.of(seq).value)
+    val chunkTwo =
+      BatchId(TxnAppId.backfill(orders.id, Layer.Bronze, history), BatchSeq.of(2).value)
+    tookIt(first.id) shouldBe Vector(dead.start.id, next.start.id)
+    tookIt(regular(3)) shouldBe Vector(third)
+    tookIt(chunkTwo) shouldBe Vector(chunk)
+    tookIt(regular(2)) should have size 1
+    tookIt(regular(9)) shouldBe empty
+
+    // The batch of each of some runs, and how it stands: not that of a run of another source,
+    // nor of another layer of the source.
+    def batchesOf(runs: RunId*): Map[RunId, (BatchId, BatchStatus)] =
+      database.run(Batches.takenOf(_, orders.id, Layer.Bronze, runs))
+    val committing = tookIt(regular(2)).head
+    batchesOf(
+      dead.start.id,
+      next.start.id,
+      committing,
+      third,
+      chunk,
+      last.start.id,
+      elsewhere,
+      silver,
+      RunId.generate()
+    ) shouldBe Map(
+      dead.start.id -> (first.id -> BatchStatus.Abandoned),
+      next.start.id -> (first.id -> BatchStatus.Abandoned),
+      committing -> (regular(2) -> BatchStatus.Committed),
+      third -> (regular(3) -> BatchStatus.Abandoned),
+      chunk -> (chunkTwo -> BatchStatus.Abandoned),
+      last.start.id -> (regular(4) -> BatchStatus.Planned)
+    )
+    batchesOf(committing) shouldBe Map(committing -> (regular(2) -> BatchStatus.Committed))
+    batchesOf() shouldBe empty
   }
 
   test("the next batch has the next number, and starts from where the state is") {

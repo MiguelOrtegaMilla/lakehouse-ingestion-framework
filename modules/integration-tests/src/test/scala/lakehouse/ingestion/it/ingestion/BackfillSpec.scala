@@ -605,6 +605,29 @@ final class BackfillSpec extends AnyFunSuite with Matchers with JdbcIngestionSui
       record(second.run, second.batch),
       record(third.run, third.batch)
     ).sorted
+
+    // Asked for by its batch, a record is of the batch of that sequence: the batch 2 and the
+    // chunk 2 have one number, and the one that was given up is left out, and said to be.
+    def askedFor(batch: BatchId): QuarantineReader.Counts =
+      reader.counts(orders.id, QuarantineReader.Asked(batch = Some(batch))).value
+    def shown(counts: QuarantineReader.Counts) =
+      counts.groups.map(group => (group.run, group.batchSeq, group.taken))
+    def committed(batch: BatchId) =
+      Some(QuarantineReader.Taken(batch, BatchStatus.Committed))
+    val one = QuarantineReader.LeftOut(records = 1L, runs = 1L)
+    val none = QuarantineReader.LeftOut(0L, 0L)
+    shown(askedFor(second.batch)) shouldBe Vector((second.run, 2L, committed(second.batch)))
+    askedFor(second.batch).leftOut shouldBe none
+    shown(askedFor(chunkSecond)) shouldBe empty
+    askedFor(chunkSecond).leftOut shouldBe one
+    shown(askedFor(first.batch)) shouldBe Vector((first.run, 1L, committed(first.batch)))
+    askedFor(first.batch).leftOut shouldBe none
+    shown(askedFor(regularFirst)) shouldBe empty
+    askedFor(regularFirst).leftOut shouldBe one
+    // In all, three records count, and two do not, of the two runs that set them apart.
+    val all = reader.counts(orders.id).value
+    all.records shouldBe 3L
+    all.leftOut shouldBe QuarantineReader.LeftOut(records = 2L, runs = 2L)
     assertLedger(orders)
   }
 }

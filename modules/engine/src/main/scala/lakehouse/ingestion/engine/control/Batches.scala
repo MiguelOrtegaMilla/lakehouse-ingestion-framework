@@ -145,20 +145,89 @@ object Batches {
       statement.setString(1, source.value)
       statement.setString(2, layer.name)
       Using.resource(statement.executeQuery()) { rows =>
-        Iterator
-          .continually(rows)
-          .takeWhile(_.next())
-          .map { row =>
-            RunId
-              .of(row.getObject("run_id", classOf[UUID]))
-              .fold(
-                reason => throw new IllegalStateException(s"control.ingestion_run.run_id $reason"),
-                identity
-              )
-          }
-          .toVector
+        Iterator.continually(rows).takeWhile(_.next()).map(runOf).toVector
       }
     }
+
+  /**
+   * The runs that took a batch, in the order they started: the one that planned it, and each
+   * that recovered it, committed it or gave it up. What a table that batches write before their
+   * end has of the batch, as a quarantine, is under the id of one of them. None, for a batch
+   * that there is not.
+   */
+  @throws[SQLException]
+  def takenBy(connection: Connection, batch: BatchId): Vector[RunId] =
+    Using.resource(
+      connection.prepareStatement(
+        """SELECT run_id FROM control.ingestion_run
+          | WHERE txn_app_id = ? AND batch_seq = ?
+          | ORDER BY started_at, run_id""".stripMargin
+      )
+    ) { statement =>
+      statement.setString(1, batch.app.value)
+      statement.setLong(2, batch.seq.value)
+      Using.resource(statement.executeQuery()) { rows =>
+        Iterator.continually(rows).takeWhile(_.next()).map(runOf).toVector
+      }
+    }
+
+  /**
+   * The batch that each of some runs of a source took, and how the batch stands: what says, of
+   * a row that says its run and the number of its batch, which sequence the number is of, and
+   * whether the batch was committed. A run that took no batch, or that is not of the source,
+   * is not in it.
+   */
+  @throws[SQLException]
+  def takenOf(
+      connection: Connection,
+      source: SourceId,
+      layer: Layer,
+      runs: Seq[RunId]
+  ): Map[RunId, (BatchId, BatchStatus)] =
+    if (runs.isEmpty) Map.empty
+    else
+      Using.resource(
+        connection.prepareStatement(
+          """SELECT run.run_id, batch.txn_app_id, batch.batch_seq, batch.status
+            |  FROM control.ingestion_run run
+            |  JOIN control.ingestion_batch batch
+            |    ON batch.txn_app_id = run.txn_app_id AND batch.batch_seq = run.batch_seq
+            | WHERE run.source_id = ? AND run.layer = ? AND run.run_id = ANY (?)""".stripMargin
+        )
+      ) { statement =>
+        statement.setString(1, source.value)
+        statement.setString(2, layer.name)
+        statement.setArray(
+          3,
+          connection.createArrayOf("uuid", runs.map(run => run.uuid: AnyRef).toArray)
+        )
+        Using.resource(statement.executeQuery()) { rows =>
+          def known[A](column: String, parsed: Either[String, A]): A =
+            parsed.fold(
+              reason => throw new IllegalStateException(s"control.ingestion_batch.$column $reason"),
+              identity
+            )
+          Iterator
+            .continually(rows)
+            .takeWhile(_.next())
+            .map { row =>
+              val batch = BatchId(
+                known("txn_app_id", TxnAppId.parse(row.getString("txn_app_id"))),
+                known("batch_seq", BatchSeq.of(row.getLong("batch_seq")))
+              )
+              runOf(row) -> (batch -> known("status", BatchStatus.parse(row.getString("status"))))
+            }
+            .toMap
+        }
+      }
+
+  private def runOf(row: ResultSet): RunId =
+    RunId
+      .of(row.getObject("run_id", classOf[UUID]))
+      .fold(
+        reason => throw new IllegalStateException(s"control.ingestion_run.run_id $reason"),
+        identity
+      )
 
   /**
    * Marks a planned batch as committed by `run`, with what it wrote.
