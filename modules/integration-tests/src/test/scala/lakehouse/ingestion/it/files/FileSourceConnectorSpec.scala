@@ -19,7 +19,6 @@ import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.it.support.{CapturedLogs, LocalSparkSuite}
-import org.apache.spark.SparkException
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Row}
@@ -1194,7 +1193,7 @@ final class FileSourceConnectorSpec
     rows(read(root, orders, planned).rows.select("id")) shouldBe Seq(Row("1"), Row("2"))
   }
 
-  test("a failure of a batch that no file has alone is let through as it was") {
+  test("files of Parquet with a column of two types fail their batch as permanent, under skip") {
     val root = landingZone()
     val orders = source("parquet", policy = "skip")
     val session = spark
@@ -1204,15 +1203,47 @@ final class FileSourceConnectorSpec
     val planned = plan(root, orders).value
     val (reading, reads) = counting(root)
 
+    // Each file reads alone, and no file of the batch is one to skip: it is the batch that
+    // cannot be read, and running again does not mend it.
+    val message = refused(reading.read(orders, configOf(orders), planned, ReadContext(spark)))
+    message should include("a column of one type in one file and of another in another")
+    message should (include("CANNOT_MERGE_SCHEMAS") and include("BIGINT") and include("STRING"))
+    message should include("Nothing was written")
+    reads shouldBe empty
+  }
+
+  test("a failure of a batch that no file has alone is let through as it was") {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    drop(root, "a.csv", "id\n1\n")
+    val b = drop(root, "b.csv", "id\n2\n")
+    unopenable(b)(())
+    val planned = plan(root, orders).value
+    val permissions = Files.getPosixFilePermissions(b)
+    val reads = mutable.Map.empty[String, Int].withDefaultValue(0)
+    // It may not be opened by the read of the batch, and may by its first read alone: what
+    // stopped the batch is no file's by then.
+    val reopening = connector(
+      root,
+      beforeAlone = (name, _) => {
+        reads(name) += 1
+        if (name == "b.csv") Files.setPosixFilePermissions(b, permissions): Unit
+      }
+    )
+
+    Files.setPosixFilePermissions(b, PosixFilePermissions.fromString("---------"))
     val failed =
-      the[SparkException] thrownBy reading.read(
-        orders,
-        configOf(orders),
-        planned,
-        ReadContext(spark)
-      )
-    failed.getCondition shouldBe "CANNOT_MERGE_SCHEMAS"
-    reads.toMap shouldBe Map("a.parquet" -> 1, "b.parquet" -> 1)
+      try
+        the[Exception] thrownBy reopening.read(
+          orders,
+          configOf(orders),
+          planned,
+          ReadContext(spark)
+        )
+      finally Files.setPosixFilePermissions(b, permissions): Unit
+    failed should not be a[RunFailedException]
+    failed should not be a[UnreadableFilesException]
+    reads.toMap shouldBe Map("a.csv" -> 1, "b.csv" -> 1)
   }
 
   test("a file that changes while the files are read alone makes it a batch whose source changed") {

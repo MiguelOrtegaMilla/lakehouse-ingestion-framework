@@ -387,10 +387,11 @@ final class UnreadableFilesSpec extends AnyFunSuite with Matchers with Ingestion
     assertLedger(of)
   }
 
-  test("a failure that is no file's keeps its class, and no file is recorded") {
+  test("files of Parquet with a column of two types fail the run as permanent, recording none") {
     val of = fileSource("parquet", options = Skip)
     dropParquet(of, "a.parquet", 1 to 1)
-    // A column of two types: each file reads alone, and the two fail together (P9's).
+    // A column of two types: each file reads alone, and the two fail together, whatever the
+    // policy of the source, as no file of them is one to skip.
     val session = spark
     import session.implicits._
     val written = workDir.resolve(s"written-${of.id.value}-numbers")
@@ -401,10 +402,20 @@ final class UnreadableFilesSpec extends AnyFunSuite with Matchers with Ingestion
     setTime(Files.move(part, directoryOf(of).resolve("b.parquet")), anHourAgo)
 
     launch(of) match {
-      case Outcome.Failed(_, failure, _) => failure shouldBe FailureClass.Internal
+      case Outcome.Failed(_, failure, message) =>
+        failure shouldBe FailureClass.Permanent
+        message should include("a column of one type in one file and of another in another")
       case other => fail(s"the run did not fail: $other")
     }
     batchesOf(of) shouldBe Seq(1L -> "PLANNED")
+    failedOf(of) shouldBe empty
+
+    // As the failure says: the file written again with the type of the other, the plan is
+    // given up (ADR-0018), and the next takes both.
+    dropParquet(of, "b.parquet", 2 to 2, at = later)
+    launch(of) shouldBe a[Outcome.GivenUp]
+    ingested(launch(of)).batch.seq.value shouldBe 2L
+    ids(of) should contain allOf ("1", "2")
     failedOf(of) shouldBe empty
     assertLedger(of)
   }
