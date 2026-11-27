@@ -668,6 +668,30 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
     )
   }
 
+  test("a file that cannot be read fails its run, unless the source says to skip it") {
+    fileConnector("min_file_age: 5m").value.onUnreadableFile shouldBe
+      FileConnectorConfig.OnUnreadableFile.Fail
+    fileConnector("on_unreadable_file: fail").value.onUnreadableFile shouldBe
+      FileConnectorConfig.OnUnreadableFile.Fail
+    fileConnector("on_unreadable_file: skip").value.onUnreadableFile shouldBe
+      FileConnectorConfig.OnUnreadableFile.Skip
+
+    fileErrors("on_unreadable_file: ignore") shouldBe
+      Seq(s"$File: connector.on_unreadable_file must be one of fail, skip")
+    fileErrors("on_unreadable_file: true") shouldBe
+      Seq(s"$File: connector.on_unreadable_file must be one of fail, skip, and is true or false")
+    // It is of the files of a source, and a table of a database has none.
+    val jdbc = Jdbc.replace(
+      "  table: public.orders\n",
+      "  table: public.orders\n  on_unreadable_file: skip\n"
+    )
+    val refused = errorsOf(jdbc)
+    refused should have size 1
+    refused.head should startWith(
+      s"$File: connector.on_unreadable_file is not a field that is known here"
+    )
+  }
+
   test("a file that may be taken the moment it appears is warned of") {
     val Loaded(connector, warnings) = fileConnector("min_file_age: 0s")
     connector.minFileAge shouldBe Duration.Zero

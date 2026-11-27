@@ -110,6 +110,34 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
     version().hash shouldBe "e6c0e5013bcfcff57979f7c307ef0630ab8f9f02834f3bbd8ee40575fe239204"
   }
 
+  test("a file source that says nothing of a file that cannot be read keeps its hash") {
+    val files =
+      """id: sales.returns
+        |connector: { type: file, path: sales/returns, format: csv }
+        |load: { mode: new_files }
+        |targets:
+        |  bronze: { table: bronze/sales/returns }
+        |""".stripMargin
+    def said(policy: String): String =
+      changed(files, "format: csv }", s"format: csv, on_unreadable_file: $policy }")
+
+    // Its hash before connector.on_unreadable_file was a field (P8.7b), and with `fail`, which
+    // is what every source did then: no snapshot of it is taken for one of a new configuration.
+    version(files).hash shouldBe "a3dead5fa224e8a2e18d03c498de9242dec4979014d1a996dd99f127fda5ea42"
+    version(said("fail")).hash shouldBe version(files).hash
+    version(said("fail")).content.hcursor
+      .downField("source")
+      .downField("connector")
+      .downField("on_unreadable_file")
+      .focus shouldBe None
+    // `skip` changes what the source ingests, and the runs made under it are told apart.
+    version(said("skip")).hash should not be version(files).hash
+    source(
+      version(said("skip")).content.hcursor.downField("source").focus.getOrElse(fail()).noSpaces
+    ).connector.asInstanceOf[FileConnectorConfig].onUnreadableFile shouldBe
+      FileConnectorConfig.OnUnreadableFile.Skip
+  }
+
   test("two files that say the same have one hash, however they say it") {
     val reordered =
       """targets:

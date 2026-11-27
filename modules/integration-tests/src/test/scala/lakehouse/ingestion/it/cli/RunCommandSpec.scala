@@ -2,10 +2,13 @@ package lakehouse.ingestion.it.cli
 
 import java.io.{ByteArrayOutputStream, PrintStream}
 import java.net.ServerSocket
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.attribute.FileTime
 import java.nio.file.{Files, Path}
 import java.time.Instant
 import java.util.TimeZone
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.GZIPOutputStream
 
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
@@ -25,6 +28,7 @@ import lakehouse.ingestion.it.support.{
   TakenAtItsWord
 }
 import org.apache.spark.sql.SparkSession
+import org.scalatest.LoneElement
 import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -46,6 +50,7 @@ import org.scalatest.time.{Seconds, Span}
 final class RunCommandSpec
     extends AnyFunSuite
     with Matchers
+    with LoneElement
     with Eventually
     with ControlPlaneSuite
     with RunCommandQueries
@@ -381,7 +386,7 @@ final class RunCommandSpec
   private def takenFiles(of: Source): Seq[String] = asSuperuser { c =>
     query(
       c,
-      "SELECT path FROM control.processed_file WHERE source_id = ? ORDER BY 1",
+      "SELECT path FROM control.processed_file WHERE source_id = ? AND status = 'TAKEN' ORDER BY 1",
       of.id.value
     ).map(_.head.split('/').last)
   }
@@ -422,6 +427,69 @@ final class RunCommandSpec
     val next = invoke(chained)
     withClue(next.err)(next.exit shouldBe Main.Exit.Ok)
     takenFiles(chained) should contain("late.csv")
+  }
+
+  /** A file of CSV of the source in gzip, cut short: what a copy that stopped halfway leaves. */
+  private def dropCutGzip(of: Source, name: String): Path = {
+    val whole = new ByteArrayOutputStream
+    Using.resource(new GZIPOutputStream(whole)) {
+      _.write(("id\n" + (1 to 2000).mkString("\n")).getBytes(UTF_8))
+    }
+    val path = files.directoryOf(of.id).resolve(name)
+    Files.write(path, whole.toByteArray.take(whole.size / 2))
+    Files.setLastModifiedTime(path, FileTime.from(Instant.now().minusSeconds(3600)))
+  }
+
+  test("a file that cannot be read stops its source in 4, naming it, by default") {
+    val stopped = fileSource()
+    drop(stopped, "a.csv", "id,amount\n1,10\n")
+    dropCutGzip(stopped, "b.csv.gz")
+
+    val ran = invoke(stopped)
+
+    ran.exit shouldBe Main.Exit.Permanent
+    said(ran).loneElement should include("'b.csv.gz' unreadable: it failed each of 3 reads")
+    batchesOf(stopped) shouldBe Seq("1" -> "PLANNED")
+    assertLedger(stopped)
+  }
+
+  test("under skip, a file that cannot be read is a warning, and the invocation takes the rest") {
+    val skipping = files.fileSource(newSourceId(), options = ", on_unreadable_file: skip")
+    drop(skipping, "a.csv", "id\n1\n")
+    dropCutGzip(skipping, "b.csv.gz")
+    drop(skipping, "c.csv", "id\n3\n")
+
+    val ran = invoke(skipping)
+
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    // One warning for the file, beside those of the deployment, and nothing that is an error.
+    ran.errors.filter(_.contains(" skipped ")).loneElement should (
+      startWith("warning: ") and
+        include("skipped 'b.csv.gz', which cannot be read: unreadable: it failed each of 3 reads")
+    )
+    // And what became of the batch.
+    said(ran).loneElement should include(
+      s"gave up the batch ${skipping.id.value}/bronze#1, and recorded its file as FAILED"
+    )
+    // The run that skipped, and the one that took the rest, in one invocation.
+    ran.lines.last shouldBe
+      s"The invocation of ${skipping.id.value} made 2 runs and committed 1 batch."
+    batchesOf(skipping) shouldBe Seq("1" -> "ABANDONED", "2" -> "COMMITTED")
+    runsOf(skipping) shouldBe Seq("SUCCEEDED" -> None, "SUCCEEDED" -> None)
+    asSuperuser { c =>
+      query(
+        c,
+        "SELECT path, status FROM control.processed_file WHERE source_id = ? ORDER BY 1",
+        skipping.id.value
+      )
+    }.map(row => row(0).split('/').last -> row(1)) shouldBe
+      Seq("a.csv" -> "TAKEN", "b.csv.gz" -> "FAILED", "c.csv" -> "TAKEN")
+    assertLedger(skipping)
+
+    // The next invocation has nothing new: the file stays recorded, and is not taken again.
+    val next = invoke(skipping)
+    withClue(next.err)(next.exit shouldBe Main.Exit.Ok)
+    next.out should include("found nothing new")
   }
 
   test("--max-batches stops the chain where it says, and the next invocation goes on") {

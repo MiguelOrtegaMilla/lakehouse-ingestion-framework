@@ -30,7 +30,7 @@ sbt "cli/run migrate --profile conf/app/local.yaml --password env:INGEST_MIGRATO
 ```
 
 ```text
-control: version 8, 8 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
+control: version 9, 9 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 delta_coordination: version 5, 5 migrations applied (jdbc:postgresql://localhost:5432/ingestion_control)
 ```
 
@@ -59,16 +59,25 @@ Run it again and it finds nothing new. A source with more than one batch takes (
 
 | Code | Meaning |
 |---|---|
-| 0 | A batch committed, nothing new, or a source that is disabled |
+| 0 | A batch committed, nothing new, or a source that is disabled. Under `connector.on_unreadable_file: skip`, also a file that cannot be read skipped and recorded, with a warning on the error output, and the rest ingested by the same invocation |
 | 2 | Another run holds the lease of the source: nothing was done |
 | 3 | A database did not answer, the run lost its lease, or its files changed under it: run it again later |
-| 4 | Something that running again does not mend: the configuration, a database that refused, a run that failed for good |
+| 4 | Something that running again does not mend: the configuration, a database that refused, a run that failed for good, a file that cannot be read (named, under `fail`, the default) |
 | 5 | More records were rejected than the source allows: nothing was committed, and they are in quarantine |
 | 128 + n | The signal n came before the first run: nothing was run. A run stopped after one ends in the code of its last run |
 | 64 | The command line is not one |
 | 70 | A mistake of the application, which nothing classified: the run is recorded as failed with the class `internal`, and its lease is free. The log has the failure whole. Alert |
 
 The whole contract is in [discovery §14.1](../architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them; `JdbcRunCommandSpec`, with a table of a database, cut for real by a proxy.
+
+### A file that cannot be read
+
+A file cut short, one that the process may not open, or a symbolic link out of the landing zone stops its source by default: the run ends in 4 and names each file and why, and every run does the same until the file is mended. Write it again, whole (another size or time makes it another file, which the next run takes), or give the process the permission to read it. A source that says `connector.on_unreadable_file: skip` goes on without it: the file is recorded in the control plane as `FAILED`, with why, and `touch` has it read again once it is mended ([ADR-0023](../adr/0023-a-file-that-cannot-be-read.md)). The files a source skipped, and why:
+
+```sql
+SELECT path, size, modified_at, error, batch_seq
+  FROM control.processed_file WHERE source_id = 'sales.returns' AND status = 'FAILED';
+```
 
 ### When a source is stuck: `abandon-batch`
 

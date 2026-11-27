@@ -258,7 +258,9 @@ final class LeasedRun private (
    *
    * The files of the batch are not recorded as taken, the state of the source does not move,
    * and the number of the batch is not used again. The next run finds nothing planned, and
-   * plans anew from what the source has by then.
+   * plans anew from what the source has by then. Files of its plan that could not be read,
+   * under a source that skips them, are recorded as such in the same transaction (`failed`,
+   * ADR-0023), and the next plan leaves them out.
    *
    * That nothing of the batch is in its tables is the caller's to ask first, of the table
    * (`TableTransactions`): a batch whose data is written is rolled forward, and never given up.
@@ -269,11 +271,13 @@ final class LeasedRun private (
    *   asked, and does not succeed; an operator's run that was asked to give it up does
    *   (ADR-0021 §2). It is made anew for each time the transaction is made, as the counts of
    *   `commit` are
+   * @param failed the files of its plan that could not be read, each with why, to be recorded
+   *   as `FAILED`; none, but for a batch given up for them
    * @return false if the lease is another run's: this process was a zombie, and nothing was
    *   changed. The batch is the other run's, to finish or to give up
    * @throws java.lang.IllegalStateException if the lease is this run's and the batch cannot be
-   *   given up: it is not the planned one. Nothing was changed, and the lease is no longer
-   *   renewed
+   *   given up: it is not the planned one, or a file said to have failed is not of its plan or
+   *   is recorded already. Nothing was changed, and the lease is no longer renewed
    * @throws java.lang.IllegalArgumentException if the reason says nothing, or the detail could
    *   not be stored. Nothing was changed, and the lease is still renewed
    * @throws java.lang.Exception a failure that may pass, once the run could not learn within its
@@ -284,7 +288,8 @@ final class LeasedRun private (
       batch: BatchId,
       reason: String,
       detail: Option[Json],
-      end: => RunEnd
+      end: => RunEnd,
+      failed: Seq[ProcessedFiles.FailedFile] = Nil
   ): Boolean = {
     require(batch.app == start.txnAppId, s"the batch $batch is not of ${start.txnAppId}")
     // Before the lease stops being renewed, as the watermark of a commit: what cannot be
@@ -297,6 +302,23 @@ final class LeasedRun private (
         def must(done: Boolean, what: String): Unit =
           if (!done) throw new IllegalStateException(s"the batch $batch was not given up: $what")
 
+        if (failed.nonEmpty) {
+          // The files that are recorded are of the plan that was written down for the batch,
+          // and not what a caller says it was, as the files that a commit records are.
+          val plan = Batches
+            .planned(connection, start.txnAppId)
+            .filter(_.id == batch)
+            .flatMap(planned => FilePlan.fromJson(planned.plan).toOption)
+          must(plan.nonEmpty, "it is not a planned batch of files")
+          must(
+            failed.forall(one => plan.exists(_.files.contains(one.file))),
+            "a file said to have failed is not of its plan"
+          )
+          must(
+            ProcessedFiles.fail(connection, start.source, batch, plan.get.directory, failed),
+            "a file of its plan was recorded already"
+          )
+        }
         must(
           Batches.abandon(connection, batch, start.id, reason, detail),
           "it is not a planned batch"

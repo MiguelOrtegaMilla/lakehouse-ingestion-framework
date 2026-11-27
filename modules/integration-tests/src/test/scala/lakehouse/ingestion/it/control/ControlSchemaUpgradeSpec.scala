@@ -18,7 +18,8 @@ import org.scalatest.matchers.should.Matchers
  * The control plane upgraded under a write-ahead log that is in use: batches written by version
  * 2 of the schema, then migration V3 (who gave a batch up, when and why: ADR-0018) and those
  * after it, up to V7 (backfills: ADR-0021 §5), whose rules on a sequence and the kinds of its
- * runs and batches take the rows of before as they are.
+ * runs and batches take the rows of before as they are, and V9 (a file that could not be read:
+ * ADR-0023), which takes every file of before for one that was taken.
  * `ControlSchemaSpec` has the schema as the migrations build it on an empty database.
  */
 final class ControlSchemaUpgradeSpec
@@ -134,6 +135,17 @@ final class ControlSchemaUpgradeSpec
         batchOfVersion2(c, newSource(), "ABANDONED")
       )
     }
+    // A file that the committed batch took, as version 2 recorded it.
+    as(Engine) { c =>
+      update(
+        c,
+        "INSERT INTO control.processed_file " +
+          "(source_id, path, size, modified_at, txn_app_id, batch_seq) " +
+          "VALUES (?, 'in/a.csv', 10, '2026-11-18T10:00:00.123Z', ?, 1)",
+        committed.app.value.stripSuffix("/bronze"),
+        committed.app.value
+      ) shouldBe 1
+    }
     val before = as(Engine)(c => query(c, "SELECT now()::text")).head.head
 
     // V3 to V6, and what an operator did under version 6 (ADR-0021): a batch given up, a reset,
@@ -144,8 +156,8 @@ final class ControlSchemaUpgradeSpec
     val ran = ControlPlaneSchema.migrate(pg)
 
     withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
-    // And V7 and V8 on top of them: the engine works on the schema that it was built for.
-    ran.lines.head shouldBe s"control: version 8, 2 migrations applied (${pg.jdbcUrl(Database)})"
+    // And V7 to V9 on top of them: the engine works on the schema that it was built for.
+    ran.lines.head shouldBe s"control: version 9, 3 migrations applied (${pg.jdbcUrl(Database)})"
     as(Engine) { c =>
       ControlSchema.verify(c) shouldBe Right(())
 
@@ -177,6 +189,12 @@ final class ControlSchemaUpgradeSpec
       val reprocess = Batches.find(c, BatchId(committed.app, BatchSeq.First.next)).value
       reprocess.kind shouldBe RunKind.Reprocess
       reprocess.reprocessOf shouldBe Some(BatchSeq.First)
+      // V9: the file that it took is a file taken, with nothing to say of an error.
+      query(
+        c,
+        "SELECT status, coalesce(error, 'none') FROM control.processed_file WHERE txn_app_id = ?",
+        committed.app.value
+      ) shouldBe Seq(Seq("TAKEN", "none"))
       val stillCommitted = Batches.find(c, committed).value
       stillCommitted.status shouldBe BatchStatus.Committed
       stillCommitted.outputs.value.map(_.version) shouldBe Vector(Some(4L))

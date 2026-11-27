@@ -11,7 +11,7 @@ import lakehouse.ingestion.engine.IngestionService.Outcome
 /**
  * The runs of an invocation (discovery §17, P6.10): one, and another after it for as long as the
  * batch that it committed says that there is more, within what the first plan of the invocation
- * saw. Each is a whole run, with its lease and its batch. The chain stops at `--max-batches`, and
+ * saw, or once a run gave its batch up for files that its source skips. Each is a whole run, with its lease and its batch. The chain stops at `--max-batches`, and
  * before a run once a signal has asked it to; its code is that of its last run (`exitOf`), or
  * 128 + the signal if it asked before the first.
  *
@@ -91,6 +91,10 @@ private[cli] object Chain {
             case Outcome.Ingested(_, _, _, _, Outcome.Next.Within(within)) => Some(Some(within))
             case Outcome.Ingested(_, _, _, _, Outcome.Next.Afresh) => Some(None)
             case _: Outcome.RolledForward => Some(None)
+            // The batch was given up for files that the source skips, and nothing committed:
+            // the next run plans without them, against what this one was given (ADR-0023 §5).
+            // Each such run takes a file out of what any plan can take, so the chain ends.
+            case _: Outcome.FilesSkipped => Some(horizon)
             case _ => None
           }
           more match {

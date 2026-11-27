@@ -37,6 +37,7 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
   private val UniqueViolation = "23505"
   private val ForeignKeyViolation = "23503"
   private val CheckViolation = "23514"
+  private val NotNullViolation = "23502"
   private val InsufficientPrivilege = "42501"
 
   private val Hash = "0123456789abcdef" * 4
@@ -156,6 +157,11 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
     // A batch is of a kind that plans one (ADR-0021 §4).
     checks("control.ingestion_batch.ingestion_batch_run_kind_check") shouldBe
       RunKind.OfBatches.map(_.name).toSet
+    // A file is taken, or could not be read (ADR-0023 §6).
+    checks("control.processed_file.processed_file_status_check") shouldBe Set(
+      lakehouse.ingestion.engine.control.ProcessedFiles.Taken,
+      lakehouse.ingestion.engine.control.ProcessedFiles.Failed
+    )
   }
 
   test("the engine's role can write the whole life of a run, from its lease to its commit") {
@@ -1041,7 +1047,8 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
             "size" -> "10",
             "modified_at" -> "'2026-11-18T10:00:00.123Z'",
             "txn_app_id" -> text(s"$source/bronze"),
-            "batch_seq" -> "1"
+            "batch_seq" -> "1",
+            "status" -> "'TAKEN'"
           )
         )(columns: _*)
 
@@ -1059,6 +1066,37 @@ final class ControlSchemaSpec extends AnyFunSuite with Matchers with BeforeAndAf
       )
       withClue("taken by a batch that is none: ")(
         sqlState(file("path" -> "'in/c.csv'", "batch_seq" -> "2")) shouldBe ForeignKeyViolation
+      )
+
+      // A file that could not be read says why, and one that was taken says nothing of it
+      // (V9, ADR-0023 §6).
+      file("path" -> "'in/d.csv'", "status" -> "'FAILED'", "error" -> "'unreadable: from x'")
+      withClue("failed, and not why: ")(
+        sqlState(file("path" -> "'in/e.csv'", "status" -> "'FAILED'")) shouldBe CheckViolation
+      )
+      withClue("failed, for a reason that says nothing: ")(
+        sqlState(
+          file("path" -> "'in/e.csv'", "status" -> "'FAILED'", "error" -> "' \t'")
+        ) shouldBe CheckViolation
+      )
+      withClue("taken, with an error: ")(
+        sqlState(file("path" -> "'in/e.csv'", "error" -> "'unreadable'")) shouldBe CheckViolation
+      )
+      withClue("neither: ")(
+        sqlState(file("path" -> "'in/e.csv'", "status" -> "'SKIPPED'")) shouldBe CheckViolation
+      )
+      // A row says which it is: an insert that does not is refused, not taken for a file taken.
+      withClue("no status: ")(
+        sqlState(
+          update(
+            c,
+            "INSERT INTO control.processed_file " +
+              "(source_id, path, size, modified_at, txn_app_id, batch_seq) " +
+              "VALUES (?, 'in/f.csv', 1, '2026-11-18T10:00:00Z', ?, 1)",
+            source,
+            s"$source/bronze"
+          )
+        ) shouldBe NotNullViolation
       )
     }
   }

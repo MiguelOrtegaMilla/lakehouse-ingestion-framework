@@ -26,7 +26,8 @@ import lakehouse.ingestion.engine.connector.{
   RangePlanner,
   ReadContext,
   ReadResult,
-  SourceChangedException
+  SourceChangedException,
+  UnreadableFilesException
 }
 import lakehouse.ingestion.engine.control.{
   Application,
@@ -36,6 +37,7 @@ import lakehouse.ingestion.engine.control.{
   ControlDatabase,
   LeasedRun,
   LeaseLostException,
+  ProcessedFiles,
   SourceStates
 }
 import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
@@ -980,11 +982,17 @@ final class IngestionService(
       val progress = bound.progress(batch.plan)
       // Nor is anything read by a run that has lost its lease.
       leased.verify()
+      // A read that starts jobs beyond those of its plan asks the lease before each.
       val read =
-        try Right(bound.read(batch.plan, ReadContext(spark)))
-        catch { case changed: SourceChangedException => Left(changed) }
+        try Right(bound.read(batch.plan, ReadContext(spark, () => leased.verify())))
+        catch {
+          case changed: SourceChangedException => Left(changed)
+          case cannot: UnreadableFilesException => Left(cannot)
+        }
       read match {
-        case Left(changed) => giveUp(batch, changed)
+        case Left(changed: SourceChangedException) => giveUp(batch, changed)
+        case Left(cannot: UnreadableFilesException) => skip(batch, progress, cannot)
+        case Left(other) => throw other
         case Right(kept: ReadResult.Kept) => finish(batch, progress, kept)
         case Right(once: ReadResult.OnePass) => finishInOnePass(batch, progress, once)
       }
@@ -1257,6 +1265,66 @@ final class IngestionService(
             Outcome.GivenUp(start.id, batch.id, changed.summary)
           else fenced(start, "another run holds it")
       }
+
+    /**
+     * Gives up a batch with files that cannot be read, under a source that skips them, if its
+     * table does not have the batch: the files are recorded as `FAILED`, with why, in the
+     * transaction that gives the batch up, and the run succeeds, having done what its source
+     * says (ADR-0023 §5). The next plan is made without them.
+     *
+     * A reprocess skips nothing: its files were taken, by the batch that read them, and an
+     * operator named them. One that cannot be read fails it as permanent.
+     */
+    private def skip(
+        batch: PlannedBatch,
+        progress: Progress,
+        cannot: UnreadableFilesException
+    ): Outcome = {
+      if (batch.reprocessOf.nonEmpty)
+        throw RunFailedException.permanent(
+          s"${batch.id} reads again files that were taken, which an operator named, and a " +
+            s"reprocess skips none of them: ${cannot.summary}. The batch stays planned, and " +
+            "abandon-batch gives it up",
+          cannot
+        )
+      val files = progress.files.getOrElse(
+        throw new IllegalStateException(
+          s"the read of ${batch.id} says that files of it cannot be read, and its plan names none"
+        )
+      )
+      val byName = files.files.map(file => file.name.value -> file).toMap
+      val failed = cannot.unreadable.map { one =>
+        ProcessedFiles.FailedFile(
+          byName.getOrElse(
+            one.item,
+            throw new IllegalStateException(
+              s"the read of ${batch.id} says that '${one.item}' cannot be read, and its plan " +
+                "has no file of that name"
+            )
+          ),
+          one.why
+        )
+      }
+      Recovery.of(Some(batch), table, tables) match {
+        case Recovery.RollForward(_) =>
+          throw new IllegalStateException(
+            s"files of ${batch.id} cannot be read, and the table at ${table.uri} has the " +
+              "batch: another writer of this sequence wrote it. Nothing was given up, and " +
+              "nothing was changed: the run after this one recovers the batch as the table " +
+              s"says. What cannot be read: ${cannot.summary}"
+          )
+        case _ =>
+          log.warn(
+            s"${batch.id} was given up, and the next run plans without the files that cannot " +
+              s"be read: ${cannot.summary}"
+          )
+          // Made for each time the transaction is, with the retries made by then.
+          def end = RunEnd.Succeeded(retried.into(RunCounts(rowsWritten = Some(0L))))
+          if (leased.abandon(batch.id, cannot.summary, Some(unreadableDetail(cannot)), end, failed))
+            Outcome.FilesSkipped(start.id, batch.id, cannot.unreadable)
+          else fenced(start, "another run holds it")
+      }
+    }
   }
 }
 
@@ -1342,6 +1410,17 @@ object IngestionService {
      */
     final case class GivenUp(run: RunId, batch: BatchId, reason: String) extends Outcome
 
+    /**
+     * Files of the batch cannot be read, and the source skips them (ADR-0023): the batch was
+     * given up, and each file recorded as `FAILED`, with why. The run succeeded, and the next
+     * run plans without them (0).
+     */
+    final case class FilesSkipped(
+        run: RunId,
+        batch: BatchId,
+        skipped: Seq[UnreadableFilesException.Unreadable]
+    ) extends Outcome
+
     /** The run failed, with the class that says what to do next (3, 4 or 5). */
     final case class Failed(run: RunId, failure: FailureClass, message: String) extends Outcome
   }
@@ -1388,6 +1467,18 @@ object IngestionService {
 
   /** How many things that changed are kept with a batch that is given up, of however many. */
   val ChangedKept = 1000
+
+  /**
+   * The files of a plan that cannot be read, as a batch that is given up for them keeps them
+   * (`abandon_detail`): each by its name in the plan, with why, and how many there were. The
+   * first `ChangedKept` are kept: each is recorded in `processed_file` too.
+   */
+  def unreadableDetail(cannot: UnreadableFilesException): Json = Json.obj(
+    "unreadable" -> Json.fromValues(cannot.unreadable.take(ChangedKept).map { one =>
+      Json.obj("item" -> Json.fromString(one.item), "why" -> Json.fromString(one.why))
+    }),
+    "total" -> Json.fromInt(cannot.unreadable.size)
+  )
 
   /**
    * What of a plan changed, as a batch that is given up keeps it (`abandon_detail`): each thing

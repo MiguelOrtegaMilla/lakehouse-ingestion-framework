@@ -143,6 +143,8 @@ object RunCommand {
   /** The code of a run, by how it ended (discovery §14.1). */
   def exitOf(outcome: Outcome): Int = outcome match {
     case _: Outcome.NothingNew | _: Outcome.Ingested | _: Outcome.RolledForward => Main.Exit.Ok
+    // What the source says to do with a file that cannot be read (ADR-0023 §5).
+    case _: Outcome.FilesSkipped => Main.Exit.Ok
     case _: Outcome.Skipped => Main.Exit.SkippedLocked
     case _: Outcome.GivenUp => Main.Exit.Transient
     case Outcome.Failed(_, failure, _) =>
@@ -184,10 +186,27 @@ object RunCommand {
       case Outcome.GivenUp(_, batch, reason) =>
         Stream.Err -> (s"error: $run gave up the batch $batch: $reason. The next run plans " +
           "anew.")
+      case Outcome.FilesSkipped(_, batch, skipped) =>
+        Stream.Err -> skippedLines(run, s"the batch $batch", skipped)
       case Outcome.Failed(_, failure, message) =>
         Stream.Err -> s"error: $run failed ($failure): $message"
     }
   }
+
+  /**
+   * A warning for each file that a run skipped, and what became of its batch: the lines of a run
+   * that did what its source says, on the error output, where what needs to be looked at is.
+   */
+  private[cli] def skippedLines(
+      run: String,
+      batch: String,
+      skipped: Seq[lakehouse.ingestion.engine.connector.UnreadableFilesException.Unreadable]
+  ): String =
+    (skipped.map(one => s"warning: $run skipped '${one.item}', which cannot be read: ${one.why}") :+
+      (s"$run gave up $batch, and recorded ${if (skipped.size == 1) "its file"
+        else s"those ${skipped.size} files"} " +
+        "as FAILED, as the source says (connector.on_unreadable_file: skip). The next run plans " +
+        "without them.")).mkString("\n")
 
   /** The tables that a batch was written to, each at its version, as a line ends with them. */
   private[cli] def written(outputs: Seq[lakehouse.ingestion.core.control.BatchOutput]): String =

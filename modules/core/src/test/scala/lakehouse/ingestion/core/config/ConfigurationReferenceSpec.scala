@@ -145,7 +145,8 @@ final class ConfigurationReferenceSpec extends AnyFunSuite with Matchers with Ei
 
   private val FullFileSource =
     """id: sales.returns
-      |connector: { type: file, path: sales/returns, format: csv, pattern: "returns-*.csv" }
+      |connector:
+      |  { type: file, path: sales/returns, format: csv, pattern: "returns-*.csv", on_unreadable_file: skip }
       |load: { mode: new_files }
       |targets:
       |  bronze: { table: bronze/sales/returns }

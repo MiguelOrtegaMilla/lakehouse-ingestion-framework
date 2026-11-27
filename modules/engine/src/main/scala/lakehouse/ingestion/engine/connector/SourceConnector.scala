@@ -86,6 +86,8 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
    *   not one that this connector reads
    * @throws SourceChangedException if the source no longer has what the plan names, as the plan
    *   names it. Nothing of the plan was given to be written
+   * @throws UnreadableFilesException if files of the plan cannot be read, and the source skips
+   *   such files. Nothing of the plan was given to be written
    */
   def read(source: Source, config: C, plan: Json, context: ReadContext): ReadResult
 
@@ -268,12 +270,23 @@ final case class PlanContext(
  */
 trait FileRegistry {
 
-  /** The files of `directory` with these names that batches of the source have taken. */
+  /**
+   * The files of `directory` with these names that batches of the source have taken, or could
+   * not read and skipped (ADR-0023): a plan leaves out both.
+   */
   def processed(directory: RelativePath, names: Seq[String]): Set[LandedFile]
 }
 
-/** What the engine gives a connector to read with. */
-final case class ReadContext(spark: SparkSession)
+/**
+ * What the engine gives a connector to read with.
+ *
+ * @param verify what a read asks before each job of Spark that it starts beyond those of the
+ *   read of its plan, as the read of each file of a plan alone (ADR-0023 §3): it throws if the
+ *   run may no longer start one, having lost its lease (ADR-0006). The jobs that are running
+ *   when a lease is lost are stopped; one that is started after it is not, unless this is asked.
+ *   The engine gives the lease of the run; a read outside a run, nothing to ask
+ */
+final case class ReadContext(spark: SparkSession, verify: () => Unit = () => ())
 
 /**
  * What a read gives: the rows of a plan, and how they may be gone over.
@@ -378,4 +391,38 @@ object SourceChangedException {
    * @param change how it is not as it was planned
    */
   final case class Changed(item: String, change: String)
+}
+
+/**
+ * Files of a plan cannot be read, and their source skips such files (ADR-0023): a file that
+ * Spark fails to read alone, at every one of its reads, or one that the landing zone refuses to
+ * open. A read raises it in place of rows, with nothing of the plan given to be written.
+ *
+ * It is not a failure with a class, as `SourceChangedException` is not: what follows is the
+ * engine's. The batch is given up, if nothing of it is in its tables, each file is recorded as
+ * one that could not be read, with why, and the next plan is made without them. A connector
+ * raises it for a source that says to skip such files alone; under `fail`, the default, the
+ * same files are a permanent failure that names them.
+ *
+ * @param summary what happened, for a person: it names each file, and never a value of a row,
+ *   the text of an exception, nor where a link leads
+ * @param unreadable each file of the plan that cannot be read, by the name that the plan has it
+ *   under, with why
+ */
+final class UnreadableFilesException(
+    val summary: String,
+    val unreadable: Seq[UnreadableFilesException.Unreadable]
+) extends RuntimeException(summary) {
+  require(unreadable.nonEmpty, "files that cannot be read are some files")
+}
+
+object UnreadableFilesException {
+
+  /**
+   * @param item the file, by the name that the plan has it under
+   * @param why what Spark said of it, by the condition of its error and the type of its cause,
+   *   or what the landing zone found; never the text of an exception, which may hold what the
+   *   file holds
+   */
+  final case class Unreadable(item: String, why: String)
 }

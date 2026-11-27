@@ -37,6 +37,14 @@ import lakehouse.ingestion.engine.failure.RunFailedException
  * A hard link is a file like any other, and Linux lets a process make one only to a file that
  * it owns or may write (`fs.protected_hardlinks`).
  *
+ * '''What no run may open''' is a file that leads out of the root, a link to nothing or round a
+ * loop, and what is not a regular file (a pipe, a socket, a device). Under `fail`, the default,
+ * such a file fails the listing of its source, and nothing is planned. Under `skip` it is
+ * listed, by what the file system says of the name itself and not of where it leads, planned as
+ * any file, and found again just before the read, as refused, for its batch to be given up and
+ * the file recorded (ADR-0023). Either way it is never opened, nor is anything looked at beyond
+ * the root.
+ *
  * The root is `file://`. A landing zone on object storage has no links, and is read with the
  * deployment that has one (E2).
  */
@@ -51,12 +59,15 @@ final class Landing(root: RootUri) {
    * A name that no run can read (`FileName`) is listed as it is, unresolved, for the planner to
    * refuse, by its place and not by the name (`FilePlanner`).
    *
+   * A file that no run may open is listed too, under `skip`, by the size and the time of the
+   * name itself: a link by its own, and not by those of what it leads to.
+   *
    * @return the files, in no order
    * @throws RunFailedException a permanent failure, for a root or a directory that is not there
-   *   or is not a directory, a directory outside the root, and every file of the source that no
-   *   run can read: one outside the root, a link to nothing, something that is not a file. A
-   *   file is never passed over without a word: a source that skipped one would lose its data
-   *   the same way (discovery §17, P5; the policy that may skip one is P8's)
+   *   or is not a directory, a directory outside the root, and, under `fail`, every file of the
+   *   source that no run may open: one outside the root, a link to nothing, something that is
+   *   not a file. A file is never passed over without a word: a source that skipped one would
+   *   lose its data the same way (discovery §17, P5)
    * @throws java.io.IOException if the file system cannot be read, as for lack of permission:
    *   the classification of errors is P8's
    */
@@ -71,13 +82,19 @@ final class Landing(root: RootUri) {
       else look(entry, name, rootReal).map(name -> _)
     }
 
-    val problems = looked.collect { case (name, Left(problem)) => s"'$name' $problem" }
-    if (problems.nonEmpty)
+    val problems = looked.collect { case (name, Landing.Look.Refused(why, _)) =>
+      s"'$name' ${why.problem}"
+    }
+    if (problems.nonEmpty && config.onUnreadableFile == FileConnectorConfig.OnUnreadableFile.Fail)
       throw RunFailedException.permanent(
         s"the directory ${config.path} of the landing zone has ${Landing.files(problems.size)} " +
-          s"that no run may read, and nothing was planned: ${Landing.some(problems.sorted)}"
+          "that no run may read, and nothing was planned, as the source fails for such a file " +
+          s"(connector.on_unreadable_file): ${Landing.some(problems.sorted)}"
       )
-    looked.collect { case (name, Right(stat)) => stat.listed(name) }
+    looked.map {
+      case (name, Landing.Look.Readable(stat)) => stat.listed(name)
+      case (name, Landing.Look.Refused(_, own)) => own.listed(name)
+    }
   }
 
   /**
@@ -87,6 +104,10 @@ final class Landing(root: RootUri) {
    *
    * Which file it is was not planned: a plan outlives the process that made it, and a restart of
    * the machine or of its container may number the same disk otherwise (`FileIdentity`).
+   *
+   * A file that no run may open, and that has the size and the time that were planned for its
+   * name, is as it was planned: it is found as refused, and is not to be read
+   * (`Confirmed.refused`).
    *
    * @return the files of the plan, in its directory as it is resolved, in the order of the plan;
    *   or what is not as it was planned, for each name that is not, in that order
@@ -129,19 +150,26 @@ final class Landing(root: RootUri) {
    */
   private def looks(config: FileConnectorConfig, plan: FilePlan)(
       otherwise: (Int, FileIdentity) => Option[String]
-  ): Either[Vector[Landing.NotAsPlanned], Vector[(Path, FileIdentity)]] = {
+  ): Either[Vector[Landing.NotAsPlanned], Vector[Landing.Found]] = {
     require(plan.directory == config.path, s"the plan is of ${plan.directory}, not ${config.path}")
     val (rootReal, directory) = locate(config)
 
     val found = plan.files.zipWithIndex.map { case (file, index) =>
       val name = file.name.value
       val entry = directory.resolve(name)
-      val now = look(entry, name, rootReal)
-        .getOrElse(Left("is not there any more, or is a directory now"))
-        .flatMap { stat =>
-          val problems = otherwise(index, stat.identity).toSeq ++ changes(file, stat)
-          if (problems.isEmpty) Right(entry -> stat.identity) else Left(problems.mkString(", "))
-        }
+      def asPlanned(stat: Landing.Stat, refused: Option[Landing.Refusal]) = {
+        val problems = otherwise(index, stat.identity).toSeq ++ changes(file, stat)
+        if (problems.isEmpty) Right(Landing.Found(entry, stat.identity, refused))
+        else Left(problems.mkString(", "))
+      }
+      val now = look(entry, name, rootReal) match {
+        case None => Left("is not there any more, or is a directory now")
+        case Some(Landing.Look.Readable(stat)) => asPlanned(stat, refused = None)
+        // Known by the name itself, as it was listed: what it leads to is not looked at. One
+        // that was planned as another file says what it is now.
+        case Some(Landing.Look.Refused(why, own)) =>
+          asPlanned(own, refused = Some(why)).left.map(_ => why.problem)
+      }
       now.left.map(Landing.NotAsPlanned(name, _))
     }
     val problems = found.collect { case Left(problem) => problem }
@@ -195,41 +223,50 @@ final class Landing(root: RootUri) {
   }
 
   /**
-   * What an entry of the directory is: a file to list, nothing to list, or what is wrong.
+   * What an entry of the directory is: a file to list, nothing to list, or one that no run may
+   * open, with why and what the file system says of the name itself.
    *
    * @return none for a directory, a link to one, and an entry that is gone since it was listed:
    *   its producer took it back, and it is not the source's any more
    */
-  private def look(
-      entry: Path,
-      name: String,
-      rootReal: Path
-  ): Option[Either[String, Landing.Stat]] =
+  private def look(entry: Path, name: String, rootReal: Path): Option[Landing.Look] =
     stat(entry, LinkOption.NOFOLLOW_LINKS).flatMap { own =>
+      def refused(code: String, problem: String) =
+        Some(Landing.Look.Refused(Landing.Refusal(code, problem), own))
       if (own.isDirectory) None
-      else if (FileName.parse(name).isLeft) Some(Right(own))
-      else if (!own.isSymbolicLink) Some(file(name, own))
+      else if (FileName.parse(name).isLeft) Some(Landing.Look.Readable(own))
+      else if (!own.isSymbolicLink) file(own).orElse(Some(Landing.Look.Readable(own)))
       else
         real(entry, missing = "is a symbolic link to nothing") match {
-          case Left(problem) => Some(Left(problem))
+          case Left(problem) => refused(Landing.Refusal.BrokenLink, problem)
           case Right(target) =>
+            // Whether it leads to a directory, which is not listed, is asked of what the file
+            // system says of the target. Nothing is opened, inside the root or out of it, and
+            // what a link out of it is listed by is its own.
             stat(target).flatMap { theirs =>
               if (theirs.isDirectory) None
               else if (!target.startsWith(rootReal))
-                Some(Left("leads out of the landing zone, through a symbolic link"))
-              else Some(file(name, theirs))
+                refused(
+                  Landing.Refusal.OutsideTheRoot,
+                  "leads out of the landing zone, through a symbolic link"
+                )
+              else file(theirs).map(_.copy(own = own)).orElse(Some(Landing.Look.Readable(theirs)))
             }
         }
     }
 
-  /** What is read under a name: a file, and nothing else. */
-  private def file(name: String, stat: Landing.Stat): Either[String, Landing.Stat] =
-    if (stat.isRegularFile) Right(stat)
-    else
-      Left(
-        "is not a file but a pipe, a socket or a device: a read of it could wait for ever, or " +
-          "never end"
+  /** What is not read under a name: what is not a file. None, for a regular file. */
+  private def file(stat: Landing.Stat): Option[Landing.Look.Refused] =
+    Option.when(!stat.isRegularFile)(
+      Landing.Look.Refused(
+        Landing.Refusal(
+          Landing.Refusal.NotAFile,
+          "is not a file but a pipe, a socket or a device: a read of it could wait for ever, " +
+            "or never end"
+        ),
+        stat
       )
+    )
 
   /**
    * The path with every link in it resolved, or why it leads nowhere: to what is not there, or
@@ -276,14 +313,56 @@ object Landing {
    */
   final class Confirmed private[files] (
       private[files] val plan: FilePlan,
-      found: Vector[(Path, FileIdentity)]
+      found: Vector[Found]
   ) {
 
     /** Where each file of the plan is, in its directory as it is resolved, in the plan's order. */
-    val paths: Vector[Path] = found.map(_._1)
+    val paths: Vector[Path] = found.map(_.path)
 
     /** Which file of the file system each was, in the plan's order. */
-    val identities: Vector[FileIdentity] = found.map(_._2)
+    val identities: Vector[FileIdentity] = found.map(_.identity)
+
+    /**
+     * The files of the plan that no run may open, each with why, in the plan's order. A plan
+     * that has one is not read: none of its files is opened.
+     */
+    val refused: Vector[(LandedFile, Refusal)] =
+      plan.files.zip(found).collect { case (file, Found(_, _, Some(why))) => file -> why }
+  }
+
+  /** A file of a plan, as a look found it as it was planned. */
+  final private[files] case class Found(
+      path: Path,
+      identity: FileIdentity,
+      refused: Option[Refusal]
+  )
+
+  /** What a look found under a name that it lists. */
+  sealed private[files] trait Look
+  private[files] object Look {
+
+    /** A file to read: what the file system says of it, through a link if it is one. */
+    final case class Readable(stat: Stat) extends Look
+
+    /** A name that no run may open, with why, and what the file system says of the name. */
+    final case class Refused(why: Refusal, own: Stat) extends Look
+  }
+
+  /**
+   * Why no run may open a name of a directory of the landing zone (ADR-0013 §2, ADR-0023 §2).
+   *
+   * @param code what a record of the file says it is, as a word: `path_outside_root`,
+   *   `broken_link` or `not_a_file`
+   * @param problem for a person, to follow the name of the file. Never where a link leads
+   */
+  final case class Refusal(code: String, problem: String) {
+    override def toString: String = s"$code: it $problem, and was not opened"
+  }
+
+  object Refusal {
+    val OutsideTheRoot = "path_outside_root"
+    val BrokenLink = "broken_link"
+    val NotAFile = "not_a_file"
   }
 
   /**

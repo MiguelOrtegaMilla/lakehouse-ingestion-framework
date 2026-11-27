@@ -107,7 +107,9 @@ object BackfillCommand {
    * nothing of what the backfill reads; a backfill that is complete says that it is.
    */
   private def said(outcome: Outcome, record: BackfillRecord): Boolean = outcome match {
-    case _: Outcome.Ingested | _: Outcome.RolledForward | _: Outcome.GivenUp => true
+    case _: Outcome.Ingested | _: Outcome.RolledForward | _: Outcome.GivenUp |
+        _: Outcome.FilesSkipped =>
+      true
     case _: Outcome.Failed => record.createdBy == outcome.run
     case _: Outcome.NothingNew | _: Outcome.Skipped => false
   }
@@ -190,6 +192,9 @@ object BackfillCommand {
           RunCommand.Stream.Err -> (s"error: $run gave up ${chunk(batch)}: $reason. The next " +
             "run plans its window anew.")
         )
+      // A backfill reads a range of a table, and no file: here for the match alone.
+      case Outcome.FilesSkipped(_, batch, skipped) =>
+        Seq(RunCommand.Stream.Err -> RunCommand.skippedLines(run, chunk(batch), skipped))
       case Outcome.Failed(_, failure, message) =>
         Seq(RunCommand.Stream.Err -> s"error: $run failed ($failure): $message")
     }

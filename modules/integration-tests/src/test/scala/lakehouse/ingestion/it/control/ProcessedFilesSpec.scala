@@ -181,6 +181,104 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     FilePlan.fromJson(database.run(Batches.find(_, givenUp.id)).value.plan) shouldBe Right(filePlan)
   }
 
+  /** The statuses and errors of the files of a source, by name, size and batch. */
+  private def statuses(of: Source): Seq[(String, String, String, String)] = asSuperuser { c =>
+    query(
+      c,
+      """SELECT path, size::text, status, coalesce(error, 'none')
+        |  FROM control.processed_file WHERE source_id = ? ORDER BY path, modified_at""".stripMargin,
+      of.id.value
+    ).map(row => (row(0).split('/').last, row(1), row(2), row(3)))
+  }
+
+  private def failedOf(plan: FilePlan, name: String, why: String): ProcessedFiles.FailedFile =
+    ProcessedFiles.FailedFile(plan.files.find(_.name.value == name).value, why)
+
+  test("a batch given up for files that cannot be read records them, in the same transaction") {
+    val returns = fileSource()
+    val skipping = open(returns)
+    val listing = Seq(listed("a.csv"), listed("b.csv"), listed("c.csv"))
+    val filePlan = planned(plan(skipping, returns, listing))
+    val givenUp = skipping.plan(filePlan.toJson)
+    val why = "unreadable: it failed each of 3 reads of it alone: from java.io.EOFException"
+
+    skipping.abandon(
+      givenUp.id,
+      "files of it cannot be read, and the source skips them",
+      None,
+      RunEnd.Succeeded(RunCounts(rowsWritten = Some(0L))),
+      failed = Seq(failedOf(filePlan, "b.csv", why))
+    ) shouldBe true
+
+    statuses(returns) shouldBe Seq(("b.csv", "10", "FAILED", why))
+    database.run(Batches.find(_, givenUp.id)).value.status shouldBe BatchStatus.Abandoned
+    database.run(Runs.find(_, skipping.start.id)).value.status shouldBe RunStatus.Succeeded
+    rows(returns).map(row => (row(0).split('/').last, row(4))) shouldBe Seq(("b.csv", "1"))
+
+    // The next plan leaves it out. Written again, it is another file, and is taken.
+    val next = open(returns)
+    planned(plan(next, returns, listing)).names.map(_.value) shouldBe Vector("a.csv", "c.csv")
+    next.finish(RunEnd.Failed(FailureClass.Permanent, "stopped by the test")) shouldBe true
+    val mended = Seq(listed("a.csv"), listed("b.csv", at = "2026-11-18T11:30:00Z"), listed("c.csv"))
+    val (taken, again) = ingest(returns, mended)
+    again.names.map(_.value).sorted shouldBe Vector("a.csv", "b.csv", "c.csv")
+    statuses(returns) shouldBe Seq(
+      ("a.csv", "10", "TAKEN", "none"),
+      ("b.csv", "10", "FAILED", why),
+      ("b.csv", "10", "TAKEN", "none"),
+      ("c.csv", "10", "TAKEN", "none")
+    )
+    taken.id.seq shouldBe BatchSeq.of(2).value
+  }
+
+  test("a file said to have failed that is not of the plan records nothing, and gives up nothing") {
+    val returns = fileSource()
+    val leased = open(returns)
+    val filePlan = planned(plan(leased, returns, Seq(listed("a.csv"))))
+    val batch = leased.plan(filePlan.toJson)
+    val other =
+      LandedFile(FileName.parse("z.csv").value, 1, Instant.parse("2026-11-18T10:00:00Z"))
+
+    the[IllegalStateException] thrownBy leased.abandon(
+      batch.id,
+      "files of it cannot be read",
+      None,
+      RunEnd.Succeeded(RunCounts.Nothing),
+      failed = Seq(ProcessedFiles.FailedFile(other, "unreadable: from x"))
+    ) should have message
+      s"the batch ${batch.id} was not given up: a file said to have failed is not of its plan"
+
+    statuses(returns) shouldBe empty
+    database.run(Batches.find(_, batch.id)).value.status shouldBe BatchStatus.Planned
+  }
+
+  test("a zombie records no file that failed") {
+    val returns = fileSource()
+    val zombie = open(returns)
+    val filePlan = planned(plan(zombie, returns, Seq(listed("a.csv"))))
+    val batch = zombie.plan(filePlan.toJson)
+    zombie.close()
+    asSuperuser { c =>
+      update(
+        c,
+        "UPDATE control.source_lease SET expires_at = now() - interval '1 second' WHERE lease_key = ?",
+        zombie.start.leaseKey.value
+      ) shouldBe 1: Unit
+    }
+    val successor = open(returns)
+
+    zombie.abandon(
+      batch.id,
+      "files of it cannot be read",
+      None,
+      RunEnd.Succeeded(RunCounts.Nothing),
+      failed = Seq(failedOf(filePlan, "a.csv", "unreadable: from x"))
+    ) shouldBe false
+    statuses(returns) shouldBe empty
+    successor.planned().value.id shouldBe batch.id
+    successor.finish(RunEnd.Failed(FailureClass.Permanent, "stopped by the test")) shouldBe true
+  }
+
   test("only the files of the plan that was written down are recorded, or nothing is") {
     val returns = fileSource()
     val leased = open(returns)

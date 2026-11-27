@@ -188,13 +188,17 @@ object JdbcConnector extends ConnectorKind {
  *   still being written would be ingested cut short (ADR-0008, the "complete file" rule)
  * @param maxFilesPerBatch the most files that one batch takes. A plan names every file of its
  *   batch, and is written down whole before anything is read (ADR-0005 §3)
+ * @param onUnreadableFile what a batch with a file that cannot be read comes to: its run fails,
+ *   naming the file, or the file is skipped and recorded (ADR-0023)
  */
 final case class FileConnectorConfig(
     path: RelativePath,
     format: FileConnectorConfig.Format,
     pattern: Option[FileConnectorConfig.Pattern],
     minFileAge: FiniteDuration = FileConnectorConfig.DefaultMinFileAge,
-    maxFilesPerBatch: Int = FileConnectorConfig.DefaultMaxFilesPerBatch
+    maxFilesPerBatch: Int = FileConnectorConfig.DefaultMaxFilesPerBatch,
+    onUnreadableFile: FileConnectorConfig.OnUnreadableFile =
+      FileConnectorConfig.OnUnreadableFile.Fail
 ) extends ConnectorConfig {
 
   override def kind: String = FileConnector.name
@@ -209,12 +213,21 @@ final case class FileConnectorConfig(
       )
       .toSeq
 
-  override def canonical: Json = Json.obj(
-    "path" -> Json.fromString(path.value),
-    "format" -> Json.fromString(format.name),
-    "pattern" -> pattern.fold(Json.Null)(p => Json.fromString(p.value)),
-    "min_file_age" -> Json.fromString(Durations.render(minFileAge)),
-    "max_files_per_batch" -> Json.fromInt(maxFilesPerBatch)
+  /**
+   * `on_unreadable_file` is there when it is `skip`, and only then (ADR-0023 §1): `fail` is what
+   * every source did before the field, and a source that says it, or says nothing, keeps the
+   * hash that it had.
+   */
+  override def canonical: Json = Json.fromFields(
+    Seq(
+      "path" -> Json.fromString(path.value),
+      "format" -> Json.fromString(format.name),
+      "pattern" -> pattern.fold(Json.Null)(p => Json.fromString(p.value)),
+      "min_file_age" -> Json.fromString(Durations.render(minFileAge)),
+      "max_files_per_batch" -> Json.fromInt(maxFilesPerBatch)
+    ) ++ Option.when(onUnreadableFile != FileConnectorConfig.OnUnreadableFile.Fail)(
+      FileConnector.OnUnreadableFile -> Json.fromString(onUnreadableFile.name)
+    )
   )
 
   /** The directory and the names. How soon a file is taken, and how many at once, are not. */
@@ -252,6 +265,23 @@ object FileConnectorConfig {
     case object Parquet extends Format("parquet")
 
     val All: Seq[Format] = Seq(Csv, Json, Parquet)
+  }
+
+  /** What a batch with a file that cannot be read comes to (ADR-0023). */
+  sealed abstract class OnUnreadableFile(val name: String)
+
+  object OnUnreadableFile {
+
+    /** The run fails as permanent, naming the file, and the batch stays planned: the default. */
+    case object Fail extends OnUnreadableFile("fail")
+
+    /**
+     * The batch is given up, the file is recorded as `FAILED` with why, and the next plan is
+     * made without it.
+     */
+    case object Skip extends OnUnreadableFile("skip")
+
+    val All: Seq[OnUnreadableFile] = Seq(Fail, Skip)
   }
 
   /**
@@ -322,6 +352,9 @@ object FileConnector extends ConnectorKind {
 
   override val loads: Set[Load.Mode] = Set(Load.Mode.NewFiles)
 
+  /** The field of what a batch with a file that cannot be read comes to. */
+  val OnUnreadableFile = "on_unreadable_file"
+
   override def read(section: Obj): Result[ConnectorConfig] =
     (
       section.required("path")(_.text(RelativePath.parse)),
@@ -332,6 +365,12 @@ object FileConnector extends ConnectorKind {
       ),
       section.orElse("max_files_per_batch", FileConnectorConfig.DefaultMaxFilesPerBatch)(
         _.integer(1, FileConnectorConfig.MaxFilesPerBatch)
+      ),
+      section.orElse(
+        OnUnreadableFile,
+        FileConnectorConfig.OnUnreadableFile.Fail: FileConnectorConfig.OnUnreadableFile
+      )(
+        _.oneOf(FileConnectorConfig.OnUnreadableFile.All.map(p => p.name -> p): _*)
       )
     ).mapN(FileConnectorConfig.apply)
 }

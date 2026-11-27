@@ -17,6 +17,8 @@ import lakehouse.ingestion.core.control.{BatchStatus, RunId, RunKind, RunStatus}
  * state is that of the last batch, or of the reset after it; each reset was of the state that
  * there was, and went on from its last batch; the files taken are those of the committed plans,
  * but for a reprocess, which reads again those of a committed batch before it and takes none;
+ * a file that failed is of the plan of a batch that was given up for it, and is not taken by it
+ * (ADR-0023);
  * no run is still running, and the run that committed a batch, or reset the state, succeeded. A
  * test that kills a run, takes its lease over or changes its source asks it of what is left once the
  * next run has finished.
@@ -133,7 +135,8 @@ object IngestionLedger {
       data: Seq[Table],
       quarantine: Table,
       resets: Seq[Reset] = Nil,
-      backfill: Option[Backfill] = None
+      backfill: Option[Backfill] = None,
+      failed: Set[(TakenFile, Long)] = Set.empty
   )
 
   sealed abstract class Rule(val name: String) {
@@ -159,6 +162,7 @@ object IngestionLedger {
     case object ResetNotSucceeded extends Rule("ResetNotSucceeded")
     case object ReprocessNotOfCommitted extends Rule("ReprocessNotOfCommitted")
     case object FilesNotAsCommitted extends Rule("FilesNotAsCommitted")
+    case object FailedNotOfAbandoned extends Rule("FailedNotOfAbandoned")
     case object StillRunning extends Rule("StillRunning")
     case object CommitterNotSucceeded extends Rule("CommitterNotSucceeded")
     case object ChunksNotTiled extends Rule("ChunksNotTiled")
@@ -172,7 +176,7 @@ object IngestionLedger {
   /** Every way in which the facts disagree; none, for a source that is as it should be. */
   def check(facts: Facts): Seq[Violation] =
     tables(facts) ++ txns(facts) ++ rows(facts) ++ state(facts) ++ resets(facts) ++
-      files(facts) ++ reprocesses(facts) ++ runs(facts) ++ backfill(facts)
+      files(facts) ++ failed(facts) ++ reprocesses(facts) ++ runs(facts) ++ backfill(facts)
 
   // -----------------------------------------------------------------------------------------------
   // Batches and the commits of the tables
@@ -481,6 +485,31 @@ object IngestionLedger {
     ) ++ show(facts.taken -- committed).map(file =>
       Violation(Rule.FilesNotAsCommitted, s"$file: taken, and in no committed plan")
     )
+  }
+
+  /**
+   * A file that failed was found by the batch that it names, which was given up for it, and is
+   * of its plan; and no batch took it (ADR-0023 §5, §6). A batch that was given up for nothing
+   * of the kind recorded none.
+   */
+  private def failed(facts: Facts): Seq[Violation] = {
+    val bySeq = facts.batches.map(batch => batch.seq -> batch).toMap
+    val taken = facts.taken.map(_._1)
+    facts.failed.toSeq.sortBy { case (file, seq) => (seq, file.path) }.flatMap { case (file, seq) =>
+      val what =
+        s"${file.path} (${file.size} bytes, ${file.modifiedMillis} ms), failed by batch $seq"
+      val ofItsBatch = bySeq.get(seq) match {
+        case None => Some(s"$what, which is no batch of the sequence")
+        case Some(batch) if batch.status != BatchStatus.Abandoned =>
+          Some(s"$what, which is ${batch.status.name}")
+        case Some(batch) if !batch.files.contains(file) =>
+          Some(s"$what, whose plan does not have it")
+        case _ => None
+      }
+      (ofItsBatch ++ Option.when(taken.contains(file))(s"$what, and taken")).map(
+        Violation(Rule.FailedNotOfAbandoned, _)
+      )
+    }
   }
 
   /**

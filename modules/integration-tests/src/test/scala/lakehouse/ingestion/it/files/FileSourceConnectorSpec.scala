@@ -1,10 +1,14 @@
 package lakehouse.ingestion.it.files
 
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, Path, StandardCopyOption}
+import java.nio.file.attribute.{BasicFileAttributeView, FileTime, PosixFilePermissions}
+import java.nio.file.{Files, LinkOption, Path, StandardCopyOption}
 import java.time.Instant
 import java.time.temporal.ChronoUnit
+import java.util.zip.GZIPOutputStream
+
+import scala.collection.mutable
+import scala.util.Using
 
 import io.circe.Json
 import lakehouse.ingestion.core.config._
@@ -14,6 +18,7 @@ import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
 import lakehouse.ingestion.it.support.LocalSparkSuite
+import org.apache.spark.SparkException
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, Row}
@@ -46,14 +51,14 @@ final class FileSourceConnectorSpec
     root
   }
 
-  private def source(format: String, batch: Option[Int] = None): Source =
+  private def source(format: String, batch: Option[Int] = None, policy: String = "fail"): Source =
     Source
       .load(
         "shop.orders.yaml",
         s"""id: shop.orders
            |connector: { type: file, path: shop/orders, format: $format${batch.fold("")(n =>
             s", max_files_per_batch: $n"
-          )} }
+          )}, on_unreadable_file: $policy }
            |load: { mode: new_files }
            |targets:
            |  bronze: { table: bronze/orders }
@@ -65,8 +70,16 @@ final class FileSourceConnectorSpec
   private def configOf(of: Source): FileConnectorConfig =
     of.connector.asInstanceOf[FileConnectorConfig]
 
-  private def connector(root: Path, afterRead: () => Unit = () => ()): FileSourceConnector =
-    new FileSourceConnector(new Landing(RootUri.parse(root.toUri.toString).value), afterRead)
+  private def connector(
+      root: Path,
+      afterRead: () => Unit = () => (),
+      beforeAlone: (String, Int) => Unit = (_, _) => ()
+  ): FileSourceConnector =
+    new FileSourceConnector(
+      new Landing(RootUri.parse(root.toUri.toString).value),
+      afterRead,
+      beforeAlone
+    )
 
   /** A file of the source, changed an hour ago: complete, for a plan made now. */
   private def drop(root: Path, name: String, text: String, at: Instant = anHourAgo): Path = {
@@ -694,6 +707,223 @@ final class FileSourceConnectorSpec
     Files.move(other, a, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
 
     rows(read(root, orders, planned).rows.select("id")) shouldBe Seq(Row("9"))
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A file that cannot be read (ADR-0023), broken for real
+  // ---------------------------------------------------------------------------------------------
+
+  /** The file with its second half gone, as a copy that stopped halfway leaves it. */
+  private def cutShort(file: Path): Path = {
+    val bytes = Files.readAllBytes(file)
+    Files.write(file, bytes.take(bytes.length / 2))
+    Files.setLastModifiedTime(file, FileTime.from(anHourAgo))
+    file
+  }
+
+  /** A file of CSV of the source in gzip, of `rows` records. */
+  private def dropGzip(root: Path, name: String, rows: Int): Path = {
+    val path = root.resolve("shop/orders").resolve(name)
+    Using.resource(new GZIPOutputStream(Files.newOutputStream(path))) {
+      _.write(("id,name\n" + (1 to rows).map(i => s"$i,name $i").mkString("\n")).getBytes(UTF_8))
+    }
+    Files.setLastModifiedTime(path, FileTime.from(anHourAgo))
+    path
+  }
+
+  /** `body` with the file one that this process may not open, and then as it was. */
+  private def unopenable[A](file: Path)(body: => A): A = {
+    val permissions = Files.getPosixFilePermissions(file)
+    Files.setPosixFilePermissions(file, PosixFilePermissions.fromString("---------"))
+    try {
+      assume(!Files.isReadable(file), "the tests run as a user that may open any file")
+      body
+    } finally Files.setPosixFilePermissions(file, permissions): Unit
+  }
+
+  /** A connector that counts the reads of each file alone. */
+  private def counting(root: Path): (FileSourceConnector, mutable.Map[String, Int]) = {
+    val reads = mutable.Map.empty[String, Int].withDefaultValue(0)
+    connector(root, beforeAlone = (name, _) => reads(name) += 1) -> reads
+  }
+
+  private def skipped(body: => Any): UnreadableFilesException = {
+    val cannot = the[UnreadableFilesException] thrownBy body
+    cannot.getMessage shouldBe cannot.summary
+    cannot.summary should include("and the source skips such files")
+    cannot.summary should include("Nothing of the batch was written")
+    cannot
+  }
+
+  test("files that cannot be read fail their batch as permanent, each named with what Spark said") {
+    val root = landingZone()
+    val orders = source("csv")
+    drop(root, "a.csv", "id,name\n1,ann\n")
+    cutShort(dropGzip(root, "b.csv.gz", rows = 20000))
+    val closed = drop(root, "c.csv", "id,name\n3,cy\n")
+    drop(root, "d.csv", "id,name\n4,dee\n")
+    val planned = plan(root, orders).value
+    val (reading, reads) = counting(root)
+
+    val message = unopenable(closed) {
+      refused(reading.read(orders, configOf(orders), planned, ReadContext(spark)))
+    }
+    message should include("the batch of shop/orders has 2 files that cannot be read")
+    message should include(
+      "'b.csv.gz' unreadable: it failed each of 3 reads of it alone: FAILED_READ_FILE.NO_HINT, " +
+        "from java.io.EOFException"
+    )
+    // Alone, it is the first file of its read, which fails the inference with no condition.
+    message should include(
+      "'c.csv' unreadable: it failed each of 3 reads of it alone: from java.io.FileNotFoundException"
+    )
+    message should include("connector.on_unreadable_file: fail")
+    // What Spark said of it, and never the text of an exception.
+    message should not include "Permission denied"
+    message should not include "Unexpected end"
+    // A file that reads alone is read once; one that cannot be read, three times.
+    reads.toMap shouldBe Map("a.csv" -> 1, "b.csv.gz" -> 3, "c.csv" -> 3, "d.csv" -> 1)
+  }
+
+  test("under skip, the same files are said, for the engine to give the batch up and record them") {
+    val root = landingZone()
+    val orders = source("parquet", policy = "skip")
+    val session = spark
+    import session.implicits._
+    dropParquet(root, "a.parquet", Seq((1L, "ann")).toDF("id", "name"))
+    cutShort(
+      dropParquet(root, "b.parquet", (1 to 1000).map(i => (i.toLong, s"n$i")).toDF("id", "name"))
+    )
+    val planned = plan(root, orders).value
+
+    val cannot = skipped(read(root, orders, planned))
+    cannot.unreadable shouldBe Seq(
+      UnreadableFilesException.Unreadable(
+        "b.parquet",
+        "unreadable: it failed each of 3 reads of it alone: " +
+          "FAILED_READ_FILE.CANNOT_READ_FILE_FOOTER, from java.lang.RuntimeException"
+      )
+    )
+    cannot.summary should include("1 file of the batch of shop/orders cannot be read")
+  }
+
+  test("a file that fails a read alone, and then reads, is sound: the failure passed") {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    drop(root, "a.csv", "id\n1\n")
+    val closed = drop(root, "b.csv", "id\n2\n")
+    val planned = plan(root, orders).value
+    val permissions = Files.getPosixFilePermissions(closed)
+    // It may be opened again once its first read alone has failed, as a disk that erred once.
+    val mending = connector(
+      root,
+      beforeAlone = (name, n) =>
+        if (name == "b.csv" && n == 2) Files.setPosixFilePermissions(closed, permissions): Unit
+    )
+
+    val passed = unopenable(closed) {
+      the[RunFailedException] thrownBy mending.read(
+        orders,
+        configOf(orders),
+        planned,
+        ReadContext(spark)
+      )
+    }
+    passed.failure shouldBe FailureClass.Transient
+    passed.getMessage should include("and read alone, 'b.csv' failed once and then read")
+    passed.getMessage should include("a failure that passed. Nothing was written")
+    // And it reads, as the run that tries again reads it.
+    rows(read(root, orders, planned).rows.select("id")) shouldBe Seq(Row("1"), Row("2"))
+  }
+
+  test("a failure of a batch that no file has alone is let through as it was") {
+    val root = landingZone()
+    val orders = source("parquet", policy = "skip")
+    val session = spark
+    import session.implicits._
+    dropParquet(root, "a.parquet", Seq((1L, "ann")).toDF("id", "name"))
+    dropParquet(root, "b.parquet", Seq(("2", "bo")).toDF("id", "name"))
+    val planned = plan(root, orders).value
+    val (reading, reads) = counting(root)
+
+    val failed =
+      the[SparkException] thrownBy reading.read(
+        orders,
+        configOf(orders),
+        planned,
+        ReadContext(spark)
+      )
+    failed.getCondition shouldBe "CANNOT_MERGE_SCHEMAS"
+    reads.toMap shouldBe Map("a.parquet" -> 1, "b.parquet" -> 1)
+  }
+
+  test("a file that changes while the files are read alone makes it a batch whose source changed") {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    val a = drop(root, "a.csv", "id\n1\n")
+    cutShort(dropGzip(root, "b.csv.gz", rows = 20000))
+    val planned = plan(root, orders).value
+    val changing = connector(
+      root,
+      beforeAlone =
+        (name, _) => if (name == "b.csv.gz") Files.write(a, "id\n1\n2\n".getBytes(UTF_8)): Unit
+    )
+
+    val changed = changedUnder(changing.read(orders, configOf(orders), planned, ReadContext(spark)))
+    changed.summary should include("changed while its files were read alone")
+    changed.changed.map(_.item) shouldBe Seq("a.csv")
+  }
+
+  test("a run that has lost its lease reads no file alone") {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    drop(root, "a.csv", "id\n1\n")
+    cutShort(dropGzip(root, "b.csv.gz", rows = 20000))
+    val planned = plan(root, orders).value
+    val (reading, reads) = counting(root)
+    val lost = new IllegalStateException("the lease is lost")
+
+    val stopped = the[IllegalStateException] thrownBy reading.read(
+      orders,
+      configOf(orders),
+      planned,
+      ReadContext(spark, verify = () => throw lost)
+    )
+    stopped shouldBe theSameInstanceAs(lost)
+    reads shouldBe empty
+  }
+
+  test(
+    "under skip, a link out of the landing zone is planned, said, and nothing of its plan read"
+  ) {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    drop(root, "a.csv", "id\n1\n")
+    val outside = Files.write(workDir.resolve(s"outside-$count.csv"), "id\n9\n".getBytes(UTF_8))
+    val link = Files.createSymbolicLink(root.resolve("shop/orders/b.csv"), outside)
+    // The link itself last changed an hour ago, as the file that it leads to did: complete.
+    Files
+      .getFileAttributeView(link, classOf[BasicFileAttributeView], LinkOption.NOFOLLOW_LINKS)
+      .setTimes(FileTime.from(anHourAgo), null, null)
+    val planned = plan(root, orders).value
+    FilePlan.fromJson(planned).value.names.map(_.value) shouldBe Vector("a.csv", "b.csv")
+    var read = false
+
+    val cannot = skipped(
+      connector(root, afterRead = () => read = true)
+        .read(orders, configOf(orders), planned, ReadContext(spark))
+    )
+    cannot.unreadable shouldBe Seq(
+      UnreadableFilesException.Unreadable(
+        "b.csv",
+        "path_outside_root: it leads out of the landing zone, through a symbolic link, and was " +
+          "not opened"
+      )
+    )
+    cannot.summary should not include outside.toString
+    read shouldBe false
+    // Under fail, the same directory plans nothing, as it always did.
+    refused(plan(root, source("csv"))) should include("'b.csv' leads out of the landing zone")
   }
 
   // ---------------------------------------------------------------------------------------------
