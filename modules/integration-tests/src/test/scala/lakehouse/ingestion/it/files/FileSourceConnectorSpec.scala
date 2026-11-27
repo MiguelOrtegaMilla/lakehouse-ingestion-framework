@@ -1568,6 +1568,39 @@ final class FileSourceConnectorSpec
     }
   }
 
+  // The other order of the race: the broken file stops the read before any header is refused,
+  // and the batch is read a file at a time, in which each header is its file's alone.
+  Seq[(String, Path => Path)](
+    "a file in gzip cut short" -> (root => cutShort(dropGzip(root, "c.csv.gz", rows = 40000))),
+    "a file that may not be opened" ->
+      (root => drop(root, "c.csv", "id,name\n" + (1 to 30000).map(i => s"$i,cy").mkString("\n")))
+  ).foreach { case (what, broken) =>
+    test(s"$what that Spark meets before a header that is not the others' fails its batch for it") {
+      val root = landingZone()
+      val orders = source("csv")
+      drop(root, "a.csv", "id,name\n1,ann\n")
+      drop(root, "b.csv", "id,nombre\n2,bea\n")
+      // The broken file is the biggest, which Spark reads first in the one task of the read.
+      val c = broken(root)
+      val planned = plan(root, orders).value
+      val (reading, reads) = counting(root)
+      def read = reading.read(orders, configOf(orders), planned, ReadContext(spark))
+
+      val OnePartition = "spark.sql.files.minPartitionNum"
+      spark.conf.set(OnePartition, "1")
+      val message =
+        try if (what.contains("opened")) unopenable(c)(refused(read)) else refused(read)
+        finally spark.conf.unset(OnePartition)
+      val name = c.getFileName.toString
+      message should include("the batch of shop/orders has 1 file that cannot be read")
+      message should include(s"'$name' unreadable: it failed each of 3 reads of it alone")
+      // The header is not said: read alone, each file has its own. It is, once the broken file
+      // is mended, by the batch that reads them together.
+      message should not include "header"
+      reads.toMap shouldBe Map("a.csv" -> 1, "b.csv" -> 1, name -> 3)
+    }
+  }
+
   test("a run that has lost its lease does not look at the bytes of its files") {
     val root = landingZone()
     val orders = source("csv")
