@@ -57,6 +57,36 @@ final class ControlDatabase private (pool: HikariDataSource) extends AutoCloseab
       result
     }
 
+  /**
+   * Runs `body` in one transaction that may only read: a statement of it that would change
+   * anything is refused by the database (SQLState 25006), whatever the role of the connection
+   * may do. It is how what only asks is held to that, as the command that reads a quarantine.
+   * What `body` asks is of one moment of the database.
+   */
+  @throws[SQLException]
+  def reading[T](body: Connection => T): T =
+    Using.resource(pool.getConnection) { connection =>
+      connection.setAutoCommit(false)
+      // The driver starts the transaction as one that reads (BEGIN READ ONLY).
+      connection.setReadOnly(true)
+      val result =
+        try {
+          val value = body(connection)
+          connection.commit()
+          value
+        } catch {
+          case failure: Throwable =>
+            undo(connection, failure)
+            // As it came, if it is still a connection: it may not be, after what failed.
+            try connection.setReadOnly(false)
+            catch { case also: Throwable => failure.addSuppressed(also) }
+            throw failure
+        }
+      connection.setReadOnly(false)
+      connection.setAutoCommit(true)
+      result
+    }
+
   /** Rolls back what is pending on `connection`, on the way out with `failure`. */
   private def undo(connection: Connection, failure: Throwable): Unit = {
     val undone =

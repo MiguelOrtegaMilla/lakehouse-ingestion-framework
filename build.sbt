@@ -118,6 +118,9 @@ lazy val cli = module("cli", artifact = "cli")
     // and not the end of sbt, started where sbt was, so that paths are those of the repository.
     run / fork := true,
     run / baseDirectory := (LocalRootProject / baseDirectory).value,
+    // And with its two outputs as they are, not as lines of the log of sbt: what a command writes
+    // to its standard output may be for another program to read, as the records of `quarantine`.
+    run / outputStrategy := Some(StdoutOutput),
     // `sbt "cli/run run …"` runs Spark in that process (discovery §17, P5): with the classpath
     // that has what is `provided`, which `spark-submit` would supply, and the options of a JVM
     // that embeds Spark, as the tests have them (project/SparkTestJvm.scala).

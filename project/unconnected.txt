@@ -8,9 +8,6 @@
 # Where the application starts.
 lakehouse.ingestion.cli.Main  The command line: the JVM starts it.
 
-# Built and tested, and connected by a later phase (discovery §20 has each as an open item).
-lakehouse.ingestion.engine.quarantine.QuarantineReader  No command reads a quarantine yet: the technical validations (P8) and observability (P11) do.
-
 # The model of the contract, where production goes by something else.
 lakehouse.ingestion.core.control.RunStatus#mayBecome  The statuses that a run may come to. Production goes by the type of its end (RunEnd), the condition of each statement and the trigger of the schema; the tests of core hold RunEnd to this.
 lakehouse.ingestion.core.control.BatchStatus#mayBecome  The statuses that a batch may come to. Production goes by the condition of each statement and the trigger of the schema.

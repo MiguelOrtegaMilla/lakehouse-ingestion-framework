@@ -58,7 +58,9 @@ object CommandProcess {
    * Starts the command line, and does not wait for it.
    *
    * @param arguments those of the application, the command first
-   * @param log the file that takes what the process prints, both streams in one
+   * @param log the file that takes what the process prints, both streams in one unless
+   *   `errors` is given
+   * @param errors the file that takes its error output alone, apart from its standard output
    * @param jvm options of the JVM besides those that every process has, as system properties
    * @param main the class whose `main` the process runs: the application's, unless a test has a
    *   launcher of its own (`HeldMain`)
@@ -68,7 +70,8 @@ object CommandProcess {
       log: Path,
       heap: String = Heap,
       jvm: Seq[String] = Nil,
-      main: String = Main.getClass.getName.stripSuffix("$")
+      main: String = Main.getClass.getName.stripSuffix("$"),
+      errors: Option[Path] = None
   ): CommandProcess = {
     val command =
       Seq(Paths.get(sys.props("java.home"), "bin", "java").toString) ++
@@ -77,9 +80,8 @@ object CommandProcess {
         Seq("-cp", sys.props("java.class.path")) ++
         Seq(main) ++
         arguments
-    val builder = new ProcessBuilder(command.asJava)
-      .redirectErrorStream(true)
-      .redirectOutput(log.toFile)
+    val builder = new ProcessBuilder(command.asJava).redirectOutput(log.toFile)
+    errors.fold(builder.redirectErrorStream(true))(file => builder.redirectError(file.toFile))
     // Same reason as in project/SparkTestJvm.scala: no hostname lookup at session start.
     builder.environment().put("SPARK_LOCAL_IP", "127.0.0.1")
     new CommandProcess(builder.start(), log)

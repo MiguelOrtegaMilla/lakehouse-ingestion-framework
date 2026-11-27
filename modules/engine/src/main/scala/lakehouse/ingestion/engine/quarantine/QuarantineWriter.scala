@@ -39,6 +39,15 @@ final case class QuarantineBatch(run: RunId, source: SourceId, id: BatchId, quar
  * quarantine of a batch is written before its data, so a batch whose data is in its table has
  * its quarantine written.
  *
+ * '''The log of a quarantine has no text of a record.''' Delta keeps, in the log of a table,
+ * the least and the greatest value of each column of each file, to pass over the files that a
+ * read does not need; it has them in the checksum of a version as well, and logs both, at INFO,
+ * with each snapshot of the table that it makes. For the text of a record that is its first
+ * characters, in the log of whatever process reads or writes the table. So a quarantine is
+ * made with the columns that those statistics are kept of said (`StatsColumns`): those that a
+ * read asks by, and neither the text of a record nor its detail. A quarantine that was made
+ * before this keeps the statistics that its files were written with.
+ *
  * @param lake where every table written to must be
  * @param tables what is asked of a table about its batches, before the write and after it
  * @param context the context of the run that every batch given here is written by
@@ -72,7 +81,29 @@ final class QuarantineWriter(lake: Lake, tables: DeltaTableTransactions, context
         said(ReadResult.ErrorDetail, lit(null).cast(StringType)).as(Quarantine.ErrorDetail),
         col(ReadResult.Record).cast(StringType).as(Quarantine.RawRecord),
         lit(Timestamp.from(batch.quarantinedAt)).as(Quarantine.QuarantinedAt)
-      )
+      ),
+      QuarantineWriter.Properties
     )
   }
+}
+
+object QuarantineWriter {
+
+  /**
+   * The columns of a quarantine that Delta keeps statistics of: what a record is asked for by,
+   * and not what it holds.
+   */
+  val StatsColumns: Seq[String] = Seq(
+    Quarantine.RunId,
+    Quarantine.BatchSeq,
+    Quarantine.SourceFile,
+    Quarantine.ErrorTypeColumn,
+    Quarantine.QuarantinedAt
+  )
+
+  /** The property of a table of Delta that says the columns that statistics are kept of. */
+  val StatsColumnsProperty = "delta.dataSkippingStatsColumns"
+
+  /** What a quarantine is made with. */
+  val Properties: Map[String, String] = Map(StatsColumnsProperty -> StatsColumns.mkString(","))
 }

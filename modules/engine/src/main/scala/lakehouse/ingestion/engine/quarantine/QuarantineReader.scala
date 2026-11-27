@@ -60,6 +60,9 @@ import org.apache.spark.sql.{Column, DataFrame, SparkSession}
  * gives. The records of a batch that is still planned are kept: of a batch that was not
  * committed because too many of its records were rejected, they are what there is to look at.
  *
+ * '''It reads, and writes nothing''': a table of the lake is read, and what it asks of the
+ * control plane is asked in a transaction that may only read (`ControlDatabase.reading`).
+ *
  * @param lake the root of the lake of the profile: every quarantine is under it
  */
 final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lake: RootUri) {
@@ -91,7 +94,7 @@ final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lak
    */
   @throws[SQLException]
   def leftOut(source: SourceId, layer: Layer = Layer.Bronze): Vector[RunId] =
-    database.run(Batches.abandonedBy(_, source, layer))
+    database.reading(Batches.abandonedBy(_, source, layer))
 
   /**
    * How many records of what is asked the quarantine of `source` has, by the run that set them
@@ -253,7 +256,7 @@ final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lak
    * if it is among those; none, for a question that names neither.
    */
   private def runsOf(asked: Asked): Option[Set[RunId]] = {
-    val ofBatch = asked.batch.map(batch => database.run(Batches.takenBy(_, batch)).toSet)
+    val ofBatch = asked.batch.map(batch => database.reading(Batches.takenBy(_, batch)).toSet)
     (asked.run, ofBatch) match {
       case (Some(run), Some(runs)) => Some(runs.filter(_ == run))
       case (Some(run), None) => Some(Set(run))
@@ -279,7 +282,7 @@ final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lak
 
   private def takenOf(source: SourceId, layer: Layer, runs: Vector[RunId]): Map[RunId, Taken] =
     database
-      .run(Batches.takenOf(_, source, layer, runs.distinct))
+      .reading(Batches.takenOf(_, source, layer, runs.distinct))
       .map { case (run, (batch, status)) => run -> Taken(batch, status) }
 }
 

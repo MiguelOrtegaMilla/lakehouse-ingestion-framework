@@ -6,11 +6,19 @@ import java.nio.file.Paths
 import scala.util.control.NonFatal
 
 import lakehouse.ingestion.core.config._
-import lakehouse.ingestion.core.control.{BackfillId, BackfillRequest, BatchSeq, OperatorRequest}
+import lakehouse.ingestion.core.control.{
+  BackfillId,
+  BackfillRequest,
+  BatchSeq,
+  OperatorRequest,
+  Quarantine,
+  RunId
+}
 import lakehouse.ingestion.core.watermark.BackfillRange
 import lakehouse.ingestion.engine.{Failures, FaultHooks}
 import lakehouse.ingestion.engine.control.DatabaseFailure
 import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
+import lakehouse.ingestion.engine.quarantine.QuarantineReader
 import org.slf4j.LoggerFactory
 
 /**
@@ -128,6 +136,10 @@ object Main {
        |       lakehouse-ingestion maintain-table (adopt | readopt | reset | collect-temps)
        |                               --profile <file> --password <reference>
        |                               --table <uri> --reason <text> [--user <role>]
+       |       lakehouse-ingestion quarantine --profile <file> --sources <directory>
+       |                               --source <id> [--run <id>] [--batch <n>
+       |                               [--backfill <id>]] [--file <path>] [--type <type>]
+       |                               [--records <n>]
        |
        |  validate    Reads the profile and every source, and says everything that is wrong in
        |              them. No connection is opened: it runs anywhere, in a moment.
@@ -169,6 +181,12 @@ object Main {
        |              needs. Each looks at the log of the table first and refuses what it does
        |              not bear out, and is recorded with who asked for it and why. It takes no
        |              lease: stop the writers of the table first.
+       |  quarantine  What a source had set apart: its records counted by the run that set
+       |              them apart, their file and why, the latest first, without those of the
+       |              batches that were given up. It reads, and writes nothing: it is no run,
+       |              and takes no lease. With --records, it writes records as they were
+       |              received, a line of JSON each, to the standard output and nowhere else:
+       |              they may hold personal data.
        |
        |  --profile   the file of the profile, as conf/app/local.yaml
        |  --sources   the directory of the sources, one .yaml file for each, as conf/sources
@@ -183,7 +201,8 @@ object Main {
        |              no limit unless said
        |  --batch     abandon-batch: the number of the batch to give up, the one that is
        |              planned, or of the chunk with --backfill; reprocess: that of the
-       |              committed batch whose files are read
+       |              committed batch whose files are read; quarantine: that of the batch
+       |              whose records are asked for, or of the chunk with --backfill
        |  --reason    why, in one line: kept with the run and with the batch, or in the
        |              maintenance log
        |  --watermark  the moment that the source is taken to be ingested up to, as
@@ -192,7 +211,16 @@ object Main {
        |  --keep-watermark  the watermark stays; only what later runs are compared with is
        |              reset. Its risks are warned of
        |  --backfill  the id of the backfill, as history-2024: lower-case letters, digits, '.',
-       |              '_' and '-'. abandon-batch: the backfill whose chunk is given up
+       |              '_' and '-'. abandon-batch: the backfill whose chunk is given up;
+       |              quarantine: the backfill whose chunk --batch names
+       |  --run       quarantine: the run that set the records apart, by its id
+       |  --file      quarantine: the file of the records, as the counts show it:
+       |              sales_returns/2026-03-01.csv
+       |  --type      quarantine: why the records were set apart, one of:
+       |              ${Quarantine.ErrorType.All.mkString(", ")}
+       |  --records   quarantine: how many records to write as they were received, the latest
+       |              first, from 1 to ${QuarantineReader.MaxRecords}; each has its first
+       |              ${QuarantineReader.MaxChars} characters at most. Without it, the counts
        |  --from      where the range starts, as 2025-01-01T00:00:00Z: it is not in the range,
        |              and a row whose watermark is from exactly is not read
        |  --to        where the range ends, which is in it: no later than the clock of the
@@ -204,8 +232,9 @@ object Main {
        |exit codes: 0 the configuration is valid, the schemas are at their version, the run
        |              ended well (a batch committed, nothing new, or a source that is
        |              disabled), the backfill ended well (chunks committed, or it is
-       |              complete), the batch was given up or reprocessed, the state was reset, or
-       |              the table was maintained;
+       |              complete), the batch was given up or reprocessed, the state was reset,
+       |              the table was maintained, or what was asked of a quarantine was shown,
+       |              were it nothing;
        |            2 another run holds the lease of the source, or of the backfill: nothing
        |              was done;
        |            3 a database could not be reached, the run lost its lease, its batch was
@@ -221,7 +250,8 @@ object Main {
        |              settled, its id has another range or chunk, or its configuration changed
        |              in a way that it cannot follow, or the table was not maintained: its log
        |              or its registry is not in the state that the operation is for, or it is
-       |              not in the lake;
+       |              not in the lake, or the quarantine was not read: the source has no such
+       |              run, or no such batch;
        |            5 more records were rejected than the source allows: nothing committed;
        |            64 the command line is not one;
        |            70 a failure that nothing classified, a mistake of the application: the log
@@ -476,6 +506,61 @@ object Main {
           )
         case Left(problem) => usage(problem, err)
       }
+    case "quarantine" :: options =>
+      val asked = for {
+        found <- parse(
+          options,
+          Set("--profile", "--sources", "--source"),
+          optional = Set("--run", "--batch", "--backfill", "--file", "--type", "--records")
+        )
+        source <- SourceId.parse(found("--source")).left.map(reason => s"--source $reason")
+        run <- given(found.get("--run")) { text =>
+          RunId.parse(text).left.map(reason => s"--run '${shown(text)}' $reason")
+        }
+        batch <- given(found.get("--batch"))(batchOf)
+        backfill <- given(found.get("--backfill")) { text =>
+          BackfillId.parse(text).left.map(reason => s"--backfill '${shown(text)}' $reason")
+        }
+        _ <- Either.cond(
+          backfill.isEmpty || batch.nonEmpty,
+          (),
+          "--backfill says the sequence of a batch: --batch must be given with it"
+        )
+        errorType <- given(found.get("--type")) { text =>
+          Either.cond(
+            Quarantine.ErrorType.All.contains(text),
+            text,
+            s"--type '${shown(text)}' is not why a record is set apart: one of " +
+              Quarantine.ErrorType.All.mkString(", ")
+          )
+        }
+        records <- given(found.get("--records")) { text =>
+          text.toIntOption
+            .filter(n => n >= 1 && n <= QuarantineReader.MaxRecords && text == n.toString)
+            .toRight(
+              s"--records '${shown(text)}' is not a number of records, from 1 to " +
+                s"${QuarantineReader.MaxRecords}"
+            )
+        }
+      } yield (
+        found("--profile"),
+        found("--sources"),
+        source,
+        QuarantineCommand.Asking(run, batch, backfill, found.get("--file"), errorType, records)
+      )
+      asked match {
+        case Right((profile, sources, source, asking)) =>
+          QuarantineCommand.run(
+            Paths.get(profile),
+            Paths.get(sources),
+            source,
+            asking,
+            SecretResolver(environment),
+            out,
+            err
+          )
+        case Left(problem) => usage(problem, err)
+      }
     case "maintain-table" :: named :: options if !named.startsWith("--") =>
       val asked = for {
         operation <- MaintainTableCommand.Operation
@@ -541,6 +626,14 @@ object Main {
         .filter(n => n >= 1 && text == n.toString)
         .map(Some(_))
         .toRight(s"--max-batches '${shown(text)}' is not a number of batches, from 1")
+  }
+
+  /** An option that may not be given, read if it is. */
+  private def given[A](option: Option[String])(
+      read: String => Either[String, A]
+  ): Either[String, Option[A]] = option match {
+    case None => Right(None)
+    case Some(text) => read(text).map(Some(_))
   }
 
   /** A moment of an option, as `load.watermark.start` is written. */
