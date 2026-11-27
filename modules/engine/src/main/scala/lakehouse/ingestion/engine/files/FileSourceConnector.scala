@@ -766,7 +766,9 @@ final class FileSourceConnector(
 
       case FileConnectorConfig.Format.Parquet =>
         val parquet = oneNameEach("a file of Parquet") {
-          everyFile(spark.read).option("mergeSchema", "true").parquet(locations: _*)
+          oneTypeEach {
+            everyFile(spark.read).option("mergeSchema", "true").parquet(locations: _*)
+          }
         }
         (parquet, refused(parquet.schema.fieldNames.toSeq))
     }
@@ -935,8 +937,40 @@ object FileSourceConnector {
   /** The condition of Spark's error for two columns of one name. */
   private val SameName = "COLUMN_ALREADY_EXISTS"
 
+  /**
+   * What Spark made of the columns of some files of Parquet, unless a column has one type in a
+   * file and another in another. Each such file reads alone (ADR-0023 §3), so it is the batch
+   * that cannot be read, and none of its files is one to skip: the failure is permanent,
+   * whatever the policy of the source, and no file is read alone for it.
+   */
+  private def oneTypeEach[A](columns: => A): A =
+    try columns
+    catch {
+      case e: Exception if hasCondition(e, TwoTypes) =>
+        // Spark says the two schemas, of names and types alone, over several lines: they are
+        // said last, on one, so that what a record of the run cuts of a wide one is of them.
+        throw RunFailedException.permanent(
+          "the files of Parquet of the batch have a column of one type in one file and of " +
+            "another in another, and a column is to have one type in every file of a batch. " +
+            "Nothing was written. Once the file of the other type is written again, or taken " +
+            "out of the landing zone, the next run gives the batch up, as its files are not " +
+            "those that it planned (ADR-0018), and plans them as they are. Spark says: " +
+            oneLine(e.getMessage),
+          e
+        )
+    }
+
+  /**
+   * The condition of Spark's error for files of Parquet whose schemas do not merge: a column of
+   * two types (`SparkUnreadableFileContractSpec`).
+   */
+  private val TwoTypes = "CANNOT_MERGE_SCHEMAS"
+
   private def firstLine(message: String): String =
     Option(message).flatMap(_.linesIterator.map(_.trim).find(_.nonEmpty)).getOrElse("")
+
+  private def oneLine(message: String): String =
+    Option(message).fold("")(_.linesIterator.map(_.trim).filter(_.nonEmpty).mkString(" "))
 
   /** The columns as text, and the one for what cannot be parsed. */
   private def asText(columns: Seq[String]): StructType = {
@@ -1047,20 +1081,18 @@ object FileSourceConnector {
   }
 
   /** Whether a failure of a read is that of a file of CSV whose header is not the others'. */
+  private[files] def otherHeader(e: Throwable): Boolean = hasCondition(e, HeaderCondition)
+
+  /** Whether a failure, or one of its causes, is Spark's with this condition. */
   @tailrec
-  private[files] def otherHeader(e: Throwable): Boolean = e match {
+  private def hasCondition(e: Throwable, condition: String): Boolean = e match {
     case null => false
-    case spark: SparkThrowable if Option(spark.getCondition).contains(HeaderCondition) => true
-    case other => otherHeader(other.getCause)
+    case spark: SparkThrowable if Option(spark.getCondition).contains(condition) => true
+    case other => hasCondition(other.getCause, condition)
   }
 
   /** Whether a failure of a read is Spark's refusal of the charset that it was given. */
-  @tailrec
-  private[files] def charsetRefused(e: Throwable): Boolean = e match {
-    case null => false
-    case spark: SparkThrowable if Option(spark.getCondition).contains(CharsetCondition) => true
-    case other => charsetRefused(other.getCause)
-  }
+  private[files] def charsetRefused(e: Throwable): Boolean = hasCondition(e, CharsetCondition)
 
   /** The condition of Spark's error for a charset that its reader does not take. */
   private val CharsetCondition = "INVALID_PARAMETER_VALUE.CHARSET"

@@ -34,7 +34,7 @@ And three facts beside the table:
 
 - **Each of those files, read alone at both moments, fails, and the same way at every read**: the same moment, the same conditions, the same causes. The sound file of the same batch, read alone, reads whole.
 - **Spark says that a file that it may not open does not exist**, while the file is there.
-- **A batch may fail with no file that fails alone.** Two files of Parquet with one column of two types fail the inference of their batch (`CANNOT_MERGE_SCHEMAS`), and each reads alone.
+- **A batch may fail with no file that fails alone.** Two files of Parquet with one column of two types fail the inference of their batch (`CANNOT_MERGE_SCHEMAS`), and each reads alone. *Corrected by the review of P8 (P8.11e):* that one is known where it is raised, and fails its batch as permanent, whatever the policy of the source, with no file read alone: no file of it is one to skip, and it had no class, so its run ended as `internal`, in 70. Once the file of the other type is written again, the next run gives the batch up (ADR-0018). What fails a batch and no file alone, and is not known, is still reported as it was.
 
 So what Spark raises does not say which file cannot be read, nor whether one cannot: the conditions are several or none, the moment is either, and what Spark calls a file that is not there may be one that it may not open. What a file does alone does say it, and says it the same way each time.
 
