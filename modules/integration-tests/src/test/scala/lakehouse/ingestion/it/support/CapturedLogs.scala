@@ -17,8 +17,11 @@ import org.apache.logging.log4j.{Level, LogManager}
  */
 object CapturedLogs {
 
-  /** @param thrown what the line was logged with, whole: its causes are those of the failure */
-  final case class Logged(level: Level, message: String, thrown: Option[Throwable])
+  /**
+   * @param thrown what the line was logged with, whole: its causes are those of the failure
+   * @param logger the name of the logger that logged it
+   */
+  final case class Logged(level: Level, message: String, thrown: Option[Throwable], logger: String)
 
   /** What `by` logs while `body` runs, with what `body` gave. */
   def of[T](by: Class[_])(body: => T): (T, Seq[Logged]) =
@@ -71,7 +74,9 @@ object CapturedLogs {
             .take(32)
             .map(cause => String.valueOf(cause.getMessage))
           if ((Iterator(message) ++ causes).exists(keep))
-            kept.add(Logged(event.getLevel, message, Option(event.getThrown))): Unit
+            kept.add(
+              Logged(event.getLevel, message, Option(event.getThrown), event.getLoggerName)
+            ): Unit
         }
       }
     appender.start()
@@ -99,7 +104,12 @@ object CapturedLogs {
         override def append(event: LogEvent): Unit =
           if (by(event.getLoggerName))
             events.add(
-              Logged(event.getLevel, event.getMessage.getFormattedMessage, Option(event.getThrown))
+              Logged(
+                event.getLevel,
+                event.getMessage.getFormattedMessage,
+                Option(event.getThrown),
+                event.getLoggerName
+              )
             ): Unit
       }
     appender.start()
