@@ -2,6 +2,7 @@ package lakehouse.ingestion.engine.files
 
 import com.fasterxml.jackson.core.json.JsonReadFeature
 import org.apache.spark.sql.catalyst.json.JSONOptions
+import org.scalatest.OptionValues
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -10,7 +11,7 @@ import org.scalatest.matchers.should.Matchers
  * what is set apart and why. That the values are those of Spark's reader of files is held by
  * `FileSourceConnectorSpec`, against the reader itself.
  */
-final class JsonLinesSpec extends AnyFunSuite with Matchers {
+final class JsonLinesSpec extends AnyFunSuite with Matchers with OptionValues {
 
   import JsonLines.Line
 
@@ -70,6 +71,16 @@ final class JsonLinesSpec extends AnyFunSuite with Matchers {
       Some("the field 'id' twice, at the first level of the record")
     // A long name is cut in the detail; the record keeps it whole.
     JsonLines.detail(Line.DuplicateField("n" * 300)).getOrElse("").length should be < 300
+  }
+
+  test("a long name is cut by its characters in the detail, and never inside one") {
+    // 201 characters, the 200th of them outside the first plane: a pair of surrogates.
+    val pair = new String(Character.toChars(0x1f600))
+    val detail = JsonLines.detail(Line.DuplicateField("a" * 199 + pair + "b")).value
+    detail shouldBe s"the field '${"a" * 199}$pair…' twice, at the first level of the record"
+    detail.codePoints().toArray.exists(Character.getType(_) == Character.SURROGATE) shouldBe false
+    // A name of 200 characters is kept whole.
+    JsonLines.detail(Line.DuplicateField("a" * 199 + pair)).value should include(s"$pair'")
   }
 
   test("a field twice inside an object of the record is kept: Bronze keeps the object as text") {

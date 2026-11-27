@@ -7,6 +7,7 @@ import java.util.UUID
 import scala.util.Using
 
 import io.circe.Json
+import lakehouse.ingestion.core.Text
 import lakehouse.ingestion.core.config.{RelativePath, SourceId, TableLocation}
 import lakehouse.ingestion.core.control._
 
@@ -284,7 +285,7 @@ object Batches {
       )
     ) { statement =>
       statement.setObject(1, run.uuid)
-      statement.setString(2, reason.trim.take(Runs.MaxMessageLength))
+      statement.setString(2, Text.upTo(reason.trim, Runs.MaxMessageLength))
       statement.setString(3, detail.map(_.noSpaces).orNull)
       statement.setString(4, batch.app.value)
       statement.setLong(5, batch.seq.value)

@@ -749,6 +749,20 @@ final class BatchesSpec extends AnyFunSuite with Matchers with ControlPlaneSuite
     )
   }
 
+  /** A character outside the first plane: two units of UTF-16, a pair of surrogates. */
+  private val Pair = new String(Character.toChars(0x1f600))
+
+  test("a reason is cut by its characters, and never inside one") {
+    val orders = newSource()
+    val leased = open(orders)
+    val planned = leased.plan(range(0, 10))
+    // Its 2000th character is outside the first plane, a pair of surrogates, as a summary of
+    // a batch given up may name a file with one.
+    val kept = "x" * (Runs.MaxMessageLength - 1) + Pair
+    leased.abandon(planned.id, kept + " and more", None, GivenUp) shouldBe true
+    batch(planned.id).abandoned.value.reason shouldBe kept
+  }
+
   test("the state of a source only moves forward") {
     val orders = newSource()
     val delta = new SimulatedDelta
