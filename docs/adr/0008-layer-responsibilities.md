@@ -3,6 +3,7 @@
 | | |
 |---|---|
 | **Status** | Accepted (2026-09-25) |
+| **Amended by** | [ADR-0023](0023-a-file-that-cannot-be-read.md) (P8.7a, 2026-11-27): a file that cannot be read is recorded as `FAILED` under `skip` alone; under `fail` the run that fails names it, and nothing of it is recorded. The errors of the landing zone below keep their original text. |
 
 ## Decision
 
