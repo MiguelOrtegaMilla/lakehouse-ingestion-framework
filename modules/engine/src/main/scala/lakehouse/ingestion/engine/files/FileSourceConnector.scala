@@ -320,12 +320,16 @@ final class FileSourceConnector(
   private def readAsOf(source: Source, config: FileConnectorConfig, files: FilePlan): ReadAs = {
     val as = files.readAs.getOrElse(ReadAs.before(config.format))
     val now = ReadAs.of(config)
+    // Said at the read, which does not know whether the run will commit the batch: the run
+    // that reads it commits it, unless it fails, and a batch committed is not one to give up.
     if (as != now)
       log.warn(
         s"${source.id}: the batch is read as it was planned, as ${as.describe}, and the source " +
-          s"now says ${now.describe}. A plan is read as it was written; to have its files read " +
-          "as the source says now, give the batch up (abandon-batch), and the next plan takes " +
-          "them so"
+          s"now says ${now.describe}. A plan is read as it was written. To have its files read " +
+          "as the source says now: once the batch is committed, as the run that reads it " +
+          "commits it, reprocess it (reprocess), whose plan takes them so; while it is planned, " +
+          "if the run fails before its commit, give it up (abandon-batch), and the next plan " +
+          "takes them so"
       )
     as
   }

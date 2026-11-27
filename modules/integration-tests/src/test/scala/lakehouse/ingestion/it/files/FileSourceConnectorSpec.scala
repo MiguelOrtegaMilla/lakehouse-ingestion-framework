@@ -419,8 +419,10 @@ final class FileSourceConnectorSpec
       "shop.orders: the batch is read as it was planned, as csv (delimiter ';' (U+003B), " +
         "quote '\"' (U+0022), escape '\"' (U+0022), encoding UTF-8), and the source now says " +
         "csv (delimiter ',' (U+002C), quote '\"' (U+0022), escape '\"' (U+0022), encoding " +
-        "UTF-8). A plan is read as it was written; to have its files read as the source says " +
-        "now, give the batch up (abandon-batch), and the next plan takes them so"
+        "UTF-8). A plan is read as it was written. To have its files read as the source says " +
+        "now: once the batch is committed, as the run that reads it commits it, reprocess it " +
+        "(reprocess), whose plan takes them so; while it is planned, if the run fails before " +
+        "its commit, give it up (abandon-batch), and the next plan takes them so"
     )
     // Read as the source says, it says nothing.
     CapturedLogs.of(classOf[FileSourceConnector])(read(root, semicolons, planned))._2 shouldBe empty
