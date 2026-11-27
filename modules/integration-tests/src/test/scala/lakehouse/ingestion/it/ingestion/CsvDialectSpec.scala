@@ -96,7 +96,12 @@ final class CsvDialectSpec
     val done = ingested(outcome)
     done.batch shouldBe batchId(orders, 1)
     done.counts.rowsWritten shouldBe Some(2)
-    warnings.exists(_.contains(AsPlanned)) shouldBe true
+    // The run that warns of it commits it: by the time the warning is read, the batch is no
+    // longer one to give up, and what reads its files as the source says now is a reprocess.
+    batchesOf(orders) shouldBe Seq(1L -> "COMMITTED")
+    warnings.find(_.contains(AsPlanned)).value should include(
+      "once the batch is committed, as the run that reads it commits it, reprocess it (reprocess)"
+    )
     // The rows and the records set apart are of one read, the one that was planned.
     columnsOf(orders) should contain allOf ("id", "name")
     columnsOf(orders) should not contain "id,name"
