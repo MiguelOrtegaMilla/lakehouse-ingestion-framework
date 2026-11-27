@@ -90,6 +90,8 @@ object LocalSparkSuite {
     "spark.sql.catalog.spark_catalog" -> "org.apache.spark.sql.delta.catalog.DeltaCatalog",
     // As every session of a run has it (RunSession.engine): windows-1252 is read so (ADR-0024).
     "spark.sql.legacy.javaCharsets" -> "true",
+    // And the checksums of Delta without the files of their table, which Delta logs.
+    "spark.databricks.delta.allFilesInCrc.enabled" -> "false",
     "spark.sql.warehouse.dir" -> dir.resolve("warehouse").toString
   )
 
