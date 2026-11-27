@@ -430,8 +430,9 @@ object SourceChangedException {
 
 /**
  * Files of a plan cannot be read, and their source skips such files (ADR-0023): a file that
- * Spark fails to read alone, at every one of its reads, or one that the landing zone refuses to
- * open. A read raises it in place of rows, with nothing of the plan given to be written.
+ * Spark fails to read alone, at every one of its reads, one that the landing zone refuses to
+ * open, or one whose bytes are not of the encoding of its source (ADR-0024 §4). A read raises
+ * it in place of rows, with nothing of the plan given to be written.
  *
  * It is not a failure with a class, as `SourceChangedException` is not: what follows is the
  * engine's. The batch is given up, if nothing of it is in its tables, each file is recorded as
@@ -456,7 +457,8 @@ object UnreadableFilesException {
   /**
    * @param item the file, by the name that the plan has it under
    * @param why what Spark said of it, by the condition of its error and the type of its cause,
-   *   or what the landing zone found; never the text of an exception, which may hold what the
+   *   what the landing zone found, or where its first byte that is not of its encoding is, with
+   *   what to do about it; never the text of an exception nor a byte, which may hold what the
    *   file holds
    */
   final case class Unreadable(item: String, why: String)

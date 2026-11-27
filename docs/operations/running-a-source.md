@@ -79,6 +79,22 @@ SELECT path, size, modified_at, error, batch_seq
   FROM control.processed_file WHERE source_id = 'sales.returns' AND status = 'FAILED';
 ```
 
+### A file that is not of the encoding of its source
+
+A file of CSV with a byte that is not of the encoding that its source says (`connector.csv.encoding`, UTF-8 unless it says another), or a file of JSON with one that is not UTF-8, is a file that cannot be read: read, it would have the character U+FFFD where its source had another ([ADR-0024](../adr/0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) §4). The run says where the first such byte is, by its offset and its line, and never the byte:
+
+```text
+'prices.csv' not_of_its_encoding: the byte at offset 18 of the file, in line 3, is not of UTF-8
+```
+
+Either the file is wrong, or what the source says of its files is:
+
+- **The file is wrong**, one among others that are right: have it written again, in the encoding of the source. Written again, it is another file, which the next run takes.
+- **The source is wrong**, and every file of it is in another encoding, as a spreadsheet's in `windows-1252` under a source that says nothing: correct `connector.csv.encoding`. Under `fail`, the batch then stays as it was planned, in the encoding of before, and is given up with `abandon-batch` (below), so that the next plan takes its files as the source says now. Under `skip`, the batch was given up already and its files recorded as `FAILED`: `touch` them, and the next run takes them as new files. A `reprocess` does not take them: it reads the files of a batch that was committed.
+- **Under `ISO-8859-1`**, a byte of 0x80 to 0x9F is refused, and the message says to try `windows-1252`: those bytes are the euro and the quotes of a spreadsheet, and control characters in ISO-8859-1.
+
+A file of JSON has no field for its encoding: it is to be written again, in UTF-8.
+
 ### When a source is stuck: `abandon-batch`
 
 A batch is planned before anything is read, and every run replays its plan until it is committed. A plan that cannot be run, because the directory or the table it names is no longer the source's, stops the source. An operator gives it up:

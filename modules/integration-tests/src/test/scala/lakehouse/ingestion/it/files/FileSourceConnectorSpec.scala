@@ -25,7 +25,7 @@ import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType
 import org.apache.spark.sql.{DataFrame, Row}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
-import org.scalatest.{EitherValues, OptionValues}
+import org.scalatest.{EitherValues, LoneElement, OptionValues}
 
 /**
  * The file connector on real files and a real Spark (P5.7): what it plans, how it reads a plan
@@ -37,6 +37,7 @@ final class FileSourceConnectorSpec
     with Matchers
     with EitherValues
     with OptionValues
+    with LoneElement
     with LocalSparkSuite {
 
   private val now = Instant.now().truncatedTo(ChronoUnit.MILLIS)
@@ -1281,6 +1282,244 @@ final class FileSourceConnectorSpec
     read shouldBe false
     // Under fail, the same directory plans nothing, as it always did.
     refused(plan(root, source("csv"))) should include("'b.csv' leads out of the landing zone")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // A file whose bytes are not of its encoding (ADR-0024 §4 to §6)
+  // ---------------------------------------------------------------------------------------------
+
+  private val Mark = Array(0xef, 0xbb, 0xbf).map(_.toByte)
+
+  /** A batch of three files of CSV said to be UTF-8: one that is, and two with a byte that is not. */
+  private def notAllUtf8(root: Path): Unit = {
+    drop(root, "a.csv", "id,name\n1,Peña\n")
+    dropBytes(root, "b.csv", bytesOf("id,name\n1,ann\n2,ni", 0xf1, "o\n"))
+    dropBytes(root, "c.csv.gz", bytesOf("id,name\n3,Ren", 0xe9, "\n"), gzip = true)
+    ()
+  }
+
+  private val NotUtf8InB =
+    "not_of_its_encoding: the byte at offset 18 of the file, in line 3, is not of UTF-8"
+  private val NotUtf8InC =
+    "not_of_its_encoding: the byte at offset 13 of what the file holds, decompressed, in " +
+      "line 2, is not of UTF-8"
+
+  test("a file with a byte that is not of its encoding fails its batch, named with where it is") {
+    val root = landingZone()
+    notAllUtf8(root)
+
+    val message = refused(ingest(root, source("csv")))
+    message should include("the batch of shop/orders has 2 files that cannot be read")
+    message should include(s"'b.csv' $NotUtf8InB")
+    message should include(s"'c.csv.gz' $NotUtf8InC")
+    message should include("connector.on_unreadable_file: fail")
+    message should include(
+      "correct connector.csv.encoding and give the batch up (abandon-batch)"
+    )
+    // Where the byte is, and never what the file holds.
+    message should not include "ni"
+    message should not include "Ren"
+    message should not include "�"
+  }
+
+  test("under skip, the files that are not of their encoding are said, with what to do") {
+    val root = landingZone()
+    notAllUtf8(root)
+
+    val cannot = skipped(ingest(root, source("csv", policy = "skip")))
+    // Each says what to do, as its record keeps it and as its warning says it.
+    val toDo = "To have it taken again, correct connector.csv.encoding, if it is the encoding " +
+      "of the source that is wrong, and touch the file (touch)"
+    cannot.unreadable shouldBe Seq(
+      UnreadableFilesException.Unreadable("b.csv", s"$NotUtf8InB. $toDo"),
+      UnreadableFilesException.Unreadable("c.csv.gz", s"$NotUtf8InC. $toDo")
+    )
+    cannot.summary should include("2 files of the batch of shop/orders cannot be read")
+    // A batch that is given up is not one to give up, and no reprocess takes its files.
+    cannot.summary should not include "abandon-batch"
+    cannot.summary should not include "reprocess"
+  }
+
+  test("under ISO-8859-1, a byte of 0x80 to 0x9F is not of it, and the read says windows-1252") {
+    val sheet = bytesOf("id;importe\r\n1;10 ", 0x80, "\r\n")
+    val root = landingZone()
+    dropBytes(root, "a.csv", sheet)
+
+    val message =
+      refused(ingest(root, source("csv", csv = """delimiter: ";", encoding: ISO-8859-1""")))
+    message should include(
+      "'a.csv' not_of_its_encoding: the byte at offset 17 of the file, in line 2, is a control " +
+        "character of ISO-8859-1 (0x80 to 0x9F), which a text does not have: the file may be " +
+        "of windows-1252"
+    )
+    // Which it is.
+    val read = ingest(root, source("csv", csv = """delimiter: ";", encoding: windows-1252"""))
+    rows(read.rows.select("id", "importe")) shouldBe Seq(Row("1", "10 €"))
+  }
+
+  test("the mark of UTF-8 in a file whose source says an encoding of one byte is not of it") {
+    Seq("ISO-8859-1", "windows-1252").foreach { encoding =>
+      val root = landingZone()
+      dropBytes(root, "a.csv", bytesOf(Mark, "id,name\n1,ann\n"))
+
+      withClue(encoding) {
+        refused(ingest(root, source("csv", csv = s"encoding: $encoding"))) should include(
+          "'a.csv' not_of_its_encoding: it starts with the mark of the order of bytes of " +
+            s"UTF-8, and its source says $encoding: it is a file of UTF-8"
+        )
+      }
+    }
+  }
+
+  test("a U+FFFD that the source wrote is read, and a byte that windows-1252 has not is not") {
+    val written = landingZone()
+    dropBytes(written, "a.csv", bytesOf("id,name\n1,a", 0xef, 0xbf, 0xbd, "b\n"))
+    rows(ingest(written, source("csv")).rows.select("id", "name")) shouldBe
+      Seq(Row("1", "a�b"))
+
+    val undefined = landingZone()
+    dropBytes(undefined, "a.csv", bytesOf("id\nx", 0x81, "\n"))
+    refused(ingest(undefined, source("csv", csv = "encoding: windows-1252"))) should include(
+      "'a.csv' not_of_its_encoding: the byte at offset 4 of the file, in line 2, is not of " +
+        "windows-1252"
+    )
+  }
+
+  test("a file of JSON is of UTF-8, and one with a byte that is not cannot be read") {
+    val why =
+      "not_of_its_encoding: the byte at offset 22 of the file, in line 2, is not of UTF-8"
+    def files(root: Path): Unit = {
+      drop(root, "a.json", "{\"id\":\"1\",\"name\":\"Peña\"}\n")
+      dropBytes(root, "b.json", bytesOf("{\"id\":\"2\"}\n{\"name\":\"ni", 0xf1, "o\"}\n"))
+      ()
+    }
+    val failing = landingZone()
+    files(failing)
+    val message = refused(ingest(failing, source("json")))
+    message should include(s"'b.json' $why")
+    message should include("JSON is read as UTF-8")
+    message should not include "connector.csv.encoding"
+
+    val skipping = landingZone()
+    files(skipping)
+    val cannot = skipped(ingest(skipping, source("json", policy = "skip")))
+    cannot.unreadable shouldBe Seq(
+      UnreadableFilesException.Unreadable(
+        "b.json",
+        s"$why. JSON is read as UTF-8: the file is to be written again, in UTF-8"
+      )
+    )
+  }
+
+  test("a header that is not the others' for the encoding of its file is said by that file") {
+    def files(root: Path): Unit = {
+      drop(root, "a.csv", "id,año\n1,x\n")
+      dropBytes(root, "b.csv", bytesOf("id,a", 0xf1, "o\n2,y\n"))
+      ()
+    }
+    val why = "not_of_its_encoding: the byte at offset 4 of the file, in line 1, is not of UTF-8"
+    val failing = landingZone()
+    files(failing)
+    val message = refused(ingest(failing, source("csv")))
+    message should include(s"'b.csv' $why")
+    message should not include "do not all have one header"
+
+    // And it is the source's to say what becomes of it.
+    val skipping = landingZone()
+    files(skipping)
+    val one = skipped(ingest(skipping, source("csv", policy = "skip"))).unreadable.loneElement
+    one.item shouldBe "b.csv"
+    one.why should startWith(s"$why. To have it taken again")
+  }
+
+  test("a name of a header with a NUL, or that starts with a second mark, fails its batch") {
+    def refusedOf(bytes: Array[Byte], csv: String = ""): String = {
+      val root = landingZone()
+      dropBytes(root, "a.csv", bytes)
+      refused(ingest(root, source("csv", csv = csv)))
+    }
+    val utf16 = "id,v\n1,x\n".getBytes("UTF-16LE")
+    val nul = "a name with a NUL (U+0000)"
+
+    // A file with nothing but a mark, and one of UTF-16 with no mark, whose bytes are of UTF-8.
+    refusedOf(Mark) should include(nul)
+    refusedOf(utf16) should include(nul)
+    // With its mark, a file of UTF-16 is not of UTF-8, and that is what is said.
+    refusedOf(bytesOf(0xff, 0xfe, utf16)) should include(
+      "'a.csv' not_of_its_encoding: the byte at offset 0 of the file, in line 1, is not of " +
+        "UTF-8: the file starts with the mark of the order of bytes of UTF-16"
+    )
+    // Under an encoding of one byte its mark is two characters, and its names have NULs.
+    refusedOf(bytesOf(0xff, 0xfe, utf16), "encoding: windows-1252") should include(nul)
+
+    // Spark takes one mark off, and the second would be the start of the first name.
+    refusedOf(bytesOf(Mark, Mark, "id,name\n1,ann\n")) should include(
+      "a name that starts with the mark of the order of bytes (U+FEFF)"
+    )
+  }
+
+  test("a file that changes before its bytes are looked at is a batch whose source changed") {
+    val root = landingZone()
+    val orders = source("csv")
+    val a = drop(root, "a.csv", "id\n1\n")
+    val planned = plan(root, orders).value
+
+    // What it holds by then is not of UTF-8; and it is not the file that was planned.
+    val changing = connector(
+      root,
+      afterRead = () => {
+        Files.write(a, bytesOf("id\n", 0xf1, "\n2\n"))
+        ()
+      }
+    )
+    val changed =
+      changedUnder(changing.read(orders, configOf(orders), planned, ReadContext(spark)))
+    changed.summary should include("1 file of it changed while it was read")
+    changed.changed.map(_.item) shouldBe Seq("a.csv")
+  }
+
+  test("bytes that cannot be looked at, with no file changed, are a failure that passes") {
+    val root = landingZone()
+    val orders = source("csv")
+    val a = drop(root, "a.csv", "id\n1\n")
+    unopenable(a)(())
+    val planned = plan(root, orders).value
+    val permissions = Files.getPosixFilePermissions(a)
+
+    // Spark read it, and it may not be opened by the time its bytes are looked at.
+    val closing = connector(
+      root,
+      afterRead = () => {
+        Files.setPosixFilePermissions(a, PosixFilePermissions.fromString("---------"))
+        ()
+      }
+    )
+    val failure =
+      try
+        the[RunFailedException] thrownBy
+          closing.read(orders, configOf(orders), planned, ReadContext(spark))
+      finally Files.setPosixFilePermissions(a, permissions): Unit
+    failure.failure shouldBe FailureClass.Transient
+    failure.getMessage should include("their bytes could not be looked at")
+    failure.getMessage should include("with no file changed")
+    failure.getMessage should not include "Permission denied"
+  }
+
+  test("a run that has lost its lease does not look at the bytes of its files") {
+    val root = landingZone()
+    val orders = source("csv")
+    // A file that would fail its batch, if its bytes were looked at.
+    dropBytes(root, "a.csv", bytesOf("id\n", 0xf1, "\n"))
+    val planned = plan(root, orders).value
+    val lost = new IllegalStateException("the lease is lost")
+
+    val stopped = the[IllegalStateException] thrownBy connector(root).read(
+      orders,
+      configOf(orders),
+      planned,
+      ReadContext(spark, verify = () => throw lost)
+    )
+    stopped shouldBe theSameInstanceAs(lost)
   }
 
   // ---------------------------------------------------------------------------------------------

@@ -492,6 +492,44 @@ final class RunCommandSpec
     next.out should include("found nothing new")
   }
 
+  test("a file that is not of its encoding ends in 4, or under skip is a warning with what to do") {
+    // Of ISO-8859-1, under sources that say nothing of their encoding: UTF-8.
+    def dropLatin1(of: Source): Unit = {
+      val path = files.directoryOf(of.id).resolve("b.csv")
+      Files.write(path, "id,name\n2,Peña\n".getBytes("ISO-8859-1"))
+      Files.setLastModifiedTime(path, FileTime.from(Instant.now().minusSeconds(3600))): Unit
+    }
+    val why =
+      "not_of_its_encoding: the byte at offset 12 of the file, in line 2, is not of UTF-8"
+
+    val stopped = fileSource()
+    drop(stopped, "a.csv", "id,name\n1,ann\n")
+    dropLatin1(stopped)
+    val ran = invoke(stopped)
+    ran.exit shouldBe Main.Exit.Permanent
+    said(ran).loneElement should (
+      include(s"'b.csv' $why") and include("correct connector.csv.encoding")
+    )
+    batchesOf(stopped) shouldBe Seq("1" -> "PLANNED")
+    assertLedger(stopped)
+
+    val skipping = files.fileSource(newSourceId(), options = ", on_unreadable_file: skip")
+    drop(skipping, "a.csv", "id,name\n1,ann\n")
+    dropLatin1(skipping)
+    val skipped = invoke(skipping)
+    withClue(skipped.err)(skipped.exit shouldBe Main.Exit.Ok)
+    skipped.errors.filter(_.contains(" skipped ")).loneElement should (
+      startWith("warning: ") and
+        include(
+          s"skipped 'b.csv', which cannot be read: $why. To have it taken again, correct "
+        ) and
+        include("connector.csv.encoding") and
+        include("touch the file")
+    )
+    batchesOf(skipping) shouldBe Seq("1" -> "ABANDONED", "2" -> "COMMITTED")
+    assertLedger(skipping)
+  }
+
   test("--max-batches stops the chain where it says, and the next invocation goes on") {
     val limited = oneAtATime(3)
 
