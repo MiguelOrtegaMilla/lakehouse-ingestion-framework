@@ -72,7 +72,7 @@ final class QuarantineSpec extends AnyFunSuite with Matchers with EitherValues {
       "raw_record",
       "quarantined_at"
     )
-    Quarantine.ErrorType.All shouldBe Seq("unparsed")
+    Quarantine.ErrorType.All shouldBe Seq("unparsed", "trailing_text", "duplicate_field")
   }
 
   test("the share of a batch that may be rejected is allowed whole, and no more") {

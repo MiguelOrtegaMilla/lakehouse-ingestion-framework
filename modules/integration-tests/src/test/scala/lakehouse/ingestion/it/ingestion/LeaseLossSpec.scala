@@ -404,7 +404,7 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
 
     Seq(
       (refused, FaultPoint.AfterPlan, FailureClass.Permanent, "_run_id"),
-      (rejecting, FaultPoint.AfterQuarantineWrite, FailureClass.Data, "could not be parsed")
+      (rejecting, FaultPoint.AfterQuarantineWrite, FailureClass.Data, "were set apart")
     ).foreach { case (source, point, failure, said) =>
       val first = batchId(source, 1)
 

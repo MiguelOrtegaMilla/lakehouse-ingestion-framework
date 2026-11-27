@@ -164,7 +164,7 @@ The decision, with what was left out and what it costs, is [ADR-0020](../adr/002
 
 ### Records that are rejected
 
-A record that cannot be made a row is not lost, and does not stop the rest of its batch by itself. It is kept whole, as the text that it was, in the quarantine of its source: a table of the lake at `_quarantine/bronze/<id of the source>`, with the file that it came from, the batch, the run, and why. Today that is a record that the parser of its format could not parse: a line that is not JSON, a record of CSV with more values or fewer than its header.
+A record that cannot be made a row is not lost, and does not stop the rest of its batch by itself. It is kept whole, as the text that it was, in the quarantine of its source: a table of the lake at `_quarantine/bronze/<id of the source>`, with the file that it came from, the batch, the run, and why (`error_type`, and `error_detail` where more is known): `unparsed`, a record that the parser of its format could not parse, as a line that is no record of JSON or a record of CSV with more values or fewer than its header; and, for JSON, `trailing_text`, a record with text after its object, with the column where the text starts, and `duplicate_field`, a record with a field twice at its first level, with the name of the field.
 
 `quality.max_rejected_ratio` says how many are too many. It is a share of the records that a batch read, and it is allowed whole: with `0.01`, one record of a hundred is taken, and two are not. When a batch is beyond it, nothing of the batch is written to Bronze, the run ends in 5, and the rejected records are in quarantine to be looked at. The same data gives the same result, so the batch waits until the source allows more, or sends what it meant to. By default no record may be rejected.
 
@@ -221,7 +221,13 @@ Files that are left in a directory of the landing zone. It loads by `new_files`.
 
 **CSV is read as RFC 4180 writes it**, in UTF-8, with a header: values are separated by commas, a value is quoted if it has a comma, a quote or the end of a line in it, and a quote inside a quoted value is written twice (`"said ""hi"""`). A backslash is a character like any other. A source cannot say another dialect or another encoding yet.
 
-**JSON is one record to a line** (JSON Lines), a line ended by `\n` or `\r\n`; a blank line is passed over. A record written over several lines, as a pretty-printed one, is read a line at a time, and each of its lines is set apart as a record that cannot be parsed: a source has no field to read it otherwise.
+**JSON is one record to a line** (JSON Lines), a line ended by `\n` or `\r\n`; a blank line is passed over. A record is one object, with each field of its first level once and nothing after it but spaces, and each value is kept as it was written: a string as what it says, `null` as none, and a number, `true`, an object or a list as the text that it was written as (`10.50` is `10.50`). Everything else is set apart, with why:
+
+- **text after the object** (`trailing_text`), as `{"id":"4"} trailing`, `{"id":"4"} {"id":"5"}` or a comment: Spark's own reader would take the object and drop the rest without a word;
+- **a field twice at the first level** (`duplicate_field`), as `{"id":"1","id":"2"}`: Spark's own reader would keep one of the two values, or refuse the batch. A field twice inside an object of a record is kept, as the object's text;
+- **a line that is no whole object** (`unparsed`): a number, a string, a broken object, and each line of a record written over several lines, as a pretty-printed one, since a source has no field to read it otherwise. *Changed with P8.8:* a line that is a list of objects, as `[{"id":"1"},{"id":"2"}]`, is set apart too. Spark's reader made a row of each object of it up to P8.8, rows that could not be told apart by their line, and none of an empty list.
+
+They count against `quality.max_rejected_ratio` as any record set apart does. Fields that differ only in their case still fail the batch, as below.
 
 **The columns are the source's, under the names that it gave them, and each name is one column.** Spark and Delta tell the names of columns apart without their case. So a batch of JSON whose records have fields that differ only in their case, as `id` in one and `ID` in another, fails, and names both: read as one column, the values under one of the two names would be lost. A record with a field twice fails its batch the same way; inside an object nothing is told apart, since an object is kept as the JSON it was written as. A header of CSV with a name twice, case aside, or with an empty name fails its batch as files with different headers do. A column may be named `_metadata`.
 

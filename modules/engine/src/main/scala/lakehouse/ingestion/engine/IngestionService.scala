@@ -1233,7 +1233,8 @@ final class IngestionService(
         leased,
         RunEnd.Failed(
           FailureClass.Data,
-          s"$rejected of the $read records of ${batch.id} could not be parsed, which is more " +
+          s"$rejected of the $read records of ${batch.id} were set apart, as records that could " +
+            "not be parsed or that are not as their source writes them, which is more " +
             s"than the share that ${source.id} allows, ${source.quality.maxRejectedRatio} " +
             "(quality.max_rejected_ratio). The batch is not committed, and nothing of it was " +
             s"written to Bronze: it stays planned. The records are in quarantine, at " +

@@ -1462,7 +1462,7 @@ final class IngestionServiceSpec extends AnyFunSuite with Matchers with Ingestio
     outcome match {
       case Outcome.Failed(_, failure, message) =>
         failure shouldBe FailureClass.Data
-        message should include(s"1 of the 2 records of $first could not be parsed")
+        message should include(s"1 of the 2 records of $first were set apart")
         message should include("0.0 (quality.max_rejected_ratio)")
         message should include("nothing of it was written to Bronze")
         message should include(s"in quarantine, at ${quarantine(orders).uri}")

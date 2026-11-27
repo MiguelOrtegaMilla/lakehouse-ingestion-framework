@@ -324,9 +324,11 @@ object ReadResult {
    * The engine counts both before it writes either: the share of the records that were
    * rejected is known before a row is in Bronze (ADR-0008).
    *
-   * @param unparsed the records that could not be parsed, as they were written in the source:
-   *   `_source_file` and `_record`, both text. None for a source whose records are never text
-   *   to parse, as a file of Parquet
+   * @param unparsed the records that could not be parsed, or that were set apart for what they
+   *   are, as they were written in the source: `_source_file` and `_record`, both text, and, for
+   *   a connector that knows more of why, `_error_type`, one of `Quarantine.ErrorType`, and
+   *   `_error_detail`, both text. Without them a record is one that could not be parsed. None for
+   *   a source whose records are never text to parse, as a file of Parquet
    */
   final case class Kept(rows: DataFrame, unparsed: Option[DataFrame]) extends ReadResult
 
@@ -352,6 +354,12 @@ object ReadResult {
 
   /** The column of an unparsed record that has its text, as it was in the source. */
   val Record = "_record"
+
+  /** The column of a record set apart that says why, as `Quarantine.ErrorType` names it. */
+  val ErrorType = "_error_type"
+
+  /** The column of a record set apart that says what more is known of why. */
+  val ErrorDetail = "_error_detail"
 }
 
 /**

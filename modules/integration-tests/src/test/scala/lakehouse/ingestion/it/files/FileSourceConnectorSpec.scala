@@ -233,10 +233,11 @@ final class FileSourceConnectorSpec
     val result = ingest(root, source("csv"))
 
     rows(result.rows.select("id", "name")) shouldBe Seq(Row("1", "ann"), Row("4", "cy"))
-    result.unparsed.value.columns.toSeq shouldBe Seq("_source_file", "_record")
+    result.unparsed.value.columns.toSeq shouldBe
+      Seq("_source_file", "_record", "_error_type", "_error_detail")
     rows(result.unparsed.value) shouldBe Seq(
-      Row("shop/orders/a.csv", "2"),
-      Row("shop/orders/a.csv", "3,bob,extra")
+      Row("shop/orders/a.csv", "2", "unparsed", null),
+      Row("shop/orders/a.csv", "3,bob,extra", "unparsed", null)
     )
   }
 
@@ -377,7 +378,9 @@ final class FileSourceConnectorSpec
       Row("10.50", null, "1", """["x","y"]""", null),
       Row(null, """{"name":"Bea"}""", "2", null, "true")
     )
-    rows(result.unparsed.value) shouldBe Seq(Row("shop/orders/a.json", "not json"))
+    rows(result.unparsed.value) shouldBe Seq(
+      Row("shop/orders/a.json", "not json", "unparsed", null)
+    )
   }
 
   test("a file of JSON with no line that parses has every line set apart") {
@@ -477,12 +480,130 @@ final class FileSourceConnectorSpec
     refused(ingest(record, source("json"))) should include("'Id' and 'id'")
   }
 
-  test("a record of JSON with a field twice fails the batch, as a failure that says its class") {
+  test("a record of JSON with a field twice at its first level is set apart, by its name") {
     val root = landingZone()
-    drop(root, "a.json", """{"id":"1"}""" + "\n" + """{"id":"5","id":"6"}""" + "\n")
+    drop(
+      root,
+      "a.json",
+      """{"id":"1"}""" + "\n" + """{"id":"5","id":"6"}""" + "\n" +
+        """{"id":"7","o":{"x":1,"x":2}}""" + "\n"
+    )
 
-    refused(ingest(root, source("json"))) should
-      (include("a field twice") and include("Nothing was written"))
+    val result = ingest(root, source("json"))
+
+    // An object inside a record is kept as its text, field twice and all.
+    rows(result.rows.select("id", "o")) shouldBe
+      Seq(Row("1", null), Row("7", """{"x":1,"x":2}"""))
+    rows(result.unparsed.value) shouldBe Seq(
+      Row(
+        "shop/orders/a.json",
+        """{"id":"5","id":"6"}""",
+        "duplicate_field",
+        "the field 'id' twice, at the first level of the record"
+      )
+    )
+  }
+
+  test("a record of JSON with text after its object is set apart, with where the text starts") {
+    val root = landingZone()
+    drop(
+      root,
+      "a.json",
+      Seq(
+        """{"id":"1"}""",
+        """{"id":"4"} trailing""",
+        """{"id":"5"} {"id":"6"}""",
+        """{"id":"7"} // a note""",
+        """{'id':'8'} x""",
+        """{"id":"9"}   """
+      ).mkString("", "\n", "\n")
+    )
+
+    val result = ingest(root, source("json"))
+
+    // Spark's reader would have read 4, 5, 7 and 8 as their objects, and dropped the rest.
+    rows(result.rows.select("id")) shouldBe Seq(Row("1"), Row("9"))
+    rows(result.unparsed.value.drop("_source_file")) shouldBe Seq(
+      Row("""{"id":"4"} trailing""", "trailing_text", "text after the object, from column 12"),
+      Row("""{"id":"5"} {"id":"6"}""", "trailing_text", "text after the object, from column 12"),
+      Row("""{"id":"7"} // a note""", "trailing_text", "text after the object, from column 12"),
+      Row("""{'id':'8'} x""", "trailing_text", "text after the object, from column 12")
+    )
+  }
+
+  test("a record of JSON has the values that Spark's reader of files gives it, as written") {
+    val root = landingZone()
+    val written = Seq(
+      """{"id":"1","amount":10.50,"big":12345678901234567890123,"exp":1e2,"neg": -0 }""",
+      """{"id":"2","o": { "a" : 1.50 , "b":[1, 2] } ,"l":[ 1.50 ],"t":true,"n":null}""",
+      """{"id":"3","s":"a\"b é 😀","e":"","x":NaN,'q':'single'}""",
+      """{"id":"4","_metadata":{"etag":"x"}}"""
+    )
+    val file = drop(root, "a.json", written.mkString("", "\n", "\n"))
+
+    val result = ingest(root, source("json"))
+    val columns = result.rows.columns.toSeq.filterNot(Set("_source_file", "_rescued_data"))
+    // Spark's own reader of files, given the same columns as text.
+    val spark = this.spark.read
+      .option("mode", "PERMISSIVE")
+      .schema(StructType(columns.map(StructField(_, StringType))))
+      .json(s"file:$file")
+
+    rows(result.rows.select(columns.map(col): _*)) shouldBe rows(spark)
+    rows(result.rows.select("amount", "exp", "neg", "o", "l", "s", "x"))
+      .filter(_.get(0) != null) shouldBe
+      Seq(Row("10.50", "1e2", "-0", null, null, null, null))
+    result.unparsed.value.count() shouldBe 0
+  }
+
+  test("a line of JSON that is no whole object is set apart: a list, a record over several lines") {
+    val root = landingZone()
+    drop(
+      root,
+      "a.json",
+      Seq(
+        """{"id":"1"}""",
+        // Spark's reader made rows of a list of objects up to P8.8, and none of an empty one.
+        """[{"id":"2"},{"id":"3"}]""",
+        "[]",
+        "5",
+        // A record written over several lines: each of its lines, as Spark's reader has it.
+        "{",
+        """  "id": "4",""",
+        "}"
+      ).mkString("", "\n", "\n")
+    )
+
+    val result = ingest(root, source("json"))
+
+    rows(result.rows.select("id")) shouldBe Seq(Row("1"))
+    rows(result.unparsed.value.select("_record", "_error_type")) shouldBe Seq(
+      Row("""  "id": "4",""", "unparsed"),
+      Row("5", "unparsed"),
+      Row("[]", "unparsed"),
+      Row("""[{"id":"2"},{"id":"3"}]""", "unparsed"),
+      Row("{", "unparsed"),
+      Row("}", "unparsed")
+    )
+  }
+
+  test("lines of JSON ended as Windows ends them, blank lines, and a file in gzip are read") {
+    val root = landingZone()
+    drop(root, "a.json", "{\"id\":\"1\"}\r\n\r\n   \n{\"id\":\"2\"}")
+    val zipped = root.resolve("shop/orders/b.json.gz")
+    Using.resource(new GZIPOutputStream(Files.newOutputStream(zipped))) {
+      _.write("\uFEFF{\"id\":\"3\"}\n".getBytes(UTF_8))
+    }
+    Files.setLastModifiedTime(zipped, FileTime.from(anHourAgo))
+
+    val result = ingest(root, source("json"))
+
+    rows(result.rows.select("id", "_source_file")) shouldBe Seq(
+      Row("1", "shop/orders/a.json"),
+      Row("2", "shop/orders/a.json"),
+      Row("3", "shop/orders/b.json.gz")
+    )
+    result.unparsed.value.count() shouldBe 0
   }
 
   test("fields that differ only in their case inside an object of JSON are kept, as its text") {
@@ -806,6 +927,26 @@ final class FileSourceConnectorSpec
       )
     )
     cannot.summary should include("1 file of the batch of shop/orders cannot be read")
+  }
+
+  test("a file of JSON cut short is found by its reads alone, as its lines are read as text") {
+    val root = landingZone()
+    val orders = source("json", policy = "skip")
+    drop(root, "a.json", "{\"id\":\"1\"}\n")
+    val cut = root.resolve("shop/orders/b.json.gz")
+    Using.resource(new GZIPOutputStream(Files.newOutputStream(cut))) {
+      _.write((1 to 20000).map(i => s"""{"id":"$i"}""").mkString("", "\n", "\n").getBytes(UTF_8))
+    }
+    cutShort(cut)
+    val planned = plan(root, orders).value
+
+    skipped(read(root, orders, planned)).unreadable shouldBe Seq(
+      UnreadableFilesException.Unreadable(
+        "b.json.gz",
+        "unreadable: it failed each of 3 reads of it alone: FAILED_READ_FILE.NO_HINT, " +
+          "from java.io.EOFException"
+      )
+    )
   }
 
   test("the reads alone wait before each round after the first, longer the second time") {
