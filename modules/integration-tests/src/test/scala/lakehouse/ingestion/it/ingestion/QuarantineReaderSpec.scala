@@ -220,7 +220,7 @@ final class QuarantineReaderSpec
   // Some records, as they were received
   // ---------------------------------------------------------------------------------------------
 
-  test("the records shown are the latest, in an order that is whole, taken as the first of it") {
+  test("the records shown are the latest, in the order that is said, taken as the first of it") {
     val orders = fileSource(rejected = Some("0.9"))
     drop(orders, "a.csv", "id,name\n0,ok\n9,z,extra\n1,b,extra\n")
     drop(orders, "b.csv", "id,name\n5,m,extra\n")

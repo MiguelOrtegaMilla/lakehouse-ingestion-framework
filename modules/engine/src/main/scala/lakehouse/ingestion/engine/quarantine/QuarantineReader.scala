@@ -193,15 +193,20 @@ final class QuarantineReader(database: ControlDatabase, spark: SparkSession, lak
    * `TakeOrderedAndProject`): each task keeps its first `records` and no more, so the
    * quarantine is never sorted whole, and no more than that reaches this process.
    *
-   * '''The order is whole.''' The latest first, by when the run set them apart, which is one
-   * moment for the records of a batch; then by their run, their file, their type and their
-   * text: a quarantine does not keep where in its file a record was. Two records that are
-   * alike in all of it are the same line of what is shown.
+   * '''The order.''' The latest first, by when the run set them apart, which is one moment for
+   * the records of a batch; then by their run, their file, their type, the text that is shown
+   * of them and how many characters they have: a quarantine does not keep where in its file a
+   * record was.
    *
    * '''The text is cut before it is ordered''', so that a record that is the rest of a file,
    * as one after a quote that is not closed, is let go of where it is read. Spark counts and
    * cuts a text by its characters (code points), and never inside one: a character outside the
    * basic plane, which is two units of a string of the JVM, is kept whole or left out whole.
+   *
+   * '''So the order is whole but for one case''': two records of one run, one file and one
+   * type whose first `MaxChars` characters are the same, and that have as many characters.
+   * Which of the two comes first is not said, and nor is which of them is among the first
+   * `records`; what is shown of each is the same.
    */
   @throws[SQLException]
   def sampleOf(
@@ -286,7 +291,11 @@ object QuarantineReader {
   /** How many records `sample` shows at most. */
   val MaxRecords = 1000
 
-  /** How many characters of the text of a record `sample` shows at most. */
+  /**
+   * How many characters of the text of a record `sample` shows at most. A character is a code
+   * point, which is up to four bytes: a record is 32 KiB at most, and `MaxRecords` of them 32
+   * MiB, which is the most that a sample brings to the process that asks for it.
+   */
   val MaxChars = 8192
 
   /**
