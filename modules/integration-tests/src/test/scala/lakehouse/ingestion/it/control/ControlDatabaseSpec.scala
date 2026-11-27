@@ -100,6 +100,32 @@ final class ControlDatabaseSpec
     }
   }
 
+  test("a transaction that may only read is refused what would change anything") {
+    opened() { database =>
+      val before = snapshots(database)
+
+      // It reads, as of one moment.
+      database.reading { c =>
+        query(c, "SHOW transaction_read_only").head.head shouldBe "on"
+        query(c, "SELECT count(*) FROM control.config_snapshot").head.head.toInt shouldBe before
+      }
+      // And the database refuses it a change, whatever its role may do.
+      val refused = intercept[SQLException] {
+        database.reading(c => update(c, insertSnapshot('1')))
+      }
+      refused.getSQLState shouldBe "25006"
+      snapshots(database) shouldBe before
+
+      // Its connection is given back as it came: one that may write, and commits by itself.
+      (1 to 4).foreach { _ =>
+        database.run(c => (c.isReadOnly, c.getAutoCommit)) shouldBe ((false, true))
+      }
+      database.run(c => update(c, insertSnapshot('1'))) shouldBe 1
+      database.transaction(c => update(c, insertSnapshot('2'))) shouldBe 1
+      snapshots(database) shouldBe before + 2
+    }
+  }
+
   test("a failure that is no SQL's undoes the transaction as well") {
     opened() { database =>
       val before = snapshots(database)

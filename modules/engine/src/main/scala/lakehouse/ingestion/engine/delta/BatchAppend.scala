@@ -42,18 +42,29 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
   /**
    * @param rows the rows as they are to be in the table. They are computed by the write, and
    *   again if the write is tried again
+   * @param properties the properties of Delta (`delta.`) that the table is made with, if this
+   *   write makes it: a table that is there keeps its own
    * @throws RunFailedException a permanent failure: a table outside the lake, or one that
    *   forgets its transactions; rows that the table does not take as they are; a batch that
    *   another writer of the same sequence got ahead of without writing it; a table whose
    *   schema or protocol others kept changing
    */
-  def append(table: TableLocation, batch: Written, rows: DataFrame): Result = {
+  def append(
+      table: TableLocation,
+      batch: Written,
+      rows: DataFrame,
+      properties: Map[String, String] = Map.empty
+  ): Result = {
     require(
       context.runId == batch.run.uuid,
       s"the batch is written by run ${batch.run}, and the context is of ${context.runId}"
     )
+    require(
+      properties.keys.forall(_.startsWith(TableProperty)),
+      s"a property of a table of Delta starts with $TableProperty"
+    )
     lake.confine(table)
-    attempts(table, batch, rows, conflicts = 0)
+    attempts(table, batch, rows, properties, conflicts = 0)
   }
 
   private def has(table: TableLocation, batch: BatchId): Boolean =
@@ -64,13 +75,14 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
       table: TableLocation,
       batch: Written,
       rows: DataFrame,
+      properties: Map[String, String],
       conflicts: Int
   ): Result =
     // Asked before every attempt: Delta skips a write that the table has without a word, and
     // what this write did is told by what the table said before it.
     if (has(table, batch.id)) AlreadyThere(tables.committedAt(table, batch.id))
     else
-      attempt(table, batch, rows) match {
+      attempt(table, batch, rows, properties) match {
         case None =>
           // The table is asked for the batch after the write: where it is, and how many rows
           // its commit counted. For rows that are read from their source as they are written,
@@ -100,7 +112,7 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
         // another source of the same table, most often making it at the same moment. The write
         // is made again on the table as it is now, where Delta checks the rows anew.
         case Some(_) if conflicts < Retries =>
-          attempts(table, batch, rows, conflicts + 1)
+          attempts(table, batch, rows, properties, conflicts + 1)
 
         // A conflict that asks for a re-plan is a permanent failure once its one retry is spent
         // (ADR-0010 §1, ADR-0022 §1): what changed is the table, and a write that the table as it
@@ -119,7 +131,12 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
    *
    * @return none, if Delta took it; the conflict that it lost to, if the table changed under it
    */
-  private def attempt(table: TableLocation, batch: Written, rows: DataFrame): Option[Throwable] =
+  private def attempt(
+      table: TableLocation,
+      batch: Written,
+      rows: DataFrame,
+      properties: Map[String, String]
+  ): Option[Throwable] =
     try {
       context.attribute {
         rows.write
@@ -132,6 +149,9 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
             CommitMetadata(batch.run, batch.source, batch.id).text
           )
           .option("mergeSchema", "false")
+          // Delta takes an option that is a property of a table for one of the table that the
+          // write makes, and for nothing of a table that is there.
+          .options(properties)
           .save(table.uri)
       }
       None
@@ -151,6 +171,9 @@ final class BatchAppend(lake: Lake, tables: DeltaTableTransactions, context: Com
 }
 
 object BatchAppend {
+
+  /** What the name of a property of a table of Delta starts with. */
+  val TableProperty = "delta."
 
   /**
    * The batch that a write is of.

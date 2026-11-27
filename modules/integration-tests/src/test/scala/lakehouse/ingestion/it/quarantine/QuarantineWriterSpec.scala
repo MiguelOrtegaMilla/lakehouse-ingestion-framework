@@ -1,9 +1,13 @@
 package lakehouse.ingestion.it.quarantine
 
 import java.net.URI
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path => LocalPath, Paths}
 import java.sql.Timestamp
 import java.time.Instant
+
+import scala.jdk.CollectionConverters._
+import scala.util.Using
 
 import io.delta.tables.DeltaTable
 import lakehouse.ingestion.core.config.{PathTableLocator, RelativePath, RootUri, SourceId}
@@ -14,7 +18,10 @@ import lakehouse.ingestion.engine.delta.BatchAppend.{AlreadyThere, Appended}
 import lakehouse.ingestion.engine.delta.{CommitMetadata, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.engine.quarantine.{QuarantineBatch, QuarantineWriter}
 import lakehouse.ingestion.it.logstore.CoordinatedDeltaSuite
+import lakehouse.ingestion.it.support.CapturedLogs
 import lakehouse.ingestion.logstore.CommitContext
+import org.apache.logging.log4j.Level
+import org.apache.spark.sql.delta.DeltaLog
 import org.apache.spark.sql.types.{LongType, StringType, TimestampType}
 import org.apache.spark.sql.{DataFrame, Row}
 import org.scalatest.funsuite.AnyFunSuite
@@ -206,6 +213,52 @@ final class QuarantineWriterSpec
       .collect()
       .map(_.getString(0))
       .toSeq shouldBe texts
+  }
+
+  test("the log of a quarantine has no text of a record, and nor has what Delta logs of it") {
+    val source = newSource()
+    val table = quarantineOf(source)
+    val held = "PERSON-OMEGA"
+
+    // Every logger, as low as it logs, while the table is made, written again and read: Delta
+    // logs each snapshot that it makes of a table, with the statistics of its files.
+    val (_, heard) = CapturedLogs.everything(Level.ALL)(_.contains(held)) {
+      write(
+        batch(source, 1),
+        unparsed("returns/a.csv" -> s"$held,1,extra", "returns/b.csv" -> s"zz $held")
+      )
+      write(batch(source, 2), unparsed("returns/c.csv" -> s"$held again"))
+      read(table).where("batch_seq = 2").count() shouldBe 1L
+    }
+    withClue(heard.kept.map(line => s"${line.level} ${line.message.take(120)}").mkString("\n")) {
+      heard.kept shouldBe empty
+    }
+    heard.loggers.exists(_.startsWith("org.apache.spark.sql.delta")) shouldBe true
+
+    // The table says which of its columns statistics are kept of: not the text, nor its detail.
+    DeltaLog
+      .forTable(spark, table.uri)
+      .update()
+      .metadata
+      .configuration
+      .get(QuarantineWriter.StatsColumnsProperty) shouldBe
+      Some("run_id,batch_seq,source_file,error_type,quarantined_at")
+    // So no file of its log has the text of a record: its commits, nor its checksums.
+    val log = Using.resource(Files.list(Paths.get(new URI(table.uri)).resolve("_delta_log"))) {
+      _.iterator.asScala.filter(Files.isRegularFile(_)).toVector
+    }
+    val commits = log.filter(_.toString.endsWith(".json"))
+    commits should have size 2
+    log.foreach { file =>
+      withClue(s"${file.getFileName}: ") {
+        new String(Files.readAllBytes(file), UTF_8) should not include held
+      }
+    }
+    // The statistics that a read asks by are kept.
+    new String(Files.readAllBytes(commits.head), UTF_8) should include("minValues")
+    // And the records are in the table, whole.
+    read(table).select("raw_record").collect().map(_.getString(0)).toSeq should
+      contain theSameElementsAs Seq(s"$held,1,extra", s"zz $held", s"$held again")
   }
 
   test("the quarantine and the data of a batch are two tables, each with the batch once") {

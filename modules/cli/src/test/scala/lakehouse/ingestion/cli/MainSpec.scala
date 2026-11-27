@@ -682,6 +682,66 @@ final class MainSpec
     usage should include("or the backfill named is not there")
   }
 
+  test(
+    "quarantine: what is asked of it is read before anything is opened, or it is no command line"
+  ) {
+    def quarantine(more: String*): Ran =
+      run(
+        Seq("quarantine", "--profile", "p.yaml", "--sources", "conf/sources", "--source", "s.a") ++
+          more: _*
+      )
+    def refused(more: String*): String = {
+      val ran = quarantine(more: _*)
+      ran.exit shouldBe Main.Exit.Usage
+      ran.out shouldBe empty
+      ran.errors.head
+    }
+    run("quarantine", "--profile", "p.yaml", "--sources", "conf/sources").errors.head shouldBe
+      "error: --source must be given"
+    // How many records, written as a number is: from 1 to those that are shown at most.
+    Seq("0", "-1", "1001", "01", "ten", "1.5", "").foreach { records =>
+      withClue(records) {
+        refused("--records", records) should include("is not a number of records, from 1 to 1000")
+      }
+    }
+    refused("--records") shouldBe "error: --records has no value after it"
+    refused("--type", "broken") shouldBe
+      "error: --type 'broken' is not why a record is set apart: one of unparsed, " +
+      "trailing_text, duplicate_field"
+    refused("--run", "the-first") should startWith("error: --run 'the-first' is not a run id")
+    refused("--batch", "0") shouldBe "error: --batch '0' is not the number of a batch, from 1"
+    refused("--backfill", "history") shouldBe
+      "error: --backfill says the sequence of a batch: --batch must be given with it"
+    refused("--batch", "1", "--backfill", "History") should
+      startWith("error: --backfill 'History' must be lower-case")
+    refused("--reason", "to look") shouldBe "error: '--reason' is not an option of this command"
+    // What is asked rightly gets as far as the configuration, which is not there (4).
+    quarantine(
+      "--run",
+      RunId.generate().toString,
+      "--batch",
+      "2",
+      "--backfill",
+      "history",
+      "--file",
+      "s_a/a.csv",
+      "--type",
+      "unparsed",
+      "--records",
+      "1000"
+    ).exit shouldBe Main.Exit.Permanent
+
+    usage should include("lakehouse-ingestion quarantine --profile <file> --sources <directory>")
+    usage should include("[--records <n>]")
+    usage should include("It reads, and writes nothing: it is no run")
+    usage should include("to the standard output and nowhere else")
+    usage should include("they may hold personal data")
+    Quarantine.ErrorType.All.foreach(why => usage should include(why))
+    usage should include("from 1 to 1000; each has its first")
+    usage should include("or what was asked of a quarantine was shown")
+    usage should include("or the quarantine was not read: the source has no such")
+  }
+
   test("reprocess: a batch by its number and a reason, or the command line is not one: 64") {
     def reprocess(more: String*): Ran =
       run(
@@ -745,7 +805,7 @@ final class MainSpec
 
     usage should include("lakehouse-ingestion reset-state --profile <file>")
     usage should include("(--watermark <moment> | --forget-watermark")
-    usage should include("the state was reset, or the table was maintained;")
+    usage should include("the state was reset, the table was maintained, or what was asked")
     usage should include("reset: a batch is planned, the source has no state, or no such")
   }
 

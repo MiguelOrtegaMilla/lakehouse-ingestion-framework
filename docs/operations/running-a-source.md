@@ -95,6 +95,50 @@ Either the file is wrong, or what the source says of its files is:
 
 A file of JSON has no field for its encoding: it is to be written again, in UTF-8.
 
+### What a source had set apart: `quarantine`
+
+A record that cannot be made a row is kept in the quarantine of its source, and a run that sets apart more of them than its source allows ends in 5, with its batch planned. To see what they are:
+
+```bash
+sbt "cli/run quarantine --profile conf/app/local.yaml --sources conf/sources --source sales.returns"
+```
+
+```text
+The quarantine of sales.returns has 14 records of what was asked, in 2 groups by run, file and type:
+
+RUN                                   BATCH  STATUS     FILE                         TYPE      RECORDS  LATEST
+0193a5f0-7c2e-7b1a-9f3e-2d4c6a8b0e1f  7      PLANNED    sales_returns/2026-03-02.csv  unparsed       12  2026-03-02T06:00:04Z
+0193a0c9-11d4-7e02-8a55-90b1c3d2e4f6  6      COMMITTED  sales_returns/2026-03-01.csv  unparsed        2  2026-03-01T06:00:03Z
+
+By type: unparsed 14.
+```
+
+A group is the records that one run set apart of one file for one reason, the group with the latest records first; `STATUS` is that of the batch of the run, and `PLANNED` is a batch that its threshold stopped. What is asked may be less: `--run <id>`, `--batch <n>` (with `--backfill <id>` for a chunk of a backfill), `--file <path>`, as the table shows it, and `--type` (`unparsed`, `trailing_text` or `duplicate_field`). A thousand groups are shown at most, with how many there are.
+
+**The records of a batch that was given up are left out**, and the command says how many: the batch after it sets the same records apart again, under its own number.
+
+**The command reads, and writes nothing.** It is no run, takes no lease, and leaves nothing in the control plane; it may be run while the source is, and on a source that is disabled.
+
+**`--records <n>` shows records as they were received, and they may hold personal data.** Up to n of them, from 1 to 1000, the latest first, each as a line of JSON on the standard output, which then has nothing else: the warning, and how many were written, are on the error output.
+
+```bash
+sbt -error "cli/run quarantine --profile conf/app/local.yaml --sources conf/sources --source sales.returns --batch 7 --records 20" > rejected.jsonl
+jq -r .raw_record rejected.jsonl
+```
+
+`-error` has sbt say nothing of its own, so that the file has the records alone.
+
+- **Where the records go is yours to mind.** The command writes them to its standard output and nowhere else: not to its error output, and not to a log, of the application or of Spark. Under an orchestrator, the standard output of a task is a log: `--records` is for a terminal, or for a file that is kept as the quarantine is.
+- **A line is safe to show.** Each character that a terminal acts on, or that ends a line, is written as its escape (`\u001b`): a control character, the separators of lines U+2028 and U+2029, and the characters that turn the direction of a text. `jq` gives the text back as it was.
+- **A long record is cut** at its first 8192 characters (`truncated`), with how many it has (`raw_record_chars`): a record may be the rest of a file, after a quote that is not closed. The whole of it is in the table.
+- **It does not page.** The records are the first of their order, and less is asked for by a run, a batch, a file or a type. Whoever needs every record reads the table of Delta, at `_quarantine/bronze/<source id>` under the lake, leaving out the runs of the batches that were given up ([the reference](../configuration/reference.md#records-that-are-rejected) has the query).
+
+| Code | Meaning |
+|---|---|
+| 0 | What was asked was shown, were it nothing: a source with no quarantine never had a record set apart |
+| 3 | A database did not answer |
+| 4 | The configuration is not valid, or the source has no such run or batch |
+
 ### When a source is stuck: `abandon-batch`
 
 A batch is planned before anything is read, and every run replays its plan until it is committed. A plan that cannot be run, because the directory or the table it names is no longer the source's, stops the source. An operator gives it up:
