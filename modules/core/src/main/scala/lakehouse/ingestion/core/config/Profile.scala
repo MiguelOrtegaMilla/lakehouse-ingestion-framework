@@ -270,6 +270,32 @@ object Profile {
      * `encode()` and `decode()` take any charset of the JDK too, for any SQL of a run.
      */
     val JavaCharsets = "spark.sql.legacy.javaCharsets"
+
+    /**
+     * Whether Delta writes the files of a small table into the checksum of each of its versions
+     * (`.crc`), each file with the least and the greatest value of each of its columns. It is
+     * off in every session of the engine. Delta logs each snapshot that it makes with its
+     * checksum, at INFO, which is the level that Spark logs at unless it is told otherwise: with
+     * the files in it, values of the rows of a table, of the columns of its source, are in the
+     * log of every process that reads or writes the table (discovery §20).
+     *
+     * '''What is given up.''' In Delta 4.4 the files of a checksum are read by one thing: the
+     * check of the files of a snapshot against them, after a commit and when a checkpoint is
+     * written, which Delta makes only in its verification mode
+     * (`spark.databricks.delta.allFilesInCrc.verificationMode.enabled`, off by default, and on
+     * by itself for a session that is not in UTC, which no session of the engine is). With the
+     * files out of the checksum there is nothing to check a snapshot against, in that mode or
+     * out of it. The rest of a checksum is written as before: how many files a table has and
+     * their size, its metadata, its protocol and its transactions. A read loses nothing: the
+     * files of a snapshot are made from the log whatever the checksum has, and the statistics
+     * that a read passes over files by are in the commits.
+     *
+     * The setting is internal to Delta: it is set here and nowhere else, and
+     * `DeltaSnapshotLogContractSpec` pins what it does. It is of what a session writes, and not
+     * of what it reads: a table whose last checksum was written with its files is logged so
+     * until its next commit by a session of the engine.
+     */
+    val FilesInChecksum = "spark.databricks.delta.allFilesInCrc.enabled"
   }
 
   /**
@@ -324,6 +350,11 @@ object Profile {
       Some(
         "is set by the engine: every session of a run reads the encodings that a source of " +
           "CSV may say, windows-1252 among them, only while this is on (ADR-0024)"
+      )
+    else if (is(EngineSpark.FilesInChecksum))
+      Some(
+        "is set by the engine: Delta logs the checksum of a table with each snapshot of it, " +
+          "and with this on the checksum has the files of the table, each with values of its rows"
       )
     else if (is(TransactionRetentionDefault))
       Some(

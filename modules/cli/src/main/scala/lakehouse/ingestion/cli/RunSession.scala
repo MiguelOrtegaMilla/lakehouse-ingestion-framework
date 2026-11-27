@@ -23,6 +23,8 @@ import org.apache.spark.sql.delta.DeltaLog
  *    a batch wrote;
  *  - UTC as the time zone of the session, which is that of the JVM as well (`jvmToUtc`);
  *  - any charset of the JDK for a reader of CSV, so that windows-1252 is read (ADR-0024 §2);
+ *  - the checksums of Delta written without the files of their table, so that no snapshot of a
+ *    table is logged with values of its rows (`Profile.EngineSpark.FilesInChecksum`);
  *  - `PostgresLogStore` for the scheme of the lake, so that every commit to a table of the lake
  *    is coordinated (ADR-0004);
  *  - the settings of the LogStore, made from `databases.coordination`, under `spark.hadoop.`:
@@ -96,6 +98,7 @@ object RunSession {
       Profile.EngineSpark.CommitMetrics -> "true",
       Profile.EngineSpark.SessionTimeZone -> Zone,
       Profile.EngineSpark.JavaCharsets -> "true",
+      Profile.EngineSpark.FilesInChecksum -> "false",
       StartupGuard.logStoreKey(scheme) -> classOf[PostgresLogStore].getName
     ) ++ LogStoreSettings.hadoop(profile.databases.coordination).map { case (key, value) =>
       s"spark.hadoop.$key" -> value

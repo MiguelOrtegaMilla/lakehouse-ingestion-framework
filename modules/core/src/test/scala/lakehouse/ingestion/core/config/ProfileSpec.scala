@@ -371,6 +371,11 @@ final class ProfileSpec extends AnyFunSuite with Matchers with EitherValues {
         "engine: the rows that a run wrote are read from the commits of its batch, which " +
         "Delta counts them in only while this is on"
     )
+    settings("spark.databricks.delta.allFilesInCrc.enabled") shouldBe Seq(
+      s"$File: spark.settings.spark.databricks.delta.allFilesInCrc.enabled is set by the " +
+        "engine: Delta logs the checksum of a table with each snapshot of it, and with this " +
+        "on the checksum has the files of the table, each with values of its rows"
+    )
     settings("spark.sql.session.timeZone") shouldBe Seq(
       s"$File: spark.settings.spark.sql.session.timeZone is set by the engine: every session " +
         "of a run is in UTC, as its JVM is, so that a time means the same to the engine, to " +
