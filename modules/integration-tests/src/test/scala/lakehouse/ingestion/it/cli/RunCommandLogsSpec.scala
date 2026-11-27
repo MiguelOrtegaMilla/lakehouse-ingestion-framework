@@ -11,6 +11,7 @@ import scala.util.Using
 
 import lakehouse.ingestion.cli.{Main, RunSession}
 import lakehouse.ingestion.core.config.Source
+import lakehouse.ingestion.engine.files.FileSourceConnector
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{
@@ -231,6 +232,31 @@ final class RunCommandLogsSpec
       loggers should contain("org.apache.parquet.io.RecordConsumerLoggingWrapper")
       (loggers -- ParquetWriters) shouldBe empty
     }
+  }
+
+  test("as it is deployed, what univocity parsed of a value too long is in no line of the log") {
+    // A quote that is not closed, with the rest of the file after it longer than the bound: the
+    // read of the file fails, and univocity's failure has the end of what it parsed, which
+    // Spark logs at WARN and at ERROR with each task that fails.
+    val held = "PERSON-PARSED"
+    val of = files.fileSource(newSourceId())
+    // Pieces of 20 characters, each with the text, to past the bound.
+    val rest =
+      Seq.tabulate(FileSourceConnector.MaxValueLength / 20 + 2)(i => f"$held-$i%06d").mkString
+    drop(of, "a.csv", s"id,name\n1,\"$rest\n2,y\n")
+    val (out, err) = (files.newLog(), files.newLog())
+
+    val ended = CommandProcess
+      .start(arguments(of), out, errors = Some(err), classpath = CommandProcess.Deployed)
+      .await()
+
+    val logged = Files.readAllLines(err, UTF_8).asScala.toSeq
+    withClue(logged.takeRight(30).mkString("\n"))(ended.exit shouldBe Main.Exit.Permanent)
+    logged.filter(_.contains(held)).map(_.take(200)) shouldBe empty
+    // Spark logged the failure of each task, with what univocity said of it, and the
+    // configuration of the application took out what follows the marker.
+    logged.count(_.contains("content parsed=<not logged>")) should be > 0
+    Files.readAllLines(out, UTF_8).asScala.filter(_.contains(held)) shouldBe empty
   }
 
   /**

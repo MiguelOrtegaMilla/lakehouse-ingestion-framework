@@ -1214,6 +1214,61 @@ final class FileSourceConnectorSpec
     reads shouldBe empty
   }
 
+  // A value of CSV longer than the bound (P8.11): what a quote that is not closed takes in, the
+  // rest of its file, and what a process would end for want of memory for.
+  private val Bound = FileSourceConnector.MaxValueLength
+  private val Held = "PERSON-HELD"
+
+  /** A file of the source with a quote that is not closed, and more than the bound after it. */
+  private def unclosed(root: Path, name: String): Path =
+    drop(root, name, s"id,v\n2,\"$Held " + "x" * Bound + "\n3,y\n")
+
+  private val TooLong =
+    s"unreadable: a value of it, or a name of its header, is longer than $Bound characters " +
+      "(units of UTF-16), the longest that a value of CSV may be: most often a quote that is " +
+      "not closed, which takes the rest of its file into one value"
+
+  test(
+    "a value of CSV longer than the bound fails its file at its first read alone, and says why"
+  ) {
+    val root = landingZone()
+    val orders = source("csv")
+    drop(root, "a.csv", "id,v\n1,x\n")
+    unclosed(root, "b.csv")
+    val planned = plan(root, orders).value
+    val (reading, reads) = counting(root)
+
+    val message = refused(reading.read(orders, configOf(orders), planned, ReadContext(spark)))
+    message should include("the batch of shop/orders has 1 file that cannot be read")
+    message should include(s"'b.csv' $TooLong")
+    // What it held, and what univocity says of it, are not said.
+    message should not include Held
+    message should not include "content parsed"
+    // It fails the same at every read: it is read alone once.
+    reads.toMap shouldBe Map("a.csv" -> 1, "b.csv" -> 1)
+  }
+
+  test("under skip, a value longer than the bound is said of its file, for it to be recorded") {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    drop(root, "a.csv", "id,v\n1,x\n")
+    unclosed(root, "b.csv")
+    val planned = plan(root, orders).value
+
+    val cannot = skipped(read(root, orders, planned))
+    cannot.unreadable shouldBe Seq(UnreadableFilesException.Unreadable("b.csv", TooLong))
+    cannot.getMessage should not include Held
+  }
+
+  test("a value of CSV as long as the bound is read, and a name of a header as long") {
+    val root = landingZone()
+    val name = "n" * Bound
+    drop(root, "a.csv", s"id,$name\n1,${"x" * Bound}\n")
+
+    val read = ingest(root, source("csv"))
+    rows(read.rows.select("id", name)) shouldBe Seq(Row("1", "x" * Bound))
+  }
+
   test("a failure of a batch that no file has alone is let through as it was") {
     val root = landingZone()
     val orders = source("csv", policy = "skip")
