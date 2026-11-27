@@ -6,6 +6,7 @@ import scala.collection.mutable
 import scala.util.Using
 
 import com.fasterxml.jackson.core.{JsonFactory, JsonParser, JsonToken}
+import lakehouse.ingestion.core.Text
 import org.apache.spark.sql.catalyst.json.JSONOptions
 
 /**
@@ -149,7 +150,8 @@ private[files] object JsonLines {
   def detail(line: Line): Option[String] = line match {
     case Line.TrailingText(column) => Some(s"text after the object, from column $column")
     case Line.DuplicateField(name) =>
-      val kept = if (name.length <= NameKept) name else s"${name.take(NameKept)}…"
+      val cut = Text.upTo(name, NameKept)
+      val kept = if (cut.length == name.length) name else s"$cut…"
       Some(s"the field '$kept' twice, at the first level of the record")
     case _ => None
   }

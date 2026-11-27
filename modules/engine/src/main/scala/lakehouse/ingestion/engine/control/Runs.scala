@@ -6,6 +6,7 @@ import java.util.UUID
 
 import scala.util.Using
 
+import lakehouse.ingestion.core.Text
 import lakehouse.ingestion.core.config.SourceId
 import lakehouse.ingestion.core.control._
 
@@ -23,7 +24,10 @@ import lakehouse.ingestion.core.control._
  */
 object Runs {
 
-  /** A message is for a person to read, not a place to keep a stack trace. */
+  /**
+   * A message is for a person to read, not a place to keep a stack trace: so many characters of
+   * it, as Unicode counts them (`Text.upTo`), are kept.
+   */
   val MaxMessageLength = 2000
 
   private val Columns =
@@ -111,7 +115,7 @@ object Runs {
       setInt(statement, 7, end.counts.writeConflicts)
       setInt(statement, 8, end.counts.commitContention)
       statement.setString(9, failure.map(_.failure.name).orNull)
-      statement.setString(10, failure.map(_.message.take(MaxMessageLength)).orNull)
+      statement.setString(10, failure.map(f => Text.upTo(f.message, MaxMessageLength)).orNull)
       statement.setObject(11, run.uuid)
       statement.executeUpdate() == 1
     }

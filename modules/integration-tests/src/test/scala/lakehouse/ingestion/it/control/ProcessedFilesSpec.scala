@@ -231,6 +231,27 @@ final class ProcessedFilesSpec extends AnyFunSuite with Matchers with ControlPla
     taken.id.seq shouldBe BatchSeq.of(2).value
   }
 
+  test("why a file failed is cut by its characters, and never inside one") {
+    val returns = fileSource()
+    val skipping = open(returns)
+    val filePlan = planned(plan(skipping, returns, Seq(listed("a.csv"), listed("b.csv"))))
+    val givenUp = skipping.plan(filePlan.toJson)
+    // Its 2000th character is outside the first plane, a pair of surrogates, as the name of a
+    // file in it may have one.
+    val pair = new String(Character.toChars(0x1f600))
+    val kept = "x" * (Runs.MaxMessageLength - 1) + pair
+
+    skipping.abandon(
+      givenUp.id,
+      "files of it cannot be read, and the source skips them",
+      None,
+      RunEnd.Succeeded(RunCounts(rowsWritten = Some(0L))),
+      failed = Seq(failedOf(filePlan, "b.csv", kept + " and more"))
+    ) shouldBe true
+
+    statuses(returns) shouldBe Seq(("b.csv", "10", "FAILED", kept))
+  }
+
   test("a file said to have failed that is not of the plan records nothing, and gives up nothing") {
     val returns = fileSource()
     val leased = open(returns)

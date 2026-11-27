@@ -99,6 +99,22 @@ final class RunsSpec extends AnyFunSuite with Matchers with ControlPlaneSuite {
     record.counts shouldBe RunCounts(retries = Some(5))
   }
 
+  /** A character outside the first plane: two units of UTF-16, a pair of surrogates. */
+  private val Pair = new String(Character.toChars(0x1f600))
+
+  test("a message is cut by its characters, and never inside one") {
+    val start = starting(source(newSourceId().value))
+    database.run(Runs.open(_, start, epoch(1)))
+    // Its 2000th character is outside the first plane, a pair of surrogates, as a name of a
+    // file may have one: a cut of 2000 units of UTF-16 kept half of it, which was written `?`.
+    val kept = "x" * (Runs.MaxMessageLength - 1) + Pair
+    database.run(
+      Runs.end(_, start.id, RunEnd.Failed(FailureClass.Permanent, kept + " and more"))
+    ) shouldBe true
+
+    find(start.id).value.failure.value.message shouldBe kept
+  }
+
   test("each class of failure is one that the audit trail takes") {
     FailureClass.All.foreach { failure =>
       val start = starting(source(newSourceId().value))

@@ -5,6 +5,7 @@ import java.time.OffsetDateTime
 
 import scala.util.Using
 
+import lakehouse.ingestion.core.Text
 import lakehouse.ingestion.core.config.{RelativePath, SourceId}
 import lakehouse.ingestion.core.control.BatchId
 import lakehouse.ingestion.core.files.{FileName, FilePlan, LandedFile}
@@ -148,7 +149,7 @@ object ProcessedFiles {
         7,
         connection.createArrayOf(
           "text",
-          files.map(failed => failed.error.trim.take(Runs.MaxMessageLength)).toArray[AnyRef]
+          files.map(failed => Text.upTo(failed.error.trim, Runs.MaxMessageLength)).toArray[AnyRef]
         )
       )
       statement.executeUpdate() == files.size
