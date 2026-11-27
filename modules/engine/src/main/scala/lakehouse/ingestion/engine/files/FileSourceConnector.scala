@@ -137,6 +137,17 @@ import org.slf4j.LoggerFactory
  * not a file) is one that cannot be read too, under `skip`, found just before the read: none of
  * the files of its plan is then read, and it is never opened (`Landing`).
  *
+ * '''A file whose bytes are not of its encoding cannot be read either''' (ADR-0024 §4 and §5).
+ * Spark reads such a byte as U+FFFD and says nothing. So once it has read a batch of CSV or of
+ * JSON, every byte of each of its files is decoded once more, by a decoder that reports what
+ * it cannot decode (`FileBytes`): CSV in the encoding of its plan, JSON in UTF-8. A file with a
+ * byte that is not of it, with a byte of 0x80 to 0x9F under ISO-8859-1, or with the mark of
+ * UTF-8 under an encoding of one byte to a character, is one that cannot be read, under the
+ * same policy; it is said with where the byte is, and never with the byte. A read that fails
+ * for the names of its batch (a header that is not the others', a name that no producer gave)
+ * has the bytes looked at before it says so: a file that is not of its encoding is why, and
+ * is what is said.
+ *
  * '''The files are the planned ones while they are read.''' A name may be given to another file
  * at any moment. So, just before Spark reads the files, each name must still lead to a file of
  * the size and the time that were planned, and which file of the file system it is, its device
@@ -239,7 +250,12 @@ final class FileSourceConnector(
     val read =
       try readOf(context.spark, config, as, files.directory, each)
       catch {
-        case known: RunFailedException => throw known
+        // What a read refuses of the names of a batch may be what a file that is not of its
+        // encoding was read as: a header that is not the others', for one. Such a file is
+        // what is said, and it is the source's to say what becomes of it.
+        case known: RunFailedException =>
+          val cannot = notOfItsEncoding(config, as, files, before, each, context)
+          throw if (cannot.isEmpty) known else unreadableAs(config, as, cannot, known)
         case refused: Exception if charsetRefused(refused) =>
           throw RunFailedException.permanent(
             s"Spark refuses to read the files of ${config.path} in ${as.describe}: the session " +
@@ -251,7 +267,8 @@ final class FileSourceConnector(
         case NonFatal(failed) => throw alone(config, as, files, before, each, failed, context)
       }
     afterRead()
-    confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
+    val cannot = notOfItsEncoding(config, as, files, before, each, context)
+    if (cannot.nonEmpty) throw unreadableAs(config, as, cannot)
 
     if (as.format == FileConnectorConfig.Format.Parquet)
       ReadResult.Kept(read.rows, unparsed = None)
@@ -443,6 +460,92 @@ final class FileSourceConnector(
   }
 
   /**
+   * The files of a plan whose bytes are not of the encoding that they were read by, each with
+   * why (ADR-0024 §4 and §5), and the look at the files after the read (`Landing.confirmAgain`).
+   * CSV is of the encoding of its plan, and JSON of UTF-8; Parquet has no text to decode.
+   *
+   * It is asked once Spark has read the files, so that those it opens are files that Spark
+   * read whole, and before the look at the files, so that the bytes looked at are those of the
+   * files that were planned, as the bytes read are. A look at the bytes that fails is of no
+   * file: a file that changed makes it a batch whose source changed (ADR-0018), and otherwise
+   * the failure is one that passes.
+   *
+   * @throws SourceChangedException if a file of the plan changed by the look after the read
+   * @throws RunFailedException a transient failure, if the bytes could not be looked at
+   */
+  private def notOfItsEncoding(
+      config: FileConnectorConfig,
+      as: ReadAs,
+      files: FilePlan,
+      before: Landing.Confirmed,
+      each: Vector[(LandedFile, Path)],
+      context: ReadContext
+  ): Vector[(LandedFile, String)] = {
+    val found =
+      if (as.format == FileConnectorConfig.Format.Parquet) Right(Vector.empty)
+      else {
+        // No job is started by a run that has lost its lease.
+        context.verify()
+        val encoding = as.csv.fold[CsvDialect.Encoding](CsvDialect.Encoding.Utf8)(_.encoding)
+        try
+          Right(
+            FileBytes.notOfEncoding(context.spark, each.map(file => s"file:${file._2}"), encoding)
+          )
+        catch { case NonFatal(failed) => Left(failed) }
+      }
+    confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
+    found match {
+      case Right(whys) =>
+        each.map(_._1).zip(whys).collect { case (file, Some(why)) => file -> why }
+      case Left(failed) =>
+        throw RunFailedException.transient(
+          s"the files of the batch of ${config.path} were read, and their bytes could not be " +
+            s"looked at for those that are not of their encoding (${said(failed)}), with no " +
+            "file changed: a failure that passed. Nothing was written",
+          failed
+        )
+    }
+  }
+
+  /**
+   * Files that are not of their encoding, as the policy of the source has files that cannot
+   * be read (ADR-0024 §4), with what to do about them: which is not the same for a source that
+   * may say its encoding as for one of JSON, nor for a batch that stays planned as for one
+   * that is given up.
+   *
+   * Under `fail` it is said once, after the files. Under `skip` it is said of each file, with
+   * why: that is what its record keeps (`processed_file`), and what the warning for it says.
+   */
+  private def unreadableAs(
+      config: FileConnectorConfig,
+      as: ReadAs,
+      cannot: Seq[(LandedFile, String)],
+      cause: Throwable = null
+  ): Exception = {
+    val csv = as.format == FileConnectorConfig.Format.Csv
+    val encoding = s"connector.${FileConnector.Csv}.${CsvDialect.EncodingField}"
+    config.onUnreadableFile match {
+      case FileConnectorConfig.OnUnreadableFile.Fail =>
+        val toDo =
+          if (csv)
+            s"If it is the encoding of the source that is wrong, correct $encoding and give " +
+              "the batch up (abandon-batch): a batch is read as it was planned, and the next " +
+              "plan takes its files as the source says by then"
+          else
+            "JSON is read as UTF-8, and a source has no field to say another encoding: such a " +
+              "file is to be written again, in UTF-8"
+        unreadable(config, cannot, cause, Some(toDo))
+      case FileConnectorConfig.OnUnreadableFile.Skip =>
+        val toDo =
+          if (csv)
+            s"To have it taken again, correct $encoding, if it is the encoding of the source " +
+              "that is wrong, and touch the file (touch)"
+          else "JSON is read as UTF-8: the file is to be written again, in UTF-8"
+        unreadable(config, cannot.map { case (file, why) => file -> s"$why. $toDo" }, cause)
+    }
+  }
+
+  /**
    * What a read of a batch that failed with `failed` comes to, once each of its files is read
    * alone (ADR-0023 §3): the files that cannot be read, under the policy of the source; a
    * failure that passed, if a file failed and then read; or `failed` as it was.
@@ -555,27 +658,31 @@ final class FileSourceConnector(
    * failure that names each, under `fail`; under `skip`, what the engine gives the batch up by.
    *
    * @param cannot each file, with why: never the text of an exception
+   * @param toDo what more there is to do about such files than what the policy says, if anything
    */
   private def unreadable(
       config: FileConnectorConfig,
       cannot: Seq[(LandedFile, String)],
-      cause: Throwable = null
+      cause: Throwable = null,
+      toDo: Option[String] = None
   ): Exception = {
     val named = cannot.map { case (file, why) => s"'${file.name}' $why" }
+    val more = toDo.fold("")(what => s". $what")
     config.onUnreadableFile match {
       case FileConnectorConfig.OnUnreadableFile.Fail =>
         RunFailedException.permanent(
           s"the batch of ${config.path} has ${Landing.files(cannot.size)} that cannot be read, " +
             s"and nothing of it was written: ${Landing.some(named)}. The source fails for such " +
             s"a file (connector.${FileConnector.OnUnreadableFile}: fail), until it is written " +
-            "again, which the next run takes as a new file; or until the source skips such files",
+            "again, which the next run takes as a new file; or until the source skips such " +
+            s"files$more",
           cause
         )
       case FileConnectorConfig.OnUnreadableFile.Skip =>
         new UnreadableFilesException(
           s"${Landing.files(cannot.size)} of the batch of ${config.path} cannot be read, and " +
             s"the source skips such files (connector.${FileConnector.OnUnreadableFile}: skip): " +
-            s"${Landing.some(named)}. Nothing of the batch was written",
+            s"${Landing.some(named)}. Nothing of the batch was written$more",
           cannot.map { case (file, why) =>
             UnreadableFilesException.Unreadable(file.name.value, why)
           }
@@ -609,7 +716,7 @@ final class FileSourceConnector(
           .option("quote", dialect.quote.toString)
           .option("escape", dialect.escape.toString)
           .option("encoding", dialect.encoding.name)
-        val columns = refused(header.csv(locations: _*).schema.fieldNames.toSeq)
+        val columns = refused(ofAProducer(header.csv(locations: _*).schema.fieldNames.toSeq))
         val csv = header
           .option("enforceSchema", "false")
           .option("mode", "PERMISSIVE")
@@ -820,6 +927,38 @@ object FileSourceConnector {
       )
     columns
   }
+
+  /**
+   * The names of a header of CSV, if each is one that a producer may have given (ADR-0024 §6).
+   * Two are not, and Spark reads both without a word (`SparkCsvDialectContractSpec`):
+   *
+   *  - one with a NUL: the header of a file of UTF-16, which is not read (ADR-0024 §2), as it
+   *    reads in an encoding of one byte or in UTF-8, and that of a file with nothing but the
+   *    mark of the order of bytes;
+   *  - one that starts with that mark: Spark takes one mark off a file, and a file that has it
+   *    twice, as some tools leave it, keeps the second at the start of its first name.
+   *
+   * The names are not said: they are no names.
+   */
+  private def ofAProducer(columns: Seq[String]): Seq[String] = {
+    if (columns.exists(_.contains('\u0000')))
+      throw RunFailedException.permanent(
+        "the header of the files of CSV of the batch has a name with a NUL (U+0000), which no " +
+          "text has: a file of the batch is of UTF-16, which is not read, or has nothing but " +
+          "the mark of the order of bytes. Nothing was written: the file is to be written " +
+          "again, in an encoding that a source may say and with a header"
+      )
+    if (columns.exists(_.startsWith(ByteOrderMark)))
+      throw RunFailedException.permanent(
+        "the header of the files of CSV of the batch has a name that starts with the mark of " +
+          "the order of bytes (U+FEFF): a file of the batch has the mark twice, and one is " +
+          "taken off. Nothing was written: the file is to be written again, with one mark or none"
+      )
+    columns
+  }
+
+  /** The mark of the order of bytes, as a character of a text that was decoded. */
+  private val ByteOrderMark = "\uFEFF"
 
   /** How many reads of a file alone it fails at, at most, before it cannot be read (ADR-0023). */
   val AloneReads = 3
