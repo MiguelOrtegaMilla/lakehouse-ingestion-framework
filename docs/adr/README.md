@@ -26,7 +26,8 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0020](0020-the-watermark-of-an-incremental-load.md) | The watermark of an incremental load: a window of the source's clock, fixed when the batch is planned | Accepted · what `load.watermark.start` bounds, by ADR-0021 |
 | [0021](0021-operator-actions-and-backfills.md) | What an operator does to a source is a run, and a backfill is a sequence of its own | Accepted |
 | [0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) | A failure of a run is classified once, and a run that may pass resumes where it is durable | Accepted |
-| [0023](0023-a-file-that-cannot-be-read.md) | A file that cannot be read stops its source, or is skipped and recorded, as the source says | Accepted |
+| [0023](0023-a-file-that-cannot-be-read.md) | A file that cannot be read stops its source, or is skipped and recorded, as the source says | Accepted · a third kind of file that cannot be read added by ADR-0024 |
+| [0024](0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) | A source of CSV says its dialect and its encoding, a plan says how its files are read, and a file that is not in its encoding cannot be read | Accepted |
 
 Superseded decisions:
 - *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
@@ -43,6 +44,7 @@ Amended decisions:
 - *ADR-0020, points 6 and 7, the rows at or before `load.watermark.start` are not the source's to ingest*: ADR-0021 (P7.1) has them not the regular sequence's to read. `start` is where that sequence begins, and a backfill, a sequence of its own, reads the history before it.
 - *ADR-0018, points 3 and 5, nothing of an abandoned batch is recorded, and the run that gives it up ends in 3*: ADR-0023 (P8.7a) has a batch given up under `skip` record its files that cannot be read as `FAILED`, in the same transaction, and its run end well. A batch whose source changed is given up as before.
 - *ADR-0008 and ADR-0013 §2, a file that cannot be read, or outside the root, is recorded as `FAILED` and then the policy applies*: ADR-0023 (P8.7a) records it under `skip` alone. Under `fail` the run names it and fails, and a file outside the root is refused when it is listed, as before.
+- *ADR-0023 §2, what a file that cannot be read is*: ADR-0024 (P8.9a) adds a third kind, a file whose bytes are not of the encoding of its source, found by a look at its bytes once Spark has read it. The policy, and what each of its values does, stand as they are.
 
 Schema evolution (P9) gets its own ADR in its phase, once the policies are validated against Delta 4.4's type-widening support.
 

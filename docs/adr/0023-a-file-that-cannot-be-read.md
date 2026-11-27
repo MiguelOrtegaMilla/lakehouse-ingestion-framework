@@ -54,6 +54,7 @@ So what Spark raises does not say which file cannot be read, nor whether one can
 
 1. **A file of the plan that, read alone as its batch is read, at both moments, fails with what the read does not know, at each of three reads**: a failure that nothing classified where it was raised. The failure of a file read alone with a class (a header of CSV that is not the batch's, a field twice) is that failure, as it is today.
 2. **A file that the landing zone refuses to open**: one outside the root through a symbolic link, a link to nothing or round a loop, something that is not a regular file. It is known as such by a look at the file system, and it is never opened or read by the engine, nor by Spark. A link out of the root is listed and planned by its own size and time; of what it leads to, the file system is asked only whether it is a directory, which is not listed, as for any link. Where it leads is said nowhere.
+3. *Added by [ADR-0024](0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) §4 and §5 (P8.9a, 2026-11-27):* a file whose bytes are not of the encoding of its source.
 
 Not one:
 
