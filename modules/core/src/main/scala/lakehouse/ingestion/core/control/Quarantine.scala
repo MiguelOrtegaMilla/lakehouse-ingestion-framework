@@ -70,6 +70,22 @@ object Quarantine {
      */
     val Unparsed = "unparsed"
 
-    val All: Seq[String] = Seq(Unparsed)
+    /**
+     * A record of JSON with text after its object, on its line: the object is whole, and what
+     * follows it is not nothing. Spark's reader would take the object and drop the rest without
+     * a word (P8.8). The detail says the column where the text starts, and not the text, which
+     * is in the record.
+     */
+    val TrailingText = "trailing_text"
+
+    /**
+     * A record of JSON with a field written twice at its first level: Spark's reader would keep
+     * one of the two values without a word, or refuse the batch (P8.8). The detail names the
+     * field, and says none of its values. An object inside a record is kept as its text, field
+     * twice and all.
+     */
+    val DuplicateField = "duplicate_field"
+
+    val All: Seq[String] = Seq(Unparsed, TrailingText, DuplicateField)
   }
 }

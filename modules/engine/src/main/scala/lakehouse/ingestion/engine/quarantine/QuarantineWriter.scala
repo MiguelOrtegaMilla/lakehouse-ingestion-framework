@@ -8,7 +8,7 @@ import lakehouse.ingestion.core.control.{BatchId, Quarantine, RunId}
 import lakehouse.ingestion.engine.connector.ReadResult
 import lakehouse.ingestion.engine.delta.{BatchAppend, DeltaTableTransactions, Lake}
 import lakehouse.ingestion.logstore.CommitContext
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.{Column, DataFrame}
 import org.apache.spark.sql.functions.{col, lit}
 import org.apache.spark.sql.types.StringType
 
@@ -49,10 +49,17 @@ final class QuarantineWriter(lake: Lake, tables: DeltaTableTransactions, context
 
   /**
    * @param unparsed the records that a read set apart (`ReadResult.unparsed`): the file of
-   *   each, and its text
+   *   each, and its text, and why if the read says it; a record that does not say is one that
+   *   could not be parsed
    * @throws lakehouse.ingestion.engine.failure.RunFailedException as `BatchAppend.append`
    */
-  def write(table: TableLocation, batch: QuarantineBatch, unparsed: DataFrame): BatchAppend.Result =
+  def write(
+      table: TableLocation,
+      batch: QuarantineBatch,
+      unparsed: DataFrame
+  ): BatchAppend.Result = {
+    def said(column: String, otherwise: Column): Column =
+      if (unparsed.columns.contains(column)) col(column).cast(StringType) else otherwise
     appends.append(
       table,
       BatchAppend.Written(batch.run, batch.source, batch.id),
@@ -60,10 +67,12 @@ final class QuarantineWriter(lake: Lake, tables: DeltaTableTransactions, context
         lit(batch.run.toString).as(Quarantine.RunId),
         lit(batch.id.seq.value).as(Quarantine.BatchSeq),
         col(EngineColumns.SourceFile).cast(StringType).as(Quarantine.SourceFile),
-        lit(Quarantine.ErrorType.Unparsed).as(Quarantine.ErrorTypeColumn),
-        lit(null).cast(StringType).as(Quarantine.ErrorDetail),
+        said(ReadResult.ErrorType, lit(Quarantine.ErrorType.Unparsed))
+          .as(Quarantine.ErrorTypeColumn),
+        said(ReadResult.ErrorDetail, lit(null).cast(StringType)).as(Quarantine.ErrorDetail),
         col(ReadResult.Record).cast(StringType).as(Quarantine.RawRecord),
         lit(Timestamp.from(batch.quarantinedAt)).as(Quarantine.QuarantinedAt)
       )
     )
+  }
 }

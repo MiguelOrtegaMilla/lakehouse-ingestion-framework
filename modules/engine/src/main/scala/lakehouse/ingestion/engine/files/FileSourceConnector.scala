@@ -17,6 +17,7 @@ import lakehouse.ingestion.core.config.{
   RelativePath,
   Source
 }
+import lakehouse.ingestion.core.control.Quarantine
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
 import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner, LandedFile}
 import lakehouse.ingestion.engine.failure.RunFailedException
@@ -30,7 +31,8 @@ import lakehouse.ingestion.engine.connector.{
   UnreadableFilesException
 }
 import org.apache.spark.SparkThrowable
-import org.apache.spark.sql.functions.{col, lit, udf}
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import org.apache.spark.sql.functions.{col, explode, lit, udf}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 import org.apache.spark.sql.{AnalysisException, DataFrame, DataFrameReader, SparkSession}
 import org.slf4j.LoggerFactory
@@ -51,13 +53,23 @@ import org.slf4j.LoggerFactory
  *    a value is quoted if it has a comma, a quote or the end of a line in it, a quote inside
  *    it is written twice, and a backslash is a character like any other. A source that writes
  *    another dialect has no way to say so yet (P8). The columns of JSON are those of the
- *    objects of the batch, each under its name as it was written; a value that is an object or
- *    a list is kept as the JSON it was written as. JSON is one object to a line.
+ *    first level of the records of the batch, each under its name as it was written; a value
+ *    that is an object or a list is kept as the JSON it was written as.
+ *  - '''JSON is one record to a line''', read as text, and each line read by Jackson as
+ *    Spark's reader of files reads a record, each value as it was written (`JsonLines`, P8.8):
+ *    a record is one whole object, each field of its first level once, and nothing after it
+ *    but spaces. A blank line is passed over, as Spark passes over it. A record with text
+ *    after its object (`trailing_text`), and one with a field twice at its first level
+ *    (`duplicate_field`), are set apart with why: of the first, Spark would take the object and
+ *    drop the rest, and of the second keep one of the two values, both without a word. A line
+ *    that is no whole object is set apart as one that cannot be parsed: a line of a record
+ *    written over several lines, and a list, of which Spark's reader made rows up to P8.8.
  *  - '''Parquet with its own types''', and the columns of every file of the batch: a column
  *    that only some files have is null in the rows of the others. Two files with one column
  *    of two types fail the read.
  *  - '''A record that cannot be parsed''' is set apart, with its text as it was (`unparsed`):
- *    a line that is not JSON, a record of CSV with more values or fewer than the header has. A
+ *    a line that is not a record of JSON, a record of CSV with more values or fewer than the
+ *    header has. A
  *    quote of CSV that is not closed is not one: the parser takes the rest of the file into
  *    that value, which is then kept as it was read, for Silver and its checks to see.
  *  - Every row says the file that it was read from (`_source_file`), as `<directory>/<name>`
@@ -71,8 +83,8 @@ import org.slf4j.LoggerFactory
  *  - ''fields of JSON that differ only in their case'', as `id` in one record and `ID` in
  *    another, would be read as one column, with the values under one of the two names left
  *    out. They fail the batch, as permanent, naming both: which of the two a column is to be
- *    is the policy of a schema (P9). So does a record with a field twice, which Spark refuses
- *    with an error of no class. Inside an object nothing is told apart: it is kept as its text;
+ *    is the policy of a schema (P9). A record with a field twice is set apart (above). Inside
+ *    an object nothing is told apart: it is kept as its text;
  *  - ''a header of CSV with a name twice, case aside, or with an empty name'' is read by Spark
  *    under names of its own making, which no file then has: the batch fails, as permanent, and
  *    says so, as it does for files whose headers differ;
@@ -208,7 +220,7 @@ final class FileSourceConnector(
     if (before.refused.nonEmpty)
       throw unreadable(config, before.refused.map { case (file, why) => file -> why.toString })
     val each = files.files.zip(before.paths)
-    val (read, kept) =
+    val read =
       try readOf(context.spark, config, files.directory, each)
       catch {
         case known: RunFailedException => throw known
@@ -218,18 +230,30 @@ final class FileSourceConnector(
     confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
 
     if (config.format == FileConnectorConfig.Format.Parquet)
-      ReadResult.Kept(kept, unparsed = None)
+      ReadResult.Kept(read.rows, unparsed = None)
     else
       ReadResult.Kept(
         // The column that stood for the columns of a batch that has none goes with it. A
         // column of the source is kept, whatever it is named.
-        rows = kept.filter(col(Unparsed).isNull).drop(Unparsed +: read.placeholder.toSeq: _*),
-        unparsed = Some(
-          kept
-            .filter(col(Unparsed).isNotNull)
-            .select(col(EngineColumns.SourceFile), col(Unparsed).as(ReadResult.Record))
-        )
+        rows = read.rows.filter(col(Unparsed).isNull).drop(Unparsed +: read.placeholder.toSeq: _*),
+        unparsed = Some(unparsedOf(read))
       )
+  }
+
+  /**
+   * The records that a read set apart: those that Spark could not parse, and those that the
+   * look at the lines of JSON set apart before Spark read them, each with why.
+   */
+  private def unparsedOf(read: Reading): DataFrame = {
+    val cannot = read.rows
+      .filter(col(Unparsed).isNotNull)
+      .select(
+        col(EngineColumns.SourceFile),
+        col(Unparsed).as(ReadResult.Record),
+        lit(Quarantine.ErrorType.Unparsed).as(ReadResult.ErrorType),
+        lit(null).cast(StringType).as(ReadResult.ErrorDetail)
+      )
+    read.apart.fold(cannot)(cannot.unionByName(_))
   }
 
   /** The files of a plan are what its commit records: each is taken, and never again. */
@@ -280,22 +304,37 @@ final class FileSourceConnector(
     }
 
   /**
-   * The files read, at both moments: their columns are inferred, and their rows kept by Spark
-   * apart from the files (`Dataset.localCheckpoint`), which everything after is made from.
+   * The files read, at both moments: their columns are inferred, and what is read of them is
+   * kept by Spark apart from the files (`Dataset.localCheckpoint`), which everything after is
+   * made from. For CSV and Parquet that is their rows; for JSON, its lines, which are read once
+   * and looked at before their fields are (`jsonOf`).
    *
    * @param each the files, each with where it is, as the look before the read found it
-   * @return what was read, and what was kept of it
+   * @return what was read, made from what was kept
    */
   private def readOf(
       spark: SparkSession,
       config: FileConnectorConfig,
       directory: RelativePath,
       each: Vector[(LandedFile, Path)]
-  ): (Reading, DataFrame) = {
+  ): Reading = {
+    val paths = each.map(_._2)
+    paths.map(_.toString).find(_.exists(Globbed.contains(_))).foreach { _ =>
+      throw RunFailedException.permanent(
+        "the directory of the files, with its symbolic links resolved, has a character that " +
+          s"Spark reads as a pattern (one of $Globbed): it would read other files"
+      )
+    }
     val sourceFileOf = each.map { case (file, path) =>
       path.toString -> s"${directory.value}/${file.name.value}"
     }.toMap
-    val read = readable(spark, config.format, each.map(_._2), sourceFileOf)
+    if (config.format == FileConnectorConfig.Format.Json)
+      jsonOf(spark, paths.map(path => s"file:$path"), sourceFileOf)
+    else kept(config, readable(spark, config.format, paths, sourceFileOf))
+  }
+
+  /** The rows of a read of CSV or Parquet, kept by Spark apart from the files. */
+  private def kept(config: FileConnectorConfig, read: Reading): Reading = {
     val kept =
       try read.rows.localCheckpoint(eager = true)
       catch {
@@ -309,7 +348,49 @@ final class FileSourceConnector(
             e
           )
       }
-    (read, kept)
+    read.copy(rows = kept)
+  }
+
+  /**
+   * The lines of the files of a batch of JSON, read as text once and kept, each read as a record
+   * by Jackson, as Spark's reader of files would read it (`JsonLines`): a blank line is passed
+   * over, as Spark passes over it; a record is a row; and every other line is set apart, with
+   * why. The columns are the names of the first level of the records, each as it was written.
+   */
+  private def jsonOf(
+      spark: SparkSession,
+      locations: Seq[String],
+      sourceFileOf: Map[String, String]
+  ): Reading = {
+    val text = everyFile(spark.read).text(locations: _*)
+    val file = text.metadataColumn(FileMetadata).getField("file_path")
+    val lines = text
+      .select(col("value").as(Line), ofItsFile(sourceFileOf)(file).as(SourceFile))
+      .withColumn(Look, lookedAt(col(Line)))
+      .filter(col(s"$Look.kind") =!= Kind.Blank)
+      .localCheckpoint(eager = true)
+
+    val columns = refused(fieldsOfJson(lines))
+    val kind = col(s"$Look.kind")
+    val values = col(s"$Look.values")
+    val rows = lines
+      .filter(kind === Kind.Record)
+      .select(
+        columns.map(name => values.getItem(name).as(name)) ++ Seq(
+          lit(null).cast(StringType).as(Unparsed),
+          col(SourceFile),
+          lit(null).cast(StringType).as(EngineColumns.RescuedData)
+        ): _*
+      )
+    val apart = lines
+      .filter(kind =!= Kind.Record)
+      .select(
+        col(SourceFile),
+        col(Line).as(ReadResult.Record),
+        kind.as(ReadResult.ErrorType),
+        col(s"$Look.detail").as(ReadResult.ErrorDetail)
+      )
+    Reading(rows, placeholder = None, apart = Some(apart))
   }
 
   /**
@@ -461,20 +542,7 @@ final class FileSourceConnector(
       paths: Vector[Path],
       sourceFileOf: Map[String, String]
   ): Reading = {
-    paths.map(_.toString).find(_.exists(Globbed.contains(_))).foreach { _ =>
-      throw RunFailedException.permanent(
-        "the directory of the files, with its symbolic links resolved, has a character that " +
-          s"Spark reads as a pattern (one of $Globbed): it would read other files"
-      )
-    }
     val locations = paths.map(path => s"file:$path")
-    val ofItsFile = udf { (uri: String) =>
-      val path = Paths.get(new URI(uri)).toString
-      sourceFileOf.getOrElse(
-        path,
-        throw new IllegalStateException("a file that is not of the plan was read")
-      )
-    }
 
     val (read, columns) = format match {
       case FileConnectorConfig.Format.Csv =>
@@ -496,13 +564,7 @@ final class FileSourceConnector(
         (csv, columns)
 
       case FileConnectorConfig.Format.Json =>
-        val columns = refused(fieldsOfJson(spark, locations))
-        val json = everyFile(spark.read)
-          .option("columnNameOfCorruptRecord", Unparsed)
-          .option("mode", "PERMISSIVE")
-          .schema(asText(columns))
-          .json(locations: _*)
-        (json, columns)
+        throw new IllegalArgumentException("JSON is read by its lines (jsonOf)")
 
       case FileConnectorConfig.Format.Parquet =>
         val parquet = oneNameEach("a file of Parquet") {
@@ -514,7 +576,7 @@ final class FileSourceConnector(
     // The file of a row, asked for by what it is and not by its name: a source may have a
     // column `_metadata` of its own, which a name would find in place of Spark's.
     val file = read.metadataColumn(FileMetadata).getField("file_path")
-    val withFile = read.select(col("*"), ofItsFile(file).as(SourceFile))
+    val withFile = read.select(col("*"), ofItsFile(sourceFileOf)(file).as(SourceFile))
     val text = format != FileConnectorConfig.Format.Parquet
     Reading(
       if (text) withFile.withColumn(EngineColumns.RescuedData, lit(null).cast(StringType))
@@ -524,33 +586,26 @@ final class FileSourceConnector(
   }
 
   /**
-   * The fields of the objects of a batch of JSON, each as it was written.
+   * The fields of the records of a batch of JSON, each as it was written: the names of the
+   * first level of each record, as the look at its line found them, and in the order of their
+   * names, as Spark's inference orders them.
    *
-   * They are asked with the case of a name counting, in a session of Spark of this question's
-   * own. Asked as the session of a run tells names apart, without their case, two fields that
-   * differ only in it come back as one column, under one of the two names, and the read that
-   * follows finds the values under that name alone: those under the other are left out of the
-   * row, of what is set apart, and of every count. So the two are found here, and refused.
+   * Spark and Delta tell the names of columns apart without their case, and Spark's reader
+   * finds a field of a line by its name, with its case: two fields that differ only in it would
+   * be one column, under one of the two names, and the values under the other would be left out
+   * of the row, of what is set apart, and of every count. So the two are found here, and refused.
    *
-   * @throws RunFailedException a permanent failure, for fields that differ only in their case,
-   *   and for a record with a field twice
+   * @throws RunFailedException a permanent failure, for fields that differ only in their case
    */
-  private def fieldsOfJson(spark: SparkSession, locations: Seq[String]): Seq[String] = {
-    // The settings of the session of the run are not touched: this one is made from it, has
-    // its own, and is left to be collected. The jobs that it starts are the thread's, and so
-    // the run's, to stop.
-    val exact = spark.newSession()
-    exact.conf.set("spark.sql.caseSensitive", "true")
-    val fields = oneNameEach("a record of JSON") {
-      everyFile(exact.read)
-        .option("columnNameOfCorruptRecord", Unparsed)
-        .option("primitivesAsString", "true")
-        .json(locations: _*)
-        .schema
-        .fieldNames
-        .toSeq
-        .filterNot(_ == Unparsed)
-    }
+  private def fieldsOfJson(lines: DataFrame): Seq[String] = {
+    val fields = lines
+      .filter(col(s"$Look.kind") === Kind.Record)
+      .select(explode(col(s"$Look.names")).as(Name))
+      .distinct()
+      .collect()
+      .map(_.getString(0))
+      .toSeq
+      .sorted
     val alike = fields
       .groupBy(_.toLowerCase(Locale.ROOT))
       .values
@@ -597,12 +652,65 @@ object FileSourceConnector {
   private val FileMetadata = "_metadata"
 
   /**
-   * What is read of a batch, before it is kept.
+   * What is read of a batch.
    *
+   * @param rows its rows, with the column of the records that Spark could not parse
    * @param placeholder the column that the read made for a batch whose files have none, to be
    *   dropped once the files are read; none, if the files have columns, whatever they are named
+   * @param apart the records set apart before Spark read them, each with why, as
+   *   `ReadResult.unparsed` has them; none, for a format whose records are not looked at first
    */
-  final private case class Reading(rows: DataFrame, placeholder: Option[String])
+  final private case class Reading(
+      rows: DataFrame,
+      placeholder: Option[String],
+      apart: Option[DataFrame] = None
+  )
+
+  /** The `_source_file` of each path that a read reads, by the path as Spark gives it, decoded. */
+  private def ofItsFile(sourceFileOf: Map[String, String]): UserDefinedFunction = udf {
+    (uri: String) =>
+      val path = Paths.get(new URI(uri)).toString
+      sourceFileOf.getOrElse(
+        path,
+        throw new IllegalStateException("a file that is not of the plan was read")
+      )
+  }
+
+  /**
+   * What a line of JSON is, as a row: its kind, which for a line set apart is its type in the
+   * quarantine (`Quarantine.ErrorType`); the detail of one set apart; and for a record, the
+   * names of its first level and the value of each, as text.
+   */
+  final case class Looked(
+      kind: String,
+      detail: String,
+      names: Seq[String],
+      values: Map[String, String]
+  )
+
+  private object Kind {
+    val Blank = "blank"
+    val Record = "record"
+  }
+
+  private val lookedAt: UserDefinedFunction = udf { (line: String) =>
+    val looked = JsonLines.of(line)
+    val detail = JsonLines.detail(looked).orNull
+    def apart(kind: String) = Looked(kind, detail, Nil, Map.empty)
+    looked match {
+      case JsonLines.Line.Blank => apart(Kind.Blank)
+      case record: JsonLines.Line.Record =>
+        Looked(Kind.Record, detail, record.names, record.fields.toMap)
+      case _: JsonLines.Line.TrailingText => apart(Quarantine.ErrorType.TrailingText)
+      case _: JsonLines.Line.DuplicateField => apart(Quarantine.ErrorType.DuplicateField)
+      case JsonLines.Line.NotARecord => apart(Quarantine.ErrorType.Unparsed)
+    }
+  }
+
+  /** The columns of the lines of JSON while they are read: the line, and what it is. */
+  private val Line = "_lakehouse_line"
+  private val Look = "_lakehouse_look"
+  private val Name = "_lakehouse_name"
 
   /**
    * A reader that passes over no file, whatever its session is set to: one that is corrupt, or

@@ -113,6 +113,32 @@ final class QuarantineWriterSpec
     entry(table.uri, 0).runId shouldBe Some(first.run.uuid)
   }
 
+  test("a record that a read says more of is kept with why: its type, and what more it knows") {
+    val source = newSource()
+    val first = batch(source, 1)
+    val session = spark
+    import session.implicits._
+    val records = Seq(
+      ("in/a.json", """{"id":"1","id":"2"}""", "duplicate_field", "the field 'id' twice"),
+      ("in/a.json", """{"id":"3"} x""", "trailing_text", "text after the object, from column 12"),
+      ("in/a.json", "not json", "unparsed", null)
+    ).toDF("_source_file", "_record", "_error_type", "_error_detail")
+
+    write(first, records) shouldBe Appended(0, conflicts = 0, rows = Some(3))
+
+    read(quarantineOf(source))
+      .select("error_type", "error_detail", "raw_record")
+      .orderBy("error_type")
+      .collect()
+      .toSeq shouldBe Seq(
+      Row("duplicate_field", "the field 'id' twice", """{"id":"1","id":"2"}"""),
+      Row("trailing_text", "text after the object, from column 12", """{"id":"3"} x"""),
+      Row("unparsed", null, "not json")
+    )
+    // The types are those of the model, for whoever reads the quarantine.
+    Quarantine.ErrorType.All shouldBe Seq("unparsed", "trailing_text", "duplicate_field")
+  }
+
   test("the quarantine of a source is under the engine's own directory of the lake") {
     val source = newSource()
     val table = quarantineOf(source)
