@@ -108,6 +108,12 @@ final class QuarantineCommandSpec
 
   private def read(line: String): JsonNode = new ObjectMapper().readTree(line)
 
+  /**
+   * A line of a log in the pattern of Spark's default (`%d{yy/MM/dd HH:mm:ss} %p %c{1}: %m`),
+   * as its level and the last part of the name of its logger.
+   */
+  private val Logged = """\d\d/\d\d/\d\d \d\d:\d\d:\d\d ([A-Z]+) ([^ :]+): .*""".r
+
   /** Whether a terminal, or a reader of lines, acts on a character of a text. */
   private def actedOn(text: String): Boolean =
     text.codePoints.toArray.exists { codePoint =>
@@ -373,6 +379,48 @@ final class QuarantineCommandSpec
     warned shouldBe true
     debug should be > 1000L
     ofSpark shouldBe true
+  }
+
+  test(
+    "as it is deployed, it logs at INFO to its error output, and its standard output is records"
+  ) {
+    val returns = rejecting()
+    val (out, err) = (files.newLog(), files.newLog())
+
+    // On the classpath of the command line alone, which has the application's configuration
+    // of its log, and told nothing of it.
+    val ended = CommandProcess
+      .start(
+        asking(returns.id.value, Seq("--records", "10")),
+        out,
+        errors = Some(err),
+        classpath = CommandProcess.Deployed
+      )
+      .await()
+
+    val errors = Files.readAllLines(err, UTF_8).asScala.toSeq
+    withClue(errors.takeRight(30).mkString("\n"))(ended.exit shouldBe Main.Exit.Ok)
+    // Its standard output is the records, a line each, and nothing else.
+    val written = Files.readAllLines(out, UTF_8).asScala.toSeq
+    withClue(written.take(5).mkString("\n")) {
+      written.map(read(_).get("raw_record").asText) shouldBe Seq(Quoted, Trailing, Acted)
+    }
+    // Its error output has the warning, and the log in the pattern of Spark's own default.
+    errors should contain(QuarantineCommand.PersonalData)
+    Held.foreach(held => errors.mkString("\n") should not include held)
+    val logged = errors.collect { case Logged(level, logger) => level -> logger }
+    withClue(logged.take(40).mkString("\n")) {
+      logged.map(_._1).toSet should contain("INFO")
+      logged.map(_._1).toSet -- Set("INFO", "WARN", "ERROR") shouldBe empty
+    }
+    // From its first line: what is logged before Spark starts, as the pool of the control
+    // plane opens, is there as the rest is. Without the application's configuration, it is
+    // lost (log4j2 logs errors alone until Spark sets its default).
+    val firstOfSpark = logged.indexWhere(_._2 == "SparkContext")
+    withClue(logged.take(40).mkString("\n")) {
+      firstOfSpark should be > 0
+      logged.take(firstOfSpark).map(_._2) should contain("HikariDataSource")
+    }
   }
 
   // ---------------------------------------------------------------------------------------------

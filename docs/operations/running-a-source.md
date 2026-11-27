@@ -70,9 +70,13 @@ Run it again and it finds nothing new. A source with more than one batch takes (
 
 The whole contract is in [discovery §14.1](../architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them; `JdbcRunCommandSpec`, with a table of a database, cut for real by a proxy.
 
+### Where a command logs
+
+**Every command logs to its error output, at INFO, and its standard output has what the command writes and nothing else**: the records of `quarantine --records` among them. The command line has a configuration of log4j2 of its own (`modules/cli/src/main/resources/log4j2.properties`), with the pattern of Spark's default, and a deployment may give another with `-Dlog4j2.configurationFile`. Without one, log4j2 logs errors alone, to the standard output, until Spark sets its own default the first time that it logs: what a command logs before then is lost, or written among what it prints.
+
 ### What a run logs of what its source holds
 
-**At INFO, which is the level that a process logs at unless it is told otherwise, no line of the log of a run has a value of a row**, nor of a record that was set apart: not a line of the application, nor of Spark, of Delta or of Parquet. What a run prints says how many rows it read, wrote and rejected and the names of its files, and never what they hold. The names of the columns of a source are logged: Delta says the schema of a table with each snapshot of it.
+**At INFO, which is the level that the command line logs at, no line of the log of a run has a value of a row**, nor of a record that was set apart: not a line of the application, nor of Spark, of Delta or of Parquet. What a run prints says how many rows it read, wrote and rejected and the names of its files, and never what they hold. The names of the columns of a source are logged: Delta says the schema of a table with each snapshot of it.
 
 - **Delta would log values, and the engine has it not.** Delta logs each snapshot of a table with the checksum of its version, and that checksum has the files of a small table, each with the least and the greatest value of each column, unless the session writes its checksums without them. Every session of a run does (`spark.databricks.delta.allFilesInCrc.enabled`, off, which a profile may not set; [the reference](../configuration/reference.md) has what the engine sets). What is given up for it is a check that Delta makes only in its verification mode, which is off by default: that of the files of a snapshot against those of its checksum.
 - **A table that another writer of Delta committed to last is logged with those values** by whoever reads it, a run among them, until a run commits to it: the setting is of what a session writes, and not of what it reads.

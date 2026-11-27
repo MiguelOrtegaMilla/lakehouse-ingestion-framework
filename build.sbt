@@ -167,7 +167,13 @@ lazy val integrationTests = module("integration-tests", artifact = "integration-
       log4jCore
     ),
     // The suites use repository files (compose file, init scripts) through this path.
-    Test / javaOptions += s"-Drepo.root=${(LocalRootProject / baseDirectory).value}"
+    Test / javaOptions += s"-Drepo.root=${(LocalRootProject / baseDirectory).value}",
+    // The classpath of the command line as `cli/run` has it, for a test that runs a command as
+    // it is deployed, with the application's configuration of its log (CommandProcess.Deployed).
+    Test / javaOptions += {
+      val deployed = (cli / Compile / fullClasspath).value.files
+      s"-Dcli.classpath=${deployed.mkString(java.io.File.pathSeparator)}"
+    }
   )
 
 def module(id: String, artifact: String): Project =
