@@ -55,6 +55,14 @@ object CommandProcess {
   val Heap = "768m"
 
   /**
+   * The classpath of the command line as `cli/run` starts it, with nothing of the tests: that of
+   * this JVM has the configuration of the log of the tests (`log4j2-test.properties`), which
+   * log4j2 takes before the application's own. Given by the build (`cli.classpath`).
+   */
+  lazy val Deployed: String =
+    sys.props.getOrElse("cli.classpath", Assertions.fail("the build gives no cli.classpath"))
+
+  /**
    * Starts the command line, and does not wait for it.
    *
    * @param arguments those of the application, the command first
@@ -64,6 +72,8 @@ object CommandProcess {
    * @param jvm options of the JVM besides those that every process has, as system properties
    * @param main the class whose `main` the process runs: the application's, unless a test has a
    *   launcher of its own (`HeldMain`)
+   * @param classpath that of this JVM, unless a test runs the command as it is deployed
+   *   (`Deployed`)
    */
   def start(
       arguments: Seq[String],
@@ -71,13 +81,14 @@ object CommandProcess {
       heap: String = Heap,
       jvm: Seq[String] = Nil,
       main: String = Main.getClass.getName.stripSuffix("$"),
-      errors: Option[Path] = None
+      errors: Option[Path] = None,
+      classpath: String = sys.props("java.class.path")
   ): CommandProcess = {
     val command =
       Seq(Paths.get(sys.props("java.home"), "bin", "java").toString) ++
         JavaModuleOptions.defaultModuleOptionArray().toSeq ++
         Seq(s"-Xmx$heap", "-Duser.timezone=UTC") ++ jvm ++
-        Seq("-cp", sys.props("java.class.path")) ++
+        Seq("-cp", classpath) ++
         Seq(main) ++
         arguments
     val builder = new ProcessBuilder(command.asJava).redirectOutput(log.toFile)
