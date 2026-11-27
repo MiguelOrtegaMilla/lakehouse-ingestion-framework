@@ -8,6 +8,7 @@ import java.time.temporal.ChronoUnit
 import java.util.zip.GZIPOutputStream
 
 import scala.collection.mutable
+import scala.concurrent.duration._
 import scala.util.Using
 
 import io.circe.Json
@@ -805,6 +806,29 @@ final class FileSourceConnectorSpec
       )
     )
     cannot.summary should include("1 file of the batch of shop/orders cannot be read")
+  }
+
+  test("the reads alone wait before each round after the first, longer the second time") {
+    val root = landingZone()
+    val orders = source("csv", policy = "skip")
+    drop(root, "a.csv", "id\n1\n")
+    cutShort(dropGzip(root, "b.csv.gz", rows = 20000))
+    cutShort(dropGzip(root, "c.csv.gz", rows = 20000))
+    val planned = plan(root, orders).value
+    val (reading, reads) = counting(root)
+    val asked = mutable.Buffer.empty[FiniteDuration]
+
+    skipped(
+      reading.read(
+        orders,
+        configOf(orders),
+        planned,
+        ReadContext(spark, pause = wait => asked += wait: Unit)
+      )
+    ).unreadable.map(_.item) shouldBe Seq("b.csv.gz", "c.csv.gz")
+    // A wait for each round, whatever the number of files that it reads again.
+    asked.toSeq shouldBe Seq(1.second, 2.seconds)
+    reads.toMap shouldBe Map("a.csv" -> 1, "b.csv.gz" -> 3, "c.csv.gz" -> 3)
   }
 
   test("a file that fails a read alone, and then reads, is sound: the failure passed") {

@@ -982,9 +982,15 @@ final class IngestionService(
       val progress = bound.progress(batch.plan)
       // Nor is anything read by a run that has lost its lease.
       leased.verify()
-      // A read that starts jobs beyond those of its plan asks the lease before each.
+      // A read that starts jobs beyond those of its plan asks the lease before each, and waits
+      // within the budget of the run, while the run may go on.
+      val context = ReadContext(
+        spark,
+        verify = () => leased.verify(),
+        pause = wait => retried.pause(wait, leased.lost.isEmpty && !leased.ending): Unit
+      )
       val read =
-        try Right(bound.read(batch.plan, ReadContext(spark, () => leased.verify())))
+        try Right(bound.read(batch.plan, context))
         catch {
           case changed: SourceChangedException => Left(changed)
           case cannot: UnreadableFilesException => Left(cannot)

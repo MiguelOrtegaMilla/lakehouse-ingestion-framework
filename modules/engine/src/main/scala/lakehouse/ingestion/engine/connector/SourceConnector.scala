@@ -285,8 +285,16 @@ trait FileRegistry {
  *   run may no longer start one, having lost its lease (ADR-0006). The jobs that are running
  *   when a lease is lost are stopped; one that is started after it is not, unless this is asked.
  *   The engine gives the lease of the run; a read outside a run, nothing to ask
+ * @param pause what a read asks to wait before it reads again what failed, as a file read alone
+ *   a second and a third time (ADR-0023 §3): the run waits that long, or what is left of its
+ *   budget of retries if that is less (ADR-0022 §5), and looks at its lease while it does. A read
+ *   outside a run does not wait
  */
-final case class ReadContext(spark: SparkSession, verify: () => Unit = () => ())
+final case class ReadContext(
+    spark: SparkSession,
+    verify: () => Unit = () => (),
+    pause: FiniteDuration => Unit = _ => ()
+)
 
 /**
  * What a read gives: the rows of a plan, and how they may be gone over.

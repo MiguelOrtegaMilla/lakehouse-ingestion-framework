@@ -128,6 +128,47 @@ final class RunRetriesSpec extends AnyFunSuite with Matchers {
   }
 
   // ---------------------------------------------------------------------------------------------
+  // A wait in the middle of an attempt (ADR-0023 §3)
+
+  private def timed(body: => FiniteDuration): (FiniteDuration, FiniteDuration) = {
+    val started = System.nanoTime()
+    val said = body
+    (said, (System.nanoTime() - started).nanos)
+  }
+
+  test("a pause waits within the budget, cut to what is left of it, and is no retry") {
+    val short =
+      Profile.Retries(budget = 1.second, firstBackoff = 100.millis, maxBackoff = 100.millis)
+    val run = retries(short)
+
+    // The budget is counted from the first pause, the failure of the run that it waits after.
+    val (first, took) = timed(run.pause(300.millis, may = true))
+    first should be >= 300.millis
+    took should be >= 300.millis
+    // What is left of it, and not what was asked.
+    val (second, _) = timed(run.pause(2.seconds, may = true))
+    second should be >= 400.millis
+    second should be < 1.second
+    // Spent: no wait.
+    run.pause(1.second, may = true) should be < 100.millis
+    run.made shouldBe 0
+    run.into(RunCounts.Nothing) shouldBe RunCounts.Nothing
+
+    // And a failure after it is let through, with the budget spent by the pauses.
+    val failure = RunFailedException.transient("the disk went away")
+    the[Throwable] thrownBy run(may = true)(throw failure) shouldBe theSameInstanceAs(failure)
+  }
+
+  test("a pause ends once the run may not go on, and a budget of nothing does not pause") {
+    val run = retries()
+    var asked = 0
+    run.pause(30.seconds, { asked += 1; asked < 3 }) should be < 5.seconds
+
+    val none = Profile.Retries(Duration.Zero, 100.millis, 100.millis)
+    retries(none).pause(1.second, may = true) should be < 100.millis
+  }
+
+  // ---------------------------------------------------------------------------------------------
   // The transaction that ends a run, settled (ADR-0022 §6)
 
   /** What `settle` is given, each answering or failing as a test says, and how often it was. */
