@@ -1505,6 +1505,69 @@ final class FileSourceConnectorSpec
     failure.getMessage should not include "Permission denied"
   }
 
+  test("a read refused as permanent stays so, when the bytes of its files cannot be looked at") {
+    val root = landingZone()
+    val orders = source("csv")
+    drop(root, "a.csv", "id,name\n1,ann\n")
+    val b = drop(root, "b.csv", "id,nombre\n2,bea\n")
+    unopenable(b)(())
+    val planned = plan(root, orders).value
+    val permissions = Files.getPosixFilePermissions(b)
+
+    // Spark refused the header of b, which may not be opened by the time the bytes are looked
+    // at: the look says nothing of the files, and the failure of the read is what is known.
+    val closing = connector(
+      root,
+      afterRead = () => {
+        Files.setPosixFilePermissions(b, PosixFilePermissions.fromString("---------"))
+        ()
+      }
+    )
+    val failure =
+      try
+        the[RunFailedException] thrownBy
+          closing.read(orders, configOf(orders), planned, ReadContext(spark))
+      finally Files.setPosixFilePermissions(b, permissions): Unit
+    failure.failure shouldBe FailureClass.Permanent
+    failure.getMessage should include("do not all have one header")
+    // What the look met goes with it, for whoever reads the failure whole.
+    failure.getSuppressed.toSeq should have size 1
+  }
+
+  // A header refused, beside a file that cannot be read from the start: the look at the bytes,
+  // after the refusal, meets the file as the read did not, and is no reason to try again.
+  Seq[(String, Path => Path)](
+    "a file in gzip cut short" -> (root => cutShort(dropGzip(root, "c.csv.gz", rows = 2000))),
+    "a file that may not be opened" -> (root => drop(root, "c.csv", "id,name\n3,cy\n"))
+  ).foreach { case (what, broken) =>
+    test(s"a header that is not the others', beside $what, fails its batch as permanent") {
+      val root = landingZone()
+      val orders = source("csv")
+      // Two files with headers that differ, each bigger than the broken one.
+      drop(root, "a.csv", "id,name\n" + (1 to 10000).map(i => s"$i,ann").mkString("\n"))
+      drop(root, "b.csv", "id,nombre\n" + (1 to 20000).map(i => s"$i,bea").mkString("\n"))
+      val c = broken(root)
+      val planned = plan(root, orders).value
+      def reading = connector(root).read(orders, configOf(orders), planned, ReadContext(spark))
+
+      // Spark reads the files in one task, the biggest first, so that it is the header that
+      // stops the read, as it does when its task fails first: on two cores, the broken file is
+      // read beside it, and which of the two Spark says is a race.
+      val OnePartition = "spark.sql.files.minPartitionNum"
+      spark.conf.set(OnePartition, "1")
+      val failure =
+        try
+          if (what.contains("opened")) unopenable(c)(the[RunFailedException] thrownBy reading)
+          else the[RunFailedException] thrownBy reading
+        finally spark.conf.unset(OnePartition)
+      withClue(failure.getMessage) {
+        failure.failure shouldBe FailureClass.Permanent
+        failure.getMessage should include("do not all have one header")
+      }
+      failure.getSuppressed.toSeq should have size 1
+    }
+  }
+
   test("a run that has lost its lease does not look at the bytes of its files") {
     val root = landingZone()
     val orders = source("csv")
