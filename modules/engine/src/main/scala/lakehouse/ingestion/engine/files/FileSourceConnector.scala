@@ -179,8 +179,9 @@ import org.slf4j.LoggerFactory
  * files as they are by then (ADR-0018). A file that was written again is another file, and is
  * planned as a new one.
  *
- * @param afterRead what runs once Spark has read the files and before they are confirmed again:
- *   nothing, but in the tests that change a file at that moment
+ * @param afterRead what runs once Spark has read the files and before they are confirmed again
+ *   and their bytes looked at, whether the read went well or Spark stopped it with a failure of
+ *   the run: nothing, but in the tests that change a file at that moment
  * @param beforeAlone what runs before each read of a file alone, given its name and which read
  *   it is, from 1: nothing, but in the tests that mend a file between two reads
  */
@@ -254,8 +255,22 @@ final class FileSourceConnector(
         // encoding was read as: a header that is not the others', for one. Such a file is
         // what is said, and it is the source's to say what becomes of it.
         case known: RunFailedException =>
-          val cannot = notOfItsEncoding(config, as, files, before, each, context)
-          throw if (cannot.isEmpty) known else unreadableAs(config, as, cannot, known)
+          afterRead()
+          throw looked(config, as, files, before, each, context) match {
+            case Right(notOf) if notOf.nonEmpty => unreadableAs(config, as, notOf, known)
+            case Right(_) => known
+            // A look that could not be made says nothing of the files, and the failure of the
+            // read is what is known of the batch: it keeps its class, and what the look met
+            // goes with it. A file that cannot be read is no reason to try a refusal again.
+            case Left(failed) =>
+              log.warn(
+                s"the read of the batch of ${config.path} failed as ${known.failure} " +
+                  s"(${said(known)}), and the bytes of its files could not be looked at after " +
+                  s"it (${said(failed)}): the failure of the read is reported, as it was"
+              )
+              known.addSuppressed(failed)
+              known
+          }
         case refused: Exception if charsetRefused(refused) =>
           throw RunFailedException.permanent(
             s"Spark refuses to read the files of ${config.path} in ${as.describe}: the session " +
@@ -461,14 +476,9 @@ final class FileSourceConnector(
 
   /**
    * The files of a plan whose bytes are not of the encoding that they were read by, each with
-   * why (ADR-0024 §4 and §5), and the look at the files after the read (`Landing.confirmAgain`).
-   * CSV is of the encoding of its plan, and JSON of UTF-8; Parquet has no text to decode.
-   *
-   * It is asked once Spark has read the files, so that those it opens are files that Spark
-   * read whole, and before the look at the files, so that the bytes looked at are those of the
-   * files that were planned, as the bytes read are. A look at the bytes that fails is of no
-   * file: a file that changed makes it a batch whose source changed (ADR-0018), and otherwise
-   * the failure is one that passes.
+   * why, once Spark has read them whole (`looked`). A look at the bytes that could not be made,
+   * with no file changed, is a failure that passes: the read went well, and nothing else is
+   * known of the batch.
    *
    * @throws SourceChangedException if a file of the plan changed by the look after the read
    * @throws RunFailedException a transient failure, if the bytes could not be looked at
@@ -480,7 +490,41 @@ final class FileSourceConnector(
       before: Landing.Confirmed,
       each: Vector[(LandedFile, Path)],
       context: ReadContext
-  ): Vector[(LandedFile, String)] = {
+  ): Vector[(LandedFile, String)] =
+    looked(config, as, files, before, each, context) match {
+      case Right(cannot) => cannot
+      case Left(failed) =>
+        throw RunFailedException.transient(
+          s"the files of the batch of ${config.path} were read, and their bytes could not be " +
+            s"looked at for those that are not of their encoding (${said(failed)}), with no " +
+            "file changed: a failure that passed. Nothing was written",
+          failed
+        )
+    }
+
+  /**
+   * The files of a plan whose bytes are not of the encoding that they were read by, each with
+   * why (ADR-0024 §4 and §5), and the look at the files after the read (`Landing.confirmAgain`).
+   * CSV is of the encoding of its plan, and JSON of UTF-8; Parquet has no text to decode.
+   *
+   * It is asked once Spark has read the files, so that those it opens are files that Spark
+   * read whole, and before the look at the files, so that the bytes looked at are those of the
+   * files that were planned, as the bytes read are. A look at the bytes that fails is of no
+   * file: a file that changed makes it a batch whose source changed (ADR-0018), and otherwise
+   * it is what the look met, for the caller to say what it comes to.
+   *
+   * @return the files that are not of their encoding, or the failure of a look that could not
+   *   be made
+   * @throws SourceChangedException if a file of the plan changed by the look after the read
+   */
+  private def looked(
+      config: FileConnectorConfig,
+      as: ReadAs,
+      files: FilePlan,
+      before: Landing.Confirmed,
+      each: Vector[(LandedFile, Path)],
+      context: ReadContext
+  ): Either[Throwable, Vector[(LandedFile, String)]] = {
     val found =
       if (as.format == FileConnectorConfig.Format.Parquet) Right(Vector.empty)
       else {
@@ -494,16 +538,8 @@ final class FileSourceConnector(
         catch { case NonFatal(failed) => Left(failed) }
       }
     confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
-    found match {
-      case Right(whys) =>
-        each.map(_._1).zip(whys).collect { case (file, Some(why)) => file -> why }
-      case Left(failed) =>
-        throw RunFailedException.transient(
-          s"the files of the batch of ${config.path} were read, and their bytes could not be " +
-            s"looked at for those that are not of their encoding (${said(failed)}), with no " +
-            "file changed: a failure that passed. Nothing was written",
-          failed
-        )
+    found.map { whys =>
+      each.map(_._1).zip(whys).collect { case (file, Some(why)) => file -> why }
     }
   }
 
