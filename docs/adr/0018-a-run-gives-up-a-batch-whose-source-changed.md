@@ -6,6 +6,7 @@
 | **Amends** | [ADR-0005](0005-batch-wal-and-idempotent-writes.md) §3: a planned batch had one way out, its commit, and an operator's hand. It gains a second, taken by the run that holds the lease. The rest of ADR-0005 stands: a plan is immutable, and a `batch_seq` maps to one plan for ever. |
 | **Related** | [ADR-0006](0006-source-leases-with-epoch-fencing.md), [ADR-0008](0008-layer-responsibilities.md), [ADR-0010](0010-concurrent-write-conflict-handling.md) |
 | **Superseded in part** | [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md) (P5.10, 2026-11-19) replaces the last consequences below: the known limit of a zombie that writes an abandoned batch, and the tombstone that was to close it. A run that lost its lease commits to no table, so there is no window, and no tombstone. Those passages keep their original text and point to it. |
+| **Amended by** | [ADR-0023](0023-a-file-that-cannot-be-read.md) (P8.7a, 2026-11-27): a batch with files that cannot be read is given up the same way under `skip`, with those files recorded as `FAILED` in the same transaction (in place of point 3), and the run that gives it up ends well (in place of point 5). For a batch whose source changed, the decision stands as it is. |
 
 ## Context
 

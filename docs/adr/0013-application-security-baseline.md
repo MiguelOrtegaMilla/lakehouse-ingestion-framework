@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Accepted (Phase 0 closure, 2026-11-10) |
 | **Related** | [ADR-0003](0003-control-plane-in-postgresql.md), [ADR-0004](0004-postgresql-coordinated-delta-logstore.md), [ADR-0007](0007-metadata-format.md), [ADR-0011](0011-storage-profiles.md) |
+| **Amended by** | [ADR-0023](0023-a-file-that-cannot-be-read.md) (P8.7a, 2026-11-27): a file outside the root is refused when it is listed under `fail`, as P5 built it, and is planned and recorded as `FAILED` without being opened under `skip`. §2 keeps its original text. |
 
 ## Context
 
