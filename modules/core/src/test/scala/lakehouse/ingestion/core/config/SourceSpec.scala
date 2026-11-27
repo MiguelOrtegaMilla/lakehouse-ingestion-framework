@@ -692,6 +692,19 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
     )
   }
 
+  test("a source of JSON is read a record to a line: it has no field for records over several") {
+    // Spark's own option, and the name that a field of this model would have: neither is one.
+    Seq("multiLine", "multi_line").foreach { field =>
+      withClue(field) {
+        val refused = fileErrors(s"$field: true")
+        refused should have size 1
+        refused.head should startWith(
+          s"$File: connector.$field is not a field that is known here"
+        )
+      }
+    }
+  }
+
   test("a file that may be taken the moment it appears is warned of") {
     val Loaded(connector, warnings) = fileConnector("min_file_age: 0s")
     connector.minFileAge shouldBe Duration.Zero
