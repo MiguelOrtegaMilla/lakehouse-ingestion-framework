@@ -5,6 +5,7 @@ import java.nio.file.{Path, Paths}
 import java.util.Locale
 
 import scala.annotation.tailrec
+import scala.concurrent.duration._
 import scala.util.control.NonFatal
 
 import io.circe.Json
@@ -94,8 +95,9 @@ import org.slf4j.LoggerFactory
  *
  *  - the files are looked at again, as after every read: one that changed makes it a batch
  *    whose source changed (ADR-0018), whatever Spark said;
- *  - each file is read alone, as the batch is read, up to `AloneReads` times. One that fails at
- *    every read, with what the read does not know, cannot be read. One that fails and then
+ *  - each file is read alone, as the batch is read, up to `AloneReads` times, those that failed
+ *    again after a wait that grows (`AloneWaits`), within the budget of the run. One that fails
+ *    at every read, with what the read does not know, cannot be read. One that fails and then
  *    reads is sound, and the failure of the batch is one that passed: the run tries again. One
  *    that fails alone with a failure that the read knows (a header, a field twice) is not one
  *    that cannot be read: that failure is the file's, and is met by the read of a batch;
@@ -333,9 +335,7 @@ final class FileSourceConnector(
       s"the batch of ${config.path} could not be read (${said(failed)}): each of its " +
         s"${Landing.files(each.size)} is read alone, to find those that cannot be read"
     )
-    val found = each.map { case (file, path) =>
-      file -> readAlone(config, files.directory, file, path, context)
-    }
+    val found = readAlone(config, files.directory, each, context)
     confirmed(config, "while its files were read alone")(
       landing.confirmAgain(config, files, before)
     )
@@ -362,16 +362,22 @@ final class FileSourceConnector(
     }
   }
 
-  /** What one file comes to, read alone up to `AloneReads` times. */
+  /**
+   * What each file comes to, read alone up to `AloneReads` times, in rounds: each file once, and
+   * those that failed again after a wait, longer each time (`AloneWaits`), which the run waits
+   * within its budget (`ReadContext.pause`). A wait is for a round, and not for each file: a
+   * plan whose files all fail waits no longer than one with a file that fails.
+   *
+   * @return each file, with what it came to, in the order of `each`
+   */
   private def readAlone(
       config: FileConnectorConfig,
       directory: RelativePath,
-      file: LandedFile,
-      path: Path,
+      each: Vector[(LandedFile, Path)],
       context: ReadContext
-  ): Alone = {
-    @tailrec
-    def attempt(n: Int): Alone = {
+  ): Vector[(LandedFile, Alone)] = {
+    // What one read of a file alone found, at the read `n`: none, for a file to be read again.
+    def once(file: LandedFile, path: Path, n: Int): Option[Alone] = {
       // No job is started by a run that has lost its lease.
       context.verify()
       beforeAlone(file.name.value, n)
@@ -384,14 +390,32 @@ final class FileSourceConnector(
           case NonFatal(failed) => Some(Right(failed))
         }
       failure match {
-        case None if n == 1 => Alone.Read
-        case None => Alone.Passed(n - 1)
-        case Some(Left(_)) => Alone.Known
-        case Some(Right(failed)) if n == AloneReads => Alone.Unreadable(said(failed))
-        case Some(Right(_)) => attempt(n + 1)
+        case None if n == 1 => Some(Alone.Read)
+        case None => Some(Alone.Passed(n - 1))
+        case Some(Left(_)) => Some(Alone.Known)
+        case Some(Right(failed)) if n == AloneReads => Some(Alone.Unreadable(said(failed)))
+        case Some(Right(_)) => None
       }
     }
-    attempt(1)
+
+    @tailrec
+    def round(n: Int, left: Vector[Int], found: Map[Int, Alone]): Map[Int, Alone] =
+      if (left.isEmpty) found
+      else {
+        if (n > 1) context.pause(AloneWaits(n - 2))
+        val read = left.map { index =>
+          val (file, path) = each(index)
+          index -> once(file, path, n)
+        }
+        round(
+          n + 1,
+          read.collect { case (index, None) => index },
+          found ++ read.collect { case (index, Some(alone)) => index -> alone }
+        )
+      }
+
+    val found = round(1, each.indices.toVector, Map.empty)
+    each.indices.toVector.map(index => each(index)._1 -> found(index))
   }
 
   /**
@@ -639,6 +663,14 @@ object FileSourceConnector {
 
   /** How many reads of a file alone it fails at, at most, before it cannot be read (ADR-0023). */
   val AloneReads = 3
+
+  /**
+   * The waits before the second read of a file alone and before the third: short, and longer
+   * the second time, so that a disk or a mount that is away for a few seconds does not leave a
+   * sound file as one that cannot be read. The run waits them within its budget of retries.
+   */
+  val AloneWaits: Vector[FiniteDuration] = Vector(1.second, 2.seconds)
+  require(AloneWaits.size == AloneReads - 1, "a wait before each read alone but the first")
 
   /** What a record of a file that Spark cannot read says it is, as a word. */
   val Unreadable = "unreadable"

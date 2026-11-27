@@ -304,25 +304,86 @@ final class UnreadableFilesSpec extends AnyFunSuite with Matchers with Ingestion
     assertLedger(of)
   }
 
-  test("a file whose read fails once and then reads is not recorded: the run tries again") {
+  /**
+   * A file that the process may not open until two seconds after its first read alone, as a
+   * mount that takes a few seconds to come back: it is given back by a thread of its own, by the
+   * time and not by a read. The moment of each read of it alone is kept.
+   */
+  final private class AwayForAWhile(file: Path) {
+    private val permissions = Files.getPosixFilePermissions(file)
+    @volatile var reads = Vector.empty[Long]
+    private var back = Option.empty[Thread]
+
+    def beforeAlone(name: String, n: Int): Unit =
+      if (file.getFileName.toString == name) {
+        reads :+= System.nanoTime()
+        if (n == 1) {
+          val thread = new Thread(() => {
+            Thread.sleep(2000)
+            Files.setPosixFilePermissions(file, permissions): Unit
+          })
+          thread.setDaemon(true)
+          thread.start()
+          back = Some(thread)
+        }
+      }
+
+    def awaitBack(): Unit = back.foreach(_.join(10000))
+
+    /** How far apart the reads alone were. */
+    def gaps: Vector[FiniteDuration] =
+      reads.zip(reads.drop(1)).map { case (a, b) => (b - a).nanos }
+  }
+
+  test("a file that may not be opened for two seconds is waited for, within the budget") {
     val of = fileSource(options = Skip)
     drop(of, "a.csv", "id\n1\n")
     val closed = drop(of, "b.csv", "id\n2\n")
-    val permissions = Files.getPosixFilePermissions(closed)
-    // As a disk that erred once: it may be opened again from its second read alone.
+    val away = new AwayForAWhile(closed)
     val by = service(
       tries =
         Profile.Retries(budget = 30.seconds, firstBackoff = 100.millis, maxBackoff = 100.millis),
-      beforeAlone = (name, n) =>
-        if (name == "b.csv" && n == 2) Files.setPosixFilePermissions(closed, permissions): Unit
+      beforeAlone = away.beforeAlone
     )
 
     val done = unopenable(closed)(ingested(launch(of, by)))
+    away.awaitBack()
 
+    // Read alone, it failed twice, 1 s and 2 s apart, and then read: the run tried again.
+    away.gaps should have size 2
+    away.gaps(0) should be >= 1.second
+    away.gaps(1) should be >= 2.seconds
     done.batch.seq shouldBe BatchSeq.First
     runOf(done.run).counts.retries shouldBe Some(1)
     ids(of) shouldBe Seq("1", "2")
     failedOf(of) shouldBe empty
+    assertLedger(of)
+  }
+
+  test("a run with no budget left does not wait: a file away for two seconds is recorded") {
+    // The known limit (ADR-0023): what is away for longer than the waits is taken for the file's.
+    val of = fileSource(options = Skip)
+    drop(of, "a.csv", "id\n1\n")
+    val closed = drop(of, "b.csv", "id\n2\n")
+    val away = new AwayForAWhile(closed)
+
+    val skipped = unopenable(closed) {
+      val outcome = launch(of, service(beforeAlone = away.beforeAlone))
+      away.awaitBack()
+      outcome
+    }
+
+    skipped match {
+      case Outcome.FilesSkipped(_, _, Seq(Unreadable("b.csv", _))) => ()
+      case other => fail(s"the file was not skipped: $other")
+    }
+    away.gaps.foreach(_ should be < 1.second)
+    // Back by now, and the same file: it is not taken again until it is touched.
+    ingested(launch(of)).batch.seq.value shouldBe 2L
+    launch(of) shouldBe a[Outcome.NothingNew]
+    setTime(closed, later)
+    ingested(launch(of)).batch.seq.value shouldBe 3L
+    ids(of) shouldBe Seq("1", "2")
     assertLedger(of)
   }
 

@@ -28,6 +28,9 @@ import org.slf4j.LoggerFactory
  * that it was not committed. A read of the row is not a retry of the run, which asks and does
  * nothing again; it waits as one does, and draws on the budget.
  *
+ * A step of an attempt may wait within the same budget too (`pause`): the reads of a file alone
+ * once a read of a batch failed (ADR-0023 §3). It is no retry of the run either.
+ *
  * It is the run's, and is used on the thread of the run alone.
  *
  * @param what the run, as its log says it
@@ -89,6 +92,24 @@ final private[engine] class RunRetries(
           count(again.failure)
       }
     answer.get
+  }
+
+  /**
+   * Waits `wait`, or what is left of the budget if that is less, in the middle of an attempt
+   * that failed in part and goes on: the reads of a file alone, a second and a third time
+   * (ADR-0023 §3). The failure that it waits after is the run's: the budget is counted from it,
+   * if the run had none before. It is no retry, and is not counted as one; a run whose budget is
+   * spent waits no more.
+   *
+   * @param may whether the run may go on, looked at while it waits: a wait ends once it may not
+   * @return how long it waited
+   */
+  def pause(wait: FiniteDuration, may: => Boolean): FiniteDuration = {
+    val left = retries.budget - sinceFirst()
+    val cut = if (left <= Duration.Zero) Duration.Zero else wait.min(left)
+    val started = System.nanoTime()
+    waited(cut, may)
+    (System.nanoTime() - started).nanos
   }
 
   /**
