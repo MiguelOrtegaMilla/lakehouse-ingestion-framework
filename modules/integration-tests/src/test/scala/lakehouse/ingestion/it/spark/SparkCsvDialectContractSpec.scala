@@ -49,7 +49,9 @@ import org.scalatest.matchers.should.Matchers
  *  - the mark of the order of bytes of UTF-8 is taken off, but a second one is kept, and in a
  *    file read in another encoding it is three characters at the start of the first name;
  *  - inside a quoted value, the end of line of the file is read as LF: a value of a file whose
- *    lines end in CRLF has LF where it had CRLF;
+ *    lines end in CRLF has LF where it had CRLF. A file of a spreadsheet, whose records end in
+ *    CRLF and whose cells have LF, reads as written; one that mixes its ends of lines changes a
+ *    value, or makes two records one, without a word;
  *  - a file read with values over several lines is read whole, by one task.
  */
 final class SparkCsvDialectContractSpec extends AnyFunSuite with Matchers with LocalSparkSuite {
@@ -450,9 +452,63 @@ final class SparkCsvDialectContractSpec extends AnyFunSuite with Matchers with L
     val glued = read()(file(bytes("id,v\r\n1,x\n2,y\r\n")))
     glued.records shouldBe empty
     glued.unparsed shouldBe Seq("1,x\n2,y")
-    // After a first LF, a CRLF leaves its CR at the end of the last value.
-    read()(file(bytes("id,v\n1,x\r\n2,y\n"))).records shouldBe
+    // A record of one value has no value too many: two are one, and nothing is set apart.
+    val one = read()(file(bytes("id\r\n1\n2\r\n3\r\n")))
+    one.records shouldBe Seq(Seq("1\n2"), Seq("3"))
+    one.unparsed shouldBe empty
+    // After a first LF, a CRLF leaves its CR at the end of the last value, and nothing says so.
+    val cr = read()(file(bytes("id,v\n1,x\r\n2,y\n")))
+    cr.records shouldBe Seq(Seq("1", "x\r"), Seq("2", "y"))
+    cr.unparsed shouldBe empty
+    // Which a value that ends in CR between quotes, in a file of LF, is too.
+    read()(file(bytes("id,v\n1,\"x\r\"\n2,y\n"))).records shouldBe
       Seq(Seq("1", "x\r"), Seq("2", "y"))
+  }
+
+  test("a file of a spreadsheet: records that end in CRLF, and LF inside a cell, as written") {
+    // A spreadsheet ends each record in CRLF, and a line inside a cell in LF alone. In Spain it
+    // separates values by `;`, and writes "CSV" in windows-1252 and "CSV UTF-8" with a mark.
+    val excel = Dialect(";", "\"", "\"")
+    val expected = Read(
+      Seq("id", "nombre", "nota"),
+      Seq(
+        Seq("1", "Peña", "línea uno\nlínea dos"),
+        Seq("2", "Ruiz; Ana", "dice \"hola\"\n10 €"),
+        // An empty value is none.
+        Seq("3", null, null)
+      )
+    )
+    val utf8 = read(excel.in("UTF-8"))(
+      file(
+        bytes(
+          Bom,
+          "id;nombre;nota\r\n",
+          "1;Peña;\"línea uno\nlínea dos\"\r\n",
+          "2;\"Ruiz; Ana\";\"dice \"\"hola\"\"\n10 €\"\r\n",
+          "3;;\r\n"
+        )
+      )
+    )
+    utf8 shouldBe expected
+    val cp1252 = read(excel.in("windows-1252"), javaCharsets)(
+      file(
+        bytes(
+          "id;nombre;nota\r\n",
+          "1;Pe",
+          0xf1,
+          "a;\"l",
+          0xed,
+          "nea uno\nl",
+          0xed,
+          "nea dos\"\r\n",
+          "2;\"Ruiz; Ana\";\"dice \"\"hola\"\"\n10 ",
+          0x80,
+          "\"\r\n",
+          "3;;\r\n"
+        )
+      )
+    )
+    cp1252 shouldBe expected
   }
 
   // ---------------------------------------------------------------------------------------------
