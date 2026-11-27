@@ -116,17 +116,22 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite with LedgerF
    * @param on how it reaches the control plane: as the suite does, unless a test has a way of
    *   its own, to break
    * @param tries for how long its runs try again: as the suite says, unless a test says otherwise
+   * @param beforeAlone what happens before each read of a file alone, given its name and which
+   *   read it is (ADR-0023)
    */
   protected def service(
       hooks: FaultHooks = FaultHooks.Off,
       at: Instant = Now,
       afterRead: () => Unit = () => (),
       on: ControlDatabase = database,
-      tries: Profile.Retries = retries
+      tries: Profile.Retries = retries,
+      beforeAlone: (String, Int) => Unit = (_, _) => ()
   ): IngestionService =
     new IngestionService(
       on,
-      ConnectorRegistry(new FileSourceConnector(new Landing(landingRoot), afterRead)),
+      ConnectorRegistry(
+        new FileSourceConnector(new Landing(landingRoot), afterRead, beforeAlone)
+      ),
       spark,
       lakeRoot,
       timing,
@@ -218,9 +223,22 @@ trait IngestionSuite extends ControlPlaneSuite with LocalSparkSuite with LedgerF
     query(
       c,
       "SELECT path, size::text, batch_seq::text FROM control.processed_file " +
-        "WHERE source_id = ? ORDER BY path, batch_seq",
+        "WHERE source_id = ? AND status = 'TAKEN' ORDER BY path, batch_seq",
       of.id.value
     ).map(row => (row(0).split('/').last, row(1).toLong, row(2).toLong))
+  }
+
+  /**
+   * The files that batches of a source could not read (ADR-0023): the name, the batch that was
+   * given up for it, and why.
+   */
+  protected def failedOf(of: Source): Seq[(String, Long, String)] = asSuperuser { c =>
+    query(
+      c,
+      "SELECT path, batch_seq::text, error FROM control.processed_file " +
+        "WHERE source_id = ? AND status = 'FAILED' ORDER BY path, batch_seq",
+      of.id.value
+    ).map(row => (row(0).split('/').last, row(1).toLong, row(2)))
   }
 
   /** The lease of a source runs out in the database, whatever its holder believes of it. */

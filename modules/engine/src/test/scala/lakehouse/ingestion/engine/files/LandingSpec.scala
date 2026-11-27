@@ -1,9 +1,10 @@
 package lakehouse.ingestion.engine.files
 
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.attribute.FileTime
-import java.nio.file.{Files, Path, StandardCopyOption}
+import java.nio.file.attribute.{BasicFileAttributes, FileTime}
+import java.nio.file.{Files, LinkOption, Path, StandardCopyOption}
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.Comparator
 
 import scala.util.Using
@@ -314,6 +315,72 @@ final class LandingSpec
     Files.createSymbolicLink(orders.resolve("a.csv"), pipe)
 
     refused(list()).getMessage should include("'a.csv' is not a file but a pipe")
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Under a source that skips what cannot be read (ADR-0023)
+  // ---------------------------------------------------------------------------------------------
+
+  private def skipping: FileConnectorConfig =
+    config().copy(onUnreadableFile = FileConnectorConfig.OnUnreadableFile.Skip)
+
+  /** What the file system says of a name itself, a link included: its size and its time. */
+  private def own(path: Path): (Long, Instant) = {
+    val attributes =
+      Files.readAttributes(path, classOf[BasicFileAttributes], LinkOption.NOFOLLOW_LINKS)
+    (attributes.size, attributes.lastModifiedTime.toInstant.truncatedTo(ChronoUnit.MILLIS))
+  }
+
+  test("under skip, what no run may open is listed by the name itself, and found refused") {
+    val sound = write(orders.resolve("a.csv"), bytes = 5)
+    val out = Files.createSymbolicLink(orders.resolve("b.csv"), write(outside.resolve("b")))
+    val dangling = Files.createSymbolicLink(orders.resolve("c.csv"), landing.resolve("gone.csv"))
+    val pipe = orders.resolve("d.csv")
+    new ProcessBuilder("mkfifo", pipe.toString).inheritIO().start().waitFor() shouldBe 0
+
+    val listed = list(skipping).map(file => file.name -> (file.size -> file.modifiedAt)).toMap
+    listed shouldBe Map(
+      "a.csv" -> own(sound),
+      // The link by its own size and time: of what it leads to, nothing.
+      "b.csv" -> own(out),
+      "c.csv" -> own(dangling),
+      "d.csv" -> own(pipe)
+    )
+
+    val plan = FilePlan(
+      skipping.path,
+      Vector("a.csv", "b.csv", "c.csv", "d.csv").map { name =>
+        LandedFile(FileName.parse(name).value, listed(name)._1, listed(name)._2)
+      }
+    )
+    val confirmed = new Landing(rootAt(landing)).confirm(skipping, plan).value
+    confirmed.refused.map { case (file, why) => file.name.value -> why.code } shouldBe Vector(
+      "b.csv" -> Landing.Refusal.OutsideTheRoot,
+      "c.csv" -> Landing.Refusal.BrokenLink,
+      "d.csv" -> Landing.Refusal.NotAFile
+    )
+    // What a record of it says: what was found, never where a link leads.
+    confirmed.refused.head._2.toString shouldBe
+      "path_outside_root: it leads out of the landing zone, through a symbolic link, and was " +
+      "not opened"
+    confirmed.refused.map(_._2.toString).foreach(_ should not include outside.toString)
+
+    // Under fail the same directory plans nothing, as it always did.
+    refused(list()).getMessage should include("has 3 files that no run may read")
+  }
+
+  test("a name planned as refused, that leads to a file by the read, is not as planned") {
+    val dangling = Files.createSymbolicLink(orders.resolve("c.csv"), landing.resolve("gone.csv"))
+    val (size, at) = own(dangling)
+    val plan = FilePlan(skipping.path, Vector(LandedFile(FileName.parse("c.csv").value, size, at)))
+    write(landing.resolve("gone.csv"), bytes = 7)
+
+    new Landing(rootAt(landing)).confirm(skipping, plan).left.value shouldBe Vector(
+      Landing.NotAsPlanned(
+        "c.csv",
+        s"is of 7 bytes, and was of $size, was changed at $changed, and was of $at"
+      )
+    )
   }
 
   // ---------------------------------------------------------------------------------------------

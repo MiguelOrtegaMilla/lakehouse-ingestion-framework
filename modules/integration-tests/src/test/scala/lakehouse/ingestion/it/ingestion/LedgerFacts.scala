@@ -216,15 +216,20 @@ trait LedgerFacts {
       }
     }(_ => Nil)
 
-    val taken = asSuperuser { c =>
+    // The files that batches took, and those that batches could not read (ADR-0023).
+    def files(status: String) = asSuperuser { c =>
       query(
         c,
         "SELECT path, size::text, (extract(epoch FROM modified_at) * 1000)::bigint::text, " +
-          "batch_seq::text FROM control.processed_file WHERE source_id = ? AND txn_app_id = ?",
+          "batch_seq::text FROM control.processed_file " +
+          "WHERE source_id = ? AND txn_app_id = ? AND status = ?",
         of.id.value,
-        app.value
+        app.value,
+        status
       )
     }.map(row => TakenFile(row(0), row(1).toLong, row(2).toLong) -> row(3).toLong).toSet
+    val taken = files("TAKEN")
+    val failed = files("FAILED")
 
     val data = (batches.map(_.target) :+ configured.uri).distinct.map { uri =>
       ledgerTable(
@@ -268,7 +273,7 @@ trait LedgerFacts {
         }
     }
 
-    Facts(batches, runs, state, taken, data, apart, resets, backfill)
+    Facts(batches, runs, state, taken, data, apart, resets, backfill, failed)
   }
 
   private def ledgerTable(

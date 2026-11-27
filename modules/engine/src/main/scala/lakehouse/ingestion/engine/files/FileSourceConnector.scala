@@ -5,6 +5,7 @@ import java.nio.file.{Path, Paths}
 import java.util.Locale
 
 import scala.annotation.tailrec
+import scala.util.control.NonFatal
 
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
@@ -12,10 +13,11 @@ import lakehouse.ingestion.core.config.{
   EngineColumns,
   FileConnector,
   FileConnectorConfig,
+  RelativePath,
   Source
 }
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
-import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner}
+import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner, LandedFile}
 import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
@@ -23,7 +25,8 @@ import lakehouse.ingestion.engine.connector.{
   ReadContext,
   ReadResult,
   SourceChangedException,
-  SourceConnector
+  SourceConnector,
+  UnreadableFilesException
 }
 import org.apache.spark.SparkThrowable
 import org.apache.spark.sql.functions.{col, lit, udf}
@@ -76,11 +79,34 @@ import org.slf4j.LoggerFactory
  *    under which Spark gives the file of a row, which is asked for in the way that a column of
  *    the source does not hide (`Dataset.metadataColumn`).
  *
- * '''A file that cannot be read fails its batch, whatever the session is set to.''' With
+ * '''No file is passed over without a word, whatever the session is set to.''' With
  * `spark.sql.files.ignoreCorruptFiles`, Spark passes over a file that it cannot read, or keeps
  * what it had read of it, and says nothing: the file would be recorded as taken with its rows
  * not in Bronze. Every read says that no file is passed over, which a setting of a session
- * does not change. The policy that may skip a file, and says that it did, is P8's.
+ * does not change.
+ *
+ * '''A file that cannot be read stops its source, or is skipped, as the source says'''
+ * (`connector.on_unreadable_file`, ADR-0023). What Spark raises does not say which file of a
+ * batch it is, nor whether one is: its conditions are several or none, at the inference of the
+ * columns or at the checkpoint, and it says that a file that it may not open does not exist
+ * (`SparkUnreadableFileContractSpec`). What a file does alone says it, the same way at every
+ * read. So once a read of a batch fails with what the read does not know:
+ *
+ *  - the files are looked at again, as after every read: one that changed makes it a batch
+ *    whose source changed (ADR-0018), whatever Spark said;
+ *  - each file is read alone, as the batch is read, up to `AloneReads` times. One that fails at
+ *    every read, with what the read does not know, cannot be read. One that fails and then
+ *    reads is sound, and the failure of the batch is one that passed: the run tries again. One
+ *    that fails alone with a failure that the read knows (a header, a field twice) is not one
+ *    that cannot be read: that failure is the file's, and is met by the read of a batch;
+ *  - the files are looked at again, after the reads alone.
+ *
+ * Under `fail` the files that cannot be read are a permanent failure that names each, and why;
+ * under `skip` the read says them (`UnreadableFilesException`), and the engine gives the batch
+ * up and records them. If none cannot be read and none passed, the failure of the batch is let
+ * through as it was. A file that the landing zone refuses (outside the root, a link to nothing,
+ * not a file) is one that cannot be read too, under `skip`, found just before the read: none of
+ * the files of its plan is then read, and it is never opened (`Landing`).
  *
  * '''The files are the planned ones while they are read.''' A name may be given to another file
  * at any moment. So, just before Spark reads the files, each name must still lead to a file of
@@ -115,9 +141,14 @@ import org.slf4j.LoggerFactory
  *
  * @param afterRead what runs once Spark has read the files and before they are confirmed again:
  *   nothing, but in the tests that change a file at that moment
+ * @param beforeAlone what runs before each read of a file alone, given its name and which read
+ *   it is, from 1: nothing, but in the tests that mend a file between two reads
  */
-final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => ())
-    extends SourceConnector[FileConnectorConfig] {
+final class FileSourceConnector(
+    landing: Landing,
+    afterRead: () => Unit = () => (),
+    beforeAlone: (String, Int) => Unit = (_, _) => ()
+) extends SourceConnector[FileConnectorConfig] {
 
   import FileSourceConnector._
 
@@ -171,21 +202,15 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
   ): ReadResult.Kept = {
     val files = planOf(source, config, plan)
     val before = confirmed(config, "since it was planned")(landing.confirm(config, files))
-    val read =
-      readable(context.spark, config.format, before.paths, sourceFiles(files, before.paths))
-    // What is read is kept by Spark apart from the files, and everything after is made from it.
-    val kept =
-      try read.rows.localCheckpoint(eager = true)
+    // A file that no run may open is never opened, and nor is any other of its plan.
+    if (before.refused.nonEmpty)
+      throw unreadable(config, before.refused.map { case (file, why) => file -> why.toString })
+    val each = files.files.zip(before.paths)
+    val (read, kept) =
+      try readOf(context.spark, config, files.directory, each)
       catch {
-        case e: Exception if otherHeader(e) =>
-          throw RunFailedException.permanent(
-            s"a file of CSV of the batch of ${config.path} does not have the header that the " +
-              "batch is read by. Either the files do not all have one header, or a header has " +
-              "a name twice, case aside, or a name that is empty, which Spark reads under a " +
-              "name of its own making. Spark reads a record by the place of its values, and " +
-              "would put them under another column's name. Nothing was written",
-            e
-          )
+        case known: RunFailedException => throw known
+        case NonFatal(failed) => throw alone(config, files, before, each, failed, context)
       }
     afterRead()
     confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
@@ -251,6 +276,156 @@ final class FileSourceConnector(landing: Landing, afterRead: () => Unit = () => 
           problems.map(problem => SourceChangedException.Changed(problem.name, problem.how))
         )
     }
+
+  /**
+   * The files read, at both moments: their columns are inferred, and their rows kept by Spark
+   * apart from the files (`Dataset.localCheckpoint`), which everything after is made from.
+   *
+   * @param each the files, each with where it is, as the look before the read found it
+   * @return what was read, and what was kept of it
+   */
+  private def readOf(
+      spark: SparkSession,
+      config: FileConnectorConfig,
+      directory: RelativePath,
+      each: Vector[(LandedFile, Path)]
+  ): (Reading, DataFrame) = {
+    val sourceFileOf = each.map { case (file, path) =>
+      path.toString -> s"${directory.value}/${file.name.value}"
+    }.toMap
+    val read = readable(spark, config.format, each.map(_._2), sourceFileOf)
+    val kept =
+      try read.rows.localCheckpoint(eager = true)
+      catch {
+        case e: Exception if otherHeader(e) =>
+          throw RunFailedException.permanent(
+            s"a file of CSV of the batch of ${config.path} does not have the header that the " +
+              "batch is read by. Either the files do not all have one header, or a header has " +
+              "a name twice, case aside, or a name that is empty, which Spark reads under a " +
+              "name of its own making. Spark reads a record by the place of its values, and " +
+              "would put them under another column's name. Nothing was written",
+            e
+          )
+      }
+    (read, kept)
+  }
+
+  /**
+   * What a read of a batch that failed with `failed` comes to, once each of its files is read
+   * alone (ADR-0023 §3): the files that cannot be read, under the policy of the source; a
+   * failure that passed, if a file failed and then read; or `failed` as it was.
+   *
+   * @throws SourceChangedException if a file of the plan changed by the look after the read, or
+   *   after the reads alone: whatever Spark said, the plan is what is wrong (ADR-0018)
+   */
+  private def alone(
+      config: FileConnectorConfig,
+      files: FilePlan,
+      before: Landing.Confirmed,
+      each: Vector[(LandedFile, Path)],
+      failed: Throwable,
+      context: ReadContext
+  ): Throwable = {
+    // Spark says that a file which it may not open does not exist: what is gone is known by a
+    // look at the files, and not by what Spark raised.
+    confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
+    log.warn(
+      s"the batch of ${config.path} could not be read (${said(failed)}): each of its " +
+        s"${Landing.files(each.size)} is read alone, to find those that cannot be read"
+    )
+    val found = each.map { case (file, path) =>
+      file -> readAlone(config, files.directory, file, path, context)
+    }
+    confirmed(config, "while its files were read alone")(
+      landing.confirmAgain(config, files, before)
+    )
+
+    val cannot = found.collect { case (file, Alone.Unreadable(why)) =>
+      file -> s"$Unreadable: it failed each of $AloneReads reads of it alone: $why"
+    }
+    val passed = found.collect { case (file, Alone.Passed(failures)) =>
+      s"'${file.name}' failed ${times(failures)} and then read"
+    }
+    if (cannot.nonEmpty) unreadable(config, cannot, failed)
+    else if (passed.nonEmpty)
+      RunFailedException.transient(
+        s"the batch of ${config.path} could not be read (${said(failed)}), and read alone, " +
+          s"${Landing.some(passed)}: a failure that passed. Nothing was written",
+        failed
+      )
+    else {
+      log.warn(
+        s"the batch of ${config.path} could not be read, and each of its files reads alone: " +
+          "the failure is not a file's"
+      )
+      failed
+    }
+  }
+
+  /** What one file comes to, read alone up to `AloneReads` times. */
+  private def readAlone(
+      config: FileConnectorConfig,
+      directory: RelativePath,
+      file: LandedFile,
+      path: Path,
+      context: ReadContext
+  ): Alone = {
+    @tailrec
+    def attempt(n: Int): Alone = {
+      // No job is started by a run that has lost its lease.
+      context.verify()
+      beforeAlone(file.name.value, n)
+      val failure =
+        try {
+          readOf(context.spark, config, directory, Vector(file -> path))
+          None
+        } catch {
+          case known: RunFailedException => Some(Left(known))
+          case NonFatal(failed) => Some(Right(failed))
+        }
+      failure match {
+        case None if n == 1 => Alone.Read
+        case None => Alone.Passed(n - 1)
+        case Some(Left(_)) => Alone.Known
+        case Some(Right(failed)) if n == AloneReads => Alone.Unreadable(said(failed))
+        case Some(Right(_)) => attempt(n + 1)
+      }
+    }
+    attempt(1)
+  }
+
+  /**
+   * Files of a plan that cannot be read, as the policy of the source has them: a permanent
+   * failure that names each, under `fail`; under `skip`, what the engine gives the batch up by.
+   *
+   * @param cannot each file, with why: never the text of an exception
+   */
+  private def unreadable(
+      config: FileConnectorConfig,
+      cannot: Seq[(LandedFile, String)],
+      cause: Throwable = null
+  ): Exception = {
+    val named = cannot.map { case (file, why) => s"'${file.name}' $why" }
+    config.onUnreadableFile match {
+      case FileConnectorConfig.OnUnreadableFile.Fail =>
+        RunFailedException.permanent(
+          s"the batch of ${config.path} has ${Landing.files(cannot.size)} that cannot be read, " +
+            s"and nothing of it was written: ${Landing.some(named)}. The source fails for such " +
+            s"a file (connector.${FileConnector.OnUnreadableFile}: fail), until it is written " +
+            "again, which the next run takes as a new file; or until the source skips such files",
+          cause
+        )
+      case FileConnectorConfig.OnUnreadableFile.Skip =>
+        new UnreadableFilesException(
+          s"${Landing.files(cannot.size)} of the batch of ${config.path} cannot be read, and " +
+            s"the source skips such files (connector.${FileConnector.OnUnreadableFile}: skip): " +
+            s"${Landing.some(named)}. Nothing of the batch was written",
+          cannot.map { case (file, why) =>
+            UnreadableFilesException.Unreadable(file.name.value, why)
+          }
+        )
+    }
+  }
 
   /**
    * The rows of the files, lazily, with the column of the records that cannot be parsed for CSV
@@ -462,12 +637,47 @@ object FileSourceConnector {
     columns
   }
 
-  /** `_source_file` of each path that is read, by the path as Spark gives it, decoded. */
-  private def sourceFiles(plan: FilePlan, paths: Vector[Path]): Map[String, String] =
-    paths
-      .zip(plan.files)
-      .map { case (path, file) => path.toString -> s"${plan.directory}/${file.name}" }
-      .toMap
+  /** How many reads of a file alone it fails at, at most, before it cannot be read (ADR-0023). */
+  val AloneReads = 3
+
+  /** What a record of a file that Spark cannot read says it is, as a word. */
+  val Unreadable = "unreadable"
+
+  /** What one file came to, read alone. */
+  sealed private trait Alone
+  private object Alone {
+
+    /** It read, at its first read. */
+    case object Read extends Alone
+
+    /** It failed, and then read: it is sound, and what it failed with passed. */
+    final case class Passed(failures: Int) extends Alone
+
+    /** It failed with a failure that the read knows: not one that cannot be read. */
+    case object Known extends Alone
+
+    /** It failed at every read, with what the read does not know. */
+    final case class Unreadable(why: String) extends Alone
+  }
+
+  private def times(count: Int): String = if (count == 1) "once" else s"$count times"
+
+  /** How far the causes of a failure are followed: further than any chain of Spark's. */
+  private val MaxCauses = 16
+
+  /**
+   * What Spark said of a failure, as a record may keep it: the conditions of its errors, from
+   * the outside in, and the type of the cause where it began. Never the text of an exception,
+   * which may hold what the file holds (ADR-0022, as built in P8.3).
+   */
+  private[files] def said(failure: Throwable): String = {
+    val chain =
+      Iterator.iterate(failure)(_.getCause).takeWhile(_ != null).take(MaxCauses).toVector
+    val conditions = chain.collect {
+      case spark: SparkThrowable if spark.getCondition != null => spark.getCondition
+    }.distinct
+    (conditions :+ s"from ${chain.last.getClass.getName}").mkString(", ")
+  }
 
   /** Whether a failure of a read is that of a file of CSV whose header is not the others'. */
   @tailrec

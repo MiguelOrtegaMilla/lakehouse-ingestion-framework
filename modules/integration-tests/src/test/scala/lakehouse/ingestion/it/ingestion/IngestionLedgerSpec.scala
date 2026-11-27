@@ -371,6 +371,27 @@ final class IngestionLedgerSpec extends AnyFunSuite with Matchers {
       Set(Rule.FilesNotAsCommitted)
   }
 
+  test("a file that failed is of the plan of the batch given up for it, and nothing took it") {
+    // Batch 4 was given up for d, which cannot be read, as a source that skips such files does.
+    val skipped = clean.copy(failed = Set(file("d") -> 4L))
+    rules(skipped) shouldBe empty
+
+    // Of a batch that was committed (which took it), of one that is no batch, and of a plan that
+    // does not have it.
+    rules(clean.copy(failed = Set(file("e") -> 5L))) shouldBe Set(Rule.FailedNotOfAbandoned)
+    rules(clean.copy(failed = Set(file("d") -> 9L))) shouldBe Set(Rule.FailedNotOfAbandoned)
+    rules(clean.copy(failed = Set(file("x") -> 4L))) shouldBe Set(Rule.FailedNotOfAbandoned)
+    // And one that a batch took as well, as it is in the plan of a committed batch.
+    rules(
+      batch(skipped, 5)(_.copy(files = Set(file("d"), file("e"))))
+        .copy(taken = skipped.taken + (file("d") -> 5L))
+    ) shouldBe Set(Rule.FailedNotOfAbandoned)
+    IngestionLedger.check(clean.copy(failed = Set(file("e") -> 5L))).map(_.message) shouldBe Seq(
+      "s/e (10 bytes, 1000 ms), failed by batch 5, which is COMMITTED",
+      "s/e (10 bytes, 1000 ms), failed by batch 5, and taken"
+    )
+  }
+
   test("a run still running, and a batch committed by a run that did not succeed") {
     rules(run(clean, r3)(_.copy(status = RunStatus.Running))) shouldBe Set(Rule.StillRunning)
     rules(run(clean, r1)(_.copy(status = RunStatus.Failed))) shouldBe
