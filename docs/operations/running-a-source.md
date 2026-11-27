@@ -74,6 +74,15 @@ The whole contract is in [discovery §14.1](../architecture/00-architecture-disc
 
 **Every command logs to its error output, at INFO, and its standard output has what the command writes and nothing else**: the records of `quarantine --records` among them. The command line has a configuration of log4j2 of its own (`modules/cli/src/main/resources/log4j2.properties`), with the pattern of Spark's default, and a deployment may give another with `-Dlog4j2.configurationFile`. Without one, log4j2 logs errors alone, to the standard output, until Spark sets its own default the first time that it logs: what a command logs before then is lost, or written among what it prints.
 
+**A configuration of its own is to take out what univocity parsed.** When a value of CSV is longer than the bound, univocity, Spark's parser of CSV, fails with what it had parsed in its message, after `content parsed=`: up to 1003 characters of the source. Spark logs that failure at WARN and at ERROR with each task that fails, so the configuration of the application replaces those characters in every line, of the message and of its stack trace, and writes no stack trace outside its pattern. A deployment that gives another configuration copies both:
+
+```properties
+appender.console.layout.alwaysWriteExceptions = false
+appender.console.layout.pattern = %d{yy/MM/dd HH:mm:ss} %p %c{1}: %replace{%m%n%ex}{(?s)content parsed=.{0,1003}(?<![\\r\\n])}{content parsed=<not logged>}
+```
+
+Without `alwaysWriteExceptions = false`, log4j2 writes the stack trace again, whole, after the pattern. `RunCommandLogsSpec` runs a command with the configuration of the application, and finds none of what was parsed in its log.
+
 ### What a run logs of what its source holds
 
 **At INFO, which is the level that the command line logs at, no line of the log of a run has a value of a row**, nor of a record that was set apart: not a line of the application, nor of Spark, of Delta or of Parquet. What a run prints says how many rows it read, wrote and rejected and the names of its files, and never what they hold. The names of the columns of a source are logged: Delta says the schema of a table with each snapshot of it.

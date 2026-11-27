@@ -18,6 +18,7 @@ import lakehouse.ingestion.cli.{Main, RunSession, Stop}
 import lakehouse.ingestion.core.config.{Profile, Source}
 import lakehouse.ingestion.core.control.{Layer, LeaseKey, LeaseTiming}
 import lakehouse.ingestion.engine.control.LeasedRun
+import lakehouse.ingestion.engine.files.FileSourceConnector
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint}
 import lakehouse.ingestion.it.control.ControlPlaneSuite
 import lakehouse.ingestion.it.support.ControlPlaneSchema._
@@ -490,6 +491,55 @@ final class RunCommandSpec
     val next = invoke(skipping)
     withClue(next.err)(next.exit shouldBe Main.Exit.Ok)
     next.out should include("found nothing new")
+  }
+
+  test(
+    "a value longer than the bound ends in 4, or is skipped, and its text is in no row nor output"
+  ) {
+    // A quote that is not closed, and the rest of the file after it, longer than the bound:
+    // what univocity says of it has what it parsed, which Spark logs, and nothing else may keep.
+    val held = "PERSON-UNCLOSED"
+    def unclosed(of: Source): Unit =
+      drop(
+        of,
+        "b.csv",
+        s"id,v\n2,\"$held " + "x" * FileSourceConnector.MaxValueLength + s" $held-END\n3,y\n"
+      ): Unit
+    // Every text of the control plane that a run, a batch or a file of the source keeps.
+    def kept(of: Source): Seq[String] = asSuperuser { c =>
+      Seq(
+        "SELECT coalesce(error_message, '') FROM control.ingestion_run WHERE source_id = ?",
+        "SELECT coalesce(abandon_reason, '') || ' ' || coalesce(abandon_detail::text, '') " +
+          "FROM control.ingestion_batch WHERE source_id = ?",
+        "SELECT coalesce(error, '') FROM control.processed_file WHERE source_id = ?"
+      ).flatMap(sql => query(c, sql, of.id.value).map(_.head))
+    }
+    def holdsNothing(ran: Ran, of: Source): Unit = {
+      (ran.out + ran.err) should not include held
+      (ran.out + ran.err) should not include "content parsed"
+      kept(of).filter(_.contains(held)) shouldBe empty
+      kept(of).filter(_.contains("content parsed")) shouldBe empty: Unit
+    }
+
+    val stopped = fileSource()
+    drop(stopped, "a.csv", "id,v\n1,x\n")
+    unclosed(stopped)
+    val failed = invoke(stopped)
+    withClue(failed.err)(failed.exit shouldBe Main.Exit.Permanent)
+    said(failed).loneElement should include("'b.csv' unreadable: a value of it")
+    runsOf(stopped) shouldBe Seq("FAILED" -> Some("permanent"))
+    kept(stopped).exists(_.contains("a value of it, or a name of its header")) shouldBe true
+    holdsNothing(failed, stopped)
+
+    val skipping = files.fileSource(newSourceId(), options = ", on_unreadable_file: skip")
+    drop(skipping, "a.csv", "id,v\n1,x\n")
+    unclosed(skipping)
+    val ran = invoke(skipping)
+    withClue(ran.err)(ran.exit shouldBe Main.Exit.Ok)
+    batchesOf(skipping) shouldBe Seq("1" -> "ABANDONED", "2" -> "COMMITTED")
+    kept(skipping).count(_.contains("a value of it, or a name of its header")) should be >= 1
+    holdsNothing(ran, skipping)
+    assertLedger(skipping)
   }
 
   test("a file that is not of its encoding ends in 4, or under skip is a warning with what to do") {

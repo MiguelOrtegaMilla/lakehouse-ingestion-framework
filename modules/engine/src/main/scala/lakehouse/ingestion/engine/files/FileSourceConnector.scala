@@ -615,7 +615,7 @@ final class FileSourceConnector(
     )
 
     val cannot = found.collect { case (file, Alone.Unreadable(why)) =>
-      file -> s"$Unreadable: it failed each of $AloneReads reads of it alone: $why"
+      file -> s"$Unreadable: $why"
     }
     val passed = found.collect { case (file, Alone.Passed(failures)) =>
       s"'${file.name}' failed ${times(failures)} and then read"
@@ -668,7 +668,12 @@ final class FileSourceConnector(
         case None if n == 1 => Some(Alone.Read)
         case None => Some(Alone.Passed(n - 1))
         case Some(Left(_)) => Some(Alone.Known)
-        case Some(Right(failed)) if n == AloneReads => Some(Alone.Unreadable(said(failed)))
+        // A value too long is so at every read: the file cannot be read, from its first.
+        case Some(Right(failed)) if tooLong(failed) => Some(Alone.Unreadable(TooLong))
+        case Some(Right(failed)) if n == AloneReads =>
+          Some(
+            Alone.Unreadable(s"it failed each of $AloneReads reads of it alone: ${said(failed)}")
+          )
         case Some(Right(_)) => None
       }
     }
@@ -756,6 +761,7 @@ final class FileSourceConnector(
           .option("quote", dialect.quote.toString)
           .option("escape", dialect.escape.toString)
           .option("encoding", dialect.encoding.name)
+          .option("maxCharsPerColumn", MaxValueLength.toString)
         val columns = refused(ofAProducer(header.csv(locations: _*).schema.fieldNames.toSeq))
         val csv = header
           .option("enforceSchema", "false")
@@ -1034,6 +1040,43 @@ object FileSourceConnector {
   /** The mark of the order of bytes, as a character of a text that was decoded. */
   private val ByteOrderMark = "\uFEFF"
 
+  /**
+   * The longest value of CSV that a read takes, and the longest name of a header, in units of
+   * UTF-16 as univocity counts them (`maxCharsPerColumn`): about a million characters, half as
+   * many outside the first plane. A file with a longer one cannot be read (ADR-0023).
+   *
+   * Spark reads with no bound by default, and a quote that is not closed takes the rest of its
+   * file into one value, which a file of some hundreds of megabytes ends its process for want
+   * of memory with. univocity reserves the bound once for each parser, whatever the number of
+   * columns: 2 MiB for each file that a task reads (`SparkCsvValueBoundContractSpec`).
+   */
+  val MaxValueLength: Int = 1 << 20
+
+  /** Why a file with a value longer than the bound cannot be read: never what the value holds. */
+  private val TooLong =
+    s"a value of it, or a name of its header, is longer than $MaxValueLength characters " +
+      "(units of UTF-16), the longest that a value of CSV may be: most often a quote that is " +
+      "not closed, which takes the rest of its file into one value"
+
+  /**
+   * Whether a failure of a read is univocity's for a value longer than the bound. It is known by
+   * the name of its class and the words of its message, and univocity is not a dependency of
+   * the engine: `SparkCsvValueBoundContractSpec` pins both. Its message is never repeated: it
+   * has the end of what it parsed, a value of the source.
+   */
+  private[files] def tooLong(failure: Throwable): Boolean =
+    Iterator
+      .iterate(failure)(_.getCause)
+      .takeWhile(_ != null)
+      .take(MaxCauses)
+      .exists { cause =>
+        cause.getClass.getName == TextParsing &&
+        Option(cause.getMessage).exists(_.contains(ExceedsTheBound))
+      }
+
+  private val TextParsing = "com.univocity.parsers.common.TextParsingException"
+  private val ExceedsTheBound = "exceeds the maximum number of characters defined in your parser"
+
   /** How many reads of a file alone it fails at, at most, before it cannot be read (ADR-0023). */
   val AloneReads = 3
 
@@ -1061,7 +1104,10 @@ object FileSourceConnector {
     /** It failed with a failure that the read knows: not one that cannot be read. */
     case object Known extends Alone
 
-    /** It failed at every read, with what the read does not know. */
+    /**
+     * It cannot be read: it failed at every read with what the read does not know, or once with
+     * a value too long.
+     */
     final case class Unreadable(why: String) extends Alone
   }
 
