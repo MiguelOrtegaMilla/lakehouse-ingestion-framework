@@ -245,6 +245,71 @@ final class SparkJsonLinesContractSpec extends AnyFunSuite with Matchers with Lo
       .map(_.getString(0)) shouldBe again
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // The fields of an object inside a record (P8.11, for the typing of Silver)
+  // ---------------------------------------------------------------------------------------------
+
+  // At the first level, two fields that differ only in their case are one column, and the
+  // values of one of them were lost: the connector refuses such a batch (P5.14). Inside an
+  // object, the connector reads the object as text, and these pin that nothing of it is lost
+  // there, and where it would be: in a read of the object as a struct, as the typing of Silver
+  // reads it (P10).
+
+  private val OfCase = """{"id":"1","customer":{"name":"Bea","NAME":"B"}}"""
+  private val Twice = """{"id":"1","customer":{"name":"Bea","name":"B"}}"""
+
+  test("an object read as text is the text it was written as, with each field that it has") {
+    read(file(OfCase + "\n"), "id", "customer") shouldBe
+      Seq(Row("1", """{"name":"Bea","NAME":"B"}""", null))
+    read(file(Twice + "\n"), "id", "customer") shouldBe
+      Seq(Row("1", """{"name":"Bea","name":"B"}""", null))
+  }
+
+  test("read as a struct with one of two names that differ in their case, the other is dropped") {
+    val session = spark
+    import session.implicits._
+    val customer = StructType(Seq(StructField("name", StringType)))
+    val record = StructType(Seq(StructField("id", StringType), StructField("customer", customer)))
+
+    // By the reader of files and by from_json, with nothing set apart and nothing said.
+    spark.read.schema(record).json(s"file:${file(OfCase + "\n")}").collect().toSeq shouldBe
+      Seq(Row("1", Row("Bea")))
+    Seq(OfCase)
+      .toDF("v")
+      .select(from_json(col("v"), record).as("r"))
+      .select("r.*")
+      .collect() shouldBe
+      Array(Row("1", Row("Bea")))
+    // A field written twice keeps its last value.
+    Seq(Twice)
+      .toDF("v")
+      .select(from_json(col("v"), record).as("r"))
+      .select("r.*")
+      .collect() shouldBe
+      Array(Row("1", Row("B")))
+  }
+
+  test("a struct with both names is refused by the reader of files, and read by from_json") {
+    val session = spark
+    import session.implicits._
+    val both = StructType(Seq(StructField("name", StringType), StructField("NAME", StringType)))
+    val record = StructType(Seq(StructField("id", StringType), StructField("customer", both)))
+
+    val refused = the[AnalysisException] thrownBy
+      spark.read.schema(record).json(s"file:${file(OfCase + "\n")}").collect()
+    refused.getCondition shouldBe "COLUMN_ALREADY_EXISTS"
+    Seq(OfCase)
+      .toDF("v")
+      .select(from_json(col("v"), record).as("r"))
+      .select("r.*")
+      .collect() shouldBe
+      Array(Row("1", Row("Bea", "B")))
+    // Inferred as Spark infers it, case aside, the object is refused as well.
+    (the[AnalysisException] thrownBy spark.read
+      .json(s"file:${file(OfCase + "\n")}")
+      .schema).getCondition shouldBe "COLUMN_ALREADY_EXISTS"
+  }
+
   /** The rows of lines read by from_json, with the columns given as text. */
   private def fromJson(lines: Seq[String], columns: Seq[String]): Seq[Row] = {
     val session = spark
