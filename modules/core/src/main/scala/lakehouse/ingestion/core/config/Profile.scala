@@ -260,6 +260,16 @@ object Profile {
      * one zone and read in another, a bound is off by their difference.
      */
     val SessionTimeZone = "spark.sql.session.timeZone"
+
+    /**
+     * Whether a reader with a charset takes any charset of the JDK, and not only the seven of
+     * Spark's own list, which windows-1252 is not on. It is on in every session of the engine,
+     * so that a source of CSV in windows-1252 is read (ADR-0024 §2). The setting is internal to
+     * Spark (`isPublic = false`): it is set here and nowhere else, and
+     * `SparkCsvDialectContractSpec` pins what it does. It is of the session, and lets
+     * `encode()` and `decode()` take any charset of the JDK too, for any SQL of a run.
+     */
+    val JavaCharsets = "spark.sql.legacy.javaCharsets"
   }
 
   /**
@@ -309,6 +319,11 @@ object Profile {
       Some(
         "is set by the engine: the rows that a run wrote are read from the commits of its " +
           "batch, which Delta counts them in only while this is on"
+      )
+    else if (is(EngineSpark.JavaCharsets))
+      Some(
+        "is set by the engine: every session of a run reads the encodings that a source of " +
+          "CSV may say, windows-1252 among them, only while this is on (ADR-0024)"
       )
     else if (is(TransactionRetentionDefault))
       Some(

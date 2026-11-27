@@ -138,6 +138,55 @@ final class ConfigVersionSpec extends AnyFunSuite with Matchers with EitherValue
       FileConnectorConfig.OnUnreadableFile.Skip
   }
 
+  test("a source of CSV that says nothing of its dialect, or says the default, keeps its hash") {
+    val files =
+      """id: sales.returns
+        |connector: { type: file, path: sales/returns, format: csv }
+        |load: { mode: new_files }
+        |targets:
+        |  bronze: { table: bronze/sales/returns }
+        |""".stripMargin
+    def said(dialect: String): String =
+      changed(files, "format: csv }", s"format: csv, csv: { $dialect } }")
+    def stored(text: String): Option[Json] =
+      version(text).content.hcursor
+        .downField("source")
+        .downField("connector")
+        .downField("csv")
+        .focus
+
+    // The hash that it had before connector.csv was a field (P8.9b), as P8.7b pinned it.
+    version(files).hash shouldBe "a3dead5fa224e8a2e18d03c498de9242dec4979014d1a996dd99f127fda5ea42"
+    version(said("")).hash shouldBe version(files).hash
+    version(said("""delimiter: ",", quote: "\"", escape: "\"", encoding: utf-8""")).hash shouldBe
+      version(files).hash
+    stored(said("")) shouldBe None
+
+    // Each field that is not the default changes it, and the dialect is stored whole.
+    Seq("""delimiter: ";"""", """quote: "'"""", """escape: "\\"""", "encoding: windows-1252")
+      .foreach { field =>
+        withClue(field)(version(said(field)).hash should not be version(files).hash)
+      }
+    stored(said("""delimiter: ";", encoding: iso-8859-1""")) shouldBe Some(
+      Json.obj(
+        "delimiter" -> Json.fromString(";"),
+        "quote" -> Json.fromString("\""),
+        "escape" -> Json.fromString("\""),
+        "encoding" -> Json.fromString("ISO-8859-1")
+      )
+    )
+    val readBack = source(
+      version(said("""delimiter: ";"""")).content.hcursor.downField("source").focus.get.noSpaces
+    ).connector.asInstanceOf[FileConnectorConfig]
+    readBack.csv.delimiter shouldBe ';'
+    // Bronze keeps text of CSV, whatever its dialect (ADR-0008): no change that it cannot follow.
+    ConfigVersion.breakingChanges(
+      version(files).content,
+      version(said("""delimiter: ";""""))
+    ) shouldBe
+      empty
+  }
+
   test("two files that say the same have one hash, however they say it") {
     val reordered =
       """targets:

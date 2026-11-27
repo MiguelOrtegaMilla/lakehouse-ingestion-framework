@@ -111,6 +111,20 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
   def more(source: Source, config: C, plan: Json): Option[Json] = None
 
   /**
+   * The plan of a batch that reads again what `plan` read, as the source says to read it now: a
+   * reprocess (ADR-0021 §4), which reads the files of a batch that was committed again, and is
+   * asked for when what they were read as is to be mended. It reads the plan and nothing else,
+   * as `progress` does.
+   *
+   * @return the plan itself, unless the connector says otherwise. A connector whose plan says how
+   *   its source is read (ADR-0024 §3) gives a plan of the same input, read as its configuration
+   *   says now
+   * @throws lakehouse.ingestion.engine.failure.RunFailedException a permanent failure, if the plan is
+   *   not one that this connector reads
+   */
+  def again(source: Source, config: C, plan: Json): Json = plan
+
+  /**
    * Whether a read of this plan gives its source whole, as the source is when it is read, and
    * not as it was when the plan was made: a snapshot of a table, whose plan names the table
    * and nothing of what is in it. It reads the plan and nothing else, as `progress` does.
@@ -176,6 +190,8 @@ abstract class SourceConnector[C <: ConnectorConfig](implicit configClass: Class
     override def more(plan: Json): Option[Json] =
       SourceConnector.this.more(source, config, plan)
 
+    override def again(plan: Json): Json = SourceConnector.this.again(source, config, plan)
+
     override def wholeWhenRead(plan: Json): Boolean =
       SourceConnector.this.wholeWhenRead(source, config, plan)
 
@@ -200,6 +216,9 @@ abstract class BoundSource private[connector] (val source: Source) {
 
   /** @see [[SourceConnector.more]] */
   def more(plan: Json): Option[Json]
+
+  /** @see [[SourceConnector.again]] */
+  def again(plan: Json): Json
 
   /** @see [[SourceConnector.wholeWhenRead]] */
   def wholeWhenRead(plan: Json): Boolean

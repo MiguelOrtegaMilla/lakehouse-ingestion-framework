@@ -146,7 +146,12 @@ final class ConfigurationReferenceSpec extends AnyFunSuite with Matchers with Ei
   private val FullFileSource =
     """id: sales.returns
       |connector:
-      |  { type: file, path: sales/returns, format: csv, pattern: "returns-*.csv", on_unreadable_file: skip }
+      |  type: file
+      |  path: sales/returns
+      |  format: csv
+      |  pattern: "returns-*.csv"
+      |  on_unreadable_file: skip
+      |  csv: { delimiter: ";", quote: "'", escape: "\\", encoding: windows-1252 }
       |load: { mode: new_files }
       |targets:
       |  bronze: { table: bronze/sales/returns }
@@ -200,7 +205,8 @@ final class ConfigurationReferenceSpec extends AnyFunSuite with Matchers with Ei
       "columns.customer_email.silver.mask",
       "targets.silver.partition_by",
       "freshness_sla",
-      "connector.pattern"
+      "connector.pattern",
+      "connector.csv.encoding"
     )
   }
 

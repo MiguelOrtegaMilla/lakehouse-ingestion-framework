@@ -623,7 +623,8 @@ final class IngestionService(
                   "a full load reads the whole table at every run. Nothing was planned, read " +
                   "or written"
               )
-            val batch = leased.plan(record.plan, table, Some(of))
+            // The files of the batch, read as the source says to read them now (ADR-0024 §3).
+            val batch = leased.plan(bound.again(record.plan), table, Some(of))
             log.info(
               s"the run ${start.id} planned ${batch.id}, which reads the files of $earlier again"
             )

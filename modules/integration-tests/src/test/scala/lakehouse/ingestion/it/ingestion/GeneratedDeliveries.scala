@@ -1,6 +1,7 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.Files
+import java.nio.file.attribute.FileTime
 
 import lakehouse.ingestion.core.config.{EngineColumns, Source}
 import lakehouse.ingestion.it.support.FileGenerator.Delivery
@@ -18,7 +19,11 @@ trait GeneratedDeliveries extends IngestionSuite {
 
   /** The files of a delivery, in the directory of a source, complete for a run that starts now. */
   protected def leave(of: Source, delivery: Delivery): Unit =
-    delivery.files.foreach(file => drop(of, file.name, file.text): Unit)
+    delivery.files.foreach { file =>
+      val path = directoryOf(of).resolve(file.name)
+      Files.write(path, delivery.bytesOf(file))
+      Files.setLastModifiedTime(path, FileTime.from(anHourAgo)): Unit
+    }
 
   /** A row, or a record: its file, and its value under each of the columns, if it has one. */
   protected type Record = (String, Seq[Option[String]])
@@ -55,5 +60,5 @@ trait GeneratedDeliveries extends IngestionSuite {
     delivery.files.flatMap(file => file.corrupt.map(text => (batch, file.name, text))).sorted
 
   protected def bytes(delivery: Delivery): Long =
-    delivery.files.map(_.text.getBytes(UTF_8).length.toLong).sum
+    delivery.files.map(file => delivery.bytesOf(file).length.toLong).sum
 }

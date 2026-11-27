@@ -7,7 +7,7 @@ import cats.data.NonEmptyChain
 import cats.syntax.all._
 import io.circe.{ACursor, Json}
 import lakehouse.ingestion.core.StoredForm
-import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, Unwritten}
+import lakehouse.ingestion.core.config.{CsvDialect, FileConnectorConfig, RelativePath, Unwritten}
 
 /**
  * A file as the listing of a directory gives it: its name in the directory, its size in bytes,
@@ -155,21 +155,65 @@ object FileHorizon {
 }
 
 /**
+ * How the files of a plan are read (ADR-0024 §3): their format and, for CSV, their dialect. A
+ * plan says it, and every read of the plan reads so, whatever the configuration of its source
+ * says by then: a plan is replayed exactly.
+ *
+ * @param csv the dialect, for a plan of CSV, and none for any other
+ */
+sealed abstract case class ReadAs private (
+    format: FileConnectorConfig.Format,
+    csv: Option[CsvDialect]
+) {
+
+  /** What it is, for a message. */
+  def describe: String = csv.fold(format.name)(dialect => s"${format.name} (${dialect.describe})")
+}
+
+object ReadAs {
+
+  /** As a source says to read its files now. */
+  def of(config: FileConnectorConfig): ReadAs =
+    new ReadAs(
+      config.format,
+      Option.when(config.format == FileConnectorConfig.Format.Csv)(config.csv)
+    ) {}
+
+  /**
+   * How the files of a plan written before plans said it are read (versions 1 and 2): in the
+   * format of the source, and for CSV in the default dialect, which was the only one then.
+   */
+  def before(format: FileConnectorConfig.Format): ReadAs =
+    new ReadAs(
+      format,
+      Option.when(format == FileConnectorConfig.Format.Csv)(CsvDialect.Default)
+    ) {}
+
+  private[files] def written(
+      format: FileConnectorConfig.Format,
+      csv: Option[CsvDialect]
+  ): ReadAs = new ReadAs(format, csv) {}
+}
+
+/**
  * The plan of a batch of files (ADR-0005 §3): the directory, and the files of it that the batch
  * takes, in the order they are read. It is written down before any of them is read, and a run
- * that replays it reads these files and no other.
+ * that replays it reads these files and no other, as the plan says to read them.
  *
  * It has a file at least: a run with nothing new plans no batch.
  *
  * @param directory relative to the landing root of the profile
  * @param horizon how far the chain of runs that planned it reads, and whether it has more: every
  *   plan that is made has one. A plan of version 1, written before chains, has none, and says
- *   that there is no more
+ *   that there is no more; a plan made again of the files of another has the horizon of that one
+ * @param readAs how its files are read: every plan made since P8.9 says it (version 3). A plan of
+ *   version 1 or 2 does not, and is read as such plans were (`ReadAs.before`)
  */
 final case class FilePlan private (
     directory: RelativePath,
     files: Vector[LandedFile],
-    horizon: Option[FileHorizon]
+    horizon: Option[FileHorizon],
+    readAs: Option[ReadAs]
 ) {
 
   /** The horizon that the next run of the chain plans against, if there is more. */
@@ -180,10 +224,16 @@ final case class FilePlan private (
 
   def bytes: Long = files.map(_.size).sum
 
-  /** As the control plane stores it, in the write-ahead log of batches. */
+  /**
+   * As the control plane stores it, in the write-ahead log of batches: in the form of its
+   * version, which a plan read back keeps.
+   */
   def toJson: Json = Json.fromFields(
     Seq(
-      "version" -> Json.fromInt(horizon.fold(FilePlan.Unchained)(_ => FilePlan.Version)),
+      "version" -> Json.fromInt(
+        if (readAs.nonEmpty) FilePlan.Version
+        else horizon.fold(FilePlan.Unchained)(_ => FilePlan.Chained)
+      ),
       "directory" -> Json.fromString(directory.value),
       "files" -> Json.fromValues(files.map { file =>
         Json.obj(
@@ -197,6 +247,10 @@ final case class FilePlan private (
         "complete_by" -> Json.fromString(chain.completeBy.toString),
         "remaining" -> Json.fromInt(chain.remaining)
       )
+    } ++ readAs.toSeq.flatMap { read =>
+      ("format" -> Json.fromString(read.format.name)) +: read.csv.toSeq.map(dialect =>
+        "csv" -> dialect.toJson
+      )
     }
   )
 }
@@ -206,8 +260,16 @@ object FilePlan {
   /**
    * The form of the JSON. A plan outlives the process that wrote it, by a crash, and may be
    * replayed by another version of the application: one that reads another form refuses it.
+   * Version 3 says how its files are read (P8.9), and may have no horizon: a plan made again of
+   * the files of a plan of version 1, by a reprocess, has none.
    */
-  val Version = 2
+  val Version = 3
+
+  /**
+   * The form of a plan written by a chain of runs (P6.10) before plans said how their files are
+   * read: read, and written again only for a plan that was read in it.
+   */
+  val Chained = 2
 
   /**
    * The form of a plan written before chains of runs (P6.10), with no horizon: read, and
@@ -219,11 +281,12 @@ object FilePlan {
   def apply(
       directory: RelativePath,
       files: Vector[LandedFile],
-      horizon: Option[FileHorizon] = None
+      horizon: Option[FileHorizon] = None,
+      readAs: Option[ReadAs] = None
   ): FilePlan = {
     require(files.nonEmpty, "a plan has a file at least")
     require(files.map(_.name).distinct.size == files.size, "a plan has each name once")
-    new FilePlan(directory, files, horizon)
+    new FilePlan(directory, files, horizon, readAs)
   }
 
   /**
@@ -235,16 +298,29 @@ object FilePlan {
     val top = json.hcursor
     for {
       _ <- top.keys.toRight("is not an object")
-      chained <- StoredForm.whole(top.downField("version")) match {
-        case Some(v) if v == Version => Right(true)
-        case Some(v) if v == Unchained => Right(false)
-        case Some(v) => Left(s"is of version $v, and this application reads versions 1 and 2")
+      version <- StoredForm.whole(top.downField("version")) match {
+        case Some(v) if v == Version || v == Chained || v == Unchained => Right(v)
+        case Some(v) => Left(s"is of version $v, and this application reads versions 1, 2 and 3")
         case None => Left("version is not a whole number")
       }
-      _ <-
-        if (chained)
-          StoredForm.exactly(top, "version", "directory", "files", "complete_by", "remaining")
-        else StoredForm.exactly(top, "version", "directory", "files")
+      format <- if (version == Version) formatOf(top).map(Some(_)) else Right(None)
+      chained = version == Chained || (version == Version &&
+        (top.downField("complete_by").succeeded || top.downField("remaining").succeeded))
+      _ <- StoredForm.exactly(
+        top,
+        Seq("version", "directory", "files") ++
+          (if (chained) Seq("complete_by", "remaining") else Nil) ++
+          format.toSeq.flatMap(f =>
+            "format" +: Option.when(f == FileConnectorConfig.Format.Csv)("csv").toSeq
+          ): _*
+      )
+      csv <- format match {
+        case Some(FileConnectorConfig.Format.Csv) =>
+          CsvDialect
+            .fromJson(top.downField("csv").focus.getOrElse(Json.Null))
+            .bimap(problem => s"csv $problem", Some(_))
+        case _ => Right(None)
+      }
       horizon <-
         if (chained) FileHorizon.fields(top).map { case (at, left) => Some(FileHorizon(at, left)) }
         else Right(None)
@@ -253,10 +329,26 @@ object FilePlan {
       entries <- top.downField("files").values.toRight("files is not a list")
       files <- entries.toVector.zipWithIndex.traverse { case (entry, index) => file(entry, index) }
       plan <- Either
-        .catchOnly[IllegalArgumentException](FilePlan(directory, files, horizon))
+        .catchOnly[IllegalArgumentException](
+          FilePlan(directory, files, horizon, format.map(ReadAs.written(_, csv)))
+        )
         .leftMap(_.getMessage.stripPrefix("requirement failed: "))
     } yield plan
   }
+
+  /** The format of a plan of version 3, as it writes it. */
+  private def formatOf(top: ACursor): Either[String, FileConnectorConfig.Format] =
+    top.downField("format").focus match {
+      case None => Left("has no format")
+      case Some(json) =>
+        json.asString
+          .toRight("format is not text")
+          .flatMap(text =>
+            FileConnectorConfig.Format.All
+              .find(_.name == text)
+              .toRight(s"format $text is not one that this application reads")
+          )
+    }
 
   private def file(entry: Json, index: Int): Either[String, LandedFile] = {
     val at = entry.hcursor
@@ -359,7 +451,12 @@ object FilePlanner {
       if (taken.isEmpty) NothingNew(waiting)
       else
         Planned(
-          FilePlan(config.path, taken, Some(FileHorizon(completeBy, allowed - taken.size))),
+          FilePlan(
+            config.path,
+            taken,
+            Some(FileHorizon(completeBy, allowed - taken.size)),
+            Some(ReadAs.of(config))
+          ),
           waiting,
           complete.size - taken.size
         )

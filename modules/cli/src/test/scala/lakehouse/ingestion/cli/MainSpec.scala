@@ -878,6 +878,7 @@ final class MainSpec
       "org.apache.spark.sql.delta.catalog.DeltaCatalog"
     engine("spark.databricks.delta.history.metricsEnabled") shouldBe "true"
     engine("spark.sql.session.timeZone") shouldBe "UTC"
+    engine("spark.sql.legacy.javaCharsets") shouldBe "true"
     engine(StartupGuard.logStoreKey("file")) shouldBe classOf[PostgresLogStore].getName
     engine(s"spark.hadoop.${CoordinationSettings.User}") shouldBe "ingest_coordination"
     engine(s"spark.hadoop.${CoordinationSettings.PasswordRef}") shouldBe

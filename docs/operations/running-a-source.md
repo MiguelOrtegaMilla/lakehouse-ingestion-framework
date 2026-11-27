@@ -98,6 +98,13 @@ It is a run of its own under the lease of the source, and records who asked (the
 | 64 | The command line is not one: `--reason` and `--batch` are required |
 | 70 | A mistake of the application, which nothing classified: the log has it whole. Alert |
 
+### When the dialect or the encoding of a source of CSV was wrong
+
+A source whose `connector.csv` was wrong has values under the wrong columns, records in the quarantine that were right, or a batch stopped by more of them than it allows (5). Correct the configuration; the next plan reads its files as it says. What was planned or ingested before is read as it was, and is mended so ([ADR-0024](../adr/0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) §3):
+
+- **a batch that is planned** is read as it was planned, by every run, which says so with a warning that names both dialects: give it up (`abandon-batch`), and the next run plans the same files, read as the source says now;
+- **a batch that was committed** is read again with `reprocess`, which reads its files as the source says when it is asked for. Bronze keeps both copies, each with its run.
+
 ### When a source's configuration changed: `reset-state`
 
 A run compares the configuration it is given with the one that the state of its source was last moved with, and refuses a change that what Bronze has cannot follow: another lake, another Bronze table, another watermark column, or another table to read from. When the change is meant, an operator resets the state of the source, and says what happens to its watermark:

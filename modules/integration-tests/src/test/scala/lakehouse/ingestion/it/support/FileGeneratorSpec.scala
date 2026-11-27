@@ -1,5 +1,6 @@
 package lakehouse.ingestion.it.support
 
+import java.nio.charset.Charset
 import java.nio.charset.StandardCharsets.UTF_8
 import java.security.MessageDigest
 
@@ -154,6 +155,42 @@ final class FileGeneratorSpec extends AnyFunSuite with Matchers {
     }
   }
 
+  test("a file of CSV in a dialect of its own is written in it, and holds what it says") {
+    val dialects = Seq(
+      Dialect(';', '"', '\\', Charset.forName("windows-1252")),
+      Dialect('\t', '\'', '\'', Charset.forName("ISO-8859-1")),
+      Dialect('|', '"', '"', UTF_8)
+    )
+    for (dialect <- dialects; seed <- 1L to 10L) withClue(s"$dialect, seed $seed: ") {
+      val delivery = deliver(seed, Format.Csv, Everything, dialect = dialect)
+      delivery.files.foreach { file =>
+        dialect.encoding.newEncoder().canEncode(file.text) shouldBe true
+        if (file.columns.isEmpty) file.text shouldBe ""
+        else {
+          val records = csv(file.text, dialect)
+          records.head shouldBe file.columns
+          val (whole, broken) = records.tail.partition(_.size == file.columns.size)
+          whole.map(values => file.columns.zip(values).toMap) shouldBe file.records
+          broken.map(_.mkString(dialect.delimiter.toString)) shouldBe file.corrupt
+        }
+      }
+    }
+    // Each character of the dialect is in a value of some delivery, and letters beyond ASCII.
+    dialects.foreach { dialect =>
+      val values = (1L to 10L)
+        .flatMap(seed =>
+          deliver(seed, Format.Csv, Everything, dialect = dialect).files.flatMap(_.records)
+        )
+        .flatMap(_.values)
+      Seq(dialect.delimiter, dialect.quote, dialect.escape, '\n', '\u00f1').foreach { c =>
+        withClue(s"$dialect, ${c.toInt}: ")(values.exists(_.contains(c)) shouldBe true)
+      }
+    }
+    // RFC 4180 in UTF-8 is what a delivery is in that says nothing.
+    deliver(1, Format.Csv, Everything, dialect = Dialect.Rfc4180) shouldBe
+      deliver(1, Format.Csv, Everything)
+  }
+
   test("a mix with nothing to repeat, or to put a broken record in, is refused") {
     an[IllegalArgumentException] should be thrownBy Mix(files = 0, repeated = 1)
     an[IllegalArgumentException] should be thrownBy Mix(files = 0, empty = 2, corrupt = 1)
@@ -172,8 +209,8 @@ final class FileGeneratorSpec extends AnyFunSuite with Matchers {
     try Option(mapper.readTree(line)).filter(_.isObject)
     catch { case _: JsonProcessingException => None }
 
-  /** The records of a text of CSV, by RFC 4180 and nothing else: the test's own reader. */
-  private def csv(text: String): Vector[Vector[String]] = {
+  /** The records of a text of CSV, by a dialect and nothing else: the test's own reader. */
+  private def csv(text: String, dialect: Dialect = Dialect.Rfc4180): Vector[Vector[String]] = {
     val records = Vector.newBuilder[Vector[String]]
     var record = Vector.empty[String]
     val value = new StringBuilder
@@ -181,14 +218,20 @@ final class FileGeneratorSpec extends AnyFunSuite with Matchers {
     var i = 0
     while (i < text.length) {
       val c = text.charAt(i)
+      val next = if (i + 1 < text.length) Some(text.charAt(i + 1)) else None
       if (quoted) {
-        if (c == '"' && i + 1 < text.length && text.charAt(i + 1) == '"') { value += '"'; i += 1 }
-        else if (c == '"') quoted = false
+        if (c == dialect.escape && dialect.escape != dialect.quote && next.isDefined) {
+          value += next.get
+          i += 1
+        } else if (c == dialect.quote && dialect.escape == dialect.quote && next.contains(c)) {
+          value += c
+          i += 1
+        } else if (c == dialect.quote) quoted = false
         else value += c
       } else
         c match {
-          case '"' => quoted = true
-          case ',' => record :+= value.result(); value.clear()
+          case dialect.quote => quoted = true
+          case dialect.delimiter => record :+= value.result(); value.clear()
           case '\n' =>
             records += (record :+ value.result())
             record = Vector.empty

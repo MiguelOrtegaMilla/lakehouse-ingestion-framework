@@ -11,15 +11,17 @@ import scala.util.control.NonFatal
 import io.circe.Json
 import lakehouse.ingestion.core.config.{
   ConnectorKind,
+  CsvDialect,
   EngineColumns,
   FileConnector,
   FileConnectorConfig,
+  Profile,
   RelativePath,
   Source
 }
 import lakehouse.ingestion.core.control.Quarantine
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
-import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner, LandedFile}
+import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, FilePlanner, LandedFile, ReadAs}
 import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector.{
   PlanContext,
@@ -49,12 +51,13 @@ import org.slf4j.LoggerFactory
  *    `_rescued_data` is there for what does not fit the columns, which the policy of a
  *    source's schema fills (P9). The columns of CSV are those of the header, which every file
  *    of the batch must have: Spark reads a record by the place of its values, and a file with
- *    other columns would put values under another column's name. The dialect is RFC 4180's:
- *    a value is quoted if it has a comma, a quote or the end of a line in it, a quote inside
- *    it is written twice, and a backslash is a character like any other. A source that writes
- *    another dialect has no way to say so yet (P8). The columns of JSON are those of the
- *    first level of the records of the batch, each under its name as it was written; a value
- *    that is an object or a list is kept as the JSON it was written as.
+ *    other columns would put values under another column's name. The dialect is the plan's
+ *    (below), RFC 4180's in UTF-8 unless the source says its own (`connector.csv`): a value is
+ *    quoted if it has the delimiter, the quote or the end of a line in it, and a quote inside
+ *    it is written twice, or after the escape of the source. Values over several lines are
+ *    always read. The columns of JSON are those of the first level of the records of the
+ *    batch, each under its name as it was written; a value that is an object or a list is kept
+ *    as the JSON it was written as.
  *  - '''JSON is one record to a line''', read as text, and each line read by Jackson as
  *    Spark's reader of files reads a record, each value as it was written (`JsonLines`, P8.8):
  *    a record is one whole object, each field of its first level once, and nothing after it
@@ -75,6 +78,18 @@ import org.slf4j.LoggerFactory
  *  - Every row says the file that it was read from (`_source_file`), as `<directory>/<name>`
  *    under the landing root: where the source left it, which is how `processed_file` records
  *    it.
+ *
+ * '''A plan says how its files are read''' (ADR-0024 §3): their format and, for CSV, the
+ * dialect of the source when it was planned (`ReadAs`). Every read of the plan reads so, the reads
+ * of a file alone among them, whatever the configuration says by then, and the run says so when
+ * the two differ: a plan is replayed exactly, and a batch whose records set apart were written
+ * before its process died is read again as they were. A plan written before plans said it is
+ * read in the format of the source, and for CSV in RFC 4180 and UTF-8, which was then the one
+ * dialect. A reprocess reads the files of a batch as the source says now (`again`).
+ *
+ * '''A charset that Spark refuses is the session's, and permanent''': windows-1252 is read only in a
+ * session that may read any charset of the JDK, which every session of a run is (ADR-0024 §2).
+ * Such a refusal is no file's, and is never taken for a file that cannot be read.
  *
  * '''The names of the columns are the source's, and no value is lost for its name.''' Spark
  * and Delta tell the names of columns apart without their case, and a read that left that to
@@ -215,21 +230,30 @@ final class FileSourceConnector(
       context: ReadContext
   ): ReadResult.Kept = {
     val files = planOf(source, config, plan)
+    val as = readAsOf(source, config, files)
     val before = confirmed(config, "since it was planned")(landing.confirm(config, files))
     // A file that no run may open is never opened, and nor is any other of its plan.
     if (before.refused.nonEmpty)
       throw unreadable(config, before.refused.map { case (file, why) => file -> why.toString })
     val each = files.files.zip(before.paths)
     val read =
-      try readOf(context.spark, config, files.directory, each)
+      try readOf(context.spark, config, as, files.directory, each)
       catch {
         case known: RunFailedException => throw known
-        case NonFatal(failed) => throw alone(config, files, before, each, failed, context)
+        case refused: Exception if charsetRefused(refused) =>
+          throw RunFailedException.permanent(
+            s"Spark refuses to read the files of ${config.path} in ${as.describe}: the session " +
+              s"of the run does not read that encoding (${Profile.EngineSpark.JavaCharsets} is " +
+              "not on), which the engine has every session of a run do (ADR-0024 §2). Nothing " +
+              "was read",
+            refused
+          )
+        case NonFatal(failed) => throw alone(config, as, files, before, each, failed, context)
       }
     afterRead()
     confirmed(config, "while it was read")(landing.confirmAgain(config, files, before))
 
-    if (config.format == FileConnectorConfig.Format.Parquet)
+    if (as.format == FileConnectorConfig.Format.Parquet)
       ReadResult.Kept(read.rows, unparsed = None)
     else
       ReadResult.Kept(
@@ -254,6 +278,30 @@ final class FileSourceConnector(
         lit(null).cast(StringType).as(ReadResult.ErrorDetail)
       )
     read.apart.fold(cannot)(cannot.unionByName(_))
+  }
+
+  /**
+   * How the files of a plan are read: as the plan says, and as the source said when a plan of
+   * before P8.9 was written. A configuration that says otherwise by now is said, and not
+   * followed: a plan is replayed exactly (ADR-0024 §3).
+   */
+  private def readAsOf(source: Source, config: FileConnectorConfig, files: FilePlan): ReadAs = {
+    val as = files.readAs.getOrElse(ReadAs.before(config.format))
+    val now = ReadAs.of(config)
+    if (as != now)
+      log.warn(
+        s"${source.id}: the batch is read as it was planned, as ${as.describe}, and the source " +
+          s"now says ${now.describe}. A plan is read as it was written; to have its files read " +
+          "as the source says now, give the batch up (abandon-batch), and the next plan takes " +
+          "them so"
+      )
+    as
+  }
+
+  /** The same files, read as the source says now: the plan of a reprocess (ADR-0024 §3). */
+  override def again(source: Source, config: FileConnectorConfig, plan: Json): Json = {
+    val files = planOf(source, config, plan)
+    FilePlan(files.directory, files.files, files.horizon, Some(ReadAs.of(config))).toJson
   }
 
   /** The files of a plan are what its commit records: each is taken, and never again. */
@@ -315,6 +363,7 @@ final class FileSourceConnector(
   private def readOf(
       spark: SparkSession,
       config: FileConnectorConfig,
+      as: ReadAs,
       directory: RelativePath,
       each: Vector[(LandedFile, Path)]
   ): Reading = {
@@ -328,9 +377,9 @@ final class FileSourceConnector(
     val sourceFileOf = each.map { case (file, path) =>
       path.toString -> s"${directory.value}/${file.name.value}"
     }.toMap
-    if (config.format == FileConnectorConfig.Format.Json)
+    if (as.format == FileConnectorConfig.Format.Json)
       jsonOf(spark, paths.map(path => s"file:$path"), sourceFileOf)
-    else kept(config, readable(spark, config.format, paths, sourceFileOf))
+    else kept(config, readable(spark, as, paths, sourceFileOf))
   }
 
   /** The rows of a read of CSV or Parquet, kept by Spark apart from the files. */
@@ -403,6 +452,7 @@ final class FileSourceConnector(
    */
   private def alone(
       config: FileConnectorConfig,
+      as: ReadAs,
       files: FilePlan,
       before: Landing.Confirmed,
       each: Vector[(LandedFile, Path)],
@@ -416,7 +466,7 @@ final class FileSourceConnector(
       s"the batch of ${config.path} could not be read (${said(failed)}): each of its " +
         s"${Landing.files(each.size)} is read alone, to find those that cannot be read"
     )
-    val found = readAlone(config, files.directory, each, context)
+    val found = readAlone(config, as, files.directory, each, context)
     confirmed(config, "while its files were read alone")(
       landing.confirmAgain(config, files, before)
     )
@@ -453,6 +503,7 @@ final class FileSourceConnector(
    */
   private def readAlone(
       config: FileConnectorConfig,
+      as: ReadAs,
       directory: RelativePath,
       each: Vector[(LandedFile, Path)],
       context: ReadContext
@@ -464,7 +515,7 @@ final class FileSourceConnector(
       beforeAlone(file.name.value, n)
       val failure =
         try {
-          readOf(context.spark, config, directory, Vector(file -> path))
+          readOf(context.spark, config, as, directory, Vector(file -> path))
           None
         } catch {
           case known: RunFailedException => Some(Left(known))
@@ -538,22 +589,26 @@ final class FileSourceConnector(
    */
   private def readable(
       spark: SparkSession,
-      format: FileConnectorConfig.Format,
+      as: ReadAs,
       paths: Vector[Path],
       sourceFileOf: Map[String, String]
   ): Reading = {
     val locations = paths.map(path => s"file:$path")
 
-    val (read, columns) = format match {
+    val (read, columns) = as.format match {
       case FileConnectorConfig.Format.Csv =>
-        // The dialect is RFC 4180's: a quote inside a quoted value is the quote twice. Spark's
-        // own escape is a backslash, under which such a value keeps every quote it was written
-        // with, and a comma after the doubled quote ends it.
+        // The dialect of the plan, each of its fields given to Spark, its defaults included:
+        // Spark's own escape is a backslash, under which a quote doubled, as RFC 4180 writes
+        // one, is no quote (SparkCsvDialectContractSpec). Values over several lines are always
+        // read: without them a quoted value with the end of a line in it is two records.
+        val dialect = as.csv.getOrElse(CsvDialect.Default)
         val header = everyFile(spark.read)
           .option("header", "true")
           .option("multiLine", "true")
-          .option("quote", CsvQuote)
-          .option("escape", CsvQuote)
+          .option("sep", dialect.delimiter.toString)
+          .option("quote", dialect.quote.toString)
+          .option("escape", dialect.escape.toString)
+          .option("encoding", dialect.encoding.name)
         val columns = refused(header.csv(locations: _*).schema.fieldNames.toSeq)
         val csv = header
           .option("enforceSchema", "false")
@@ -577,7 +632,7 @@ final class FileSourceConnector(
     // column `_metadata` of its own, which a name would find in place of Spark's.
     val file = read.metadataColumn(FileMetadata).getField("file_path")
     val withFile = read.select(col("*"), ofItsFile(sourceFileOf)(file).as(SourceFile))
-    val text = format != FileConnectorConfig.Format.Parquet
+    val text = as.format != FileConnectorConfig.Format.Parquet
     Reading(
       if (text) withFile.withColumn(EngineColumns.RescuedData, lit(null).cast(StringType))
       else withFile,
@@ -635,9 +690,6 @@ object FileSourceConnector {
    * engine's.
    */
   val Unparsed = "_lakehouse_unparsed"
-
-  /** The quote of CSV, which is its own escape (RFC 4180). */
-  private val CsvQuote = "\""
 
   /** What makes Spark read a path as a pattern. */
   private val Globbed = "*?[]{}\\"
@@ -826,6 +878,17 @@ object FileSourceConnector {
     case spark: SparkThrowable if Option(spark.getCondition).contains(HeaderCondition) => true
     case other => otherHeader(other.getCause)
   }
+
+  /** Whether a failure of a read is Spark's refusal of the charset that it was given. */
+  @tailrec
+  private[files] def charsetRefused(e: Throwable): Boolean = e match {
+    case null => false
+    case spark: SparkThrowable if Option(spark.getCondition).contains(CharsetCondition) => true
+    case other => charsetRefused(other.getCause)
+  }
+
+  /** The condition of Spark's error for a charset that its reader does not take. */
+  private val CharsetCondition = "INVALID_PARAMETER_VALUE.CHARSET"
 
   /**
    * The condition of Spark's error for a header of CSV that is not the schema's

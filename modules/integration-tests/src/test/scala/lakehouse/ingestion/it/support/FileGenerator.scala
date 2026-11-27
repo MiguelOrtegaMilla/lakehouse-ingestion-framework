@@ -1,5 +1,7 @@
 package lakehouse.ingestion.it.support
 
+import java.nio.charset.Charset
+import java.nio.charset.StandardCharsets.UTF_8
 import java.time.Instant
 import java.util.Locale
 
@@ -27,9 +29,9 @@ import io.circe.{Json, JsonNumber}
  * and not with what it reads back from the lake.
  *
  * Values are as a source has them: names with commas, quotes and letters beyond ASCII, a note
- * of two lines. A file of CSV is written as RFC 4180 has it, which is the dialect that the
- * engine reads: a value is quoted if it must be, with its quotes doubled. No value is empty,
- * which CSV cannot tell from no value at all.
+ * of two lines. A file of CSV is written as RFC 4180 has it, in UTF-8, unless the delivery is in
+ * a dialect of its own (`Dialect`): a value is quoted if it must be, with its quotes doubled, or
+ * after the escape of the dialect. No value is empty, which CSV cannot tell from no value at all.
  */
 object FileGenerator {
 
@@ -37,6 +39,25 @@ object FileGenerator {
   object Format {
     case object Csv extends Format("csv")
     case object Json extends Format("json")
+  }
+
+  /**
+   * How the files of CSV of a delivery are written (ADR-0024): what separates the values, what a
+   * value is quoted with, what a quote or the escape inside a quoted value is written after, and
+   * the encoding of the bytes. A delivery in a dialect of its own has values with each of its
+   * characters in them, and only values that its encoding can write.
+   */
+  final case class Dialect(
+      delimiter: Char = ',',
+      quote: Char = '"',
+      escape: Char = '"',
+      encoding: Charset = UTF_8
+  )
+
+  object Dialect {
+
+    /** RFC 4180 in UTF-8: what a delivery is written in unless it says otherwise. */
+    val Rfc4180: Dialect = Dialect()
   }
 
   /** The columns of a delivery: every file has them, but those that lack one. */
@@ -83,7 +104,7 @@ object FileGenerator {
   /**
    * A file, and what is in it.
    *
-   * @param text what the file holds, which is written as UTF-8
+   * @param text what the file holds, which is written in the encoding of its delivery
    * @param columns the columns of its records; none, for a file of no bytes
    * @param records the records that parse, each a value for every column of the file, in the
    *   order they are written
@@ -98,7 +119,14 @@ object FileGenerator {
       kind: Kind
   )
 
-  final case class Delivery(format: Format, files: Vector[Generated]) {
+  final case class Delivery(
+      format: Format,
+      files: Vector[Generated],
+      dialect: Dialect = Dialect.Rfc4180
+  ) {
+
+    /** The bytes of a file, as it is left in a landing zone. */
+    def bytesOf(file: Generated): Array[Byte] = file.text.getBytes(dialect.encoding)
 
     /** Every column of a file of the delivery, in the order they first appear. */
     def columns: Seq[String] = files.flatMap(_.columns).distinct
@@ -115,9 +143,19 @@ object FileGenerator {
    *
    * @param number which delivery of its producer it is, from 1: the names of the files and the
    *   ids of the records of two deliveries of one seed are apart
+   * @param dialect how its files of CSV are written: RFC 4180 in UTF-8 unless it says otherwise,
+   *   which gives the same files as before dialects, byte for byte
    */
-  def deliver(seed: Long, format: Format, mix: Mix, number: Int = 1): Delivery = {
+  def deliver(
+      seed: Long,
+      format: Format,
+      mix: Mix,
+      number: Int = 1,
+      dialect: Dialect = Dialect.Rfc4180
+  ): Delivery = {
     require(number >= 1 && number <= 99, "a delivery from 1 to 99")
+    require(format == Format.Csv || dialect == Dialect.Rfc4180, "a dialect is of CSV")
+    val values = new Values(dialect)
     // The number is spread over every bit of the seed (by the constant of the golden ratio), so
     // that the deliveries of one seed, and the first deliveries of seeds next to each other,
     // have nothing in common.
@@ -148,7 +186,7 @@ object FileGenerator {
         // The seed decides for the first, and the next is the other kind: two have both.
         headerOnly = !headerOnly
         val header = format == Format.Csv && headerOnly
-        val text = if (header) csvLine(Columns) + "\n" else ""
+        val text = if (header) csvLine(dialect, Columns) + "\n" else ""
         Some(
           Generated(
             name(at),
@@ -172,6 +210,8 @@ object FileGenerator {
           written(
             random,
             format,
+            dialect,
+            values,
             name(at),
             columns,
             kind,
@@ -188,13 +228,15 @@ object FileGenerator {
         val original = repeatable(random.nextInt(repeatable.size))
         original.copy(name = name(at, "-again"), kind = Kind.Again(original.name))
     }
-    Delivery(format, files)
+    Delivery(format, files, dialect)
   }
 
   /** A file with records: those that parse, and among them, wherever, those that do not. */
   private def written(
       random: java.util.Random,
       format: Format,
+      dialect: Dialect,
+      values: Values,
       name: String,
       columns: Seq[String],
       kind: Kind,
@@ -207,15 +249,17 @@ object FileGenerator {
       random,
       Vector.fill(parsed)(true) ++ Vector.fill(corrupt)(false)
     ).map { parses =>
-      val record = columns.map(column => column -> value(random, column, ids)).toMap
+      val record = columns.map(column => column -> values.of(random, column, ids)).toMap
       if (parses) Right(record)
       else
         Left(format match {
           // One value more than the header, or two alone: never a quote, which the parser
           // would follow to the end of the file.
           case Format.Csv =>
-            if (random.nextBoolean()) (columns.map(_ => word(random)) :+ "unexpected").mkString(",")
-            else s"${record("id")},${word(random)}"
+            val delimiter = dialect.delimiter.toString
+            if (random.nextBoolean())
+              (columns.map(_ => word(random)) :+ "unexpected").mkString(delimiter)
+            else s"${record("id")}$delimiter${word(random)}"
           // Cut short, anywhere after its first character: no such line is JSON.
           case Format.Json =>
             val whole = jsonLine(columns, record)
@@ -224,7 +268,9 @@ object FileGenerator {
     }
     val text = format match {
       case Format.Csv =>
-        (csvLine(columns) +: lines.map(_.fold(identity, r => csvLine(columns.map(r)))))
+        (csvLine(dialect, columns) +: lines.map(
+          _.fold(identity, r => csvLine(dialect, columns.map(r)))
+        ))
           .mkString("", "\n", "\n")
       case Format.Json =>
         lines.map(_.fold(identity, jsonLine(columns, _))).mkString("", "\n", "\n")
@@ -259,30 +305,68 @@ object FileGenerator {
   private val Channels = Vector("web", "store", "phone")
   private val Epoch = Instant.parse("2026-01-01T00:00:00Z")
 
-  private def value(random: java.util.Random, column: String, ids: Iterator[String]): String = {
-    def oneOf(values: Vector[String]): String = values(random.nextInt(values.size))
-    column match {
-      case "id" => ids.next()
-      case "customer" => oneOf(Customers)
-      case "amount" => "%d.%02d".formatLocal(Locale.ROOT, random.nextInt(5000), random.nextInt(100))
-      case "placed_at" => Epoch.plusSeconds(random.nextInt(300 * 86400).toLong).toString
-      case "note" => oneOf(Notes)
-      case Added => oneOf(Channels)
-      case other => throw new IllegalArgumentException(s"no column $other")
+  /**
+   * The values that a delivery takes: those above for RFC 4180 in UTF-8, as before dialects;
+   * for a dialect of its own, those that its encoding can write, and some with each of the
+   * characters of the dialect, its own letters and the euro among them.
+   */
+  final private class Values(dialect: Dialect) {
+
+    private def ofTheDialect(more: Vector[String]): Vector[String] => Vector[String] =
+      default =>
+        if (dialect == Dialect.Rfc4180) default
+        else (default ++ more).filter(dialect.encoding.newEncoder().canEncode(_))
+
+    private val customers = ofTheDialect(
+      Vector(
+        s"Pe\u00f1a${dialect.delimiter} Hijos",
+        s"${dialect.quote}La Llave${dialect.quote} S.A.",
+        s"C:${dialect.escape}temp | O'Brien",
+        "Caf\u00e9 \u201cEl Rinc\u00f3n\u201d"
+      )
+    )(Customers)
+    private val notes = ofTheDialect(
+      Vector("10 \u20ac, then\nmore", s"tab\there${dialect.escape}${dialect.quote}", "\u2014")
+    )(Notes)
+
+    def of(random: java.util.Random, column: String, ids: Iterator[String]): String = {
+      def oneOf(values: Vector[String]): String = values(random.nextInt(values.size))
+      column match {
+        case "id" => ids.next()
+        case "customer" => oneOf(customers)
+        case "amount" =>
+          "%d.%02d".formatLocal(Locale.ROOT, random.nextInt(5000), random.nextInt(100))
+        case "placed_at" => Epoch.plusSeconds(random.nextInt(300 * 86400).toLong).toString
+        case "note" => oneOf(notes)
+        case Added => oneOf(Channels)
+        case other => throw new IllegalArgumentException(s"no column $other")
+      }
     }
   }
 
   private def word(random: java.util.Random): String =
     Vector.fill(3 + random.nextInt(5))(('a' + random.nextInt(26)).toChar).mkString
 
-  /** A record of CSV as RFC 4180 has it: a value is quoted if it must be, with its quotes doubled. */
-  private def csvLine(values: Seq[String]): String =
+  /**
+   * A record of CSV in a dialect: a value is quoted if it has the delimiter, the quote, the
+   * escape or the end of a line in it, and inside it the escape and the quote are written after
+   * the escape. Under RFC 4180, whose escape is the quote, that is the quote twice.
+   */
+  private def csvLine(dialect: Dialect, values: Seq[String]): String = {
+    val quote = dialect.quote.toString
+    val escape = dialect.escape.toString
+    val special = Set(dialect.delimiter, dialect.quote, dialect.escape, '\r', '\n')
     values
       .map { value =>
-        if (value.exists(",\"\r\n".contains(_))) "\"" + value.replace("\"", "\"\"") + "\""
-        else value
+        if (value.exists(special)) {
+          val escaped =
+            if (dialect.escape == dialect.quote) value.replace(quote, quote + quote)
+            else value.replace(escape, escape + escape).replace(quote, escape + quote)
+          quote + escaped + quote
+        } else value
       }
-      .mkString(",")
+      .mkString(dialect.delimiter.toString)
+  }
 
   /** One object to a line; the amount is a number, with the digits it was given. */
   private def jsonLine(columns: Seq[String], record: Map[String, String]): String =
