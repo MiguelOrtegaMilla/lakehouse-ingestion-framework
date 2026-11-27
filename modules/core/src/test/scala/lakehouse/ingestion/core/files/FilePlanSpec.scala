@@ -6,9 +6,9 @@ import scala.concurrent.duration._
 import scala.util.Random
 
 import io.circe.Json
-import lakehouse.ingestion.core.config.{FileConnectorConfig, RelativePath, SafeYaml}
+import lakehouse.ingestion.core.config.{CsvDialect, FileConnectorConfig, RelativePath, SafeYaml}
 import lakehouse.ingestion.core.files.FilePlanner.{NothingNew, Planned}
-import org.scalatest.EitherValues
+import org.scalatest.{EitherValues, OptionValues}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -16,7 +16,7 @@ import org.scalatest.matchers.should.Matchers
  * The plan of a batch of files: which files a run takes, from what a directory lists, what was
  * processed and the time, and the plan as it is written down and read back (ADR-0005 §3).
  */
-final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
+final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues with OptionValues {
 
   private val Now = Instant.parse("2026-11-18T12:00:00Z")
   private val Directory = RelativePath.parse("sales/returns").value
@@ -332,8 +332,10 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
     def refusal(json: Json): String = FilePlan.fromJson(json).left.value
 
     refusal(Json.fromString("a plan")) shouldBe "is not an object"
-    refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(3)))) shouldBe
-      "is of version 3, and this application reads versions 1 and 2"
+    refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(4)))) shouldBe
+      "is of version 4, and this application reads versions 1, 2 and 3"
+    // Of version 3 without what a plan of version 3 has.
+    refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(3)))) shouldBe "has no format"
     // Of version 2 without what a plan of version 2 has.
     refusal(Written.toJson.mapObject(_.add("version", Json.fromInt(2)))) shouldBe
       "has no complete_by, has no remaining"
@@ -409,6 +411,103 @@ final class FilePlanSpec extends AnyFunSuite with Matchers with EitherValues {
       "complete_by is not written as a moment is, in UTC"
     refusal(changed("complete_by", Json.fromString("2026-11-18T11:59:00.000Z"))) shouldBe
       "complete_by is not written as a moment is, in UTC"
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // How the files of a plan are read (P8.9, ADR-0024 §3)
+  // ---------------------------------------------------------------------------------------------
+
+  private val Semicolons: CsvDialect = CsvDialect
+    .fromJson(
+      Json.obj(
+        "delimiter" -> Json.fromString(";"),
+        "quote" -> Json.fromString("'"),
+        "escape" -> Json.fromString("\\"),
+        "encoding" -> Json.fromString("windows-1252")
+      )
+    )
+    .value
+
+  private def withDialect(dialect: CsvDialect, format: FileConnectorConfig.Format) =
+    config().copy(format = format, csv = dialect)
+
+  private val ReadInItsDialect =
+    Chained.copy(readAs = Some(ReadAs.of(withDialect(Semicolons, FileConnectorConfig.Format.Csv))))
+
+  test("a plan of version 3 says how its files are read, and is read back as itself") {
+    ReadInItsDialect.toJson.noSpaces shouldBe
+      """{"version":3,"directory":"sales/returns","files":[""" +
+      """{"name":"returns 1.csv","size":0,"modified_at":"2026-11-18T10:00:00Z"},""" +
+      """{"name":"devoluciones-año.csv","size":123456789012,"modified_at":"2026-11-18T10:00:00.123Z"}],""" +
+      """"complete_by":"2026-11-18T11:59:00Z","remaining":3,"format":"csv",""" +
+      """"csv":{"delimiter":";","quote":"'","escape":"\\","encoding":"windows-1252"}}"""
+    FilePlan.fromJson(SafeYaml.parse(ReadInItsDialect.toJson.noSpaces).value).value shouldBe
+      ReadInItsDialect
+
+    // The default dialect is written whole: a plan does not depend on what a default is.
+    val default = Chained.copy(readAs = Some(ReadAs.of(config())))
+    default.toJson.hcursor.downField("csv").focus shouldBe Some(CsvDialect.Default.toJson)
+    FilePlan.fromJson(default.toJson).value shouldBe default
+
+    // A plan of JSON or of Parquet has a format and no dialect.
+    Seq(FileConnectorConfig.Format.Json, FileConnectorConfig.Format.Parquet).foreach { format =>
+      val other = Chained.copy(readAs = Some(ReadAs.of(withDialect(CsvDialect.Default, format))))
+      other.readAs.value.csv shouldBe None
+      other.toJson.hcursor.keys.value.toSet should not contain "csv"
+      other.toJson.hcursor.get[String]("format").value shouldBe format.name
+      FilePlan.fromJson(other.toJson).value shouldBe other
+    }
+
+    // A plan made again of the files of a plan of version 1, which has no horizon.
+    val again = Written.copy(readAs = Some(ReadAs.of(config())))
+    again.toJson.hcursor.get[Int]("version").value shouldBe 3
+    FilePlan.fromJson(again.toJson).value shouldBe again
+  }
+
+  test("the planner writes how the files are read, as the source says to read them now") {
+    val listing = Seq(listed("a.csv"))
+    val ownDialect = withDialect(Semicolons, FileConnectorConfig.Format.Csv)
+    planned(plan(listing, under = ownDialect)).plan.readAs shouldBe Some(ReadAs.of(ownDialect))
+    planned(plan(listing)).plan.readAs.value.csv shouldBe Some(CsvDialect.Default)
+    val json = withDialect(CsvDialect.Default, FileConnectorConfig.Format.Json)
+    planned(plan(listing, under = json)).plan.readAs.value shouldBe ReadAs.of(json)
+  }
+
+  test("a plan of version 1 or 2 says nothing of how its files are read, and is read as before") {
+    FilePlan.fromJson(Written.toJson).value.readAs shouldBe None
+    FilePlan.fromJson(Chained.toJson).value.readAs shouldBe None
+    // As the source said then: its format, and for CSV the one dialect there was.
+    ReadAs.before(FileConnectorConfig.Format.Csv) shouldBe ReadAs.of(config())
+    ReadAs.before(FileConnectorConfig.Format.Json).csv shouldBe None
+  }
+
+  test("a plan of version 3 that is not one this application wrote is refused, and says why") {
+    def refusal(json: Json): String = FilePlan.fromJson(json).left.value
+    val written = ReadInItsDialect.toJson
+    def changed(field: String, value: Json): Json = written.mapObject(_.add(field, value))
+    def dialect(field: String, value: Json): Json =
+      changed("csv", Semicolons.toJson.mapObject(_.add(field, value)))
+
+    refusal(written.mapObject(_.remove("format"))) shouldBe "has no format"
+    refusal(changed("format", Json.fromString("xml"))) shouldBe
+      "format xml is not one that this application reads"
+    refusal(changed("format", Json.fromInt(1))) shouldBe "format is not text"
+    refusal(written.mapObject(_.remove("csv"))) shouldBe "has no csv"
+    refusal(changed("format", Json.fromString("json"))) shouldBe "has a field csv"
+    refusal(written.mapObject(_.remove("remaining"))) shouldBe "has no remaining"
+    refusal(changed("csv", Json.fromString(";"))) shouldBe "csv is not an object"
+    refusal(changed("csv", Semicolons.toJson.mapObject(_.remove("escape")))) shouldBe
+      "csv has no escape"
+    refusal(dialect("extra", Json.True)) shouldBe "csv has a field extra"
+    // A dialect that a configuration would refuse is refused in a plan.
+    refusal(dialect("encoding", Json.fromString("UTF-16"))) should startWith(
+      "csv encoding is not an encoding that a source may say"
+    )
+    refusal(dialect("delimiter", Json.fromString("'"))) should startWith(
+      "csv delimiter is the quote as well"
+    )
+    refusal(dialect("quote", Json.fromString("\n"))) shouldBe
+      "csv quote is U+000A LINE FEED (LF): the end of a line ends a record"
   }
 
   test("the horizon of a chain is written in one form, and read back as itself or refused") {

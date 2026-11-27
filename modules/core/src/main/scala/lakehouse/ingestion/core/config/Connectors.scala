@@ -190,6 +190,8 @@ object JdbcConnector extends ConnectorKind {
  *   batch, and is written down whole before anything is read (ADR-0005 §3)
  * @param onUnreadableFile what a batch with a file that cannot be read comes to: its run fails,
  *   naming the file, or the file is skipped and recorded (ADR-0023)
+ * @param csv how the files are written, for a source of CSV: the default, RFC 4180 in UTF-8, for
+ *   a source that says nothing of it, and for every source of another format (ADR-0024 §1)
  */
 final case class FileConnectorConfig(
     path: RelativePath,
@@ -198,7 +200,8 @@ final case class FileConnectorConfig(
     minFileAge: FiniteDuration = FileConnectorConfig.DefaultMinFileAge,
     maxFilesPerBatch: Int = FileConnectorConfig.DefaultMaxFilesPerBatch,
     onUnreadableFile: FileConnectorConfig.OnUnreadableFile =
-      FileConnectorConfig.OnUnreadableFile.Fail
+      FileConnectorConfig.OnUnreadableFile.Fail,
+    csv: CsvDialect = CsvDialect.Default
 ) extends ConnectorConfig {
 
   override def kind: String = FileConnector.name
@@ -216,7 +219,8 @@ final case class FileConnectorConfig(
   /**
    * `on_unreadable_file` is there when it is `skip`, and only then (ADR-0023 §1): `fail` is what
    * every source did before the field, and a source that says it, or says nothing, keeps the
-   * hash that it had.
+   * hash that it had. `csv` is there, with its four fields, when the dialect is not the default,
+   * and only then, for the same reason (ADR-0024 §1).
    */
   override def canonical: Json = Json.fromFields(
     Seq(
@@ -227,10 +231,13 @@ final case class FileConnectorConfig(
       "max_files_per_batch" -> Json.fromInt(maxFilesPerBatch)
     ) ++ Option.when(onUnreadableFile != FileConnectorConfig.OnUnreadableFile.Fail)(
       FileConnector.OnUnreadableFile -> Json.fromString(onUnreadableFile.name)
-    )
+    ) ++ Option.when(!csv.isDefault)(FileConnector.Csv -> csv.toJson)
   )
 
-  /** The directory and the names. How soon a file is taken, and how many at once, are not. */
+  /**
+   * The directory and the names. How soon a file is taken, and how many at once, are not; nor is
+   * the dialect, which is how the same files are read (ADR-0024 §1).
+   */
   override def origin: Seq[String] = Seq("path", "pattern")
 
   /**
@@ -355,6 +362,9 @@ object FileConnector extends ConnectorKind {
   /** The field of what a batch with a file that cannot be read comes to. */
   val OnUnreadableFile = "on_unreadable_file"
 
+  /** The field of how the files of a source of CSV are written (ADR-0024 §1). */
+  val Csv = "csv"
+
   override def read(section: Obj): Result[ConnectorConfig] =
     (
       section.required("path")(_.text(RelativePath.parse)),
@@ -371,6 +381,27 @@ object FileConnector extends ConnectorKind {
         FileConnectorConfig.OnUnreadableFile.Fail: FileConnectorConfig.OnUnreadableFile
       )(
         _.oneOf(FileConnectorConfig.OnUnreadableFile.All.map(p => p.name -> p): _*)
-      )
-    ).mapN(FileConnectorConfig.apply)
+      ),
+      section.optional(Csv)(_.obj(CsvDialect.read))
+    ).tupled.andThen { case (path, format, pattern, minFileAge, maxFiles, onUnreadable, csv) =>
+      csv match {
+        case Some(_) if format != FileConnectorConfig.Format.Csv =>
+          Read.invalid(
+            section.path(Csv),
+            s"is how a source of CSV writes its files, and the format is ${format.name}"
+          )
+        case _ =>
+          Read.valid(
+            FileConnectorConfig(
+              path,
+              format,
+              pattern,
+              minFileAge,
+              maxFiles,
+              onUnreadable,
+              csv.getOrElse(CsvDialect.Default)
+            )
+          )
+      }
+    }
 }

@@ -1,5 +1,7 @@
 package lakehouse.ingestion.it.ingestion
 
+import java.nio.charset.Charset
+
 import lakehouse.ingestion.core.config.{EngineColumns, Source}
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.it.support.FileGenerator._
@@ -88,6 +90,28 @@ final class GeneratedFilesSpec extends AnyFunSuite with Matchers with GeneratedD
     quarantinedOf(orders) shouldBe (setApart(1, first) ++ setApart(2, second)).sorted
     launch(orders) shouldBe a[Outcome.NothingNew]
     assertLedger(orders)
+  }
+
+  test("CSV in a dialect of its own: a delivery is in Bronze and in the quarantine as written") {
+    Seq(
+      Dialect(';', '"', '\\', Charset.forName("windows-1252")) ->
+        """delimiter: ";", escape: "\\", encoding: windows-1252""",
+      Dialect('\t', '\'', '\'', Charset.forName("ISO-8859-1")) ->
+        """delimiter: "\t", quote: "'", escape: "'", encoding: ISO-8859-1"""
+    ).foreach { case (dialect, said) =>
+      withClue(s"$dialect: ") {
+        val orders = fileSource(options = s", csv: { $said }", rejected = Some("0.5"))
+        val delivery =
+          deliver(41, Format.Csv, Everything.copy(added = 0, missing = 0), dialect = dialect)
+        leave(orders, delivery)
+
+        take(orders, delivery)
+
+        written(orders, Columns) shouldBe expected(Columns, delivery)
+        quarantinedOf(orders) shouldBe setApart(1, delivery)
+        assertLedger(orders)
+      }
+    }
   }
 
   test("a file sent twice is in Bronze twice, each time under its own name") {

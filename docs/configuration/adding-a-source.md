@@ -26,6 +26,21 @@ targets:
   bronze: { table: bronze/shop/returns }   # under the lake of the profile
 ```
 
+Files that a spreadsheet saves as "CSV" in Spain, separated by `;` and in `windows-1252` ([the dialect of a source of CSV](reference.md#the-file-connector)):
+
+<!-- valid: source -->
+```yaml
+id: shop.prices
+connector:
+  type: file
+  path: shop/prices
+  format: csv
+  csv: { delimiter: ";", encoding: windows-1252 }
+load: { mode: new_files }
+targets:
+  bronze: { table: bronze/shop/prices }
+```
+
 A table of a database, loaded by what changed, and merged into Silver:
 
 <!-- valid: source -->

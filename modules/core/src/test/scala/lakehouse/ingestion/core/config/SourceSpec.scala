@@ -692,6 +692,131 @@ final class SourceSpec extends AnyFunSuite with Matchers with EitherValues {
     )
   }
 
+  test(
+    "a source of CSV says its dialect and its encoding, and each field left out is its default"
+  ) {
+    fileConnector("min_file_age: 5m").value.csv shouldBe CsvDialect.Default
+    fileConnector("csv: {}").value.csv shouldBe CsvDialect.Default
+    fileConnector(
+      """csv: { delimiter: ",", quote: "\"", escape: "\"", encoding: UTF-8 }"""
+    ).value.csv shouldBe CsvDialect.Default
+
+    val own = fileConnector(
+      """csv: { delimiter: ";", quote: "'", escape: "\\", encoding: windows-1252 }"""
+    ).value.csv
+    (own.delimiter, own.quote, own.escape, own.encoding) shouldBe
+      ((';', '\'', '\\', CsvDialect.Encoding.Windows1252))
+    val tab = fileConnector("""csv: { delimiter: "\t" }""").value.csv
+    (tab.delimiter, tab.quote, tab.escape, tab.encoding) shouldBe
+      (('\t', '"', '"', CsvDialect.Encoding.Utf8))
+    // A character of a control, or of two bytes of UTF-8, is one character.
+    fileConnector("""csv: { delimiter: "\x01" }""").value.csv.delimiter shouldBe '\u0001'
+    fileConnector("""csv: { delimiter: "§" }""").value.csv.delimiter shouldBe '§'
+    // The quote may be the escape, whichever it is.
+    fileConnector("""csv: { quote: "'", escape: "'" }""").value.csv.escape shouldBe '\''
+    // An encoding of the list, whatever its case, is that encoding.
+    fileConnector("csv: { encoding: iso-8859-1 }").value.csv.encoding shouldBe
+      CsvDialect.Encoding.Iso88591
+    fileConnector("csv: { encoding: WINDOWS-1252 }").value.csv.encoding shouldBe
+      CsvDialect.Encoding.Windows1252
+  }
+
+  test("each character of a dialect is one that Spark's parser takes") {
+    def csvErrors(fields: String): Seq[String] = fileErrors(s"csv: { $fields }")
+    val delimiter = s"$File: connector.csv.delimiter"
+
+    csvErrors("delimiter: \"\"") shouldBe Seq(s"$delimiter is empty: it is one character")
+    csvErrors("delimiter: ';;'") shouldBe Seq(s"$delimiter is 2 characters, and is one")
+    // `\t` between single quotes is a backslash and a t.
+    csvErrors("""delimiter: '\t'""") shouldBe Seq(
+      s"$delimiter is 2 characters, and is one: a character written with a backslash, as \\t " +
+        "for a tab, is written between double quotes in YAML (\"\\t\"), and between single " +
+        "quotes it is the backslash and what follows it"
+    )
+    csvErrors("""delimiter: "\n"""") shouldBe
+      Seq(s"$delimiter is U+000A LINE FEED (LF): the end of a line ends a record")
+    csvErrors("""escape: "\r"""") shouldBe Seq(
+      s"$File: connector.csv.escape is U+000D CARRIAGE RETURN (CR): the end of a line ends a record"
+    )
+    csvErrors("""quote: "\0"""") shouldBe Seq(
+      s"$File: connector.csv.quote is U+0000 NULL, which Spark's parser takes for no " +
+        "character: as the quote, it turns quoting off"
+    )
+    csvErrors("delimiter: \"\uD83D\uDE00\"") shouldBe Seq(
+      s"$delimiter is U+1F600 GRINNING FACE, which is outside the basic plane: Spark's parser " +
+        "takes a character of 16 bits"
+    )
+    csvErrors("delimiter: 5") shouldBe Seq(s"$delimiter must be text, and is a number")
+  }
+
+  test("the delimiter of a dialect is neither its quote nor its escape, and each can be written") {
+    def csvErrors(fields: String): Seq[String] = fileErrors(s"csv: { $fields }")
+    val delimiter = s"$File: connector.csv.delimiter"
+
+    csvErrors("""delimiter: "\""""") shouldBe Seq(
+      s"$delimiter is the quote as well ('\"' (U+0022)): a value that starts with it could " +
+        "not be told from one that is quoted"
+    )
+    csvErrors("""delimiter: "\\", escape: "\\"""") shouldBe Seq(
+      s"$delimiter is the escape as well ('\\' (U+005C)): what it is written before could " +
+        "not be told from the start of another value"
+    )
+    // A character that the encoding cannot write is in no file of the source.
+    csvErrors("""delimiter: "€", encoding: ISO-8859-1""") shouldBe Seq(
+      s"$delimiter is U+20AC EURO SIGN, which ISO-8859-1, the encoding of the source, cannot " +
+        "write: no file of it has one"
+    )
+    fileConnector(
+      """csv: { delimiter: "€", encoding: windows-1252 }"""
+    ).value.csv.delimiter shouldBe
+      '€'
+    // Every mistake of the section is said at once.
+    csvErrors("""delimiter: "", quote: "\n", encoding: EBCDIC""") should have size 3
+  }
+
+  test("an encoding is one of three, by its own name: another name of one of them is refused") {
+    def encodingErrors(name: String): Seq[String] = fileErrors(s"csv: { encoding: $name }")
+    val list = "is not an encoding that a source may say: one of UTF-8, ISO-8859-1, windows-1252"
+    encodingErrors("latin1") shouldBe Seq(
+      s"$File: connector.csv.encoding $list. 'latin1' is another name of ISO-8859-1: write that"
+    )
+    encodingErrors("utf8") shouldBe
+      Seq(s"$File: connector.csv.encoding $list. 'utf8' is another name of UTF-8: write that")
+    encodingErrors("cp1252") shouldBe Seq(
+      s"$File: connector.csv.encoding $list. 'cp1252' is another name of windows-1252: write that"
+    )
+    // UTF-16 is not on the list (ADR-0024 §2), nor is what the JVM has beside it.
+    encodingErrors("UTF-16") shouldBe Seq(s"$File: connector.csv.encoding $list")
+    encodingErrors("ISO-8859-15") shouldBe Seq(s"$File: connector.csv.encoding $list")
+  }
+
+  test("connector.csv has four fields, and is for a source of CSV alone") {
+    val misspelt = fileErrors("""csv: { delimter: ";" }""")
+    misspelt shouldBe Seq(
+      s"$File: connector.csv.delimter is not a field that is known here: did you mean 'delimiter'?"
+    )
+    fileErrors("csv: { multiLine: true }").head should startWith(
+      s"$File: connector.csv.multiLine is not a field that is known here"
+    )
+    fileErrors("csv: ;") shouldBe Seq(
+      s"$File: connector.csv must be a mapping of fields, and is text"
+    )
+    Seq("json", "parquet").foreach { format =>
+      withClue(format)(
+        errorsOf(
+          Files_.replace("format: csv }", s"""format: $format, csv: { delimiter: ";" } }""")
+        ) shouldBe Seq(
+          s"$File: connector.csv is how a source of CSV writes its files, and the format is $format"
+        )
+      )
+    }
+    // An empty one is not one either, with another format.
+    errorsOf(Files_.replace("format: csv }", "format: json, csv: {} }")) should have size 1
+    // A table of a database has no dialect.
+    val jdbc = Jdbc.replace("  table: public.orders\n", "  table: public.orders\n  csv: {}\n")
+    errorsOf(jdbc).head should startWith(s"$File: connector.csv is not a field that is known here")
+  }
+
   test("a source of JSON is read a record to a line: it has no field for records over several") {
     // Spark's own option, and the name that a field of this model would have: neither is one.
     Seq("multiLine", "multi_line").foreach { field =>

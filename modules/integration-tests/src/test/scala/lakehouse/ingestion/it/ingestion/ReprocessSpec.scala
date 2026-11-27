@@ -101,6 +101,35 @@ final class ReprocessSpec extends AnyFunSuite with Matchers with JdbcIngestionSu
     assertLedger(orders)
   }
 
+  test("a reprocess reads the files as the source says to read them now: a dialect corrected") {
+    val orders = fileSource()
+    // The producer escapes with a backslash, and the source said RFC 4180: the value keeps both.
+    drop(orders, "a.csv", "id,name\n1,\"a\\\\b\"\n")
+    ingested(launch(orders))
+    def names: Seq[(Long, String)] =
+      spark.read
+        .format("delta")
+        .load(bronze(orders).uri)
+        .select("_batch_seq", "name")
+        .collect()
+        .map(row => (row.getLong(0), row.getString(1)))
+        .sorted
+        .toSeq
+    names shouldBe Seq((1L, "a\\\\b"))
+
+    val corrected =
+      fileSource(options = """, csv: { escape: "\\" }""", id = orders.id.value)
+    val again = ingested(reprocess(corrected, 1))
+
+    // Its plan has the files of batch 1, read with the escape that the source says now.
+    val plan = batchOf(again.batch).plan
+    plan.hcursor.downField("files").focus shouldBe
+      batchOf(batchId(orders, 1)).plan.hcursor.downField("files").focus
+    plan.hcursor.downField("csv").get[String]("escape").toOption shouldBe Some("\\")
+    names shouldBe Seq((1L, "a\\\\b"), (2L, "a\\b"))
+    assertLedger(corrected)
+  }
+
   test("after a reset to another Bronze table, a reprocess brings the history to it") {
     val orders = twoBatches()
     val moved = fileSource(

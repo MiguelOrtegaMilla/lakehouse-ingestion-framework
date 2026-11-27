@@ -58,6 +58,14 @@ final class SparkCsvDialectContractSpec extends AnyFunSuite with Matchers with L
 
   import SparkCsvDialectContractSpec._
 
+  /**
+   * The session of the suite as Spark makes one, which reads with the charsets of its own list:
+   * a suite of the tests has the setting of a session of a run (`LocalSparkSuite`), which is
+   * what is looked at here.
+   */
+  override protected def sparkConf: Map[String, String] =
+    Map(SQLConf.LEGACY_JAVA_CHARSETS.key -> SQLConf.LEGACY_JAVA_CHARSETS.defaultValueString)
+
   /** A session that may read with any charset of the JDK, as the application's session does. */
   private lazy val javaCharsets: SparkSession = {
     val session = spark.newSession()

@@ -18,7 +18,7 @@ import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, LandedFile}
 import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
-import lakehouse.ingestion.it.support.LocalSparkSuite
+import lakehouse.ingestion.it.support.{CapturedLogs, LocalSparkSuite}
 import org.apache.spark.SparkException
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
@@ -52,14 +52,19 @@ final class FileSourceConnectorSpec
     root
   }
 
-  private def source(format: String, batch: Option[Int] = None, policy: String = "fail"): Source =
+  private def source(
+      format: String,
+      batch: Option[Int] = None,
+      policy: String = "fail",
+      csv: String = ""
+  ): Source =
     Source
       .load(
         "shop.orders.yaml",
         s"""id: shop.orders
            |connector: { type: file, path: shop/orders, format: $format${batch.fold("")(n =>
             s", max_files_per_batch: $n"
-          )}, on_unreadable_file: $policy }
+          )}, on_unreadable_file: $policy${if (csv.isEmpty) "" else s", csv: { $csv }"} }
            |load: { mode: new_files }
            |targets:
            |  bronze: { table: bronze/orders }
@@ -89,6 +94,28 @@ final class FileSourceConnectorSpec
     Files.setLastModifiedTime(path, FileTime.from(at))
     path
   }
+
+  /** A file of the source with these bytes, in gzip if it says so, changed an hour ago. */
+  private def dropBytes(
+      root: Path,
+      name: String,
+      bytes: Array[Byte],
+      gzip: Boolean = false
+  ): Path = {
+    val path = root.resolve("shop/orders").resolve(name)
+    if (gzip) Using.resource(new GZIPOutputStream(Files.newOutputStream(path)))(_.write(bytes))
+    else Files.write(path, bytes)
+    Files.setLastModifiedTime(path, FileTime.from(anHourAgo))
+    path
+  }
+
+  /** Bytes: a string as UTF-8, a number as the byte that it is, and bytes as they are. */
+  private def bytesOf(parts: Any*): Array[Byte] = parts.flatMap {
+    case text: String => text.getBytes(UTF_8).toSeq
+    case byte: Int => Seq(byte.toByte)
+    case many: Array[Byte] => many.toSeq
+    case other => throw new IllegalArgumentException(s"$other is not bytes")
+  }.toArray
 
   /** A file of Parquet of the source, written by Spark and left under a name of its own. */
   private def dropParquet(root: Path, name: String, frame: DataFrame): Path = {
@@ -285,6 +312,171 @@ final class FileSourceConnectorSpec
       Row("8", "cy")
     )
     result.unparsed.value.count() shouldBe 0
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The dialect and the encoding of a source of CSV (P8.9, ADR-0024)
+  // ---------------------------------------------------------------------------------------------
+
+  test("CSV in the dialect of its source: its delimiter, its quote and its escape") {
+    val root = landingZone()
+    drop(
+      root,
+      "a.csv",
+      "id;name;note\n" +
+        // The delimiter between quotes, a quote and the escape escaped, an end of line.
+        "1;'a; b';'it\\'s'\n" +
+        "2;'C:\\\\temp';'two\nlines'\n" +
+        // A backslash before any other character, and outside quotes, is itself.
+        "3;a\\b;'a\\nb'\n" +
+        // A quote of another kind, and the comma, are characters like any other.
+        "4;\"x\";a,b\n"
+    )
+
+    val result = ingest(root, source("csv", csv = """delimiter: ";", quote: "'", escape: "\\""""))
+
+    rows(result.rows.select("id", "name", "note")) shouldBe Seq(
+      Row("1", "a; b", "it's"),
+      Row("2", "C:\\temp", "two\nlines"),
+      Row("3", "a\\b", "a\\nb"),
+      Row("4", "\"x\"", "a,b")
+    )
+    result.unparsed.value.count() shouldBe 0
+  }
+
+  test("CSV in a tab, its values with commas and quotes as RFC 4180 has them") {
+    val root = landingZone()
+    drop(root, "a.tsv", "id\tname\n1\t\"a\tb, \"\"c\"\"\"\n2\tplain\n")
+
+    rows(
+      ingest(root, source("csv", csv = """delimiter: "\t"""")).rows.select("id", "name")
+    ) shouldBe
+      Seq(Row("1", "a\tb, \"c\""), Row("2", "plain"))
+  }
+
+  test("CSV in the encoding of its source: ISO-8859-1, and windows-1252 in gzip as well") {
+    val latin1 = landingZone()
+    dropBytes(latin1, "a.csv", bytesOf("id,a", 0xf1, "o\n1,ni", 0xf1, "o\n"))
+    val read1 = ingest(latin1, source("csv", csv = "encoding: ISO-8859-1"))
+    read1.rows.columns should contain("a\u00f1o")
+    rows(read1.rows.select("id", "a\u00f1o")) shouldBe Seq(Row("1", "ni\u00f1o"))
+
+    // As a spreadsheet in Spain writes "CSV": `;`, CRLF, and LF alone inside a cell.
+    val cp1252 = landingZone()
+    val sheet = bytesOf(
+      "id;importe;nota\r\n1;10 ",
+      0x80,
+      ";\"l",
+      0xed,
+      "nea uno\nl",
+      0xed,
+      "nea dos\"\r\n2;",
+      0x93,
+      "x",
+      0x94,
+      ";\r\n"
+    )
+    dropBytes(cp1252, "a.csv", sheet)
+    dropBytes(cp1252, "b.csv.gz", sheet, gzip = true)
+    val read2 = ingest(cp1252, source("csv", csv = """delimiter: ";", encoding: windows-1252"""))
+    rows(read2.rows.select("id", "importe", "nota")) shouldBe Seq(
+      Row("1", "10 \u20ac", "l\u00ednea uno\nl\u00ednea dos"),
+      Row("1", "10 \u20ac", "l\u00ednea uno\nl\u00ednea dos"),
+      Row("2", "\u201cx\u201d", null),
+      Row("2", "\u201cx\u201d", null)
+    )
+    read2.unparsed.value.count() shouldBe 0
+  }
+
+  test("the mark of the order of bytes of UTF-8 is taken off, of every file of a batch") {
+    val root = landingZone()
+    val mark = bytesOf(0xef, 0xbb, 0xbf)
+    dropBytes(root, "a.csv", bytesOf(mark, "id,name\n1,ann\n"))
+    dropBytes(root, "b.csv", bytesOf("id,name\n2,bea\n"))
+    dropBytes(root, "c.csv", bytesOf(mark, "id,name\n3,cy\n"))
+
+    val result = ingest(root, source("csv"))
+    result.rows.columns.filterNot(_.startsWith("_")) shouldBe Array("id", "name")
+    rows(result.rows.select("id", "name")) shouldBe Seq(
+      Row("1", "ann"),
+      Row("2", "bea"),
+      Row("3", "cy")
+    )
+  }
+
+  test("a batch is read as it was planned, whatever the source says by then, and the run says so") {
+    val root = landingZone()
+    drop(root, "a.csv", "id;name\n1;a b\n")
+    val semicolons = source("csv", csv = """delimiter: ";"""")
+    val planned = plan(root, semicolons).value
+    planned.hcursor.downField("csv").get[String]("delimiter").value shouldBe ";"
+
+    // The source says commas now: the plan is read with its semicolons, and the run says so.
+    val (result, said) =
+      CapturedLogs.of(classOf[FileSourceConnector])(read(root, source("csv"), planned))
+    rows(result.rows.select("id", "name")) shouldBe Seq(Row("1", "a b"))
+    said.map(_.message) should contain(
+      "shop.orders: the batch is read as it was planned, as csv (delimiter ';' (U+003B), " +
+        "quote '\"' (U+0022), escape '\"' (U+0022), encoding UTF-8), and the source now says " +
+        "csv (delimiter ',' (U+002C), quote '\"' (U+0022), escape '\"' (U+0022), encoding " +
+        "UTF-8). A plan is read as it was written; to have its files read as the source says " +
+        "now, give the batch up (abandon-batch), and the next plan takes them so"
+    )
+    // Read as the source says, it says nothing.
+    CapturedLogs.of(classOf[FileSourceConnector])(read(root, semicolons, planned))._2 shouldBe empty
+
+    // A plan written before plans said how its files are read is read in RFC 4180 and UTF-8,
+    // and in the format of the source, as it was then.
+    val before = FilePlan
+      .fromJson(planned)
+      .value
+      .copy(readAs = None)
+      .toJson
+    before.hcursor.get[Int]("version").value shouldBe 2
+    rows(read(root, semicolons, before).rows.select("id;name")) shouldBe Seq(Row("1;a b"))
+  }
+
+  test("a plan made again of the files of a batch reads them as the source says now") {
+    val root = landingZone()
+    drop(root, "a.csv", "id;name\n1;a,b\n")
+    val commas = source("csv")
+    val planned = plan(root, commas).value
+    val semicolons = source("csv", csv = """delimiter: ";"""")
+
+    val again = connector(root).again(semicolons, configOf(semicolons), planned)
+    val made = FilePlan.fromJson(again).value
+    val was = FilePlan.fromJson(planned).value
+    (made.directory, made.files, made.horizon) shouldBe ((was.directory, was.files, was.horizon))
+    made.readAs.value.csv.value.delimiter shouldBe ';'
+    rows(read(root, semicolons, again).rows.select("id", "name")) shouldBe Seq(Row("1", "a,b"))
+  }
+
+  test(
+    "a charset that the session of a run does not read is permanent, and no file is read alone"
+  ) {
+    val root = landingZone()
+    dropBytes(root, "a.csv", bytesOf("id,v\n1,", 0x80, "\n"))
+    dropBytes(root, "b.csv", bytesOf("id,v\n2,x\n"))
+    val cp1252 = source("csv", csv = "encoding: windows-1252")
+    val alone = mutable.Buffer.empty[String]
+    val sparks = spark.newSession()
+    sparks.conf.set(Profile.EngineSpark.JavaCharsets, "false")
+
+    val failure = the[RunFailedException] thrownBy
+      connector(root, beforeAlone = (name, _) => alone += name)
+        .read(cp1252, configOf(cp1252), plan(root, cp1252).value, ReadContext(sparks))
+    failure.failure shouldBe FailureClass.Permanent
+    failure.getMessage should startWith(
+      "Spark refuses to read the files of shop/orders in csv (delimiter ',' (U+002C), quote " +
+        "'\"' (U+0022), escape '\"' (U+0022), encoding windows-1252): the session of the run " +
+        "does not read that encoding (spark.sql.legacy.javaCharsets is not on)"
+    )
+    alone shouldBe empty
+    // The session of a run reads it.
+    rows(ingest(root, cp1252).rows.select("id", "v")) shouldBe Seq(
+      Row("1", "\u20ac"),
+      Row("2", "x")
+    )
   }
 
   test("files of CSV with different headers fail the batch, and nothing is read") {
@@ -1101,8 +1293,8 @@ final class FileSourceConnectorSpec
     drop(root, "a.csv", "id\n1\n")
     val planned = plan(root, orders).value
 
-    refused(read(root, orders, planned.mapObject(_.add("version", Json.fromInt(3))))) should
-      include("is not one that this application reads: it is of version 3")
+    refused(read(root, orders, planned.mapObject(_.add("version", Json.fromInt(4))))) should
+      include("is not one that this application reads: it is of version 4")
     refused(
       read(root, orders, planned.mapObject(_.add("directory", Json.fromString("shop/returns"))))
     ) should include("is of the directory shop/returns, and the source reads shop/orders")
@@ -1132,8 +1324,8 @@ final class FileSourceConnectorSpec
     // A plan that is not this source's has nothing to record, as it has nothing to read.
     refused(
       connector(root)
-        .progress(orders, configOf(orders), planned.mapObject(_.add("version", Json.fromInt(3))))
-    ) should include("is not one that this application reads: it is of version 3")
+        .progress(orders, configOf(orders), planned.mapObject(_.add("version", Json.fromInt(4))))
+    ) should include("is not one that this application reads: it is of version 4")
     refused(
       connector(root).progress(
         orders,

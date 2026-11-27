@@ -88,6 +88,8 @@ object LocalSparkSuite {
     "spark.driver.bindAddress" -> "127.0.0.1",
     "spark.sql.extensions" -> "io.delta.sql.DeltaSparkSessionExtension",
     "spark.sql.catalog.spark_catalog" -> "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+    // As every session of a run has it (RunSession.engine): windows-1252 is read so (ADR-0024).
+    "spark.sql.legacy.javaCharsets" -> "true",
     "spark.sql.warehouse.dir" -> dir.resolve("warehouse").toString
   )
 
