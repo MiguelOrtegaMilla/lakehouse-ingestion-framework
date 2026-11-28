@@ -15,3 +15,6 @@ lakehouse.ingestion.core.control.BatchStatus#mayBecome  The statuses that a batc
 # Measures of the LogStore that the stress runs report.
 lakehouse.ingestion.logstore.CommitContext#contentionAtInsert  The versions that a writer lost at the INSERT, apart from those it was merely behind on (ADR-0004 §7). The engine records `contention`, which counts both.
 lakehouse.ingestion.logstore.FaultHooks#waitsAt  That the wait a run asked for was in the path of the commits it measured.
+
+# Built a part before what calls it, within one phase.
+lakehouse.ingestion.engine.bronze.SchemaDecision  The schema policy of a source as a function with no I/O (ADR-0025, P9.3). The write of a batch takes it with P9.4, which is to take this line out.

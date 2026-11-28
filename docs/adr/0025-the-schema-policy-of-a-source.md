@@ -101,6 +101,8 @@ A batch of files is read as one schema before it is compared with its table. Tha
 - **JSON:** the fields are folded by case (§6).
 - **Parquet:** a column whose files have two types, one a widening of the other by §3, has the wider, and the files of the other are cast. Two types that are not so are incompatible: the batch fails as permanent.
 
+The wider type is then held to the table as any read is (§2). It makes a table that is not there yet, and widens one of the narrower type only under `widen`. Under `fail`, a table of the narrower type refuses the batch, in 4; one of the wider type takes it, the files of the narrower cast, as any read of a narrower type is. *Made explicit with P9.3 (2026-11-28), with each case in `SchemaDecisionSpec`.*
+
 ### 8. A source that its policy stops
 
 Under `fail`, and for a change that is incompatible, the batch stays planned and the run ends in 4. Its message names the column, the file where there is one, and the ways on: to change the policy, to declare a rename, and to take the file out of the landing zone, after which ADR-0018 gives the batch up and the next run plans without it. Changing the policy or the renames is enough to unblock a batch that is planned (§9). The source stops by its own choice, the criterion of ADR-0023. This closes the item of §20 on a planned batch that blocks its source, for data that is no file's.
@@ -157,3 +159,11 @@ A `ProtocolChangedException` comes only to the engine's own commit that turns ty
 - D-123 changes with P9.5: a conflict that asks for a re-plan is permanent only where the policy refuses the table.
 - §14 and §14.1 keep their codes: 3 for a conflict whose budget ran out, 4 for a schema change under `fail`. No new code, and no new name of `error_class`.
 - A fan-in under `on_missing_column: fail` needs every source to have every column of the table.
+
+## As built (P9.3, 2026-11-28)
+
+- **The decision is `SchemaDecision.decide`**, in `engine.bronze`, over the types of Spark and with no session. It is given the parts of a read in the order of its plan, the schema of the table with the columns of the engine, which it does not compare, and the policy. It gives the columns of the rows (each with its name and its type in the table, and the names of the read that give it), the columns that are rescued, and the change: added, widened, rescued, missing, and `_rescued_data` given to the table. Or it gives every reason at once, in the order in which each is met, each with the column, where it is and the setting that refuses it.
+- **A part says whether each of its rows has every column of it, or some.** A `Part.Whole` is a table, a file of Parquet, or files of CSV under one header, and two of its columns that are to be one refuse its batch: two names that differ only in their case, or two names of one rename. A `Part.Sparse` is records of JSON, where the read is to see that, a record at a time (§5, §6), with the fields in the order in which the records first have them (P9.9).
+- **A name that is refused**, the engine's or one that a table of Delta cannot have, is said once, and is not compared as a column after it.
+- **The shape of a nested type that `widen` takes:** the fields of a struct under the same names, in the same order; the elements of an array; the values of a map, whose keys keep their type. A key of a map widened is not taken: P9.1 did not pin it.
+- **Not yet called by the write**, which takes it in P9.4. Until then it is in `project/unconnected.txt`, with its reason.
