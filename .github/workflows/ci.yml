@@ -109,6 +109,8 @@ jobs:
         lakehouse.ingestion.it.ingestion.FanInSpec
         lakehouse.ingestion.it.logstore.PostgresLogStoreEndToEndSpec
         lakehouse.ingestion.it.cli.BackfillCommandSpec
+        lakehouse.ingestion.it.ingestion.RetriesSpec
+        lakehouse.ingestion.it.delta.DeltaTableTransactionsSpec
       PART_2: >-
         lakehouse.ingestion.it.ingestion.FaultMatrixSpec
         lakehouse.ingestion.it.ingestion.BackfillBesideRunSpec
@@ -118,6 +120,7 @@ jobs:
         lakehouse.ingestion.it.ingestion.JdbcIngestionSpec
         lakehouse.ingestion.it.logstore.DeltaLogStoreContractSpec
         lakehouse.ingestion.it.ingestion.QuarantineReaderSpec
+        lakehouse.ingestion.it.control.LeaseFencingSpec
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

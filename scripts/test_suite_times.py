@@ -51,11 +51,26 @@ class SuiteTimesTest(unittest.TestCase):
         printed = out.splitlines()
         self.assertEqual(printed[0], "   120.2 s  b.SlowSpec (1)")
         self.assertEqual(printed[2], "   121.8 s  2 suites")
-        # One command of the workflow: one line, its ends of lines escaped.
+        # One command of the workflow: one line, its ends of lines escaped, the total first.
         notice = printed[3]
-        self.assertTrue(notice.startswith("::notice title=Time of each suite::"))
-        self.assertIn("b.SlowSpec (1)%0A", notice)
+        self.assertTrue(notice.startswith("::notice title=Time of each suite::2 suites, 121.8 s%0A"))
+        self.assertIn("  120.2 s  SlowSpec%0A", notice)
         self.assertEqual(len(printed), 4)
+
+    def test_a_notice_keeps_within_what_github_keeps_and_says_what_it_left_out(self):
+        found = [(float(100 - i), f"lakehouse.ingestion.it.part.Suite{i:03d}Spec", 1) for i in range(400)]
+        message = suite_times.notice(found)
+        self.assertLessEqual(len(message), suite_times.NOTICE_LIMIT)
+        lines = message.splitlines()
+        self.assertEqual(lines[0], f"400 suites, {sum(s for s, _, _ in found):.1f} s")
+        self.assertEqual(lines[1], "  100.0 s  Suite000Spec")
+        left_out = 400 - (len(lines) - 2)
+        self.assertTrue(lines[-1].startswith(f"and {left_out} more, "))
+        self.assertGreater(left_out, 0)
+
+    def test_a_notice_of_suites_that_fit_leaves_none_out(self):
+        found = [(2.0, "a.BSpec", 1), (1.0, "c.DSpec", 1)]
+        self.assertEqual(suite_times.notice(found), "2 suites, 3.0 s\n    2.0 s  BSpec\n    1.0 s  DSpec")
 
     def test_a_percent_in_a_name_is_escaped_in_the_notice(self):
         report(self.one, "a%Spec", 1)

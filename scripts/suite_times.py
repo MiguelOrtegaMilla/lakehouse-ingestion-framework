@@ -7,7 +7,9 @@ took, so that the groups can be made again when they drift:
 
   - as a table in the summary of the job, when GITHUB_STEP_SUMMARY is set;
   - as one notice on the job, which the API of the checks gives to whoever reads it, with no
-    token for a public repository, where the log of a job needs one;
+    token for a public repository, where the log of a job needs one. GitHub keeps the first 4096
+    characters of the message of a notice, so the notice has the total first, each suite by the
+    name of its class, and as many as fit, the longest first;
   - on its standard output, a line for each suite.
 
 It reads every TEST-*.xml under the directories that it is given. A suite with no report did not
@@ -23,6 +25,10 @@ import sys
 import xml.etree.ElementTree as ET
 
 TITLE = "Time of each suite"
+
+# What GitHub keeps of the message of a notice, and room for what says how many were left out.
+NOTICE_LIMIT = 4096
+LEFT_OUT_ROOM = 64
 
 
 def suites(directories):
@@ -61,6 +67,20 @@ def table(found):
     )
 
 
+def notice(found, limit=NOTICE_LIMIT):
+    """The message of the notice: the total, and then as many suites as fit, the longest first."""
+    total = sum(seconds for seconds, _, _ in found)
+    said = [f"{len(found)} suites, {total:.1f} s"]
+    for index, (seconds, name, _) in enumerate(found):
+        line = f"{seconds:7.1f} s  {name.rsplit('.', 1)[-1]}"
+        if len("\n".join(said + [line])) > limit - LEFT_OUT_ROOM:
+            rest = found[index:]
+            said.append(f"and {len(rest)} more, {sum(s for s, _, _ in rest):.1f} s")
+            break
+        said.append(line)
+    return "\n".join(said)
+
+
 def escaped(text):
     """Text as the message of a command of a workflow takes it: one line."""
     return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -73,7 +93,7 @@ def main(directories):
         return 0
     said = lines(found)
     print("\n".join(said))
-    print(f"::notice title={TITLE}::" + escaped("\n".join(said)))
+    print(f"::notice title={TITLE}::" + escaped(notice(found)))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as out:
