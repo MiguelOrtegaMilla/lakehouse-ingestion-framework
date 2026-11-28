@@ -997,9 +997,18 @@ final class IngestionService(
           case cannot: UnreadableFilesException => Left(cannot)
         }
       read match {
-        case Left(changed: SourceChangedException) => giveUp(batch, changed)
-        case Left(cannot: UnreadableFilesException) => skip(batch, progress, cannot)
-        case Left(other) => throw other
+        case Left(failed) =>
+          // A run that lost its lease while it read gives nothing up. A batch is given up by a
+          // transaction that the epoch of the lease fences, and not its count: one whose count
+          // ran out, and that nobody took, is still the run's. And what a read meets once the
+          // lease is lost may be what the loss did: a read of a file stopped for the lease fails
+          // as one of a file that cannot be read does.
+          leased.verify()
+          failed match {
+            case changed: SourceChangedException => giveUp(batch, changed)
+            case cannot: UnreadableFilesException => skip(batch, progress, cannot)
+            case other => throw other
+          }
         case Right(kept: ReadResult.Kept) => finish(batch, progress, kept)
         case Right(once: ReadResult.OnePass) => finishInOnePass(batch, progress, once)
       }

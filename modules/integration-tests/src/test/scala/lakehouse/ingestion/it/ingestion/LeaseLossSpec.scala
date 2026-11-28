@@ -1,5 +1,7 @@
 package lakehouse.ingestion.it.ingestion
 
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 import java.time.{Clock, ZoneOffset}
 import java.util.concurrent.Executors
 
@@ -15,6 +17,7 @@ import lakehouse.ingestion.core.control._
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector._
 import lakehouse.ingestion.engine.control.{ControlDatabase, LeasedRun}
+import lakehouse.ingestion.engine.files.FileSourceConnector
 import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService, RunJobs}
 import lakehouse.ingestion.it.support.CapturedLogs.Logged
@@ -392,6 +395,53 @@ final class LeaseLossSpec extends AnyFunSuite with Matchers with IngestionSuite 
       ingested(launch(orders)).batch shouldBe first
       rowsOf(orders) shouldBe Seq(("1", 1L, "a.csv"))
     }
+  }
+
+  test("a run that lost its lease in the reads of a file alone gives neither it nor its batch up") {
+    // Under skip, a file that fails each of its reads alone is given up with its batch, by a
+    // transaction that the lease allows: a lease is fenced by its epoch, and nobody took this
+    // one. What a read meets once the lease is lost says nothing of the file: a read stopped for
+    // the lease fails as one of a file that cannot be read does.
+    val orders = fileSource(options = ", on_unreadable_file: skip")
+    drop(orders, "a.csv", "id\n1\n")
+    val closed = drop(orders, "b.csv", "id\n2\n")
+    val first = batchId(orders, 1)
+    @volatile var stoppedWith = Option.empty[Throwable]
+
+    val permissions = Files.getPosixFilePermissions(closed)
+    Files.setPosixFilePermissions(closed, PosixFilePermissions.fromString("---------"))
+    val outcome =
+      try {
+        assume(!Files.isReadable(closed), "the tests run as a user that may open any file")
+        throughTheProxy { control =>
+          // Before the last read of the file alone, which fails as its two reads before did, the
+          // run is cut off until its count runs out. The network is back for the read, and nobody
+          // takes the lease.
+          val cutOff = (name: String, read: Int) =>
+            if (name == "b.csv" && read == FileSourceConnector.AloneReads) {
+              proxied.faulty.disable()
+              stoppedWith = workUntilStopped()
+              proxied.faulty.enable()
+            }
+          launch(orders, service(on = control, beforeAlone = cutOff))
+        }
+      } finally Files.setPosixFilePermissions(closed, permissions): Unit
+
+    stoppedForItsLease(stoppedWith, orders)
+    val message = lostItsLease(outcome, orders)
+    message should include("it was not renewed in time")
+    // Nothing was given up: the file is not recorded as one that failed, and the batch is the
+    // next run's. The run says itself how it ended, and gives its lease up.
+    failedOf(orders) shouldBe empty
+    batchOf(first).status shouldBe BatchStatus.Planned
+    val ended = runOf(outcome.run)
+    ended.status shouldBe RunStatus.Failed
+    ended.failure.value shouldBe RunFailure(FailureClass.Transient, message)
+    holderOf(orders) shouldBe None
+
+    // The file opens now: the next run finishes the batch, with both files.
+    ingested(launch(orders)).batch shouldBe first
+    rowsOf(orders) should contain theSameElementsAs Seq(("1", 1L, "a.csv"), ("2", 1L, "b.csv"))
   }
 
   test("a run that failed for a reason of its own says so, though its control plane is not told") {
