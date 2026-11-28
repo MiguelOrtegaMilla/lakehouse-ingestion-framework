@@ -97,9 +97,11 @@ jobs:
     env:
       # The suites of the first two parts, by their whole names, as `testOnly` takes them. The
       # heaviest are shared between the two, each part about a third of what the tests take, by
-      # the times of each suite that the jobs publish (scripts/suite_times.py). The third part is
-      # every other suite: one added to the module runs there without being listed, and a name
-      # here that is no longer a suite runs nothing, and leaves its suite to the third.
+      # the times of each suite that the jobs publish (scripts/suite_times.py). A part costs
+      # besides about 1.5 s for each of its suites, which starts and stops what it needs, and
+      # the third, which has most of them, is the lighter in what its suites report. The third
+      # part is every other suite: one added to the module runs there without being listed, and
+      # a name here that is no longer a suite runs nothing, and leaves its suite to the third.
       PART_1: >-
         lakehouse.ingestion.it.stress.CoordinatedHarnessSpec
         lakehouse.ingestion.it.ingestion.KilledRunSpec
@@ -111,6 +113,9 @@ jobs:
         lakehouse.ingestion.it.cli.BackfillCommandSpec
         lakehouse.ingestion.it.ingestion.RetriesSpec
         lakehouse.ingestion.it.delta.DeltaTableTransactionsSpec
+        lakehouse.ingestion.it.ingestion.UnreadableFilesSpec
+        lakehouse.ingestion.it.ingestion.BackfillSpec
+        lakehouse.ingestion.it.ingestion.SqlInjectionSpec
       PART_2: >-
         lakehouse.ingestion.it.ingestion.FaultMatrixSpec
         lakehouse.ingestion.it.ingestion.BackfillBesideRunSpec
