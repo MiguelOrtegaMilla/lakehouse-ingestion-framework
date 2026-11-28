@@ -67,6 +67,11 @@ Run it again and it finds nothing new. A source with more than one batch takes (
 | 128 + n | The signal n came before the first run: nothing was run. A run stopped after one ends in the code of its last run |
 | 64 | The command line is not one |
 | 70 | A mistake of the application, which nothing classified: the run is recorded as failed with the class `internal`, and its lease is free. The log has the failure whole. Alert |
+| 52 | Not the application's: Spark ended the process for want of memory (`SparkExitCode.OOM`), as it does when an `OutOfMemoryError` reaches a task, a read of CSV among them. The run is as a process that died leaves it: its lease expires, and the next run recovers its batch. Give the process more memory, or find the file that needs it |
+
+A run that runs out of memory as it reads the footers of a file of Parquet does not end at all: Spark waits for the read without a bound, and the lease of the run is renewed all the while. Only a timeout from outside ends it, as a process that died ([discovery §20](../architecture/00-architecture-discovery.md#open-items-and-accepted-exceptions)).
+
+**Under sbt the code is sbt's.** A command run as `sbt "cli/run …"` that ends in anything but 0 has sbt write two lines of its own to the standard output, `[error] nonzero exit code returned from runner: 4` and the same with the task, and sbt itself ends in 1, whatever the code: the code of the command is the one in that line. The codes of this guide, and the contract of §14.1, are those of the command run without sbt, as a deployment runs it.
 
 The whole contract is in [discovery §14.1](../architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator). `RunCommandSpec` runs the command as an orchestrator does, a process of its own among them; `JdbcRunCommandSpec`, with a table of a database, cut for real by a proxy.
 
@@ -148,11 +153,12 @@ sbt -error "cli/run quarantine --profile conf/app/local.yaml --sources conf/sour
 jq -r .raw_record rejected.jsonl
 ```
 
-`-error` has sbt say nothing of its own, so that the file has the records alone.
+`-error` has sbt say nothing of its own while the command ends in 0, so that the file has the records alone. **The file is one of records only if the command ended in 0.** With another code, sbt writes its two lines to the standard output, into the file, and ends in 1 itself; the code of the command is the one in that line ([under sbt](#running-a-source)).
 
 - **Where the records go is yours to mind.** The command writes them to its standard output and nowhere else: not to its error output, and not to a log, of the application or of Spark. Under an orchestrator, the standard output of a task is a log: `--records` is for a terminal, or for a file that is kept as the quarantine is.
 - **A line is safe to show.** Each character that a terminal acts on, or that ends a line, is written as its escape (`\u001b`): a control character, the separators of lines U+2028 and U+2029, and the characters that turn the direction of a text. `jq` gives the text back as it was.
-- **A long record is cut** at its first 8192 characters (`truncated`), with how many it has (`raw_record_chars`): a record may be the rest of a file, after a quote that is not closed. The whole of it is in the table.
+- **A long record is cut** at its first 8192 characters (`truncated`), with how many it has (`raw_record_chars`): a record may be the rest of a file, after a quote that is not closed. The whole of it is in the table. A character is four bytes at most, so a record shown is 32 KiB at most, and the thousand that may be asked for bring 32 MiB to the process of the command.
+- **The order is whole, but for one case.** The latest first, by when the run set them apart, which is one moment for the records of a batch; then by their run, their file, their type, the text shown and how many characters it has. A quarantine does not keep where in its file a record was, so two records of one run, file and type whose first 8192 characters are the same, with as many in all, come in either order.
 - **It does not page.** The records are the first of their order, and less is asked for by a run, a batch, a file or a type. Whoever needs every record reads the table of Delta, at `_quarantine/bronze/<source id>` under the lake, leaving out the runs of the batches that were given up ([the reference](../configuration/reference.md#records-that-are-rejected) has the query).
 
 | Code | Meaning |
