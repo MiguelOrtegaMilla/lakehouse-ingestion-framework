@@ -68,3 +68,8 @@ A **lease** row per lease key in `control.source_lease`:
 - Residual zombie *data* writes are neutralised by Delta's idempotent writes (ADR-0005), not by the lease itself.
 
   > **Amended by [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md)** (P5.10, 2026-11-19): from P5.10 they are refused where a commit is made. The epoch of a lease is announced to the LogStore by the run that takes the lease, and named by every commit of that run; a commit under an earlier epoch takes no version. The fencing token is checked by the control plane for the state, as above, and by the LogStore for the tables.
+
+## As built (P8.11, 2026-11-28)
+
+- **A run that lost its lease acts on nothing that its read met.** A lease is fenced by its epoch, and a transaction of a run whose count ran out, and whose lease nobody took, is still the run's: a batch given up after a read that the loss stopped would be given up for what the loss did. The run asks its lease before it acts on a read that failed, as it does after one that did not (`IngestionService.ingest`, `LeaseLossSpec`). A commit is left to the epoch, by design: it records what Delta committed, which a loss can stop and never make.
+- **A run that waits for ever holds its lease for ever.** The heartbeat renews the lease of a run while its process lives, whatever the run is doing: a read that never ends, as Spark's inference of Parquet after an error of the JVM (discovery §20), blocks its source until something outside the run ends the process.
