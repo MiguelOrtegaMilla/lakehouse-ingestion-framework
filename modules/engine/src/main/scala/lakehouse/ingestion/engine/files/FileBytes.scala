@@ -215,6 +215,18 @@ object FileBytes {
     val encoding = CsvDialect.Encoding.All
       .find(_.name == name)
       .getOrElse(throw new IllegalArgumentException(s"$name is no encoding of a source"))
+    val (in, compressed) = open(location, hadoop)
+    try look(in, encoding.charset).map(why(_, encoding, compressed))
+    finally in.close()
+  }
+
+  /**
+   * A file as Spark's readers read it: with the codec of the ending of its name, if it has one,
+   * which gives what the file holds, decompressed. The stream is the caller's to close.
+   *
+   * @return the stream, and whether the file is compressed
+   */
+  private[files] def open(location: String, hadoop: Configuration): (InputStream, Boolean) = {
     val path = new HadoopPath(location)
     val codec = Option(new CompressionCodecFactory(hadoop).getCodec(path))
     val opened = path.getFileSystem(hadoop).open(path)
@@ -225,7 +237,6 @@ object FileBytes {
           opened.close()
           throw failed
       }
-    try look(in, encoding.charset).map(why(_, encoding, codec.nonEmpty))
-    finally in.close()
+    (in, codec.nonEmpty)
   }
 }

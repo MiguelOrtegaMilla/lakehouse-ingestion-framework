@@ -317,6 +317,32 @@ final class RunCommandSpec
     runsOf(rejecting) shouldBe Seq("FAILED" -> Some("data"))
   }
 
+  test("a file of JSON in gzip that opens to a line of a gigabyte ends in 4, and not for memory") {
+    // About a megabyte on disk, and one line of 2^30 characters once it is decompressed: what
+    // a run held whole, in a process with less memory than that, until the lines were looked at
+    // before Spark reads them (P8.11).
+    val bombed = files.fileSource(newSourceId(), format = "json")
+    val path = files.directoryOf(bombed.id).resolve("a.json.gz")
+    Using.resource(new GZIPOutputStream(Files.newOutputStream(path), 1 << 16)) { out =>
+      val chunk = Array.fill[Byte](1 << 20)('x'.toByte)
+      out.write("[\"".getBytes(UTF_8))
+      (1 to 1024).foreach(_ => out.write(chunk))
+      out.write("\"]".getBytes(UTF_8))
+    }
+    Files.setLastModifiedTime(path, FileTime.from(Instant.now().minusSeconds(3600)))
+    Files.size(path) should be < (8L << 20)
+
+    val log = files.newLog()
+    val ended = CommandProcess.start(arguments(bombed), log, heap = "768m").await()
+    withClue(ended.log)(ended.exit shouldBe Main.Exit.Permanent)
+    ended.log should include("'a.json.gz' line_too_long: its first line is longer than")
+    // Without the look, the process ran out of memory at each read of the file, and survived
+    // it by chance: a file that failed each of its reads, "from scala.MatchError".
+    Files.readAllLines(log, UTF_8).asScala.filter(_.contains("OutOfMemoryError")) shouldBe empty
+    runsOf(bombed) shouldBe Seq("FAILED" -> Some("permanent"))
+    batchesOf(bombed) shouldBe Seq("1" -> "PLANNED")
+  }
+
   /** One run of a source in a JVM of its own: its exit code, and the end of what it printed. */
   private def process(of: Source): (Int, String) = {
     val ended = CommandProcess.start(arguments(of), files.newLog()).await()

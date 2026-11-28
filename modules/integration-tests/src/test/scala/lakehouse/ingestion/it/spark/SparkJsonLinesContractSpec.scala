@@ -178,6 +178,16 @@ final class SparkJsonLinesContractSpec extends AnyFunSuite with Matchers with Lo
     an[JsonParseException] should be thrownBy first("﻿{\"id\":\"1\"}", strict = true)
   }
 
+  test("a line read as text ends at LF, at CRLF and at CR alone, and is held whole in memory") {
+    // Where the look at the length of the lines of a batch is to end them (P8.11): as Hadoop's
+    // reader of lines does, under Spark's reader of text, with no option of its own.
+    lines(file("a\nb\r\nc\rd\n")) shouldBe Seq("a", "b", "c", "d")
+    lines(file("a\r\rb")) shouldBe Seq("a", "", "b")
+    lines(file("a\n\r\nb\n", gzip = true)) shouldBe Seq("a", "", "b")
+    // A line has no bound: one of 3 million characters is one string.
+    lines(file("x" * 3000000 + "\n")).map(_.length) shouldBe Seq(3000000)
+  }
+
   test("from_json reads a line as the reader of files does, but for a list, which it sets apart") {
     val session = spark
     import session.implicits._
