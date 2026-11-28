@@ -54,12 +54,14 @@ GitHub Actions ([`ci.yml`](../../.github/workflows/ci.yml)) runs on every push t
 | Pinned images and actions | `scripts/check-pins.sh`: compose and Testcontainers images pinned by tag and digest, actions by commit SHA |
 | Format, boundaries and what production reaches | `scripts/check_decisions.py`, the formatting, the dependency rules between modules, and `checkUnconnected`, which compiles every module with its tests |
 | Unit tests | The tests of `core`, `delta-pg-logstore`, `engine` and `cli`, which need no service |
-| Integration tests | The tests of `integration-tests`, PostgreSQL through Testcontainers. Stress runs are not part of it |
-| Format, boundaries, compile and test | The check that `main` requires: it runs whatever the three jobs above ended in, and fails unless each of them succeeded. A required check that is skipped counts as passed, so a gate that ran only when they succeeded would let a pull request with a test in red through |
+| Integration tests (1 of 3, 2 of 3, 3 of 3) | The tests of `integration-tests`, PostgreSQL through Testcontainers, in three parts side by side that take about as long: the first two each a list of the heaviest suites, by their whole names, and the third every other suite, so that a suite added to the module runs without being listed. Stress runs are not part of it |
+| Format, boundaries, compile and test | The check that `main` requires: it runs whatever the jobs above ended in, and fails unless each of them succeeded. A required check that is skipped counts as passed, so a gate that ran only when they succeeded would let a pull request with a test in red through |
 | Dependency submission | Sends the resolved sbt dependency graph to GitHub, which raises Dependabot alerts on known vulnerabilities |
 | Dependency review | Pull requests only: fails if the change introduces a dependency with a known vulnerability of high severity or above |
 
 The stress runs have a workflow of their own ([`stress.yml`](../../.github/workflows/stress.yml)), on demand and every Monday, and not on pull requests: they take more than an hour and are evidence under load, not a gate. It runs `scripts/stress-logstore.sh` with the natural race at eight writers and 500 commits each, shows what each run's verifier found in the job summary, and keeps every report as an artifact. A change to the LogStore is run through it by hand, on its branch, before it is merged.
+
+Each job of tests ends with the time of each of its suites (`scripts/suite_times.py`, from the JUnit reports of sbt), as a table in the summary of the job and as a notice on it, which the API of the checks gives with no token: the lists of the parts are made again from them when the parts drift apart.
 
 Every job that runs sbt is set up by one local action ([`setup-build`](../../.github/actions/setup-build/action.yml)): the JDK, sbt, and the cache of what sbt downloads. The cache is found by the hash of the build definition, or failing that by the newest there is, so a change to the build downloads what it changed and not everything again. The job of the checks saves it, as it resolves and compiles the whole build and is the one that fetches scalafmt; the others read it, so what another job needs is something the build itself has: the plugin that resolves the dependency graph is one of the build's plugins for that reason.
 
