@@ -4,6 +4,7 @@
 |---|---|
 | **Status** | Accepted (P8.1, 2026-11-26) |
 | **Supersedes** | [ADR-0010](0010-concurrent-write-conflict-handling.md) §2, the retry policy: a count of attempts (5, with a backoff from 500 ms to 30 s). A budget of time from the profile takes its place, shared with the failures that pass. The rest of ADR-0010 stands, its classification of the conflicts of Delta first. |
+| **Superseded in part** | [ADR-0025](0025-the-schema-policy-of-a-source.md) (P9.2, 2026-11-28) replaces the row of a conflict that asks for a re-plan in §1: a table that the policy of the schema of the source takes is a conflict retried within the budget, and one that it refuses is permanent at once. The row keeps its original text and points to it. |
 | **Related** | [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0006](0006-source-leases-with-epoch-fencing.md), [ADR-0008](0008-layer-responsibilities.md), [ADR-0018](0018-a-run-gives-up-a-batch-whose-source-changed.md), [ADR-0019](0019-a-commit-names-the-epoch-of-its-lease.md), [ADR-0021](0021-operator-actions-and-backfills.md) |
 
 ## Context
@@ -29,6 +30,8 @@ Two more things wait for this decision (discovery §20). The transaction that en
 | Permanent | What running again does not mend, until somebody changes something | Never | `permanent` | 4 |
 | Data | More records rejected than the source allows | Never: the same data gives the same result | `data` | 5 |
 | Internal | A failure that nothing classified: a mistake of the application | Never | `internal` | 70 |
+
+> **Superseded in part by [ADR-0025](0025-the-schema-policy-of-a-source.md) §10** (P9.2, 2026-11-28): a conflict that asks for a re-plan is looked at again with the policy of the schema of the source. A table that the policy takes is retried within the budget, counted in `write_conflicts`, and a budget that runs out ends the run in 3 as `conflict`; a table that it refuses is a permanent failure at once, in 4.
 
 A run that lost its lease (ADR-0006, ADR-0019) and a batch whose source changed under its plan (ADR-0018) keep their own handling, and are not retried in the run: another run does the work, or the plan is what is wrong. Both end in 3.
 

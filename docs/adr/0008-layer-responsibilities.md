@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | Accepted (2026-09-25) |
-| **Amended by** | [ADR-0023](0023-a-file-that-cannot-be-read.md) (P8.7a, 2026-11-27): a file that cannot be read is recorded as `FAILED` under `skip` alone; under `fail` the run that fails names it, and nothing of it is recorded. The errors of the landing zone below keep their original text. |
+| **Amended by** | [ADR-0023](0023-a-file-that-cannot-be-read.md) (P8.7a, 2026-11-27): a file that cannot be read is recorded as `FAILED` under `skip` alone; under `fail` the run that fails names it, and nothing of it is recorded. The errors of the landing zone below keep their original text. [ADR-0025](0025-the-schema-policy-of-a-source.md) (P9.2, 2026-11-28): a source may give a column of its own another name in Bronze, by `schema.renames`, an alias of a name at read that changes no value and no table. The "renames" that Bronze does not do, below, keeps its original text. |
 
 ## Decision
 

@@ -11,9 +11,9 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0005](0005-batch-wal-and-idempotent-writes.md) | Batch write-ahead log and idempotent Delta writes | Accepted · a second way out of a planned batch added by ADR-0018 · what a zombie may commit, by ADR-0019 |
 | [0006](0006-source-leases-with-epoch-fencing.md) | Source leases with expiry, heartbeat and epoch fencing | Accepted · the epoch is checked for the tables too, by ADR-0019 · the key of a backfill's lease, by ADR-0021 |
 | [0007](0007-metadata-format.md) | Source metadata as YAML with startup validation | Accepted |
-| [0008](0008-layer-responsibilities.md) | Layer responsibilities: Landing, Bronze, Silver (Gold out of scope) | Accepted |
+| [0008](0008-layer-responsibilities.md) | Layer responsibilities: Landing, Bronze, Silver (Gold out of scope) | Accepted · a rename of a column of a source as an alias at read, by ADR-0025 |
 | [0009](0009-delete-detection.md) | Detecting deletes in the source | Accepted |
-| [0010](0010-concurrent-write-conflict-handling.md) | Handling concurrent write conflicts on shared Delta tables | Accepted · its retry policy superseded by ADR-0022 |
+| [0010](0010-concurrent-write-conflict-handling.md) | Handling concurrent write conflicts on shared Delta tables | Accepted · its retry policy superseded by ADR-0022 · the retry of a conflict that asks for a re-plan, by ADR-0025 |
 | [0011](0011-storage-profiles.md) | Lake storage profiles and canonical table identity | Accepted |
 | [0012](0012-module-structure.md) | sbt multi-module structure and project identity | Accepted |
 | [0013](0013-application-security-baseline.md) | Application security baseline: SQL identifiers, path confinement, least privilege, supply chain | Accepted |
@@ -25,9 +25,10 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0019](0019-a-commit-names-the-epoch-of-its-lease.md) | A commit names the epoch of its lease, and the LogStore refuses one that is not in force | Accepted |
 | [0020](0020-the-watermark-of-an-incremental-load.md) | The watermark of an incremental load: a window of the source's clock, fixed when the batch is planned | Accepted · what `load.watermark.start` bounds, by ADR-0021 |
 | [0021](0021-operator-actions-and-backfills.md) | What an operator does to a source is a run, and a backfill is a sequence of its own | Accepted |
-| [0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) | A failure of a run is classified once, and a run that may pass resumes where it is durable | Accepted · built in P8.2 to P8.5 |
+| [0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) | A failure of a run is classified once, and a run that may pass resumes where it is durable | Accepted · built in P8.2 to P8.5 · a conflict that asks for a re-plan superseded by ADR-0025 |
 | [0023](0023-a-file-that-cannot-be-read.md) | A file that cannot be read stops its source, or is skipped and recorded, as the source says | Accepted · a third kind of file that cannot be read added by ADR-0024, and two more by the bounds of P8.11 |
 | [0024](0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) | A source of CSV says its dialect and its encoding, a plan says how its files are read, and a file that is not in its encoding cannot be read | Accepted · a value of CSV bounded in P8.11 |
+| [0025](0025-the-schema-policy-of-a-source.md) | A read is held to its table by the schema policy of its source, and a change is made in the commit of its rows | Accepted · built in P9.3 to P9.10 |
 
 Superseded decisions:
 - *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
@@ -36,6 +37,7 @@ Superseded decisions:
 - *ADR-0004 §3.2 and deviation 4, a failed publish is swallowed*: replaced by ADR-0017 in P2a.
 - *ADR-0018, a tombstone in the table before a batch is marked abandoned* (planned for P5.10, never built): replaced by ADR-0019 in P5.10. A run that lost its lease is refused where it commits, so there is nothing for a tombstone to keep out.
 - *ADR-0010 §2, a count of attempts* (5, with a backoff from 500 ms to 30 s): replaced by ADR-0022 in P8.1. The budget of a run is one of time, from the profile (P3), and is shared with the failures that pass.
+- *ADR-0022 §1, a conflict that asks for a re-plan is tried once on the table as it is now, and is then permanent*: replaced by ADR-0025 in P9.2. The policy of the schema of the source is looked at against the table that another writer left: a table that it takes is a conflict retried within the budget of the run, which ends in 3 when the budget runs out, and one that it refuses is permanent at once. With it, ADR-0010 §1's "retry once" for `ProtocolChangedException`.
 
 Amended decisions:
 - *ADR-0005 §3, a planned batch is replayed until it is committed, or given up by an operator*: ADR-0018 (P5.8) adds that the run that holds the lease gives it up when its source no longer has what the plan names. No plan is changed, and the rest of the protocol stands.
@@ -45,8 +47,9 @@ Amended decisions:
 - *ADR-0018, points 3 and 5, nothing of an abandoned batch is recorded, and the run that gives it up ends in 3*: ADR-0023 (P8.7a) has a batch given up under `skip` record its files that cannot be read as `FAILED`, in the same transaction, and its run end well. A batch whose source changed is given up as before.
 - *ADR-0008 and ADR-0013 §2, a file that cannot be read, or outside the root, is recorded as `FAILED` and then the policy applies*: ADR-0023 (P8.7a) records it under `skip` alone. Under `fail` the run names it and fails, and a file outside the root is refused when it is listed, as before.
 - *ADR-0023 §2, what a file that cannot be read is*: ADR-0024 (P8.9a) adds a third kind, a file whose bytes are not of the encoding of its source, found by a look at its bytes once Spark has read it. The policy, and what each of its values does, stand as they are.
+- *ADR-0008, Bronze renames nothing*: ADR-0025 (P9.2) lets a source give a column of its own another name in Bronze, by `schema.renames`: an alias of a name at read, which changes no value and no table.
 
-Schema evolution (P9) gets its own ADR in its phase, once the policies are validated against Delta 4.4's type-widening support.
+Schema evolution (P9) has ADR-0025, written once P9.1 had pinned what Delta 4.4.1 does with a change of a schema (`DeltaSchemaContractSpec`).
 
 ## Template
 

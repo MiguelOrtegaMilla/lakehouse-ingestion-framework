@@ -4,7 +4,7 @@
 |---|---|
 | **Status** | Accepted (consequence of D3, 2026-09-25) |
 | **Related** | [ADR-0004](0004-postgresql-coordinated-delta-logstore.md), [ADR-0005](0005-batch-wal-and-idempotent-writes.md), [ADR-0008](0008-layer-responsibilities.md) |
-| **Superseded in part** | [ADR-0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) (P8.1, 2026-11-26) replaces §2, the retry policy: a budget of time from the profile, in place of a count of attempts. §2 keeps its original text and points to it. |
+| **Superseded in part** | [ADR-0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) (P8.1, 2026-11-26) replaces §2, the retry policy: a budget of time from the profile, in place of a count of attempts. §2 keeps its original text and points to it. [ADR-0025](0025-the-schema-policy-of-a-source.md) (P9.2, 2026-11-28) has a conflict that asks for a re-plan retried within that budget, where the policy of the schema takes the table as it is now, in place of the "retry once" of `ProtocolChangedException` in §1, which keeps its original text and points to it. |
 
 ## Context
 
@@ -34,6 +34,8 @@ Blind appends (Bronze) have no read set, so under Delta's default `WriteSerializ
 | `ConcurrentWriteException` (generic) | Other write–write conflict | **Retry** | Same |
 | `MetadataChangedException` | Concurrent metadata change: typically **schema evolution by another writer** | **Re-plan** | Reload the table schema, re-evaluate the source's schema policy (P9) against it. Compatible → retry; policy says `fail` → permanent. |
 | `ProtocolChangedException` | Concurrent protocol / table-feature upgrade | **Re-plan** | Check that this client supports the new protocol → retry once; otherwise permanent. |
+
+> **The re-plan, as built from P9 ([ADR-0025](0025-the-schema-policy-of-a-source.md) §10, P9.2, 2026-11-28):** the policy of the schema of the source is looked at against the table as another writer left it. A table that it takes is a conflict retried within the budget of the run (ADR-0022 §5), which ends in 3 when the budget runs out; one that it refuses is permanent at once. A `ProtocolChangedException` comes only to the engine's own commit that turns type widening on, and is retried the same way.
 | `ConcurrentTransactionException` | Another transaction committed with **our `txnAppId`** concurrently | **Identity** — never blind-retried | This means two writers with the same identity: a zombie, or a coordination bug. Go to recovery: if the table's `txn` version is `≥ batch_seq`, roll forward (the other writer committed the same immutable plan); otherwise fail permanently and alert. |
 | LogStore `IOException` (coordination unavailable) | PostgreSQL unreachable | **Transient** | Backoff retry of the step. **Never** fall back to an uncoordinated write. |
 | LogStore integrity errors (`TAINTED`, unregistered table, content mismatch) | Uncoordinated writer or misconfiguration | **Permanent** | Fail (exit 4), alert, runbook |
