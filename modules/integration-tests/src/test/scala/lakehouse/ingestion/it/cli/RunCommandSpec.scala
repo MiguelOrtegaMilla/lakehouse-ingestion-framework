@@ -317,6 +317,59 @@ final class RunCommandSpec
     runsOf(rejecting) shouldBe Seq("FAILED" -> Some("data"))
   }
 
+  test(
+    "as it is deployed, a batch read as it was planned, in a dialect that its source no longer " +
+      "says, is warned of on the error output alone"
+  ) {
+    val asPlanned = "the batch is read as it was planned"
+    val orders = fileSource(rejected = Some("0.5"))
+    // Of commas: two records, and one with a value too many. Read with `;`, three records of one
+    // column, `id,name`, and none set apart.
+    drop(orders, "a.csv", "id,name\n1,ann\n2,bea\n3,cy,extra\n")
+    // The run dies once its records set apart are written: the batch stays planned, with commas.
+    val dies: FaultHooks = (point, _) =>
+      if (point == FaultPoint.AfterQuarantineWrite)
+        throw new IllegalStateException("the run dies after its quarantine")
+    val (out, err) = (new ByteArrayOutputStream, new ByteArrayOutputStream)
+    val exit = Main.run(
+      arguments(orders),
+      new PrintStream(out, true, "UTF-8"),
+      new PrintStream(err, true, "UTF-8"),
+      Map.empty[String, String].get,
+      hooks = dies
+    )
+    withClue(err.toString("UTF-8"))(exit shouldBe Main.Exit.Internal)
+    batchesOf(orders) shouldBe Seq("1" -> "PLANNED")
+
+    // The source says `;` now, and the batch is run again by a process of its own, which logs as
+    // the application's configuration says.
+    files.fileSource(orders.id, rejected = Some("0.5"), options = """, csv: { delimiter: ";" }""")
+    val (output, errors) = (files.newLog(), files.newLog())
+    val ended = CommandProcess
+      .start(arguments(orders), output, errors = Some(errors), classpath = CommandProcess.Deployed)
+      .await()
+
+    val logged = Files.readAllLines(errors, UTF_8).asScala.toSeq
+    val printed = Files.readAllLines(output, UTF_8).asScala.toSeq
+    withClue(logged.takeRight(30).mkString("\n"))(ended.exit shouldBe Main.Exit.Ok)
+    // Read as it was planned, with commas: two rows, beside the record set apart before. The run
+    // after it, of the same invocation, finds nothing new.
+    batchesOf(orders) shouldBe Seq("1" -> "COMMITTED")
+    rowsWritten(orders) shouldBe Seq("2", "0")
+    printed.exists(_.contains("committed the batch")) shouldBe true
+    // The warning is the connector's, as the application logs, with what to do in either case:
+    // the batch committed, as the run that warns of it commits it, and the batch still planned,
+    // if that run fails before its commit.
+    val warned = logged.filter(_.contains(asPlanned)).loneElement
+    val ofTheConnector = """\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} WARN FileSourceConnector: .*"""
+    warned should fullyMatch regex ofTheConnector
+    warned should include(s"${orders.id.value}: $asPlanned, as ")
+    warned should include("reprocess it (reprocess)")
+    warned should include("give it up (abandon-batch)")
+    printed.filter(_.contains(asPlanned)) shouldBe empty
+    assertLedger(orders)
+  }
+
   test("a file of JSON in gzip that opens to a line of a gigabyte ends in 4, and not for memory") {
     // About a megabyte on disk, and one line of 2^30 characters once it is decompressed: what
     // a run held whole, in a process with less memory than that, until the lines were looked at
