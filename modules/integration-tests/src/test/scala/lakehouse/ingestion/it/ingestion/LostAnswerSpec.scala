@@ -1,21 +1,28 @@
 package lakehouse.ingestion.it.ingestion
 
-import java.time.{Clock, ZoneOffset}
+import java.time.{Clock, Instant, OffsetDateTime, ZoneOffset}
 
 import scala.annotation.tailrec
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
+import scala.util.Using
 
 import eu.rekawek.toxiproxy.model.ToxicDirection
 import io.circe.Json
 import lakehouse.ingestion.core.config._
 import lakehouse.ingestion.core.control._
+import lakehouse.ingestion.core.state.StoredWatermark
+import lakehouse.ingestion.core.watermark.{BackfillRange, WatermarkPlan}
 import lakehouse.ingestion.engine.IngestionService.Outcome
 import lakehouse.ingestion.engine.connector._
+import lakehouse.ingestion.engine.control.{Backfills, ControlDatabase, Leases}
 import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
+import lakehouse.ingestion.engine.jdbc.JdbcSourceConnector
 import lakehouse.ingestion.engine.operator.OperatorActions
-import lakehouse.ingestion.engine.{FaultPoint, IngestionService}
+import lakehouse.ingestion.engine.operator.OperatorActions.WatermarkReset
+import lakehouse.ingestion.engine.{FaultHooks, FaultPoint, IngestionService}
+import lakehouse.ingestion.it.support.ControlPlaneSchema._
 import lakehouse.ingestion.it.support.{CapturedLogs, Died}
 import org.apache.logging.log4j.Level
 import org.scalatest.OptionValues
@@ -31,12 +38,18 @@ import org.scalatest.matchers.should.Matchers
  * held back, what the transaction writes is watched for on a path that the proxy does not touch,
  * and the proxy is cut once it is there, before the answer gets through. A transaction that does
  * not reach the database is cut by the proxy alone. Each test ends with the ledger.
+ *
+ * Every transaction that ends a run is settled in `LeasedRun`, and each of the four is made
+ * here with its answer lost: the commit of a batch, the abandon of `abandon-batch`, the reset of
+ * `reset-state`, and the commit of a chunk of a backfill, which moves the progress of the
+ * backfill as well (P8.11). A reprocess commits as a run does, and has no test of its own.
  */
 final class LostAnswerSpec
     extends AnyFunSuite
     with Matchers
     with OptionValues
-    with ProxiedIngestionSuite {
+    with ProxiedIngestionSuite
+    with JdbcIngestionSuite {
 
   override protected def timing: LeaseTiming = LeaseTiming(12.seconds)
 
@@ -155,6 +168,129 @@ final class LostAnswerSpec
     // The next run plans anew, and takes the file in the next batch.
     ingested(launch(orders)).batch shouldBe batchId(orders, 2)
     rowsOf(orders) shouldBe Seq(("1", 2L, "a.csv"))
+    assertLedger(orders)
+  }
+
+  /** The changes of the state of a source that `state_change_log` has: by which run. */
+  private def changesOf(of: Source): Seq[String] = asSuperuser { c =>
+    query(
+      c,
+      "SELECT run_id::text FROM control.state_change_log WHERE source_id = ? ORDER BY change_id",
+      of.id.value
+    ).map(_.head)
+  }
+
+  test("a reset-state whose transaction is made with its answer lost says that it was done") {
+    val orders = fileSource()
+    drop(orders, "a.csv", "id\n1\n")
+    ingested(launch(orders))
+    // Its Bronze table moved, which a reset lets through.
+    val moved = fileSource(
+      id = orders.id.value,
+      table = Some(s"bronze/moved/${orders.id.value.replace('.', '_')}")
+    )
+
+    val (outcome, logged) =
+      try
+        settling(throughTheProxy(Patient) { control =>
+          val actions =
+            new OperatorActions(control, spark, lakeRoot, timing, retries, ConnectorKind.BuiltIn)
+          loseTheAnswer(changesOf(orders).nonEmpty)
+          actions.reset(moved, versionOf(moved), WatermarkReset.Keep, asked)
+        })
+      finally heldBackNoMore()
+
+    outcome shouldBe a[OperatorActions.Outcome.Done]
+    logged.filter(_.contains(CommittedLost)) should have size 1
+    // Made once, by the run of the reset, which ended well and tried nothing again.
+    changesOf(orders) shouldBe Seq(outcome.run.toString)
+    runOf(outcome.run).status shouldBe RunStatus.Succeeded
+    runOf(outcome.run).counts.retries shouldBe None
+    holderOf(orders) shouldBe None
+
+    // The source goes on in its new table, and its file stays taken.
+    launch(moved) shouldBe a[Outcome.NothingNew]
+    drop(moved, "b.csv", "id\n2\n")
+    ingested(launch(moved)).batch shouldBe batchId(moved, 2)
+    assertLedger(moved)
+  }
+
+  test("a chunk of a backfill committed with its answer lost moves the backfill on, once") {
+    def day(n: Int): Instant = Instant.parse(f"2025-01-$n%02dT00:00:00Z")
+    val id = newSourceId().value
+    val table = s"public.${id.replace('.', '_')}"
+    asOwner { c =>
+      execute(c, s"CREATE TABLE $table (id int PRIMARY KEY, updated_at timestamptz NOT NULL)")
+      Seq(1 -> day(1).plusSeconds(3600), 2 -> day(2).plusSeconds(3600)).foreach { case (row, at) =>
+        Using.resource(c.prepareStatement(s"INSERT INTO $table VALUES (?, ?)")) { insert =>
+          insert.setInt(1, row)
+          insert.setObject(2, OffsetDateTime.ofInstant(at, ZoneOffset.UTC))
+          insert.executeUpdate(): Unit
+        }
+      }
+    }
+    // The regular sequence starts in 2026: the backfill reads what is before it.
+    val orders = jdbcSource(
+      table,
+      load = """load:
+               |  mode: incremental
+               |  watermark: { column: updated_at, safety_margin: 1h, start: "2026-01-01T00:00:00Z" }""".stripMargin,
+      id = id
+    )
+    val history = BackfillRequest(
+      BackfillId.parse("history").toOption.get,
+      BackfillRange.of(day(1), day(3)).toOption.get,
+      Some(1.day)
+    )
+    val backfilling = OperatorRequest.of("ops.oncall", "the history").toOption.get
+    def chunk(by: IngestionService): Outcome =
+      by.backfill(orders, versionOf(orders), history, backfilling)
+    def onTheControlPlane(control: ControlDatabase, hooks: FaultHooks): IngestionService =
+      new IngestionService(
+        control,
+        ConnectorRegistry(new JdbcSourceConnector(SecretResolver(passwords.get))),
+        spark,
+        lakeRoot,
+        timing,
+        retries,
+        Clock.fixed(Now, ZoneOffset.UTC),
+        hooks
+      )
+    def progress: Option[(Long, RunId, Instant)] =
+      database.run(Backfills.find(_, orders.id, Layer.Bronze, history.id)).flatMap(_.progress).map {
+        p => (p.lastCommitted.value, p.updatedBy, StoredWatermark.fromJson(p.watermark).value.value)
+      }
+
+    val (outcome, logged) =
+      try
+        settling(throughTheProxy(Patient) { control =>
+          val losing = hookAt(FaultPoint.BeforeStateCommit) { batch =>
+            loseTheAnswer(batchOf(batch.id).status == BatchStatus.Committed)
+          }
+          chunk(onTheControlPlane(control, losing))
+        })
+      finally heldBackNoMore()
+
+    val first = ingested(outcome)
+    logged.filter(_.contains(CommittedLost)) should have size 1
+    first.batch shouldBe BatchId(
+      TxnAppId.backfill(orders.id, Layer.Bronze, history.id),
+      BatchSeq.First
+    )
+    runOf(first.run).status shouldBe RunStatus.Succeeded
+    runOf(first.run).counts.retries shouldBe None
+    // The progress moved once, in the commit whose answer was lost: to the end of the chunk.
+    progress shouldBe Some((1L, first.run, day(2)))
+    database
+      .run(Leases.find(_, LeaseKey.backfill(orders.id, Layer.Bronze, history.id)))
+      .flatMap(_.holder) shouldBe None
+
+    // The next chunk is the next day, and not the same one again; and then the backfill ends.
+    val second = ingested(chunk(reading()))
+    second.batch.seq.value shouldBe 2L
+    WatermarkPlan.fromJson(batchOf(second.batch).plan).toOption.get.lower shouldBe Some(day(2))
+    second.next shouldBe Outcome.Next.Ends
+    progress.map(_._1) shouldBe Some(2L)
     assertLedger(orders)
   }
 
