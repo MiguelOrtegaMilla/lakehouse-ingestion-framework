@@ -12,6 +12,23 @@ The register of known vulnerabilities in this project's dependencies that are **
 | Accepted | **91**, in 8 groups (T-01 to T-08) |
 | Fixed | none (see [Why no version overrides](#why-no-version-overrides)) |
 | Next review | **2027-02-14**, or earlier on a [trigger](#review-triggers) |
+| Reviewed | 2026-11-28, at `5bb8663` (end of P8): the same 91 alerts, each by what brings its package in ([the review](#review-of-2026-11-28-end-of-p8)) |
+
+## Review of 2026-11-28 (end of P8)
+
+At commit `5bb8663` GitHub reports the same **91 alerts** on `main` (3 critical, 41 high, 45 moderate, 2 low), all of them of the packages of T-01 to T-08. Nothing was upgraded for them, and no entry of the register changed.
+
+**Each alert by what brings its package in.** The classpaths were resolved by sbt at that commit: `cli/Runtime/dependencyClasspath` for the project's own, `cli/Compile/fullClasspath` for what the command line runs on, and `integration-tests/Test/dependencyClasspath` for the tests. The snapshot that CI submits has every configuration of every module, the tests among them.
+
+| Group | What it is | Jars | Alerts |
+|---|---|---|---|
+| The project's own dependencies | What the build declares outside `provided` and test scope, and what that pulls in: `scala-library`, circe and cats, `snakeyaml-engine`, the PostgreSQL driver, HikariCP, `slf4j-api`, `checker-qual`, and Flyway with its modules for PostgreSQL and CockroachDB | 13 | **None** |
+| What comes with Spark, Delta and Hadoop | What is `provided`: Spark, Delta, the client of Hadoop, and what they pull in, Netty, Jackson, log4j, Guava, ZooKeeper, `lz4-java`, `snappy-java` and Bouncy Castle among them | 193 | **All 91** (T-01 to T-08) |
+| The tests and the build alone | Testcontainers and its module for Toxiproxy, docker-java, JNA, Gson and ScalaTest | 27 | **None** |
+
+**What is deployed, here.** The application has no package of its own yet: a jar for `spark-submit` comes when something needs one (P11, E1). The command line runs as `sbt "cli/run …"`, on `cli/Compile/fullClasspath`: the 13 jars of the project and the 193 that are `provided`, which sbt supplies as a Spark installation would. So the packages with alerts are not in what the project ships, and they are in the process that runs it, as they would be under `spark-submit` from the jars of the installation. What bounds them is the [exposure model](#exposure-model).
+
+**Triggers that came since the baseline, not assessed in this review.** The file connector reads Parquet since P5 (T-03, T-07), and it reads what any producer leaves in the landing zone, which the project did not generate: the condition of the exposure model that its inputs are trusted no longer holds for files. P8 bounds what a file can make a process hold (a value of CSV and a line of JSON, at 1,048,576 characters) and refuses a file that is not of its encoding, which is no assessment of the advisories of Jackson (T-03, the parser of each line of JSON) or of `snappy-java` (T-07, Parquet) against files from outside. Their entries stand as they were written until that assessment, which these triggers bring forward from 2027-02-14.
 
 ## How alerts are produced
 
