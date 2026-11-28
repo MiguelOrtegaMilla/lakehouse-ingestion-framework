@@ -29,10 +29,11 @@ jobs:
           persist-credentials: false
       - run: scripts/check-pins.sh
 
-  build:
-    name: Format, boundaries, compile and test
+  # The build is three jobs side by side, and a fourth that says whether all three ended well.
+  checks:
+    name: Format, boundaries and what production reaches
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,7 +42,9 @@ jobs:
       # the discovery names is in the repository (section 22, scripts/check_decisions.py).
       - name: Table of decisions
         run: python3 -I scripts/check_decisions.py
-      # The JDK, sbt, and the cache of what sbt downloads. This job is the one that saves it.
+      # The JDK, sbt, and the cache of what sbt downloads. This job is the one that saves it: it
+      # resolves the whole build, compiles every module with its tests (checkUnconnected reads
+      # both), and is the one that fetches scalafmt, which `update` does not.
       - uses: ./.github/actions/setup-build
         with:
           save-cache: "true"
@@ -49,17 +52,75 @@ jobs:
       # that needs Maven Central, and the one that is tried again if it answers 429.
       - name: Resolve the build
         run: scripts/retry-on-429.sh sbt -batch update
-      # Unit and integration tests. The integration tests start PostgreSQL with Testcontainers
-      # (Docker is on the runner). Stress runs are tagged and left out (`sbt stress`).
-      - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries checkUnconnected Test/compile test
+      - run: sbt -batch scalafmtCheckAll scalafmtSbtCheck checkBoundaries checkUnconnected
+
+  # The modules whose tests need no service: configuration, planning, the model of the control
+  # plane, the LogStore with every fault injected in one JVM, and the engine's own.
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Resolve the build
+        run: scripts/retry-on-429.sh sbt -batch update
+      # Every module but integration-tests, which the job below runs: a module added to the build
+      # is added to one of the two.
+      - run: sbt -batch core/test delta-pg-logstore/test engine/test cli/test
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: test-reports
+          name: test-reports-unit
           path: modules/*/target/test-reports/
           retention-days: 7
           if-no-files-found: ignore
+
+  # Every component against a real PostgreSQL (Testcontainers; Docker is on the runner), real
+  # Delta and real files. Stress runs are tagged and left out (`sbt stress`).
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-build
+      - name: Resolve the build
+        run: scripts/retry-on-429.sh sbt -batch update
+      - run: sbt -batch integration-tests/test
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-reports-integration
+          path: modules/*/target/test-reports/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # The check that main requires, under the name that it had when it was one job. It runs
+  # whatever the three jobs ended in (`always()`), and fails unless each of them succeeded: a
+  # job that is skipped counts as passed for a required check, so one that only ran when they
+  # succeeded would be skipped when one of them failed, and let the pull request through.
+  build:
+    name: Format, boundaries, compile and test
+    if: always()
+    needs: [checks, unit-tests, integration-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Each part of the build succeeded
+        env:
+          CHECKS: ${{ needs.checks.result }}
+          UNIT_TESTS: ${{ needs.unit-tests.result }}
+          INTEGRATION_TESTS: ${{ needs.integration-tests.result }}
+        run: |
+          echo "checks: $CHECKS; unit tests: $UNIT_TESTS; integration tests: $INTEGRATION_TESTS"
+          [[ "$CHECKS" == success && "$UNIT_TESTS" == success && "$INTEGRATION_TESTS" == success ]]
 
   # Dependency scanning (ADR-0013 §4). GitHub does not read sbt builds, so the resolved graph is
   # submitted (scripts/dependency-snapshot.sh); Dependabot alerts and the review below work from it. Both need the repository to
@@ -78,8 +139,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The same setup, and the same cache, as the job that runs the tests. It reads the cache
-      # and does not save it: that job's is the whole one.
+      # The same setup, and the same cache, as the jobs of the build. It reads the cache and does
+      # not save it: the job of the checks saves it, whole.
       - uses: ./.github/actions/setup-build
       - name: Test the scripts
         run: python3 -I -B -m unittest discover -s scripts

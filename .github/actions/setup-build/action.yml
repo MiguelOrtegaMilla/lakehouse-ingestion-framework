@@ -6,7 +6,8 @@
 # itself and every library again. That matters beyond the minutes: Maven Central answers 429 to
 # an address that asks for too much, and a job that starts with nothing asks for everything.
 #
-# One job saves the cache, the one that runs the whole build, and the others read it. Jobs that
+# One job saves the cache, the one of the checks, which resolves and compiles the whole build and
+# fetches scalafmt, and the others read it. Jobs that
 # share a key and all save would leave in it what the first to finish happened to need. So what
 # another job needs must be something the build itself has: the plugin that resolves the
 # dependency graph is one of the build's plugins for that reason (project/plugins.sbt).
