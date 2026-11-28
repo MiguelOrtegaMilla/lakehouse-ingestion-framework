@@ -6,7 +6,7 @@ A metadata-driven ingestion framework on Apache Spark and Delta Lake: adding a s
 
 It runs on one machine, with no cloud service: Spark in local mode, Delta Lake on a local disk, and one PostgreSQL in Docker.
 
-> **Status: Checkpoint A, the minimum that can be shown.** Files and JDBC into Bronze, in full and incrementally, once whatever happens: a process killed at any point, a lease taken over, two processes writing one table. Every run is audited, and an operator has commands for a source that is stuck. Silver, schema evolution, retries and observability come next ([the plan](docs/architecture/00-architecture-discovery.md#17-revised-phase-plan)).
+> **Status: Checkpoint A, and the failures of a run (P8).** Files and JDBC into Bronze, in full and incrementally, once whatever happens: a process killed at any point, a lease taken over, two processes writing one table. Every run is audited, and an operator has commands for a source that is stuck. A failure is classified once and ends in a code that says what to do, a run that may pass rides it out within a budget, a file that cannot be read stops its source or is skipped as the source says, and what a source set apart is read with a command. Schema evolution, Silver and observability come next ([the plan](docs/architecture/00-architecture-discovery.md#17-revised-phase-plan)).
 
 ## What it does, and what shows it
 
@@ -21,9 +21,13 @@ Each line is something the framework is to guarantee, with the test that fails i
 | **Several processes write one Delta table and no commit is lost**, on a local file system, where Delta by itself does lose them | A Delta `LogStore` that takes each version of a table in PostgreSQL before the commit exists ([ADR-0004](docs/adr/0004-postgresql-coordinated-delta-logstore.md)) | With Delta's own LogStore a commit was lost in 7 runs of 7 when the race was forced; with this one, none of 10,954 commits in 33 runs, writers and PostgreSQL killed among them ([results](docs/testing/tests-and-ci.md#results-deltas-default-logstore-and-postgreslogstore)) |
 | **An incremental load loses no change** that is committed within a margin | A batch reads a window of the clock of the source, fixed when the batch is planned, and never the highest value that it happened to read ([ADR-0020](docs/adr/0020-the-watermark-of-an-incremental-load.md)) | `WatermarkPlanSpec`, `GeneratedTableSpec`: a table changed from a seed, with ties and transactions left open, read after each round |
 | **Every run can be asked about**: who ran what, with which configuration, how many rows, how it ended | Tables of the control plane that the engine can add to and cannot rewrite | `ControlSchemaSpec`; the query at the end of the demo below |
-| **An operator has a way out, and it is audited** | Giving a batch up, resetting the state of a source, reading files again and loading a history are each a run under a lease, with who asked and why ([ADR-0021](docs/adr/0021-operator-actions-and-backfills.md)) | `AbandonBatchSpec`, `ResetStateSpec`, `ReprocessSpec`, `BackfillBesideRunSpec`: a backfill beside the incremental load of the same table, in two processes, one of them killed |
+| **An operator has a way out, and it is audited** | Giving a batch up, resetting the state of a source, reading files again and loading a history are each a run under a lease, with who asked and why ([ADR-0021](docs/adr/0021-operator-actions-and-backfills.md)); a table that the LogStore refuses is mended by a command that records what it did | `AbandonBatchSpec`, `ResetStateSpec`, `ReprocessSpec`, `BackfillBesideRunSpec`: a backfill beside the incremental load of the same table, in two processes, one of them killed; `MaintainTableCommandSpec` |
+| **A failure ends in a code that says what to do** (3 again later, 4 not until something is changed, 5 the data, 70 a bug) | One classifier where a run ends; what passes is tried again where the run is durable, within a budget of time; a run whose last answer was lost reads its own row before it says how it ended ([ADR-0022](docs/adr/0022-the-classification-of-failures-and-the-retries-of-a-run.md), [the codes](docs/architecture/00-architecture-discovery.md#141-exit-codes-the-contract-with-the-orchestrator)) | `FailureClassesSpec`, `RetriesSpec` and `LostAnswerSpec`, with the control plane, the source and the coordination database cut for real by a proxy |
+| **A file that cannot be read stops its source, or is skipped and recorded**, as the source says | Each file of a batch that fails is read alone; a file cut short, one that may not be opened, one not of its encoding, and one with a value or a line too long for memory are named, and never what they hold ([ADR-0023](docs/adr/0023-a-file-that-cannot-be-read.md)) | `UnreadableFilesSpec`, with files broken for real; `SparkUnreadableFileContractSpec`, what Spark raises for each |
+| **What a source sent is kept as it sent it** | A line of JSON is a record only as it was written; CSV says its dialect and its encoding, and a batch is read as it was planned; a record that cannot be parsed is kept whole in a quarantine, which a command reads ([ADR-0024](docs/adr/0024-the-dialect-and-the-encoding-of-a-source-of-csv.md)) | `JsonRecordsSpec`, `CsvDialectSpec`, `QuarantineCommandSpec` |
+| **No value of a source reaches a log** at the level that a process logs at | Delta writes no statistics of a row where it logs them, and the log of the application takes out what Spark's parser of CSV says it parsed | `RunCommandLogsSpec`, which looks at every line of the log of a run, in the JVM and in processes of their own |
 
-The [table of decisions](docs/architecture/00-architecture-discovery.md#22-decisions-that-the-code-enforces-where-and-what-shows-it) has all 117 of them, each with the code that enforces it and its tests, and CI fails when a row names something that is no longer there.
+The [table of decisions](docs/architecture/00-architecture-discovery.md#22-decisions-that-the-code-enforces-where-and-what-shows-it) has all 142 of them, each with the code that enforces it and its tests, and CI fails when a row names something that is no longer there.
 
 ## How it works
 
@@ -165,6 +169,27 @@ docker compose -f docker/docker-compose.yml exec postgres psql -U ingest_control
 
 Files work the same way, with the source [`sales.returns`](conf/sources/sales.returns.yaml): drop a CSV in `~/lakehouse-data/landing/sales/returns`, and `run --source sales.returns` takes it once it is a minute old. That, the exit codes, and the commands of an operator (`abandon-batch`, `reset-state`, `reprocess`) are in [Running it](docs/operations/running-a-source.md). `docker compose -f docker/docker-compose.yml down -v` removes the demo's database.
 
+**What a source set apart.** A record of CSV with more values or fewer than its header is set apart, kept whole in the quarantine of its source, and by default no record may be (`quality.max_rejected_ratio`): the run ends in 5, with nothing written to Bronze.
+
+```bash
+printf 'id,amount\n1,10\n2,20\n3,30,extra\n4\n5,50\n' > ~/lakehouse-data/landing/sales/returns/returns-1.csv
+sbt "cli/run run --profile conf/app/local.yaml --sources conf/sources --source sales.returns"      # ends in 5
+sbt -error "cli/run quarantine --profile conf/app/local.yaml --sources conf/sources --source sales.returns --records 20" > rejected.jsonl
+```
+
+```text
+error: The run 01a221d2-fc06-… of sales.returns failed (data): 2 of the 5 records of sales.returns/bronze#1 were set apart, […] The batch is not committed, and nothing of it was written to Bronze: it stays planned.
+```
+
+`rejected.jsonl` has the two records, a line of JSON each and nothing else, and the warning that they may hold personal data is on the error output:
+
+```text
+{"run_id":"01a221d2-fc06-…","backfill":null,"batch_seq":1,"batch_status":"PLANNED","source_file":"sales/returns/returns-1.csv","error_type":"unparsed","error_detail":null,"quarantined_at":"2026-11-28T11:03:29.102136Z","raw_record":"3,30,extra","raw_record_chars":10,"truncated":false}
+{"run_id":"01a221d2-fc06-…","backfill":null,"batch_seq":1,"batch_status":"PLANNED","source_file":"sales/returns/returns-1.csv","error_type":"unparsed","error_detail":null,"quarantined_at":"2026-11-28T11:03:29.102136Z","raw_record":"4","raw_record_chars":1,"truncated":false}
+```
+
+Under sbt the file is the records alone only when the command ends in 0: with another code, sbt adds two lines of its own to it ([Running it](docs/operations/running-a-source.md#what-a-source-had-set-apart-quarantine) says what to do with the batch, and with the file).
+
 ## How it is tested
 
 | Level | What it is | Command | Needs |
@@ -209,7 +234,7 @@ What a module may depend on is enforced by the build ([ADR-0012](docs/adr/0012-m
 
 ## What it does not do yet
 
-It stops at Bronze. Silver (typing, deduplication by key, `MERGE`, deletes, masking of personal data), the policies for a schema that changes, retries with backoff and the classification of every error, and lineage and observability are the phases that follow, in that order. It runs on one machine and a local disk; a cluster and object storage are extensions that the design allows for and that are not built. An operator cannot yet mend a table of the LogStore from the command line, though the operations are built and tested.
+It stops at Bronze. The policies for a schema that changes (P9), Silver (typing, deduplication by key, `MERGE`, deletes, masking of personal data: P10), and lineage and observability (P11) are the phases that follow, in that order. It runs on one machine and a local disk; a cluster and object storage are extensions that the design allows for and that are not built. What is known to be left, phase by phase, is in [the open items](docs/architecture/00-architecture-discovery.md#open-items-and-accepted-exceptions).
 
 ## License
 

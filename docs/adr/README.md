@@ -25,9 +25,9 @@ Each ADR records one decision: its context, the decision, the alternatives consi
 | [0019](0019-a-commit-names-the-epoch-of-its-lease.md) | A commit names the epoch of its lease, and the LogStore refuses one that is not in force | Accepted |
 | [0020](0020-the-watermark-of-an-incremental-load.md) | The watermark of an incremental load: a window of the source's clock, fixed when the batch is planned | Accepted · what `load.watermark.start` bounds, by ADR-0021 |
 | [0021](0021-operator-actions-and-backfills.md) | What an operator does to a source is a run, and a backfill is a sequence of its own | Accepted |
-| [0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) | A failure of a run is classified once, and a run that may pass resumes where it is durable | Accepted |
-| [0023](0023-a-file-that-cannot-be-read.md) | A file that cannot be read stops its source, or is skipped and recorded, as the source says | Accepted · a third kind of file that cannot be read added by ADR-0024 |
-| [0024](0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) | A source of CSV says its dialect and its encoding, a plan says how its files are read, and a file that is not in its encoding cannot be read | Accepted |
+| [0022](0022-the-classification-of-failures-and-the-retries-of-a-run.md) | A failure of a run is classified once, and a run that may pass resumes where it is durable | Accepted · built in P8.2 to P8.5 |
+| [0023](0023-a-file-that-cannot-be-read.md) | A file that cannot be read stops its source, or is skipped and recorded, as the source says | Accepted · a third kind of file that cannot be read added by ADR-0024, and two more by the bounds of P8.11 |
+| [0024](0024-the-dialect-and-the-encoding-of-a-source-of-csv.md) | A source of CSV says its dialect and its encoding, a plan says how its files are read, and a file that is not in its encoding cannot be read | Accepted · a value of CSV bounded in P8.11 |
 
 Superseded decisions:
 - *ADR-0002, version rows* (Spark 4.1.3, Delta 4.4.0, Scala and sbt to be pinned): replaced by ADR-0014 in P1.
