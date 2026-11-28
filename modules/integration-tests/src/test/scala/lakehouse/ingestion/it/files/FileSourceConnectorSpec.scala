@@ -17,7 +17,7 @@ import lakehouse.ingestion.core.control.FailureClass
 import lakehouse.ingestion.core.files.{FileHorizon, FilePlan, LandedFile}
 import lakehouse.ingestion.engine.failure.RunFailedException
 import lakehouse.ingestion.engine.connector._
-import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing}
+import lakehouse.ingestion.engine.files.{FileSourceConnector, Landing, LineLengths}
 import lakehouse.ingestion.it.support.{CapturedLogs, LocalSparkSuite}
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
@@ -1134,11 +1134,12 @@ final class FileSourceConnectorSpec
     cutShort(cut)
     val planned = plan(root, orders).value
 
+    // The look at its lines, which is the first thing that reads it, meets the cut before
+    // Spark does (P8.11): what failed is said by its cause, with no condition of Spark's.
     skipped(read(root, orders, planned)).unreadable shouldBe Seq(
       UnreadableFilesException.Unreadable(
         "b.json.gz",
-        "unreadable: it failed each of 3 reads of it alone: FAILED_READ_FILE.NO_HINT, " +
-          "from java.io.EOFException"
+        "unreadable: it failed each of 3 reads of it alone: from java.io.EOFException"
       )
     )
   }
@@ -1267,6 +1268,62 @@ final class FileSourceConnectorSpec
 
     val read = ingest(root, source("csv"))
     rows(read.rows.select("id", name)) shouldBe Seq(Row("1", "x" * Bound))
+  }
+
+  // A line of JSON longer than the bound (P8.11): what Spark would hold whole, and a process end
+  // for want of memory for.
+  private def records(from: Int, to: Int): String =
+    (from to to).map(i => s"""{"id":"$i","v":"$Held"}""").mkString("\n")
+
+  /** One document of JSON on one line, as a list exported minified: more than the bound. */
+  private def minified(n: Int): String =
+    (1 to n).map(i => s"""{"id":"$i","v":"$Held"}""").mkString("[", ",", "]")
+
+  test("a file of JSON that is one line longer than the bound cannot be read: no JSON Lines") {
+    val root = landingZone()
+    val orders = source("json")
+    drop(root, "a.json", records(1, 2) + "\n")
+    drop(root, "b.json", minified(Bound / 20))
+    val planned = plan(root, orders).value
+    val (reading, reads) = counting(root)
+
+    val message = refused(reading.read(orders, configOf(orders), planned, ReadContext(spark)))
+    message should include("the batch of shop/orders has 1 file that cannot be read")
+    message should include(s"'b.json' ${LineLengths.why(1, Bound)}")
+    message should not include Held
+    // Looked at before Spark read it: nothing was read alone.
+    reads shouldBe empty
+  }
+
+  test("a line longer than the bound in a file of JSON Lines is said by its number, in gzip too") {
+    val root = landingZone()
+    val orders = source("json", policy = "skip")
+    drop(root, "a.json", records(1, 2) + "\n" + s"""{"id":"3","v":"${"x" * Bound}"}""" + "\n")
+    dropBytes(
+      root,
+      "b.json.gz",
+      (records(4, 5) + "\n" + minified(Bound / 20) + "\n").getBytes(UTF_8),
+      gzip = true
+    )
+    val planned = plan(root, orders).value
+
+    val cannot = skipped(read(root, orders, planned))
+    cannot.unreadable shouldBe Seq(
+      UnreadableFilesException.Unreadable("a.json", LineLengths.why(3, Bound)),
+      UnreadableFilesException.Unreadable("b.json.gz", LineLengths.why(3, Bound))
+    )
+    cannot.getMessage should not include Held
+  }
+
+  test("a line of JSON as long as the bound is read, and so are lines ended by CR alone") {
+    val root = landingZone()
+    // As long as the bound: the record and the text around its value.
+    val value = "x" * (Bound - """{"id":"1","v":""}""".length)
+    drop(root, "a.json", s"""{"id":"1","v":"$value"}""" + "\n")
+    drop(root, "b.json", records(2, 3).replace("\n", "\r") + "\r")
+
+    val read = ingest(root, source("json"))
+    rows(read.rows.select("id")) shouldBe Seq(Row("1"), Row("2"), Row("3"))
   }
 
   test("a failure of a batch that no file has alone is let through as it was") {

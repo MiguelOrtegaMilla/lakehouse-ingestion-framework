@@ -251,6 +251,12 @@ final class FileSourceConnector(
     val read =
       try readOf(context.spark, config, as, files.directory, each)
       catch {
+        // A file with a line too long cannot be read, unless it changed since it was planned.
+        case long: LinesTooLong =>
+          confirmed(config, "while its lines were looked at")(
+            landing.confirmAgain(config, files, before)
+          )
+          throw unreadable(config, long.files)
         // What a read refuses of the names of a batch may be what a file that is not of its
         // encoding was read as: a header that is not the others', for one. Such a file is
         // what is said, and it is the source's to say what becomes of it.
@@ -413,9 +419,30 @@ final class FileSourceConnector(
     val sourceFileOf = each.map { case (file, path) =>
       path.toString -> s"${directory.value}/${file.name.value}"
     }.toMap
-    if (as.format == FileConnectorConfig.Format.Json)
-      jsonOf(spark, paths.map(path => s"file:$path"), sourceFileOf)
-    else kept(config, readable(spark, as, paths, sourceFileOf))
+    if (as.format == FileConnectorConfig.Format.Json) {
+      val locations = paths.map(path => s"file:$path")
+      linesWithin(spark, each, locations)
+      jsonOf(spark, locations, sourceFileOf)
+    } else kept(config, readable(spark, as, paths, sourceFileOf))
+  }
+
+  /**
+   * The lines of the files of JSON of a read, each no longer than the bound, looked at before
+   * Spark reads them (`LineLengths`): Spark holds a line whole, and a file that is one document
+   * of JSON on one line, or a line of some hundreds of megabytes, would end the process for
+   * want of memory. A look that fails is a read that fails, of a file that cannot be read.
+   *
+   * @throws LinesTooLong the files with a line too long, each with why
+   */
+  private def linesWithin(
+      spark: SparkSession,
+      each: Vector[(LandedFile, Path)],
+      locations: Vector[String]
+  ): Unit = {
+    val long = each.map(_._1).zip(LineLengths.tooLong(spark, locations, MaxValueLength)).collect {
+      case (file, Some(line)) => file -> LineLengths.why(line, MaxValueLength)
+    }
+    if (long.nonEmpty) throw new LinesTooLong(long)
   }
 
   /** The rows of a read of CSV or Parquet, kept by Spark apart from the files. */
@@ -614,9 +641,7 @@ final class FileSourceConnector(
       landing.confirmAgain(config, files, before)
     )
 
-    val cannot = found.collect { case (file, Alone.Unreadable(why)) =>
-      file -> s"$Unreadable: $why"
-    }
+    val cannot = found.collect { case (file, Alone.Unreadable(why)) => file -> why }
     val passed = found.collect { case (file, Alone.Passed(failures)) =>
       s"'${file.name}' failed ${times(failures)} and then read"
     }
@@ -656,25 +681,23 @@ final class FileSourceConnector(
       // No job is started by a run that has lost its lease.
       context.verify()
       beforeAlone(file.name.value, n)
-      val failure =
-        try {
-          readOf(context.spark, config, as, directory, Vector(file -> path))
-          None
-        } catch {
-          case known: RunFailedException => Some(Left(known))
-          case NonFatal(failed) => Some(Right(failed))
-        }
-      failure match {
-        case None if n == 1 => Some(Alone.Read)
-        case None => Some(Alone.Passed(n - 1))
-        case Some(Left(_)) => Some(Alone.Known)
-        // A value too long is so at every read: the file cannot be read, from its first.
-        case Some(Right(failed)) if tooLong(failed) => Some(Alone.Unreadable(TooLong))
-        case Some(Right(failed)) if n == AloneReads =>
+      try {
+        readOf(context.spark, config, as, directory, Vector(file -> path))
+        Some(if (n == 1) Alone.Read else Alone.Passed(n - 1))
+      } catch {
+        // A value, or a line, too long is so at every read: the file cannot be read, from its
+        // first.
+        case long: LinesTooLong => Some(Alone.Unreadable(long.files.head._2))
+        case _: RunFailedException => Some(Alone.Known)
+        case NonFatal(failed) if tooLong(failed) =>
+          Some(Alone.Unreadable(s"$Unreadable: $TooLong"))
+        case NonFatal(failed) if n == AloneReads =>
           Some(
-            Alone.Unreadable(s"it failed each of $AloneReads reads of it alone: ${said(failed)}")
+            Alone.Unreadable(
+              s"$Unreadable: it failed each of $AloneReads reads of it alone: ${said(failed)}"
+            )
           )
-        case Some(Right(_)) => None
+        case NonFatal(_) => None
       }
     }
 
@@ -1091,6 +1114,10 @@ object FileSourceConnector {
   /** What a record of a file that Spark cannot read says it is, as a word. */
   val Unreadable = "unreadable"
 
+  /** Files of a read of JSON with a line longer than the bound, each with why. */
+  final private class LinesTooLong(val files: Vector[(LandedFile, String)])
+      extends Exception(s"${files.size} files with a line too long")
+
   /** What one file came to, read alone. */
   sealed private trait Alone
   private object Alone {
@@ -1105,8 +1132,8 @@ object FileSourceConnector {
     case object Known extends Alone
 
     /**
-     * It cannot be read: it failed at every read with what the read does not know, or once with
-     * a value too long.
+     * It cannot be read, for `why`, as its record says it: it failed at every read with what the
+     * read does not know, or once with a value or a line too long.
      */
     final case class Unreadable(why: String) extends Alone
   }

@@ -94,7 +94,7 @@ Without `alwaysWriteExceptions = false`, log4j2 writes the stack trace again, wh
 
 ### A file that cannot be read
 
-A file cut short, one that the process may not open, or a symbolic link out of the landing zone stops its source by default: the run ends in 4 and names each file and why, and every run does the same until the file is mended. Write it again, whole (another size or time makes it another file, which the next run takes), or give the process the permission to read it. A source that says `connector.on_unreadable_file: skip` goes on without it: the file is recorded in the control plane as `FAILED`, with why, and `touch` has it read again once it is mended ([ADR-0023](../adr/0023-a-file-that-cannot-be-read.md)). The files a source skipped, and why:
+A file cut short, one that the process may not open, a symbolic link out of the landing zone, a value of CSV longer than 1,048,576 characters, or a line of JSON as long (`line_too_long`, most often a file that is one document of JSON and not JSON Lines) stops its source by default: the run ends in 4 and names each file and why, and every run does the same until the file is mended. Write it again, whole (another size or time makes it another file, which the next run takes), or give the process the permission to read it. A source that says `connector.on_unreadable_file: skip` goes on without it: the file is recorded in the control plane as `FAILED`, with why, and `touch` has it read again once it is mended ([ADR-0023](../adr/0023-a-file-that-cannot-be-read.md)). The files a source skipped, and why:
 
 ```sql
 SELECT path, size, modified_at, error, batch_seq
