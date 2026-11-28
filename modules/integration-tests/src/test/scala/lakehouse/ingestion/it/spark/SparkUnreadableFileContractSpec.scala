@@ -1,22 +1,35 @@
 package lakehouse.ingestion.it.spark
 
 import java.io.{EOFException, FileNotFoundException, IOException}
+import java.net.URI
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.attribute.PosixFilePermissions
 import java.nio.file.{Files, Path}
+import java.util.UUID
+import java.util.concurrent.{ExecutionException, Executors, TimeoutException, TimeUnit}
 import java.util.zip.GZIPOutputStream
 
+import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 import scala.util.Using
 
+import com.univocity.parsers.common.TextParsingException
 import lakehouse.ingestion.it.support.LocalSparkSuite
-import org.apache.spark.SparkThrowable
+import org.apache.hadoop.fs.{
+  FSDataInputStream,
+  FSInputStream,
+  Path => HadoopPath,
+  RawLocalFileSystem
+}
 import org.apache.spark.sql.functions.col
-import org.apache.spark.sql.types.{StringType, StructField, StructType}
+import org.apache.spark.sql.types.{LongType, StringType, StructField, StructType}
 import org.apache.spark.sql.{DataFrame, DataFrameReader}
+import org.apache.spark.{SparkException, SparkThrowable}
 import org.scalatest.Assertion
+import org.scalatest.concurrent.Eventually
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.{Millis, Seconds, Span}
 
 /**
  * What Spark 4.1 raises when a file of a batch cannot be read, at each of the two moments that a
@@ -43,15 +56,41 @@ import org.scalatest.matchers.should.Matchers
  *    a sound file of the same batch, read alone, reads whole. So reading each file of a batch
  *    alone finds those that cannot be read, and finds the same ones each time;
  *  - a batch may fail with no file that fails alone: two files of Parquet with one column of two
- *    types. Such a failure is not a file's.
+ *    types. Such a failure is not a file's;
+ *  - an error that `NonFatal` does not take, an `OutOfMemoryError` among them, raised as a file
+ *    is read, comes out by the format and the moment, and none of the three ways is the error
+ *    as it was raised:
+ *    - read by Spark's reader of files, the lines of JSON and the rows of Parquet: as a
+ *      `scala.MatchError` whose value is the error, with no cause.
+ *      `FileDataSourceV2.attachFilePath` has a case for each failure that it says the file of,
+ *      and none for it. The failure of a task is then an ordinary one, which Spark's executor
+ *      does not end its process for, as it does for an `OutOfMemoryError` that reaches it
+ *      (`SparkExitCode.OOM`, 52); and the connector finds such a file one that cannot be read,
+ *      as it finds one that fails each of its reads alone;
+ *    - read by univocity, the header and the rows of CSV: as the cause of the failure of the
+ *      read, which univocity raises for whatever its input raised. An `OutOfMemoryError` reaches
+ *      Spark's executor, which looks for it among the causes, and ends its process with 52;
+ *    - read for the columns of Parquet, in futures that Spark waits for with no bound
+ *      (`ThreadUtils.parmap`): not at all. A future is never completed by such an error, and the
+ *      read waits until its job is cancelled with its tasks interrupted, which the engine does
+ *      not do (`RunJobs`). A run that meets one never ends by itself (discovery §20).
  *
  * The files are broken for real: cut short, a page of Parquet written over, the permissions of a
  * file taken away. A test of a file that cannot be opened is cancelled for a user that may open
- * any file (root).
+ * any file (root). An error that `NonFatal` does not take cannot be had of a file at will: a file
+ * system of the test's raises it (`RaisingFileSystem`), and raises an `IOException` the same way,
+ * to show that what it raises comes out as what a file that cannot be read raises.
  */
-final class SparkUnreadableFileContractSpec extends AnyFunSuite with Matchers with LocalSparkSuite {
+final class SparkUnreadableFileContractSpec
+    extends AnyFunSuite
+    with Matchers
+    with LocalSparkSuite
+    with Eventually {
 
   import SparkUnreadableFileContractSpec._
+
+  implicit override val patienceConfig: PatienceConfig =
+    PatienceConfig(timeout = Span(20, Seconds), interval = Span(50, Millis))
 
   // ---------------------------------------------------------------------------------------------
   // The reads, as the file connector makes them
@@ -375,6 +414,183 @@ final class SparkUnreadableFileContractSpec extends AnyFunSuite with Matchers wi
     readOf(Format.Parquet, number) shouldBe Right(3L)
     readOf(Format.Parquet, text) shouldBe Right(2L)
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // An error that NonFatal does not take, raised as a file is read
+  // ---------------------------------------------------------------------------------------------
+
+  /** `reader`, its files read through `RaisingFileSystem`, which raises `raised` at every read. */
+  private def raising(reader: DataFrameReader, raised: Raised): DataFrameReader =
+    reader
+      .option(RaisingFileSystem.Impl, classOf[RaisingFileSystem].getName)
+      .option(RaisingFileSystem.NoCache, "true")
+      .option(RaisingFileSystem.Raises, raised.name)
+
+  /** Where a file is, to Spark, as `RaisingFileSystem` reads it. */
+  private def raisingAt(file: Path): String = s"${RaisingFileSystem.Scheme}:$file"
+
+  /** The lines of a file, as the connector reads those of JSON: as text, kept by Spark. */
+  private def linesOf(file: Path, raised: Raised): Either[Failure, Long] =
+    caught(Stage.Checkpoint)(
+      raising(everyFile(spark.read), raised)
+        .text(raisingAt(file))
+        .localCheckpoint(eager = true)
+        .count()
+    )
+
+  /**
+   * The rows of a file of Parquet, its columns known, as the checkpoint of the connector reads
+   * them: the footer and the pages, in a task of Spark's reader of files.
+   */
+  private def rowsOfParquet(file: Path, raised: Raised): Either[Failure, Long] =
+    caught(Stage.Checkpoint)(
+      raising(everyFile(spark.read), raised)
+        .schema(StructType(Seq(StructField("id", LongType), StructField("name", StringType))))
+        .parquet(raisingAt(file))
+        .localCheckpoint(eager = true)
+        .count()
+    )
+
+  /** The header of a file of CSV, as the inference of the connector reads it. */
+  private def headerOfCsv(file: Path, raised: Raised): Either[Failure, Seq[String]] =
+    caught(Stage.Inference)(
+      raising(csvReader, raised).csv(raisingAt(file)).schema.fieldNames.toSeq
+    )
+
+  /** The rows of a file of CSV, its columns known, as the connector's checkpoint reads them. */
+  private def rowsOfCsv(file: Path, raised: Raised): Either[Failure, Long] =
+    caught(Stage.Checkpoint)(
+      raising(csvReader, raised)
+        .schema(StructType(Seq("id", "name", "note").map(StructField(_, StringType))))
+        .csv(raisingAt(file))
+        .localCheckpoint(eager = true)
+        .count()
+    )
+
+  /** The columns of a file of Parquet, as the inference of the connector reads its footer. */
+  private def columnsOfParquet(file: Path, raised: Raised): Either[Failure, Seq[String]] =
+    caught(Stage.Inference)(
+      raising(everyFile(spark.read), raised)
+        .option("mergeSchema", "true")
+        .parquet(raisingAt(file))
+        .schema
+        .fieldNames
+        .toSeq
+    )
+
+  /** One file of each format, each with what it holds. */
+  private def threeFiles(name: String): (Path, Path, Path) = {
+    val dir = directory(name)
+    (
+      csvFile(dir, "a.csv", rows = 10),
+      jsonFile(dir, "a.json", rows = 10),
+      parquetFile(dir, "a.parquet", rows = 10)
+    )
+  }
+
+  Seq(Raised.Linkage, Raised.Interrupted).foreach { raised =>
+    test(
+      s"${raised.what}, raised as the lines of JSON or the rows of Parquet are read, comes out " +
+        "as a scala.MatchError with no cause"
+    ) {
+      val (_, json, parquet) = threeFiles(s"match-${raised.name}")
+
+      for (read <- Seq(linesOf(json, raised), rowsOfParquet(parquet, raised))) {
+        val failure = read.left.toOption.get
+        // Spark's reader of files has no case for it (`FileDataSourceV2.attachFilePath`): it is
+        // the value of the MatchError, and not its cause. The error is lost but for its name.
+        failure.conditions shouldBe empty
+        failure.causes shouldBe Seq(classOf[SparkException], classOf[MatchError])
+        failure.message should include(s"(of class ${raised.kind.getName})")
+      }
+      // An ordinary failure of a task: the process, and its session, go on.
+      readOf(Format.Json, json) shouldBe Right(10L)
+      readOf(Format.Parquet, parquet) shouldBe Right(10L)
+    }
+  }
+
+  test(
+    "an error that NonFatal does not take, raised as a file of CSV is read, is kept by univocity " +
+      "as the cause of the failure of the read"
+  ) {
+    val (csv, _, _) = threeFiles("csv-raised")
+
+    for (raised <- Seq(Raised.Linkage, Raised.Interrupted)) {
+      for (read <- Seq(headerOfCsv(csv, raised), rowsOfCsv(csv, raised))) {
+        val failure = read.left.toOption.get
+        failure.conditions shouldBe Seq(NoHint)
+        failure.causes shouldBe Seq(
+          classOf[SparkException],
+          classOf[TextParsingException],
+          raised.kind
+        )
+      }
+    }
+    readOf(Format.Csv, csv) shouldBe Right(10L)
+  }
+
+  test("an IOException raised the same way fails each read as a file that cannot be read does") {
+    val (csv, json, parquet) = threeFiles("io-raised")
+    val io = Raised.Io
+
+    for (read <- Seq(linesOf(json, io), rowsOfParquet(parquet, io), rowsOfCsv(csv, io))) {
+      val failure = read.left.toOption.get
+      failure.conditions shouldBe Seq(NoHint)
+      failure.cause shouldBe classOf[IOException]
+    }
+    val inferred = columnsOfParquet(parquet, io).left.toOption.get
+    inferred.conditions shouldBe empty
+    inferred.cause shouldBe classOf[IOException]
+  }
+
+  test("an InterruptedException raised as the footer of Parquet is read fails its inference") {
+    val (_, _, parquet) = threeFiles("footer-interrupted")
+
+    val failure = columnsOfParquet(parquet, Raised.Interrupted).left.toOption.get
+    failure.conditions shouldBe empty
+    failure.causes.takeRight(2) shouldBe Seq(
+      classOf[ExecutionException],
+      classOf[InterruptedException]
+    )
+  }
+
+  test(
+    "an error that NonFatal does not take, raised as the footer of Parquet is read, leaves the " +
+      "inference waiting until its job is cancelled with its tasks interrupted"
+  ) {
+    val (_, _, parquet) = threeFiles("footer-linkage")
+    val group = s"footer-${UUID.randomUUID()}"
+    val reading = Executors.newSingleThreadExecutor()
+    val read = reading.submit[Either[Failure, Seq[String]]] { () =>
+      spark.sparkContext.setJobGroup(group, "the inference of a file", interruptOnCancel = true)
+      try columnsOfParquet(parquet, Raised.Linkage)
+      finally spark.sparkContext.clearJobGroup()
+    }
+    try {
+      // Spark reads the footers in futures, and waits for them with no bound
+      // (`ThreadUtils.parmap`). A future is never completed by such an error.
+      a[TimeoutException] should be thrownBy read.get(Waited.toSeconds, TimeUnit.SECONDS)
+    } finally {
+      // Whatever the test found, no task of it is left waiting in the JVM: its job is cancelled,
+      // with its tasks interrupted, until the read is over. A job that had not started yet when
+      // the group was first cancelled is cancelled the next time.
+      val deadline = System.nanoTime() + Released.toNanos
+      while (!read.isDone && System.nanoTime() < deadline) {
+        spark.sparkContext.cancelJobGroup(group, "the test is over")
+        try read.get(1, TimeUnit.SECONDS): Unit
+        catch { case _: TimeoutException | _: ExecutionException => () }
+      }
+      reading.shutdownNow(): Unit
+    }
+
+    val cancelled = read.get(1, TimeUnit.SECONDS).left.toOption.get
+    cancelled.conditions shouldBe Seq("SPARK_JOB_CANCELLED")
+    eventually(spark.sparkContext.statusTracker.getActiveJobIds() shouldBe empty)
+    eventually(
+      spark.sparkContext.statusTracker.getExecutorInfos.map(_.numRunningTasks).sum shouldBe 0
+    )
+    readOf(Format.Parquet, parquet) shouldBe Right(10L)
+  }
 }
 
 object SparkUnreadableFileContractSpec {
@@ -438,10 +654,11 @@ object SparkUnreadableFileContractSpec {
     def signature: (Stage, Seq[String], Seq[Class[_]]) = (stage, conditions, causes)
   }
 
+  /** What `body` raised at `stage`, were it an error: Spark may let one through as it is. */
   private def caught[A](stage: Stage)(body: => A): Either[Failure, A] =
     try Right(body)
     catch {
-      case e: Exception =>
+      case e: Throwable =>
         val chain = Iterator.iterate[Throwable](e)(_.getCause).takeWhile(_ != null).take(16).toSeq
         Left(
           Failure(
@@ -463,4 +680,74 @@ object SparkUnreadableFileContractSpec {
 
   private def jsonText(rows: Int): String =
     (1 to rows).map(i => s"""{"id":"$i","name":"name $i"}""").mkString("", "\n", "\n")
+
+  /** How long a read that waits for ever is waited for, before it is said to. */
+  private val Waited = 5.seconds
+
+  /** How long the test cancels the job of such a read for, until its task is released. */
+  private val Released = 60.seconds
+
+  /**
+   * What `RaisingFileSystem` raises at every read of the bytes of a file: two of what `NonFatal`
+   * does not take, and one that it does, raised as a file that cannot be read raises it.
+   */
+  sealed abstract class Raised(val name: String, val kind: Class[_ <: Throwable]) {
+    def what: String = s"a ${kind.getSimpleName}"
+
+    def raise(): Throwable = kind.getConstructor(classOf[String]).newInstance(Said)
+  }
+
+  object Raised {
+    case object Linkage extends Raised("linkage", classOf[LinkageError])
+    case object Interrupted extends Raised("interrupted", classOf[InterruptedException]) {
+      override def what: String = "an InterruptedException"
+    }
+    case object Io extends Raised("io", classOf[IOException]) {
+      override def what: String = "an IOException"
+    }
+
+    private val all = Seq(Linkage, Interrupted, Io)
+
+    def named(name: String): Raised =
+      all.find(_.name == name).getOrElse(throw new IllegalArgumentException(s"raise what? $name"))
+  }
+
+  /** What every error that the file system of the test raises says. */
+  private val Said = "raised by the file system of the test"
+
+  /**
+   * The local file system under a scheme of its own, whose every read of the bytes of a file
+   * raises what its configuration says (`RaisingFileSystem.Raises`). What it lists, and where it
+   * says a file is, is the local file system's; a file opens, and its first read raises.
+   *
+   * No file can be made to raise an error of the JVM at will: an `OutOfMemoryError` for real is
+   * one for the whole JVM of the tests. A `LinkageError` is one that `NonFatal` does not take,
+   * as an `OutOfMemoryError` is, and which Spark's executor does not end its process for.
+   *
+   * It is public, with no arguments, as Hadoop makes a file system: by its name, in the
+   * configuration of a read (`fs.<scheme>.impl`), and not cached, so that each read has one
+   * with its own configuration.
+   */
+  final class RaisingFileSystem extends RawLocalFileSystem {
+    override def getUri: URI = URI.create(s"${RaisingFileSystem.Scheme}:///")
+    override def getScheme: String = RaisingFileSystem.Scheme
+    override def open(path: HadoopPath, bufferSize: Int): FSDataInputStream =
+      new FSDataInputStream(new RaisingStream(Raised.named(getConf.get(RaisingFileSystem.Raises))))
+  }
+
+  object RaisingFileSystem {
+    val Scheme = "raising"
+    val Impl = s"fs.$Scheme.impl"
+    val NoCache = s"fs.$Scheme.impl.disable.cache"
+    val Raises = "raising.raises"
+  }
+
+  /** A stream of a file whose every read raises. */
+  final private class RaisingStream(raised: Raised) extends FSInputStream {
+    override def read(): Int = throw raised.raise()
+    override def read(bytes: Array[Byte], offset: Int, length: Int): Int = throw raised.raise()
+    override def seek(position: Long): Unit = ()
+    override def getPos: Long = 0L
+    override def seekToNewSource(target: Long): Boolean = false
+  }
 }
